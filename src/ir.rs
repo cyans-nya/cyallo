@@ -12,8 +12,16 @@ pub struct Program {
     pub(crate) source: Box<str>,
     pub(crate) functions: Vec<Routine>,
     pub(crate) bytecode: crate::bytecode::Module,
+    /// Identities of native code compiled for this program. Shared by clones so
+    /// versions stay unique among every unit that can run against its layout.
+    pub(crate) code_versions: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 impl Program {
+    /// A fresh native code version; zero is reserved for "no native frame".
+    pub(crate) fn next_code_version(&self) -> u64 {
+        self.code_versions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
     pub fn with_inspection(
         mut self,
         inspection: std::sync::Arc<crate::inspection::Inspection>,
@@ -72,7 +80,7 @@ impl Program {
         &self,
         jobs: cyallo_compile_jobs::Jobs,
     ) -> Result<(), crate::Diagnostic> {
-        let checked = jobs.map(&self.functions, 4, |_, r| {
+        let checked = jobs.map(&self.functions, 4, |_, _, r| {
             r.checked().map(|_| ()).map_err(Clone::clone)
         });
         for result in checked {
@@ -97,7 +105,7 @@ impl Program {
         units: &[usize],
         jobs: cyallo_compile_jobs::Jobs,
     ) -> Result<(), crate::Diagnostic> {
-        let prepared = jobs.map(units, 2, |_, &id| {
+        let prepared = jobs.map(units, 2, |_, _, &id| {
             let routine = self.functions.get(id).ok_or_else(|| {
                 crate::Diagnostic::new("E153", "invalid compilation unit", Span::default())
             })?;

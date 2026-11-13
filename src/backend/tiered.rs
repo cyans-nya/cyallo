@@ -9,10 +9,11 @@ use crate::{
     runtime::{EngineError, Session, Status, native::ExitReason},
 };
 mod scheduler;
-use scheduler::{Mailbox, Request, Slots, service};
+pub use scheduler::CompilerPool;
+use scheduler::{Mailbox, Request, Slots};
 use std::{
     cell::RefCell,
-    sync::{Arc, OnceLock, Weak},
+    sync::{Arc, Weak},
     thread::{self, ThreadId},
     time::{Duration, Instant},
 };
@@ -21,9 +22,6 @@ pub enum Tier {
     Winch,
     CraneliftFast,
     CraneliftSpeed,
-}
-pub fn compiler_worker_count() -> usize {
-    service().workers
 }
 #[derive(Debug, Clone, Copy)]
 pub struct TierPolicy {
@@ -57,18 +55,9 @@ impl Default for TierPolicy {
             eager: Default::default(),
             small_limit: 64,
             heavy_limit: 512,
-            warm_instructions: std::env::var("CAIE_WARM_INSTRUCTIONS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(5_000),
-            winch_calls: std::env::var("CAIE_WINCH_CALLS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(8),
-            winch_instructions: std::env::var("CAIE_WINCH_INSTRUCTIONS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(2_000),
+            warm_instructions: 5_000,
+            winch_calls: 8,
+            winch_instructions: 2_000,
             // Speed codegen costs milliseconds. Only amortize it against a
             // genuinely hot, loop-shaped routine.
             hot_instructions: 8_000_000,
@@ -188,12 +177,33 @@ pub struct TierEvent {
     pub function: usize,
     pub kind: TierEventKind,
 }
-#[derive(Default)]
+/// Tiered JIT factory. Its compiler pool is shared by every artifact it
+/// compiles, and lives as long as the backend or any of those artifacts.
 pub struct TieredBackend {
     pub policy: TierPolicy,
+    compiler: Arc<CompilerPool>,
+}
+impl Default for TieredBackend {
+    fn default() -> Self {
+        Self::new(TierPolicy::default())
+    }
+}
+impl TieredBackend {
+    /// A backend with its own compiler pool.
+    pub fn new(policy: TierPolicy) -> Self {
+        Self::with_compiler(policy, Arc::new(CompilerPool::new()))
+    }
+    /// A backend that compiles on an existing pool, e.g. one per REPL session.
+    pub fn with_compiler(policy: TierPolicy, compiler: Arc<CompilerPool>) -> Self {
+        Self { policy, compiler }
+    }
+    pub fn compiler(&self) -> &Arc<CompilerPool> {
+        &self.compiler
+    }
 }
 pub struct TieredArtifact {
     program: Arc<Program>,
+    compiler: Arc<CompilerPool>,
     policy: TierPolicy,
     state: RefCell<State>,
     _alive: Arc<()>,
@@ -417,6 +427,7 @@ impl TieredBackend {
             .collect();
         let artifact = TieredArtifact {
             program: program.clone(),
+            compiler: self.compiler.clone(),
             policy: self.policy,
             _alive: alive,
             state: RefCell::new(State {
@@ -536,7 +547,7 @@ impl TieredArtifact {
         } else {
             Tier::CraneliftFast
         };
-        let cost = service().predict(tier, words);
+        let cost = self.compiler.service().predict(tier, words);
         let saved = Duration::from_nanos(
             (words as u64)
                 .saturating_mul(if routine.shape.loops { 128 } else { repeats })
@@ -557,7 +568,7 @@ impl TieredArtifact {
             let request = state.requests[function].clone();
             drop(state);
             if explicit {
-                service().prioritize(&request);
+                self.compiler.service().prioritize(&request);
             }
             return Ok(super::EagerDecision::AlreadyRequested);
         }
@@ -600,7 +611,7 @@ impl TieredArtifact {
         self.request(function, tier, None);
         if priority {
             let request = self.state.borrow().requests[function].clone();
-            service().prioritize(&request);
+            self.compiler.service().prioritize(&request);
         }
         Ok(super::EagerDecision::Queued(tier))
     }
@@ -635,7 +646,7 @@ impl TieredArtifact {
         }
         let request = state.requests[function].clone();
         drop(state);
-        service().request(
+        self.compiler.service().request(
             &request,
             tier,
             executed,
@@ -662,6 +673,9 @@ impl TieredArtifact {
         let mut events = state.events.clone();
         events.sort_by_key(|event| event.elapsed);
         (state.info.clone(), events)
+    }
+    pub fn compiler_workers(&self) -> usize {
+        self.compiler.workers()
     }
     pub fn policy(&self) -> TierPolicy {
         self.policy

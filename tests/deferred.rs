@@ -65,14 +65,12 @@ fn declaration_errors_are_eager_and_analysis_is_shared_between_workers() {
 #[test]
 fn small_loop_gets_compiled_before_its_first_body_instruction() {
     let p=Arc::new(compile_for_execution("fn work(n: i64) -> i64 { let mut i = 0; while i < n { i += 1 }; return i }\nfn cold() -> i64 { return missing }\nstd::io::print(work(2000))\n",CompileOptions::default()).unwrap());
-    let jit = TieredBackend {
-        policy: TierPolicy {
-            first_call_wait: Duration::from_secs(5),
-            hot_instructions: u64::MAX,
-            warm_instructions: 0,
-            ..Default::default()
-        },
-    }
+    let jit = TieredBackend::new(TierPolicy {
+        first_call_wait: Duration::from_secs(5),
+        hot_instructions: u64::MAX,
+        warm_instructions: 0,
+        ..Default::default()
+    })
     .compile(p.clone())
     .unwrap();
     let mut s = Session::new(p.clone()).unwrap();

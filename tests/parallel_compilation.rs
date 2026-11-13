@@ -71,8 +71,8 @@ fn concurrent_preparation_initializes_only_selected_deferred_functions() {
         .unwrap(),
     );
     assert!(!p.functions()[1].is_analyzed());
-    Jobs(4).map(&[0, 1, 2, 3], 1, |_, _| {
-        p.prepare_units(&[1, 2, 3, 4, 1], Jobs(4)).unwrap()
+    Jobs(4).map(&[0, 1, 2, 3], 1, |nested, _, _| {
+        p.prepare_units(&[1, 2, 3, 4, 1], nested).unwrap()
     });
     assert!(p.functions()[1..5].iter().all(|f| f.is_analyzed()));
     assert!(!p.functions()[5].is_analyzed());

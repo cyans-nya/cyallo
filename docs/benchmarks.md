@@ -183,8 +183,8 @@ downstream work.
 Speed compile time rises sharply with body size: a 2,000-statement routine took
 roughly 6 seconds to compile on this host. That is the reason
 `speed_size_limit` skips speed codegen for bodies above 512 bytecodes.
-`CAIE_WARM_INSTRUCTIONS`, `CAIE_FAST_OPTIMIZE`, `CAIE_FAST_BACKTRACKING`, and
-`CAIE_SPEED_BACKTRACKING` override the defaults for experiments.
+Experiments override these defaults through `TierPolicy` and
+`CraneliftConfig` fields; the runtime reads no environment variables.
 
 ## Compilation and startup
 

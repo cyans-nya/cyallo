@@ -35,13 +35,11 @@ fn main() {
             println!("{name}: OK");
             continue;
         }
-        let winch = TieredBackend {
-            policy: TierPolicy {
-                hot_instructions: u64::MAX,
-                warm_instructions: u64::MAX,
-                ..Default::default()
-            },
-        }
+        let winch = TieredBackend::new(TierPolicy {
+            hot_instructions: u64::MAX,
+            warm_instructions: u64::MAX,
+            ..Default::default()
+        })
         .compile(program.clone())
         .unwrap();
         for fi in 0..program.functions().len() {

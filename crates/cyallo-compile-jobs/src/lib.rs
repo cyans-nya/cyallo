@@ -1,39 +1,14 @@
 //! Scoped, bounded compilation jobs with ordered publication and no nested pools.
-use std::{
-    cell::Cell,
-    sync::atomic::{AtomicUsize, Ordering},
-};
-thread_local! {static ACTIVE:Cell<bool>=const {Cell::new(false)};}
+//!
+//! Nesting is explicit: every job receives the [`Jobs`] it may use for nested
+//! stages. Inside a pool worker that is [`Jobs::SEQUENTIAL`], so a nested stage
+//! runs on its existing worker instead of multiplying thread pools.
+use std::sync::atomic::{AtomicUsize, Ordering};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Jobs(pub usize);
 impl Jobs {
-    pub fn for_each_mut<T: Send>(
-        self,
-        items: &mut [T],
-        minimum: usize,
-        f: impl Fn(usize, &mut T) + Sync,
-    ) {
-        let workers = self.workers().min(items.len());
-        if workers <= 1 || items.len() < minimum || ACTIVE.get() {
-            for (i, t) in items.iter_mut().enumerate() {
-                f(i, t)
-            }
-            return;
-        }
-        let width = items.len().div_ceil(workers);
-        std::thread::scope(|scope| {
-            for (chunk, items) in items.chunks_mut(width).enumerate() {
-                let f = &f;
-                scope.spawn(move || {
-                    let old = ACTIVE.replace(true);
-                    for (i, t) in items.iter_mut().enumerate() {
-                        f(chunk * width + i, t)
-                    }
-                    ACTIVE.set(old);
-                });
-            }
-        });
-    }
+    /// Runs every stage on the calling thread.
+    pub const SEQUENTIAL: Self = Self(1);
     /// Zero selects the available cores, capped at 32 to bound compiler memory.
     pub fn workers(self) -> usize {
         if self.0 == 0 {
@@ -44,39 +19,58 @@ impl Jobs {
             self.0.clamp(1, 128)
         }
     }
-    /// Every result is published in input order, including errors. A nested stage
-    /// executes in its existing worker, rather than multiplying thread pools.
+    /// Whether `len` items with this `minimum` stay on the calling thread.
+    fn sequential(self, len: usize, minimum: usize) -> Option<usize> {
+        let workers = self.workers().min(len);
+        (workers > 1 && len >= minimum).then_some(workers)
+    }
+    pub fn for_each_mut<T: Send>(
+        self,
+        items: &mut [T],
+        minimum: usize,
+        f: impl Fn(Jobs, usize, &mut T) + Sync,
+    ) {
+        let Some(workers) = self.sequential(items.len(), minimum) else {
+            for (i, t) in items.iter_mut().enumerate() {
+                f(self, i, t)
+            }
+            return;
+        };
+        let width = items.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            for (chunk, items) in items.chunks_mut(width).enumerate() {
+                let f = &f;
+                scope.spawn(move || {
+                    for (i, t) in items.iter_mut().enumerate() {
+                        f(Jobs::SEQUENTIAL, chunk * width + i, t)
+                    }
+                });
+            }
+        });
+    }
+    /// Every result is published in input order, including errors.
     pub fn map<'a, T: Sync, R: Send>(
         self,
         items: &'a [T],
         minimum: usize,
-        f: impl Fn(usize, &'a T) -> R + Sync,
+        f: impl Fn(Jobs, usize, &'a T) -> R + Sync,
     ) -> Vec<R> {
-        let workers = self.workers().min(items.len());
-        if workers <= 1 || items.len() < minimum || ACTIVE.get() {
-            return items.iter().enumerate().map(|(i, t)| f(i, t)).collect();
-        }
-        struct Active(bool);
-        impl Active {
-            fn enter() -> Self {
-                Self(ACTIVE.replace(true))
-            }
-        }
-        impl Drop for Active {
-            fn drop(&mut self) {
-                ACTIVE.set(self.0)
-            }
-        }
+        let Some(workers) = self.sequential(items.len(), minimum) else {
+            return items
+                .iter()
+                .enumerate()
+                .map(|(i, t)| f(self, i, t))
+                .collect();
+        };
         let next = AtomicUsize::new(0);
         let work = || {
-            let _active = Active::enter();
             let mut out = vec![];
             loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= items.len() {
                     break;
                 }
-                out.push((i, f(i, &items[i])))
+                out.push((i, f(Jobs::SEQUENTIAL, i, &items[i])))
             }
             out
         };
@@ -104,7 +98,7 @@ mod tests {
     #[test]
     fn independent_jobs_overlap_and_publish_in_order() {
         let barrier = std::sync::Barrier::new(4);
-        let values = Jobs(4).map(&[0, 1, 2, 3], 1, |i, _| {
+        let values = Jobs(4).map(&[0, 1, 2, 3], 1, |_, i, _| {
             barrier.wait();
             (i, std::thread::current().id())
         });
@@ -120,11 +114,16 @@ mod tests {
     }
     #[test]
     fn nested_stages_reuse_their_worker() {
-        Jobs(4).map(&[0, 1, 2, 3], 1, |_, _| {
+        Jobs(4).map(&[0, 1, 2, 3], 1, |nested, _, _| {
+            assert_eq!(nested, Jobs::SEQUENTIAL);
             let parent = std::thread::current().id();
-            Jobs(8).map(&[0, 1, 2, 3], 1, |_, _| {
+            nested.map(&[0, 1, 2, 3], 1, |_, _, _| {
                 assert_eq!(std::thread::current().id(), parent)
             });
         });
+    }
+    #[test]
+    fn sequential_callers_pass_their_own_jobs_through() {
+        Jobs(4).map(&[0], 4, |nested, _, _| assert_eq!(nested, Jobs(4)));
     }
 }

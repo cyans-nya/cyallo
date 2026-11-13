@@ -174,7 +174,7 @@ pub fn compile_modules(
         Diagnostic::new("E140", "module source exceeds span limit", Span::default())
     })?;
     let jobs = cyallo_compile_jobs::Jobs(options.jobs);
-    let indexed = jobs.map(sources, 2, |_, module| {
+    let indexed = jobs.map(sources, 2, |_, _, module| {
         cyallo_parser::index_modern(&module.source)
     });
     let work: Vec<_> = indexed
@@ -184,7 +184,7 @@ pub fn compile_modules(
             (0..index.as_ref().map_or(0, |index| index.units().len())).map(move |unit| (file, unit))
         })
         .collect();
-    let parsed = jobs.map(&work, 4, |_, &(file, unit)| {
+    let parsed = jobs.map(&work, 4, |_, _, &(file, unit)| {
         indexed[file]
             .as_ref()
             .expect("indexed file")

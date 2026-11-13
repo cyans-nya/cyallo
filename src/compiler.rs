@@ -79,5 +79,6 @@ pub(crate) fn compile_ast_unfolded(
         source: source.into(),
         functions: checked.functions,
         bytecode,
+        code_versions: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
     })
 }

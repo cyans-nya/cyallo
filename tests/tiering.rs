@@ -18,13 +18,11 @@ fn native_fast_request(
 ) {
     let program = Arc::new(compile(source).unwrap());
     let origin = Instant::now();
-    let artifact = TieredBackend {
-        policy: TierPolicy {
-            warm_instructions: 5_000,
-            first_call_wait: Duration::ZERO,
-            ..Default::default()
-        },
-    }
+    let artifact = TieredBackend::new(TierPolicy {
+        warm_instructions: 5_000,
+        first_call_wait: Duration::ZERO,
+        ..Default::default()
+    })
     .compile_with_reporting(program.clone(), origin)
     .unwrap();
     for fi in 0..program.functions().len() {
@@ -118,13 +116,11 @@ fn native_callees_request_fast_without_returning_to_the_driver() {
 #[test]
 fn rejected_speed_size_does_not_repeatedly_yield_native_code() {
     let program = Arc::new(compile("let mut n = 0\nwhile true { n += 1 }\n").unwrap());
-    let artifact = TieredBackend {
-        policy: TierPolicy {
-            hot_instructions: 64,
-            speed_size_limit: 0,
-            ..Default::default()
-        },
-    }
+    let artifact = TieredBackend::new(TierPolicy {
+        hot_instructions: 64,
+        speed_size_limit: 0,
+        ..Default::default()
+    })
     .compile_with_reporting(program.clone(), Instant::now())
     .unwrap();
     artifact.precompile(0, Tier::CraneliftFast).unwrap();
@@ -247,14 +243,12 @@ fn tiers_preserve_calls_input_and_errors() {
 #[test]
 fn hot_loop_promotes_at_budget_boundary() {
     let program = Arc::new(compile("let mut n = 0\nwhile true { n += 1 }\n").unwrap());
-    let artifact = TieredBackend {
-        policy: TierPolicy {
-            hot_instructions: 50,
-            warm_instructions: 0,
-            execution_quantum: 16,
-            ..Default::default()
-        },
-    }
+    let artifact = TieredBackend::new(TierPolicy {
+        hot_instructions: 50,
+        warm_instructions: 0,
+        execution_quantum: 16,
+        ..Default::default()
+    })
     .compile(program.clone())
     .unwrap();
     artifact.wait_for_compilation(Duration::from_secs(30));
@@ -270,14 +264,12 @@ fn hot_loop_promotes_at_budget_boundary() {
 fn osr_promotes_a_running_invocation_without_restarting_it() {
     let source = "let mut calls = 0\nproc work(limit: i64) -> i64 {\n calls += 1\n let mut progress = 0\n while progress < limit { progress += 1 }\n return progress\n}\nlet result = work(10000)\nstd::io::print(result, \":\", calls)\n";
     let program = Arc::new(compile(source).unwrap());
-    let artifact = TieredBackend {
-        policy: TierPolicy {
-            hot_instructions: 64,
-            warm_instructions: 0,
-            execution_quantum: 16,
-            ..Default::default()
-        },
-    }
+    let artifact = TieredBackend::new(TierPolicy {
+        hot_instructions: 64,
+        warm_instructions: 0,
+        execution_quantum: 16,
+        ..Default::default()
+    })
     .compile(program.clone())
     .unwrap();
     let mut session = Session::new(program).unwrap();
@@ -339,14 +331,12 @@ fn winch_checked_arithmetic_and_input_match_interpreter() {
 fn osr_keeps_byref_aliases_to_caller_storage() {
     let source = "let mut n = 0\nproc work(left: &mut i64) { let right = left; while *left < 1000 { *left += 1; *right += 1 } }\nwork(&mut n)\nstd::io::print(n)\n";
     let program = Arc::new(compile(source).unwrap());
-    let artifact = TieredBackend {
-        policy: TierPolicy {
-            hot_instructions: 32,
-            warm_instructions: 0,
-            execution_quantum: 16,
-            ..Default::default()
-        },
-    }
+    let artifact = TieredBackend::new(TierPolicy {
+        hot_instructions: 32,
+        warm_instructions: 0,
+        execution_quantum: 16,
+        ..Default::default()
+    })
     .compile(program.clone())
     .unwrap();
     let mut session = Session::new(program).unwrap();

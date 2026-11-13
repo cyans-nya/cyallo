@@ -17,13 +17,11 @@ fn context() -> Context {
     }
 }
 fn engines(p: &Arc<cyallo::ir::Program>) -> Vec<Box<dyn Executable>> {
-    let baseline = TieredBackend {
-        policy: TierPolicy {
-            hot_instructions: u64::MAX,
-            warm_instructions: u64::MAX,
-            ..Default::default()
-        },
-    }
+    let baseline = TieredBackend::new(TierPolicy {
+        hot_instructions: u64::MAX,
+        warm_instructions: u64::MAX,
+        ..Default::default()
+    })
     .compile(p.clone())
     .unwrap();
     for fi in 0..p.functions().len() {

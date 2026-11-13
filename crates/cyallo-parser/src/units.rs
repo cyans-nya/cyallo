@@ -32,7 +32,7 @@ impl<'src> IndexedSource<'src> {
         .program()
     }
     pub fn parse(&self, repl: bool, jobs: Jobs) -> Result<Ast, Diagnostic> {
-        let parsed = jobs.map(&self.units, 4, |i, _| self.parse_unit(i, repl));
+        let parsed = jobs.map(&self.units, 4, |_, i, _| self.parse_unit(i, repl));
         self.assemble(parsed)
     }
     /// Merge results in unit order, independent of their execution order.

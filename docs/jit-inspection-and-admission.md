@@ -64,7 +64,7 @@ speculative words and 2 ms of predicted compilation work. `always_eager` retains
 the outstanding cap and a 4,096-word routine limit. Each artifact shares one
 **1 ms first-call wait budget**, instead of granting every callee a fresh wait.
 Timeout continues interpretation while background work remains eligible.
-`TierPolicy` exposes these limits; `CAIE_EAGER_ROUTINES=0` disables prediction.
+`TierPolicy` exposes these limits; `TierPolicy::eager.enabled = false` disables prediction.
 
 Compile-cost histories have eight logarithmic size buckets per tier. Each keeps
 sixteen samples and predicts their upper quartile. Initial estimates are 50 µs

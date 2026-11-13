@@ -25,15 +25,13 @@ fn execute(source: &str, input: &[&str]) -> (String, Status) {
     };
     let mut a = Session::with_context(p.clone(), context.clone()).unwrap();
     a.run(100_000);
-    let baseline = TieredBackend {
-        policy: TierPolicy {
-            small_limit: usize::MAX - 1,
-            heavy_limit: usize::MAX,
-            hot_instructions: u64::MAX,
-            warm_instructions: u64::MAX,
-            ..Default::default()
-        },
-    }
+    let baseline = TieredBackend::new(TierPolicy {
+        small_limit: usize::MAX - 1,
+        heavy_limit: usize::MAX,
+        hot_instructions: u64::MAX,
+        warm_instructions: u64::MAX,
+        ..Default::default()
+    })
     .compile(p.clone())
     .unwrap();
     for fi in 0..p.functions().len() {

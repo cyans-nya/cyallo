@@ -154,12 +154,7 @@ pub(crate) fn render(
     .unwrap();
     let mut timeline = Vec::new();
     if let Some(Compiled::Tiered(artifact)) = artifact {
-        writeln!(
-            text,
-            "  compiler workers: {}",
-            cyallo::backend::compiler_worker_count()
-        )
-        .unwrap();
+        writeln!(text, "  compiler workers: {}", artifact.compiler_workers()).unwrap();
         let policy = artifact.policy();
         eager_policy(&mut text, policy);
         writeln!(

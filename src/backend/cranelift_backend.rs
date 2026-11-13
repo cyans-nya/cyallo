@@ -52,8 +52,8 @@ pub enum ResumeStrategy {
     AllPcs,
     LoopHeaders,
 }
-/// Resolved code-generation options. Optimization is independent of dispatch
-/// scope and resume entries, allowing matched comparisons without changing env.
+/// Code-generation options. Optimization is independent of dispatch scope and
+/// resume entries, so configurations can be compared directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CraneliftConfig {
     pub optimization: OptimizationLevel,
@@ -67,6 +67,12 @@ pub struct CraneliftConfig {
 }
 impl Default for CraneliftConfig {
     fn default() -> Self {
+        Self::fast()
+    }
+}
+impl CraneliftConfig {
+    /// Eager fast settings: unoptimized codegen over linked all-PC routines.
+    pub const fn fast() -> Self {
         Self {
             optimization: OptimizationLevel::None,
             scope: CompilationScope::PerRoutine,
@@ -76,41 +82,12 @@ impl Default for CraneliftConfig {
             procedure_inlining: false,
         }
     }
-}
-fn environment_flag(name: &str, default: bool) -> bool {
-    std::env::var(name).ok().map_or(default, |value| {
-        !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        )
-    })
-}
-impl CraneliftConfig {
-    /// Effective eager fast settings, including process environment overrides.
-    pub fn fast() -> Self {
-        static SETTINGS: std::sync::OnceLock<CraneliftConfig> = std::sync::OnceLock::new();
-        *SETTINGS.get_or_init(|| Self {
-            optimization: if environment_flag("CAIE_FAST_OPTIMIZE", false) {
-                OptimizationLevel::SpeedAndSize
-            } else {
-                OptimizationLevel::None
-            },
-            backtracking: environment_flag("CAIE_FAST_BACKTRACKING", true),
-            inlining: environment_flag("CAIE_INLINE_ROUTINES", true),
-            procedure_inlining: environment_flag("CAIE_INLINE_PROCEDURES", false),
-            ..Self::default()
-        })
-    }
-    /// Effective eager speed settings. Like fast, uses linked all-PC routines.
-    pub fn speed() -> Self {
-        static SETTINGS: std::sync::OnceLock<CraneliftConfig> = std::sync::OnceLock::new();
-        *SETTINGS.get_or_init(|| Self {
+    /// Eager speed settings. Like fast, uses linked all-PC routines.
+    pub const fn speed() -> Self {
+        Self {
             optimization: OptimizationLevel::Speed,
-            backtracking: environment_flag("CAIE_SPEED_BACKTRACKING", true),
-            inlining: environment_flag("CAIE_INLINE_ROUTINES", true),
-            procedure_inlining: environment_flag("CAIE_INLINE_PROCEDURES", false),
-            ..Self::default()
-        })
+            ..Self::fast()
+        }
     }
     /// Per-routine settings used by independently replaceable JIT tiers.
     pub fn tiered(speed: bool) -> Self {
@@ -279,7 +256,7 @@ impl NativeBackend for CraneliftConfig {
             }
             CompilationScope::PerRoutine => program
                 .codegen_jobs()
-                .map(&program.functions, 4, |fi, routine| {
+                .map(&program.functions, 4, |_, fi, routine| {
                     if routine.attributes.compilation == cyallo_ast::CompileHint::AlwaysLazy {
                         Ok(None)
                     } else {
@@ -1114,7 +1091,7 @@ fn compile_configured(
     function: Option<usize>,
     config: CraneliftConfig,
 ) -> Result<CraneliftUnit, CompileError> {
-    let version = super::next_code_version();
+    let version = program.next_code_version();
     let mut artifact = compile_part(program.clone(), function, config, false, version)?;
     if config.resume == ResumeStrategy::LoopHeaders {
         artifact.continuation = Some(Box::new(compile_part(

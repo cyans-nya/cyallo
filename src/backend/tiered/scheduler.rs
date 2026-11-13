@@ -214,7 +214,6 @@ pub(super) struct Service {
     history: Mutex<CostHistory>,
     queue: Mutex<Queue>,
     wake: kanal::Sender<()>,
-    pub workers: usize,
 }
 fn worker_count(logical: usize) -> usize {
     logical.saturating_sub(1).clamp(1, 3)
@@ -353,103 +352,156 @@ impl Service {
         let _ = self.wake.try_send(());
     }
 }
-pub(super) fn service() -> &'static Arc<Service> {
-    static SERVICE: OnceLock<Arc<Service>> = OnceLock::new();
-    SERVICE.get_or_init(|| {
+/// Owns the compiler threads, their queue and their cost history. Artifacts
+/// and backends hold it through `Arc`; when the last handle drops, the wake
+/// channel closes and the workers are joined. Queued requests whose artifacts
+/// were dropped are skipped, never compiled.
+pub struct CompilerPool {
+    service: Arc<Service>,
+    threads: Vec<thread::JoinHandle<()>>,
+}
+impl CompilerPool {
+    /// `min(3, logical CPUs - 1)` workers, at least one.
+    pub fn new() -> Self {
+        Self::with_workers(worker_count(
+            thread::available_parallelism().map_or(1, usize::from),
+        ))
+    }
+    /// A pool with `workers` threads. Threads the OS refuses to create are
+    /// omitted; with none, requests stay queued and code keeps interpreting.
+    pub fn with_workers(workers: usize) -> Self {
         let (wake, receiver) = kanal::bounded(1);
         let service = Arc::new(Service {
             history: Mutex::default(),
             queue: Mutex::default(),
             wake,
-            workers: worker_count(thread::available_parallelism().map_or(1, usize::from)),
         });
-        for worker in 0..service.workers {
-            let compiler = service.clone();
-            let receiver = receiver.clone();
-            thread::Builder::new()
-                .name(format!("cyallo-codegen-{}", worker + 1))
-                .spawn(move || {
-                    loop {
-                        let Some((request, tier, queued)) = compiler.take() else {
-                            if receiver.recv().is_err() {
-                                break;
-                            }
-                            continue;
-                        };
-                        let started = Instant::now();
-                        let range = request.state.lock().unwrap().eager_range;
-                        if let Some(range @ (small, medium, forced)) = range
-                            && let Ok(body) = request.program.functions[request.function].checked()
-                        {
-                            let size = body.code.len();
-                            let outside = if forced { size > medium } else { size < small || size >= medium };
-                            if outside && compiler.reject_eager(&request, tier, range) {
-                                let kind = if matches!(body.attributes.compilation,
-                                    cyallo_ast::CompileHint::Eager | cyallo_ast::CompileHint::AlwaysEager)
-                                { "unfulfilled" } else { "eager" };
-                                request.program.notice(kind, request.function, format!(
-                                    "actual lowered size {size} is outside eager eligibility; retained lazy tiering"));
-                                continue;
-                            }
-                        }
-                        request.event(
-                            started,
-                            TierEventKind::CompileStarted {
-                                tier,
-                                worker: thread::current().id(),
-                                queue_time: started.duration_since(queued),
-                            },
-                        );
-                        let mut actual = tier;
-                        let mut fallback = None;
-                        let result = match tier {
-                            Tier::Winch => {
-                                match WinchUnit::compile(request.program.clone(), request.function)
-                                {
-                                    Ok(unit) => Ok(Unit::Winch(Box::new(unit))),
-                                    Err(error) => {
-                                        fallback = Some(error);
-                                        actual = Tier::CraneliftFast;
-                                        compile_unit(
-                                            request.program.clone(),
-                                            request.function,
-                                            false,
-                                        )
-                                        .map(|unit| Unit::Cranelift(Box::new(unit)))
-                                    }
-                                }
-                            }
-                            Tier::CraneliftFast | Tier::CraneliftSpeed => compile_unit(
-                                request.program.clone(),
-                                request.function,
-                                tier == Tier::CraneliftSpeed,
-                            )
-                            .map(|unit| Unit::Cranelift(Box::new(unit))),
-                        };
-                        let completed = Instant::now();
-                        if result.is_ok() && !request.program.inspection().is_some_and(|o|o.options.emit_ir || o.options.emit_bytecode || o.options.emit_clif || o.options.full_trace) {
-                            let words=request.program.functions[request.function].code.len();
-                            compiler.history.lock().unwrap().record(actual,words,completed.duration_since(started));
-                        }
-                        compiler.finish(
-                            &request,
-                            tier,
-                            Some(Finished {
-                                function: request.function,
-                                actual,
-                                result,
-                                elapsed: completed.duration_since(started),
-                                thread: thread::current().id(),
-                                fallback,
-                                completed,
-                            }),
-                        );
-                    }
-                })
-                .expect("create dedicated compiler thread");
+        let threads = (0..workers)
+            .filter_map(|worker| {
+                let compiler = service.clone();
+                let receiver = receiver.clone();
+                thread::Builder::new()
+                    .name(format!("cyallo-codegen-{}", worker + 1))
+                    .spawn(move || work(&compiler, &receiver))
+                    .ok()
+            })
+            .collect();
+        Self { service, threads }
+    }
+    pub fn workers(&self) -> usize {
+        self.threads.len()
+    }
+    pub(super) fn service(&self) -> &Service {
+        &self.service
+    }
+}
+impl Default for CompilerPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Drop for CompilerPool {
+    fn drop(&mut self) {
+        // Closing twice is impossible here; the error only reports that case.
+        let _ = self.service.wake.close();
+        let current = thread::current().id();
+        for worker in self.threads.drain(..) {
+            if worker.thread().id() != current {
+                let _ = worker.join();
+            }
         }
-        service
-    })
+    }
+}
+fn work(compiler: &Service, receiver: &kanal::Receiver<()>) {
+    loop {
+        let Some((request, tier, queued)) = compiler.take() else {
+            if receiver.recv().is_err() {
+                break;
+            }
+            continue;
+        };
+        let started = Instant::now();
+        let range = request.state.lock().unwrap().eager_range;
+        if let Some(range @ (small, medium, forced)) = range
+            && let Ok(body) = request.program.functions[request.function].checked()
+        {
+            let size = body.code.len();
+            let outside = if forced {
+                size > medium
+            } else {
+                size < small || size >= medium
+            };
+            if outside && compiler.reject_eager(&request, tier, range) {
+                let kind = if matches!(
+                    body.attributes.compilation,
+                    cyallo_ast::CompileHint::Eager | cyallo_ast::CompileHint::AlwaysEager
+                ) {
+                    "unfulfilled"
+                } else {
+                    "eager"
+                };
+                request.program.notice(kind, request.function, format!(
+                        "actual lowered size {size} is outside eager eligibility; retained lazy tiering"));
+                continue;
+            }
+        }
+        request.event(
+            started,
+            TierEventKind::CompileStarted {
+                tier,
+                worker: thread::current().id(),
+                queue_time: started.duration_since(queued),
+            },
+        );
+        let mut actual = tier;
+        let mut fallback = None;
+        let result = match tier {
+            Tier::Winch => match WinchUnit::compile(request.program.clone(), request.function) {
+                Ok(unit) => Ok(Unit::Winch(Box::new(unit))),
+                Err(error) => {
+                    fallback = Some(error);
+                    actual = Tier::CraneliftFast;
+                    compile_unit(request.program.clone(), request.function, false)
+                        .map(|unit| Unit::Cranelift(Box::new(unit)))
+                }
+            },
+            Tier::CraneliftFast | Tier::CraneliftSpeed => compile_unit(
+                request.program.clone(),
+                request.function,
+                tier == Tier::CraneliftSpeed,
+            )
+            .map(|unit| Unit::Cranelift(Box::new(unit))),
+        };
+        let completed = Instant::now();
+        if result.is_ok()
+            && !request.program.inspection().is_some_and(|o| {
+                o.options.emit_ir
+                    || o.options.emit_bytecode
+                    || o.options.emit_clif
+                    || o.options.full_trace
+            })
+        {
+            let words = request.program.functions[request.function].code.len();
+            compiler.history.lock().unwrap().record(
+                actual,
+                words,
+                completed.duration_since(started),
+            );
+        }
+        compiler.finish(
+            &request,
+            tier,
+            Some(Finished {
+                function: request.function,
+                actual,
+                result,
+                elapsed: completed.duration_since(started),
+                thread: thread::current().id(),
+                fallback,
+                completed,
+            }),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -461,7 +513,6 @@ mod tests {
             history: Mutex::default(),
             queue: Mutex::default(),
             wake,
-            workers: 1,
         };
         let owner = Arc::new(());
         let request = Request::new(
@@ -522,6 +573,15 @@ mod tests {
         );
         service.finish(&request, tier, None);
         assert_eq!(service.take().unwrap().1, Tier::CraneliftSpeed);
+    }
+    #[test]
+    fn dropping_the_pool_stops_and_joins_its_workers() {
+        let pool = CompilerPool::with_workers(2);
+        assert_eq!(pool.workers(), 2);
+        let service = pool.service.clone();
+        drop(pool);
+        // Every worker has exited and released its handle.
+        assert_eq!(Arc::strong_count(&service), 1);
     }
     #[test]
     fn abandoned_requests_are_skipped() {

@@ -84,13 +84,11 @@ fn clean_native_call_returns_skip_materialization_but_dirty_yields_do_not() {
         ],
         [Tier::Winch, Tier::CraneliftSpeed, Tier::CraneliftFast],
     ] {
-        let artifact = TieredBackend {
-            policy: TierPolicy {
-                warm_instructions: u64::MAX,
-                hot_instructions: u64::MAX,
-                ..Default::default()
-            },
-        }
+        let artifact = TieredBackend::new(TierPolicy {
+            warm_instructions: u64::MAX,
+            hot_instructions: u64::MAX,
+            ..Default::default()
+        })
         .compile(program.clone())
         .unwrap();
         for (fi, tier) in tiers.into_iter().enumerate() {
@@ -128,13 +126,11 @@ fn clean_native_call_returns_skip_materialization_but_dirty_yields_do_not() {
 fn every_instruction_can_handoff_between_native_and_interpreter() {
     let source = "let mut x: f64 = 2\nlet mut n = 0\nproc add(a: &mut i64) { let b = a; *a += 3; *b += *a }\nfor i = 1 to 8 { add(&mut n); x = x * 1.5; if n > 100 { n -= 7 } }\nlet mut a = [n, 2, 3]\nstd::io::print(a[0], x, '🐈' > 'a', !false)\n";
     let program = Arc::new(compile(source).unwrap());
-    let baseline = TieredBackend {
-        policy: TierPolicy {
-            hot_instructions: u64::MAX,
-            warm_instructions: u64::MAX,
-            ..Default::default()
-        },
-    }
+    let baseline = TieredBackend::new(TierPolicy {
+        hot_instructions: u64::MAX,
+        warm_instructions: u64::MAX,
+        ..Default::default()
+    })
     .compile(program.clone())
     .unwrap();
     for fi in 0..program.functions().len() {

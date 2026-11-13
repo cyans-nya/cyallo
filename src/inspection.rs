@@ -170,7 +170,7 @@ impl Inspection {
             .map(|f| f.is_analyzed())
             .collect();
         // Formatting each checked routine is independent; cold units stay cold.
-        jobs.map(program.functions(), 4, |fi, routine| {
+        jobs.map(program.functions(), 4, |_, fi, routine| {
             if analyzed[fi] {
                 self.emit_routine(program, fi, routine)
             }

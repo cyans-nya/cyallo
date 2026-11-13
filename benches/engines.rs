@@ -67,15 +67,13 @@ fn warm(program: &Arc<cyallo::ir::Program>, tier: Tier) -> (TieredArtifact, Dura
     let start = Instant::now();
     // Freeze the requested tier: a hot workload must not silently promote a
     // baseline/fast measurement to speed during the repeated samples.
-    let artifact = TieredBackend {
-        policy: TierPolicy {
-            small_limit: usize::MAX - 1,
-            heavy_limit: usize::MAX,
-            hot_instructions: u64::MAX,
-            warm_instructions: u64::MAX,
-            ..TierPolicy::default()
-        },
-    }
+    let artifact = TieredBackend::new(TierPolicy {
+        small_limit: usize::MAX - 1,
+        heavy_limit: usize::MAX,
+        hot_instructions: u64::MAX,
+        warm_instructions: u64::MAX,
+        ..TierPolicy::default()
+    })
     .compile(program.clone())
     .unwrap();
     assert!(artifact.wait_for_compilation(Duration::from_secs(30)));
@@ -165,15 +163,13 @@ fn admission(name: &str, source: &str, dialect: Dialect) {
                 )
                 .unwrap(),
             );
-            let artifact = TieredBackend {
-                policy: TierPolicy {
-                    eager: cyallo::backend::EagerPolicy {
-                        enabled: index == 1,
-                        ..Default::default()
-                    },
+            let artifact = TieredBackend::new(TierPolicy {
+                eager: cyallo::backend::EagerPolicy {
+                    enabled: index == 1,
                     ..Default::default()
                 },
-            }
+                ..Default::default()
+            })
             .compile(program.clone())
             .unwrap();
             let mut session = Session::new(program).unwrap();

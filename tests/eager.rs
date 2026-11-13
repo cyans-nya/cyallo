@@ -67,12 +67,10 @@ fn speculative_work_is_bounded_and_lowered_rejections_wake_waiters() {
         max_words: estimate + 1,
         ..Default::default()
     };
-    let jit = TieredBackend {
-        policy: TierPolicy {
-            eager,
-            ..Default::default()
-        },
-    }
+    let jit = TieredBackend::new(TierPolicy {
+        eager,
+        ..Default::default()
+    })
     .compile(p.clone())
     .unwrap();
     let _ = jit.hint_call_soon(1).unwrap();
@@ -85,12 +83,10 @@ fn speculative_work_is_bounded_and_lowered_rejections_wake_waiters() {
         max_total_words: 0,
         ..Default::default()
     };
-    let jit = TieredBackend {
-        policy: TierPolicy {
-            eager,
-            ..Default::default()
-        },
-    }
+    let jit = TieredBackend::new(TierPolicy {
+        eager,
+        ..Default::default()
+    })
     .compile(p.clone())
     .unwrap();
     assert!(matches!(

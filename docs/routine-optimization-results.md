@@ -48,8 +48,8 @@ measured runtime, while copied bodies increase compilation work and code size.
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `CraneliftConfig.inlining` / `CAIE_INLINE_ROUTINES` | `true` / `1` | Master switch; bounded scalar function and procedure inlining |
-| `CraneliftConfig.procedure_inlining` / `CAIE_INLINE_PROCEDURES` | `false` / `0` | Also embed effectful procedures while retaining frames |
+| `CraneliftConfig.inlining` | `true` | Master switch; bounded scalar function and procedure inlining |
+| `CraneliftConfig.procedure_inlining` | `false` | Also embed effectful procedures while retaining frames |
 
 `--jit-report` uses existing logical counters and preserves both optimization
 paths. Intrusive `--jit-trace` / `Session::enable_reporting` disables both inline
@@ -141,8 +141,10 @@ so it stays opt-in.
 | cranelift | 20.35 / 25.44 | 7.04 / 7.76 | 2.89× |
 | cranelift_speed | 21.25 / 21.87 | 7.99 / 8.26 | 2.66× |
 
-Cold runs use the same release binary, set `CAIE_INLINE_ROUTINES=0/1` and
-`CAIE_INLINE_PROCEDURES=0`, and verify identical program output. These include
+Cold runs used the same release binary with routine inlining off and on
+(procedure inlining off), and verified identical program output. The
+environment switches used for those runs have since been removed; configure
+`CraneliftConfig` instead. These include
 frontend, backend, Session setup and process startup. They do not use full reports.
 
 Recorded measurements: [JSON](measurements/routine-optimization-2026-11-12.json).

@@ -260,7 +260,7 @@ pub fn analyze(
             functions: routines,
         });
     }
-    let bodies = cyallo_compile_jobs::Jobs(options.jobs).map(&ast.functions, 4, |_, f| {
+    let bodies = cyallo_compile_jobs::Jobs(options.jobs).map(&ast.functions, 4, |_, _, f| {
         lower_routine(
             f,
             &globals,
@@ -275,9 +275,11 @@ pub fn analyze(
         functions.push(body?);
     }
     crate::effects::analyze(&mut functions, &services)?;
-    cyallo_compile_jobs::Jobs(options.jobs).for_each_mut(&mut functions, 4, |index, function| {
-        finish_lowering(function, index == 0)
-    });
+    cyallo_compile_jobs::Jobs(options.jobs).for_each_mut(
+        &mut functions,
+        4,
+        |_, index, function| finish_lowering(function, index == 0),
+    );
     let functions: Vec<_> = functions.into_iter().map(ir::Routine::ready).collect();
     Ok(ir::Module {
         records,

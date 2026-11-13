@@ -116,7 +116,7 @@ impl Module {
     pub(crate) fn lower(functions: &[ir::Routine], jobs: cyallo_compile_jobs::Jobs) -> Self {
         Self {
             functions: jobs
-                .map(functions, 4, |_, f| {
+                .map(functions, 4, |_, _, f| {
                     let routine = Routine {
                         source: f.clone(),
                         lowered: Default::default(),

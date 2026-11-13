@@ -129,7 +129,7 @@ input, errors, budget exits and GC keep their ordinary contracts. Internal retur
 resume the exact caller PC, including selective speed units. An arbitrary-PC
 resume bridge may still execute a call normally. Full reporting disables inline
 entry, preserving observed frames and per-tier metrics. This procedure path is
-opt-in (`procedure_inlining` / `CAIE_INLINE_PROCEDURES=1`): measured code growth
+opt-in (`CraneliftConfig.procedure_inlining`): measured code growth
 does not generally repay the retained frame/helper costs.
 
 The CLI's `--jit-report` captures counter baselines and renders logical work,
@@ -180,7 +180,11 @@ embedding application's global allocator.
 
 ## Compilation service and admission
 
-The default pool has `min(3, logical CPUs - 1)` workers, with one on single-core or
+A `CompilerPool` owns the compiler threads, queue and cost history. Each
+`TieredBackend` creates one (or shares one through `with_compiler`), and every
+artifact it compiles holds the pool alive; dropping the last handle closes the
+wake channel and joins the workers. There is no process-wide compiler service.
+A pool has `min(3, logical CPUs - 1)` workers, with one on single-core or
 unknown hosts. Threads are named `cyallo-codegen-N`. Jobs own immutable program
 metadata, function IDs, and weak artifact-owner tickets, never live sessions.
 Kanal channels transport bounded, coalesced wakeups. An authoritative priority

@@ -4,12 +4,12 @@ mod error;
 pub use error::CompileError;
 mod tiered;
 pub use crate::admission::{EagerDecision, EagerPolicy};
-pub use tiered::compiler_worker_count;
 mod winch;
 #[cfg(feature = "wasm-adapter")]
 mod winch_wasm;
 pub use tiered::{
-    Tier, TierEvent, TierEventKind, TierInfo, TierPolicy, TieredArtifact, TieredBackend,
+    CompilerPool, Tier, TierEvent, TierEventKind, TierInfo, TierPolicy, TieredArtifact,
+    TieredBackend,
 };
 #[cfg(feature = "wasm-adapter")]
 pub use winch_wasm::WasmBackend;
@@ -24,10 +24,6 @@ pub use cranelift_backend::{
     EagerCraneliftArtifact, EagerSpeedArtifact, OptimizationLevel, ResumeStrategy,
 };
 use std::sync::Arc;
-fn next_code_version() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
 pub trait Executable {
     fn run(&self, session: &mut Session, budget: usize) -> Result<(), EngineError>;
 }

@@ -23,15 +23,13 @@ fn assert_counts(session: &Session) {
     }
 }
 fn backend() -> TieredBackend {
-    TieredBackend {
-        policy: TierPolicy {
-            small_limit: usize::MAX - 1,
-            heavy_limit: usize::MAX,
-            hot_instructions: u64::MAX,
-            warm_instructions: u64::MAX,
-            ..Default::default()
-        },
-    }
+    TieredBackend::new(TierPolicy {
+        small_limit: usize::MAX - 1,
+        heavy_limit: usize::MAX,
+        hot_instructions: u64::MAX,
+        warm_instructions: u64::MAX,
+        ..Default::default()
+    })
 }
 
 #[test]

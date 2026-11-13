@@ -27,7 +27,7 @@ impl WinchUnit {
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
-            let bytes = emit::compile(&program, function, super::next_code_version());
+            let bytes = emit::compile(&program, function, program.next_code_version());
             let builder =
                 JITBuilder::with_flags(&[("opt_level", "none")], default_libcall_names())?;
             let mut module = JITModule::new(builder);

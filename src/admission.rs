@@ -13,7 +13,7 @@ pub struct EagerPolicy {
 impl Default for EagerPolicy {
     fn default() -> Self {
         Self {
-            enabled: std::env::var("CAIE_EAGER_ROUTINES").as_deref() != Ok("0"),
+            enabled: true,
             min_words: 16,
             max_words: 128,
             max_routines: 4,

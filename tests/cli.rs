@@ -325,7 +325,6 @@ fn jit_report_preserves_inlining_and_has_compact_output() {
         "cranelift_speed",
         "--jit-report",
     ])
-    .env("CAIE_INLINE_ROUTINES", "1")
     .output()
     .unwrap();
     assert!(result.status.success());
