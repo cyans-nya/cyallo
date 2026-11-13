@@ -83,7 +83,7 @@ fn collection_push_evaluates_its_argument_before_growth() {
 #[test]
 fn utilities() {
     output(
-        "std::io::print(std::string::trim(\" 水 \"), std::string::upper(\"straße\"), std::string::lower(\"ABC\"), std::string::contains(\"water\",\"at\"), std::string::starts_with(\"water\",\"wa\"), std::string::ends_with(\"water\",\"er\"), std::string::replace(\"a-b-a\",\"a\",\"x\"))\nstd::io::print(std::num::abs(-3), std::num::min(2,5), std::num::max(2.5,5), std::num::clamp(20,0,10), std::num::clamp(5,0,3.5), std::num::round(1.6), std::num::floor(-1.2), std::num::ceil(1.2), std::num::sqrt(9), std::num::pow(2,3))\nlet a = Vec[5,3,1]\nstd::io::print(std::array::sum(a),std::array::len(a),a.len())\nlet mut values = Vec[10]\nvalues.push(30)\nstd::io::print(values.len(),values[1],std::array::sum(values))\n",
+        "std::io::print(std::string::trim(\" 水 \"), std::string::upper(\"straße\"), std::string::lower(\"ABC\"), std::string::contains(\"water\",\"at\"), std::string::starts_with(\"water\",\"wa\"), std::string::ends_with(\"water\",\"er\"), std::string::replace(\"a-b-a\",\"a\",\"x\"))\nstd::io::print(std::num::abs(-3), std::num::min(2,5), std::num::max(2.5,5.0), std::num::clamp(20,0,10), std::num::clamp(5.0,0.0,3.5), std::num::round(1.6), std::num::floor(-1.2), std::num::ceil(1.2), std::num::sqrt(9.0), std::num::pow(2.0,3.0))\nlet a = Vec[5,3,1]\nstd::io::print(std::array::sum(a),std::array::len(a),a.len())\nlet mut values = Vec[10]\nvalues.push(30)\nstd::io::print(values.len(),values[1],std::array::sum(values))\n",
         "水STRASSEabcTRUETRUETRUEx-b-x\n325103.52-2238\n933\n23040\n",
     );
 }
@@ -188,7 +188,7 @@ fn compatibility_rejects_modern_syntax_and_utilities() {
 #[test]
 fn invalid_utility_domains_match() {
     for source in [
-        "std::io::print(std::num::sqrt(-1))\n",
+        "std::io::print(std::char::from_code(-1))\n",
         "std::io::print(std::num::abs(-9223372036854775808))\n",
         "std::io::print(std::num::clamp(1,10,0))\n",
         "std::io::print(std::array::sum([9223372036854775807,1]))\n",
@@ -260,5 +260,43 @@ fn strings_concatenate_with_plus() {
         "let x = 3\nlet ok = 1 < x < 5\n",
     ] {
         assert!(compile(source).is_err(), "accepted {source}");
+    }
+}
+#[test]
+fn numbers_follow_rust_like_rules() {
+    // Integer `/` truncates; float arithmetic is IEEE; `%` keeps the dividend's sign.
+    output(
+        "let a = 7\nlet b = -2\nstd::io::print(a / b, \":\", a % b, \":\", -7 % 2, \":\", 7.5 % 2.0)\n",
+        "-3:1:-1:1.5\n",
+    );
+    output(
+        "let zero = 0.0\nstd::io::print(1.0 / zero, \":\", -1.0 / zero, \":\", std::num::sqrt(-1.0), \":\", 0.0 / zero == 0.0 / zero)\n",
+        "inf:-inf:NaN:FALSE\n",
+    );
+    output(
+        "let x: f32 = 2.0\nlet y: u8 = 200\nstd::io::print(std::num::pow(x, 3.0), \":\", y / 3u8, \":\", std::num::max(y, 7u8))\n",
+        "8:66:200\n",
+    );
+    for source in [
+        "let a: f64 = 1\n",
+        "let a = 2.5 * 2\n",
+        "let a = 1\nlet b = 2.5\nlet c = a + b\n",
+        "let a = 7 div 2\n",
+        "let a = std::num::sqrt(4)\n",
+        "let a: i64 = 1\nlet b: f64 = 2.0\nlet c = std::num::max(a, b)\n",
+        "let a = 1u8 + 1u16\n",
+    ] {
+        assert!(compile(source).is_err(), "accepted {source}");
+    }
+    // Integer division is checked; casts to integers stay checked.
+    for source in [
+        "let a = 0\nstd::io::print(1 / a)\n",
+        "let a = -9223372036854775807 - 1\nstd::io::print(a / -1)\n",
+        "let a = 1.0 / 0.0\nstd::io::print(a as i64)\n",
+    ] {
+        let p = Arc::new(compile(source).unwrap());
+        let mut a = Session::new(p).unwrap();
+        a.run(1000);
+        assert!(matches!(a.status(), Status::Failed(_)), "{source}");
     }
 }

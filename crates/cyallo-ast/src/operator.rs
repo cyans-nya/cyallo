@@ -5,7 +5,10 @@ pub enum Operator {
     Add,
     Subtract,
     Multiply,
+    /// `/`: integer division truncates and is checked; float division is IEEE.
     Divide,
+    /// CAIE `/`: both operands become REAL, and a zero divisor is an error.
+    RealDivide,
     IntegerDivide,
     Remainder,
     Concat,
@@ -43,6 +46,7 @@ impl Operator {
                 | Self::Subtract
                 | Self::Multiply
                 | Self::Divide
+                | Self::RealDivide
                 | Self::IntegerDivide
                 | Self::Remainder
         )
@@ -54,7 +58,7 @@ impl std::fmt::Display for Operator {
             Self::Add => "+",
             Self::Subtract => "-",
             Self::Multiply => "*",
-            Self::Divide => "/",
+            Self::Divide | Self::RealDivide => "/",
             Self::IntegerDivide => "div",
             Self::Remainder => "%",
             Self::Concat | Self::Borrow => "&",

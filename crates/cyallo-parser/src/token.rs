@@ -66,7 +66,6 @@ pub enum TokenKind {
     StringType,
     True,
     False,
-    Div,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
@@ -102,7 +101,6 @@ impl TokenKind {
             "continue" => Self::Continue,
             "true" => Self::True,
             "false" => Self::False,
-            "div" => Self::Div,
             "string" => Self::StringType,
             "char" => Self::CharType,
             _ => Self::Identifier,
@@ -168,7 +166,6 @@ impl TokenKind {
             Self::Minus => (Operator::Subtract, 5),
             Self::Star => (Operator::Multiply, 6),
             Self::Slash => (Operator::Divide, 6),
-            Self::Div => (Operator::IntegerDivide, 6),
             _ => return None,
         })
     }

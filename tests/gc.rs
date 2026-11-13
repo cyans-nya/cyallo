@@ -142,11 +142,11 @@ fn sum(n: i64, acc: f64) -> f64 {
     return sum(n - 1, subtotal)
 }
 proc read_amount(base: f64) -> f64 {
-    let mut value: f64 = 0
+    let mut value: f64 = 0.0
     std::runtime::caie::input(&mut value)
     return value + sum(4, base)
 }
-std::io::print(read_amount(2))
+std::io::print(read_amount(2.0))
 "#,
             Default::default(),
         )

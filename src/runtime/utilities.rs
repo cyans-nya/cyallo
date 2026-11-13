@@ -15,6 +15,14 @@ pub(super) fn call(
     _limit: usize,
 ) -> RunResult<Value> {
     use cyallo_ast::{Number, NumberKind};
+    // The same-type `std::num` functions share the general implementations.
+    let n = match n {
+        Intrinsic::NumAbs => Intrinsic::Abs,
+        Intrinsic::NumMin => Intrinsic::Min,
+        Intrinsic::NumMax => Intrinsic::Max,
+        Intrinsic::NumClamp => Intrinsic::Clamp,
+        other => other,
+    };
     if matches!(n, Intrinsic::Sum | Intrinsic::ArraySum) {
         let values: Vec<_> = match &args[0] {
             Value::ArraySnapshot(values) => values.iter().collect(),
@@ -32,11 +40,21 @@ pub(super) fn call(
         return Ok(total);
     }
     use cyallo_ir::intrinsic::Intrinsic;
+    if matches!(
+        n,
+        Intrinsic::FloatRound
+            | Intrinsic::FloatFloor
+            | Intrinsic::FloatCeil
+            | Intrinsic::FloatSqrt
+            | Intrinsic::FloatPow
+    ) {
+        return float_function(n, &args);
+    }
     if let Some(Value::Number(first)) = args.first() {
         let first = *first;
         let result = match n {
             Intrinsic::Abs => Some(if first.kind.float() {
-                Number::floating(first.kind, first.real().abs())?
+                Number::ieee(first.kind, first.real().abs())
             } else {
                 Number::integer(first.kind, first.int().abs())?
             }),
@@ -207,4 +225,44 @@ pub(super) fn call(
         }
         _ => return Err(Invariant::UnsupportedIntrinsic(n).into()),
     })
+}
+
+/// `std::num` float functions: same-type arguments and IEEE results, computed
+/// at the argument's width.
+fn float_function(n: cyallo_ir::intrinsic::Intrinsic, args: &[Value]) -> RunResult<Value> {
+    use cyallo_ir::intrinsic::Intrinsic;
+    macro_rules! apply {
+        ($x:expr, $y:expr) => {
+            match n {
+                Intrinsic::FloatRound => $x.round(),
+                Intrinsic::FloatFloor => $x.floor(),
+                Intrinsic::FloatCeil => $x.ceil(),
+                Intrinsic::FloatSqrt => $x.sqrt(),
+                _ => $x.powf($y),
+            }
+        };
+    }
+    match args {
+        [Value::Real(x), rest @ ..] => {
+            let y = rest
+                .first()
+                .map(|y| real(y.clone()))
+                .transpose()?
+                .unwrap_or(0.0);
+            Ok(Value::Real(apply!(*x, y)))
+        }
+        [Value::Number(x), rest @ ..] if x.kind == cyallo_ast::NumberKind::F32 => {
+            let y = rest
+                .first()
+                .map(|y| real(y.clone()))
+                .transpose()?
+                .unwrap_or(0.0) as f32;
+            let value = apply!(x.real() as f32, y);
+            Ok(Value::Number(cyallo_ast::Number::ieee(
+                x.kind,
+                value as f64,
+            )))
+        }
+        _ => Err(expected(ValueKind::Number)),
+    }
 }

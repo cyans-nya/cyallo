@@ -217,7 +217,7 @@ fn internal_declarations_are_visible_within_one_compilation_module() {
 #[test]
 fn runtime_diagnostics_name_the_imported_source() {
     let sources = [
-        module("lib.ya", "pub proc fail() -> i64 { return 1 div 0 }\n"),
+        module("lib.ya", "pub proc fail() -> i64 { return 1 / 0 }\n"),
         module(
             "main.ya",
             "mod lib;\nuse crate::lib::fail\nstd::io::print(fail())\n",
@@ -237,7 +237,7 @@ fn runtime_diagnostics_name_the_imported_source() {
         Default::default(),
     );
     assert!(report.contains("lib.ya"));
-    assert!(report.contains("1 div 0"));
+    assert!(report.contains("1 / 0"));
 }
 
 #[test]

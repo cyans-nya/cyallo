@@ -475,7 +475,7 @@ impl TokenKind {
             Self::Plus => (Operator::Add, 5),
             Self::Minus => (Operator::Subtract, 5),
             Self::Star => (Operator::Multiply, 6),
-            Self::Slash => (Operator::Divide, 6),
+            Self::Slash => (Operator::RealDivide, 6),
             Self::Div => (Operator::IntegerDivide, 6),
             Self::Mod => (Operator::Remainder, 6),
             _ => return None,

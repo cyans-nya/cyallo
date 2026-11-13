@@ -754,11 +754,20 @@ pub fn intrinsic_arguments(
             | Intrinsic::Min
             | Intrinsic::Max
             | Intrinsic::Clamp
+            | Intrinsic::NumAbs
+            | Intrinsic::NumMin
+            | Intrinsic::NumMax
+            | Intrinsic::NumClamp
             | Intrinsic::Round
             | Intrinsic::Floor
             | Intrinsic::Ceil
             | Intrinsic::Sqrt
             | Intrinsic::Pow
+            | Intrinsic::FloatRound
+            | Intrinsic::FloatFloor
+            | Intrinsic::FloatCeil
+            | Intrinsic::FloatSqrt
+            | Intrinsic::FloatPow
     ) {
         arguments
             .iter()
@@ -806,6 +815,11 @@ pub fn contextualize(expression: &Expr, wanted: &Type) -> Result<Expr> {
                     e.span,
                 ));
             }
+            // Integer literals never become floats implicitly; `2` in a float
+            // context is a type error, as in Rust. Write `2.0` or cast.
+            if kind.float() && !number.kind.float() {
+                return Ok(e);
+            }
             e.kind = ExprKind::Literal(Literal::number(number.cast(kind).map_err(|error| {
                 cyallo_ast::diagnostic::numeric_conversion_failed(error, e.span)
             })?));
@@ -816,6 +830,7 @@ pub fn contextualize(expression: &Expr, wanted: &Type) -> Result<Expr> {
                     | Operator::Subtract
                     | Operator::Multiply
                     | Operator::Divide
+                    | Operator::RealDivide
                     | Operator::IntegerDivide
                     | Operator::Remainder
             )
@@ -872,9 +887,13 @@ fn assignable(e: &Expr) -> bool {
     }
 }
 /// The operation a typed binary operator performs: `+` producing a string is concatenation.
+/// Integer `/` is the checked, truncating integer division.
 fn specialized_operator(op: Operator, result: &Type) -> Operator {
     match (op, result) {
         (Operator::Add, Type::String) => Operator::Concat,
+        (Operator::Divide, result) if result.number_kind().is_some_and(|kind| !kind.float()) => {
+            Operator::IntegerDivide
+        }
         _ => op,
     }
 }
@@ -895,11 +914,12 @@ pub fn binary_type(op: cyallo_ast::Operator, a: &Type, b: &Type, span: Span) -> 
             | Operator::Greater
             | Operator::LessEqual
             | Operator::GreaterEqual => Ok(Type::Boolean),
-            Operator::Divide if !kind.float() => Ok(Type::Real),
-            Operator::Add | Operator::Subtract | Operator::Multiply | Operator::Divide => {
-                Ok(a.clone())
-            }
-            Operator::IntegerDivide | Operator::Remainder if !kind.float() => Ok(a.clone()),
+            Operator::Add
+            | Operator::Subtract
+            | Operator::Multiply
+            | Operator::Divide
+            | Operator::Remainder => Ok(a.clone()),
+            Operator::IntegerDivide if !kind.float() => Ok(a.clone()),
             _ => Err(Diagnostic::new("E105", "invalid numeric operation", span)),
         };
     }
@@ -921,21 +941,21 @@ pub fn binary_type(op: cyallo_ast::Operator, a: &Type, b: &Type, span: Span) -> 
         {
             Some(Type::String)
         }
-        Operator::IntegerDivide | Operator::Remainder
+        Operator::IntegerDivide | Operator::Remainder | Operator::Divide
             if *a == Type::Integer && *b == Type::Integer =>
         {
             Some(Type::Integer)
         }
-        Operator::Add | Operator::Subtract | Operator::Multiply | Operator::Divide
-            if numeric(a) && numeric(b) =>
-        {
-            Some(
-                if op == Operator::Divide || *a == Type::Real || *b == Type::Real {
-                    Type::Real
-                } else {
-                    Type::Integer
-                },
-            )
+        Operator::Remainder | Operator::Divide if *a == Type::Real && *b == Type::Real => {
+            Some(Type::Real)
+        }
+        Operator::RealDivide if numeric(a) && numeric(b) => Some(Type::Real),
+        Operator::Add | Operator::Subtract | Operator::Multiply if numeric(a) && numeric(b) => {
+            Some(if *a == Type::Real || *b == Type::Real {
+                Type::Real
+            } else {
+                Type::Integer
+            })
         }
         Operator::Equal | Operator::NotEqual
             if a == b

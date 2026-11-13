@@ -124,7 +124,7 @@ fn clean_native_call_returns_skip_materialization_but_dirty_yields_do_not() {
 
 #[test]
 fn every_instruction_can_handoff_between_native_and_interpreter() {
-    let source = "let mut x: f64 = 2\nlet mut n = 0\nproc add(a: &mut i64) { let b = a; *a += 3; *b += *a }\nfor i in 1..=8 { add(&mut n); x = x * 1.5; if n > 100 { n -= 7 } }\nlet mut a = [n, 2, 3]\nstd::io::print(a[0], x, '🐈' > 'a', !false)\n";
+    let source = "let mut x: f64 = 2.0\nlet mut n = 0\nproc add(a: &mut i64) { let b = a; *a += 3; *b += *a }\nfor i in 1..=8 { add(&mut n); x = x * 1.5; if n > 100 { n -= 7 } }\nlet mut a = [n, 2, 3]\nstd::io::print(a[0], x, '🐈' > 'a', !false)\n";
     let program = Arc::new(compile(source).unwrap());
     let baseline = TieredBackend::new(TierPolicy {
         hot_instructions: u64::MAX,
@@ -204,10 +204,10 @@ fn native_errors_materialize_prior_writes_and_preserve_source_spans() {
         "(-9223372036854775808) - 1",
         "9223372036854775807 * 2",
         "-(-9223372036854775808)",
-        "(-9223372036854775808) div -1",
-        "1 div 0",
+        "(-9223372036854775808) / -1",
+        "1 / 0",
         "1 % 0",
-        "2.0 / -0.0",
+        "1.5 / 0.0 > 0.0 && 1 / 0 == 0",
         "[0][1]",
     ] {
         let source = format!("let mut result = 0\nresult = 42\nstd::io::print({expression})\n");
@@ -227,7 +227,7 @@ fn native_errors_materialize_prior_writes_and_preserve_source_spans() {
 
 #[test]
 fn native_sparse_allocation_and_complex_helpers_observe_scalar_writes() {
-    let source = "let mut values = std::collections::Vec::from(0..0)\nlet mut current = 0\nfor i in 0..=600 { current += 1; values.push(current) }\nlet copy = std::mem::clone(&values)\nvalues[0] = 999\nstd::io::print(std::array::sum(copy), \":\", copy[0], \":\", values[0])\nstd::io::print((-9223372036854775808) % -1, 1 + 2.5, 2.5 > 2, '🐈' == '🐈')\n";
+    let source = "let mut values = std::collections::Vec::from(0..0)\nlet mut current = 0\nfor i in 0..=600 { current += 1; values.push(current) }\nlet copy = std::mem::clone(&values)\nvalues[0] = 999\nstd::io::print(std::array::sum(copy), \":\", copy[0], \":\", values[0])\nstd::io::print((-9223372036854775808) % -1, 1.0 + 2.5, 2.5 > 2.0, '🐈' == '🐈')\n";
     let program = Arc::new(compile(source).unwrap());
     let native = CraneliftBackend.compile(program.clone()).unwrap();
     let mut a = Session::new(program.clone()).unwrap();

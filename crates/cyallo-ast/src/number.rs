@@ -130,6 +130,17 @@ impl Number {
             },
         })
     }
+    /// A float of `kind` holding `value` rounded to that width, infinities and NaN included.
+    pub fn ieee(kind: NumberKind, value: f64) -> Self {
+        Self {
+            kind,
+            bits: if kind == NumberKind::F32 {
+                (value as f32).to_bits() as u64
+            } else {
+                value.to_bits()
+            },
+        }
+    }
     pub fn int(self) -> i128 {
         if self.kind.signed() {
             self.bits as i64 as i128
@@ -157,7 +168,7 @@ impl Number {
     }
     pub fn cast(self, kind: NumberKind) -> Result<Self, NumberError> {
         if kind.float() {
-            return Self::floating(kind, self.real());
+            return Ok(Self::ieee(kind, self.real()));
         }
         if !self.kind.float() {
             return Self::integer(kind, self.int());
@@ -172,7 +183,7 @@ impl Number {
     }
     pub fn negate(self) -> Result<Self, NumberError> {
         if self.kind.float() {
-            return Self::floating(self.kind, -self.real());
+            return Ok(Self::ieee(self.kind, -self.real()));
         }
         if !self.kind.signed() {
             return Err(NumberError::UnsignedNegation);
@@ -202,75 +213,53 @@ impl Number {
             compare!(self.int(), other.int())
         })
     }
+    /// Float arithmetic follows IEEE 754: zero divisors and overflow produce
+    /// infinities or NaN. Integer arithmetic is checked; `/` truncates.
     pub fn binary(self, other: Self, op: crate::Operator) -> Result<Self, NumberError> {
+        use crate::Operator;
         if self.kind != other.kind {
             return Err(NumberError::OperandTypeMismatch);
         }
         if self.kind.float() {
-            if other.real() == 0.0
-                && matches!(
-                    op,
-                    crate::Operator::Divide
-                        | crate::Operator::IntegerDivide
-                        | crate::Operator::Remainder
-                )
-            {
-                return Err(NumberError::DivisionByZero);
-            }
-            if self.kind == NumberKind::F32 {
-                let a = self.real() as f32;
-                let b = other.real() as f32;
-                let n = match op {
-                    crate::Operator::Add => a + b,
-                    crate::Operator::Subtract => a - b,
-                    crate::Operator::Multiply => a * b,
-                    crate::Operator::Divide => a / b,
-                    _ => return Err(NumberError::InvalidFloatingOperation),
+            macro_rules! ieee {
+                ($a:expr, $b:expr) => {
+                    match op {
+                        Operator::Add => $a + $b,
+                        Operator::Subtract => $a - $b,
+                        Operator::Multiply => $a * $b,
+                        Operator::Divide => $a / $b,
+                        Operator::Remainder => $a % $b,
+                        _ => return Err(NumberError::InvalidFloatingOperation),
+                    }
                 };
-                return Ok(Self {
-                    kind: self.kind,
-                    bits: n.to_bits() as u64,
-                });
             }
-            let a = self.real();
-            let b = other.real();
-            let n = match op {
-                crate::Operator::Add => a + b,
-                crate::Operator::Subtract => a - b,
-                crate::Operator::Multiply => a * b,
-                crate::Operator::Divide => a / b,
-                _ => return Err(NumberError::InvalidFloatingOperation),
+            let bits = if self.kind == NumberKind::F32 {
+                ieee!(self.real() as f32, other.real() as f32).to_bits() as u64
+            } else {
+                ieee!(self.real(), other.real()).to_bits()
             };
             return Ok(Self {
                 kind: self.kind,
-                bits: n.to_bits(),
+                bits,
             });
         }
         let a = self.int();
         let b = other.int();
-        if b == 0
-            && matches!(
-                op,
-                crate::Operator::Divide
-                    | crate::Operator::IntegerDivide
-                    | crate::Operator::Remainder
-            )
-        {
-            return Err(NumberError::DivisionByZero);
-        }
-        if op == crate::Operator::Divide {
-            return Self::floating(NumberKind::F64, a as f64 / b as f64);
-        }
         let n = match op {
-            crate::Operator::Add => a.checked_add(b),
-            crate::Operator::Subtract => a.checked_sub(b),
-            crate::Operator::Multiply => a.checked_mul(b),
-            crate::Operator::IntegerDivide => a.checked_div(b),
-            crate::Operator::Remainder => a.checked_rem(b),
+            Operator::Add => a.checked_add(b),
+            Operator::Subtract => a.checked_sub(b),
+            Operator::Multiply => a.checked_mul(b),
+            Operator::Divide | Operator::IntegerDivide | Operator::Remainder if b == 0 => {
+                return Err(NumberError::DivisionByZero);
+            }
+            Operator::Divide | Operator::IntegerDivide => a.checked_div(b),
+            Operator::Remainder => a.checked_rem(b),
             _ => return Err(NumberError::InvalidIntegerOperation),
-        }
-        .ok_or(NumberError::IntegerOverflow)?;
-        Self::integer(self.kind, n)
+        };
+        // Operands fit in 64 bits, so i128 never overflows here except for
+        // u64 products; a result outside the kind's range is an overflow.
+        n.and_then(|n| Self::integer(self.kind, n).ok())
+            .ok_or(NumberError::IntegerOverflow)
     }
 }
 impl std::fmt::Display for Number {

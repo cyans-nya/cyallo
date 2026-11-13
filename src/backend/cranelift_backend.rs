@@ -963,8 +963,8 @@ impl Lower<'_, '_> {
                 let ct = &f.registers[*c];
                 let numeric = matches!(at, Type::Integer | Type::Real)
                     && matches!(ct, Type::Integer | Type::Real);
-                let floating =
-                    numeric && (*at == Type::Real || *ct == Type::Real || *op == Operator::Divide);
+                let floating = numeric
+                    && (*at == Type::Real || *ct == Type::Real || *op == Operator::RealDivide);
                 let a = if floating {
                     self.float(*a, at)
                 } else {
@@ -987,10 +987,15 @@ impl Lower<'_, '_> {
                         self.guard(overflow, NativeFault::IntegerOverflow, pc, fuel, pending);
                         value
                     }
-                    Operator::Add | Operator::Subtract | Operator::Multiply | Operator::Divide
+                    Operator::Add
+                    | Operator::Subtract
+                    | Operator::Multiply
+                    | Operator::Divide
+                    | Operator::RealDivide
                         if floating =>
                     {
-                        if *op == Operator::Divide {
+                        // CAIE division fails on a zero divisor; modern float division is IEEE.
+                        if *op == Operator::RealDivide {
                             let zero = self.b.ins().f64const(0.0);
                             let zero = self.b.ins().fcmp(FloatCC::Equal, c, zero);
                             self.guard(zero, NativeFault::DivisionByZero, pc, fuel, pending);

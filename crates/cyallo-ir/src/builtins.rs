@@ -60,6 +60,19 @@ pub fn canonical(name: &str) -> Option<Intrinsic> {
 }
 pub fn result_type(n: Intrinsic, ts: &[Type]) -> Option<Type> {
     use Type::*;
+    // `std::num` functions take one numeric type and return it; nothing mixes implicitly.
+    if let Some(arity) = match n {
+        NumAbs => Some(1),
+        NumMin | NumMax => Some(2),
+        NumClamp => Some(3),
+        _ => None,
+    } {
+        let first = ts.first()?;
+        return (ts.len() == arity
+            && first.number_kind().is_some()
+            && ts.iter().all(|t| t == first))
+        .then(|| first.clone());
+    }
     if let Some(kind) = n.cast_kind() {
         return (ts.len() == 1 && ts[0].number_kind().is_some()).then(|| Type::numeric(kind));
     }
@@ -70,6 +83,11 @@ pub fn result_type(n: Intrinsic, ts: &[Type]) -> Option<Type> {
         let kind = first.number_kind()?;
         return match (n, ts.len()) {
             (Abs, 1) | (Min | Max, 2) | (Clamp, 3) => Some(first.clone()),
+            (FloatRound | FloatFloor | FloatCeil | FloatSqrt, 1) | (FloatPow, 2)
+                if kind.float() =>
+            {
+                Some(first.clone())
+            }
             (Round | Floor | Ceil | Sqrt, 1) | (Pow, 2) => Some(if kind.float() {
                 first.clone()
             } else {
@@ -126,6 +144,10 @@ pub fn result_type(n: Intrinsic, ts: &[Type]) -> Option<Type> {
         (Trim | Upper | Lower, [String]) | (Replace, [String, String, String]) => String,
         (Contains | StartsWith | EndsWith, [String, String]) => Boolean,
         (Abs, [Integer]) => Integer,
+        // Modern float functions take and return the same float type.
+        (FloatRound | FloatFloor | FloatCeil | FloatSqrt, [Real]) | (FloatPow, [Real, Real]) => {
+            Real
+        }
         (Abs | Round | Floor | Ceil | Sqrt, [Integer | Real]) => Real,
         (Pow, [Integer | Real, Integer | Real]) => Real,
         (Min | Max, [Integer, Integer]) | (Clamp, [Integer, Integer, Integer]) => Integer,

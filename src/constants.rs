@@ -554,15 +554,10 @@ fn freeze(value: Value, ty: &Type, program: &crate::ir::Program, span: Span) -> 
         });
     }
     let kind = match (value, ty) {
-        (Value::Number(n), _) => ExprKind::Literal(Literal::Number(n)),
-        (Value::Integer(v), _) => ExprKind::Literal(Literal::Number(cyallo_ast::Number {
-            kind: cyallo_ast::NumberKind::I64,
-            bits: v as u64,
-        })),
-        (Value::Real(v), _) => ExprKind::Literal(Literal::Number(cyallo_ast::Number {
-            kind: cyallo_ast::NumberKind::F64,
-            bits: v.to_bits(),
-        })),
+        // Canonical literal forms: i64 and f64 values never use `Literal::Number`.
+        (Value::Number(n), _) => ExprKind::Literal(Literal::number(n)),
+        (Value::Integer(v), _) => ExprKind::Literal(Literal::Integer(v)),
+        (Value::Real(v), _) => ExprKind::Literal(Literal::Real(v)),
         (Value::Boolean(v), _) => ExprKind::Literal(Literal::Boolean(v)),
         (Value::Char(v), _) => ExprKind::Literal(Literal::Char(v)),
         (Value::String(v), _) => ExprKind::Literal(Literal::String(v.as_ref().into())),

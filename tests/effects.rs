@@ -41,8 +41,7 @@ fn recursion_and_checked_failures_remain_observable() {
     let mut session = Session::new(program).unwrap();
     session.run(100);
     assert_eq!(session.status(), &Status::Paused);
-    let program =
-        Arc::new(compile("const n = 5\nfn f() -> i64 { return n div 0 }\nf()\n").unwrap());
+    let program = Arc::new(compile("const n = 5\nfn f() -> i64 { return n / 0 }\nf()\n").unwrap());
     // Const uses have already become immediate values.
     assert!(!program.functions()[1].effects.reads_immutable);
     assert!(program.functions()[1].effects.may_fail);

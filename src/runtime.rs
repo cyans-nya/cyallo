@@ -1721,7 +1721,7 @@ fn binary(op: cyallo_ast::Operator, a: Value, b: Value) -> RunResult<Value> {
             Operator::Add => Some(x.checked_add(*y)),
             Operator::Subtract => Some(x.checked_sub(*y)),
             Operator::Multiply => Some(x.checked_mul(*y)),
-            Operator::IntegerDivide => Some(x.checked_div(*y)),
+            Operator::IntegerDivide | Operator::Divide => Some(x.checked_div(*y)),
             Operator::Remainder => Some(if *x == i64::MIN && *y == -1 {
                 Some(0)
             } else {
@@ -1731,7 +1731,12 @@ fn binary(op: cyallo_ast::Operator, a: Value, b: Value) -> RunResult<Value> {
         };
         if let Some(n) = n {
             return n.map(Value::Integer).ok_or_else(|| {
-                if *y == 0 && (op == Operator::IntegerDivide || op == Operator::Remainder) {
+                if *y == 0
+                    && matches!(
+                        op,
+                        Operator::IntegerDivide | Operator::Divide | Operator::Remainder
+                    )
+                {
                     ArithmeticError::DivisionByZero.into()
                 } else {
                     ArithmeticError::IntegerOverflow.into()
@@ -1763,7 +1768,10 @@ fn binary(op: cyallo_ast::Operator, a: Value, b: Value) -> RunResult<Value> {
             Operator::Add => Value::Real(x + y),
             Operator::Subtract => Value::Real(x - y),
             Operator::Multiply => Value::Real(x * y),
-            Operator::Divide => {
+            // IEEE: a zero divisor yields an infinity or NaN.
+            Operator::Divide => Value::Real(x / y),
+            Operator::Remainder => Value::Real(x % y),
+            Operator::RealDivide => {
                 if y == 0.0 {
                     return Err(ArithmeticError::DivisionByZero.into());
                 }

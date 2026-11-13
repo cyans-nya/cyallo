@@ -44,6 +44,16 @@ fn tag(t: &Type) -> u64 {
         _ => unreachable!(),
     }
 }
+/// Operators this emitter lowers inline; others use the interpreter helper.
+fn native_operator(op: Operator, floating: bool) -> bool {
+    op.is_comparison()
+        || matches!(op, Operator::Add | Operator::Subtract | Operator::Multiply)
+        || if floating {
+            matches!(op, Operator::Divide | Operator::RealDivide)
+        } else {
+            matches!(op, Operator::IntegerDivide | Operator::Remainder)
+        }
+}
 fn comparison(op: cyallo_ast::Operator) -> C {
     match op {
         Operator::Equal => C::Eq,
@@ -356,10 +366,18 @@ impl Emit {
                 self.result(*r, 7, tag(&types[*r]));
             }
             Op::Binary(r, op, a, b)
-                if scalar(&types[*a]) && scalar(&types[*b]) && *op != Operator::Concat =>
+                if scalar(&types[*a])
+                    && scalar(&types[*b])
+                    && native_operator(
+                        *op,
+                        types[*a] == Type::Real
+                            || types[*b] == Type::Real
+                            || *op == Operator::RealDivide,
+                    ) =>
             {
-                let floating =
-                    types[*a] == Type::Real || types[*b] == Type::Real || *op == Operator::Divide;
+                let floating = types[*a] == Type::Real
+                    || types[*b] == Type::Real
+                    || *op == Operator::RealDivide;
                 if floating {
                     self.float(*a, &types[*a], 0);
                     self.float(*b, &types[*b], 1);
@@ -367,8 +385,10 @@ impl Emit {
                         Operator::Add
                         | Operator::Subtract
                         | Operator::Multiply
-                        | Operator::Divide => {
-                            if *op == Operator::Divide {
+                        | Operator::Divide
+                        | Operator::RealDivide => {
+                            // CAIE division fails on a zero divisor; modern float division is IEEE.
+                            if *op == Operator::RealDivide {
                                 self.imm(7, 0);
                                 self.a.bits_to_float(2, 7);
                                 let zero = self.error(pc, NativeFault::DivisionByZero);

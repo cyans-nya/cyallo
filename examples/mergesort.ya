@@ -2,7 +2,7 @@
 // Run: cargo run -- run examples/mergesort.ya
 proc merge_sort(a: &mut []i64, scratch: &mut []i64, lo: i64, hi: i64) {
     if lo >= hi { return }
-    let mid = (lo + hi) div 2
+    let mid = (lo + hi) / 2
     merge_sort(a, scratch, lo, mid)
     merge_sort(a, scratch, mid + 1, hi)
     let mut left = lo

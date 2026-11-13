@@ -86,7 +86,7 @@ fn native_reference_store_uses_pointee_tag() {
 #[test]
 fn sized_numbers_and_checked_casts() {
     output(
-        "let mut n: u8 = 254\nn += 1\nlet big = 18446744073709551615u64\nlet small = -128i8\nlet f: f32 = 16777217\nio::print(n,\":\",big,\":\",small,\":\",f,\":\",n as u32)\n",
+        "let mut n: u8 = 254\nn += 1\nlet big = 18446744073709551615u64\nlet small = -128i8\nlet f: f32 = 16777217.0\nio::print(n,\":\",big,\":\",small,\":\",f,\":\",n as u32)\n",
         "255:18446744073709551615:-128:16777216:255\n",
     );
     assert!(compile("let n: u8 = 256\n").is_err());

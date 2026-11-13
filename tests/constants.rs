@@ -76,7 +76,7 @@ fn rejects_runtime_dependencies_effects_and_mutable_identity() {
 fn failures_and_evaluator_limits_are_compile_time_diagnostics() {
     for source in [
         "const n = 9223372036854775807 + 1\n",
-        "const n = 1 div 0\n",
+        "const n = 1 / 0\n",
         "fn forever() -> i64 { return forever() }\nconst n = forever()\n",
         "fn forever() -> i64 { while true {}; return 1 }\nconst n = forever()\n",
         "const n = std::collections::Vec::from(0..100000)\n",

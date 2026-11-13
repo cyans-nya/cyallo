@@ -225,7 +225,7 @@ fn compilation_runs_on_dedicated_worker_and_all_tiers_execute() {
 }
 #[test]
 fn tiers_preserve_calls_input_and_errors() {
-    let program=Arc::new(compile("fn twice(n: i64) -> i64 { return n * 2 }\nlet mut n = 0\nstd::runtime::caie::input(&mut n)\nstd::io::print(twice(n))\nstd::io::print(1 div 0)\n").unwrap());
+    let program=Arc::new(compile("fn twice(n: i64) -> i64 { return n * 2 }\nlet mut n = 0\nstd::runtime::caie::input(&mut n)\nstd::io::print(twice(n))\nstd::io::print(1 / 0)\n").unwrap());
     let artifact = TieredBackend::default().compile(program.clone()).unwrap();
     for function in 0..program.functions().len() {
         artifact.precompile(function, Tier::CraneliftSpeed).unwrap();

@@ -15,7 +15,7 @@ fn offset_by(offset: i64) -> fn(i64) -> i64 {
 }
 
 let offset = offset_by(3)
-let point = Point { x: 1, y: 2 }
+let point = Point { x: 1.0, y: 2.0 }
 let pair = (point, offset)
 std::io::print(pair.0.x, ":", apply(pair.1, 4))
 

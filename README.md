@@ -56,7 +56,12 @@ not chain (`a < b < c` is rejected), and `as` binds looser than unary operators:
 Integers use `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `isize`, or
 `usize`; floats use `f32` or `f64`. Unsuffixed literals take their context's numeric
 type, defaulting to `i64` and `f64`. Established numeric types require explicit,
-checked `as` casts. Integer `/` produces `f64`; `div` truncates toward zero.
+checked `as` casts; integer literals never become floats implicitly (`2.0`, not
+`2`, in a float context). `/` keeps its operand type: integer division truncates
+toward zero and is checked, `%` takes the dividend's sign, and both reject a zero
+divisor. Floats follow IEEE 754: division by zero and overflow produce infinities
+or NaN, and `%` is the IEEE remainder. Integer overflow is an error, and `as`
+conversions to integers are checked.
 
 | Type or expression | Meaning |
 | --- | --- |
