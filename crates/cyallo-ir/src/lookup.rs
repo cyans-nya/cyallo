@@ -45,6 +45,8 @@ pub enum Operation {
     CollectionPop(bool),
     CollectionLength,
     Range(bool),
+    /// `range.rev()`: the same elements in descending order.
+    RangeReverse,
     ArrayFrom,
     CellNew,
     Empty,
@@ -436,6 +438,12 @@ fn method_signature(
             ("is_complete", []) => Some((Operation::GeneratorIsComplete, Type::Boolean)),
             ("yielded", []) => Some((Operation::GeneratorYielded, yielded.clone())),
             ("completed", []) => Some((Operation::GeneratorCompleted, returned.clone())),
+            _ => None,
+        };
+    }
+    if let Type::Storage(cyallo_ast::StorageKind::Range, _) = receiver {
+        return match (name, args) {
+            ("rev", []) => Some((Operation::RangeReverse, receiver.clone())),
             _ => None,
         };
     }

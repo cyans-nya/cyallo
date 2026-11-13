@@ -16,7 +16,7 @@ proc announce(message: &string) {
     std::io::print(std::string::upper(std::string::trim(*message)))
 }
 
-for i = 0 to limit {
+for i in 0..=limit {
     if i == 2 { continue }
     if i == 32768 { break }
     total += cube(i)

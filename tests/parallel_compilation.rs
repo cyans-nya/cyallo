@@ -178,7 +178,7 @@ fn modules_parse_independently_with_stable_archive_spans() {
 
 #[test]
 fn empty_blocks_and_empty_records_parse_as_independent_units() {
-    let source = "record Empty {}\nlet e = Empty {}\nlet flag = true\nif flag {}\nwhile false {}\nlet last = 0\nfor i = 1 to last {}\nstd::io::print(42)\n";
+    let source = "record Empty {}\nlet e = Empty {}\nlet flag = true\nif flag {}\nwhile false {}\nlet last = 0\nfor i in 1..=last {}\nstd::io::print(42)\n";
     for jobs in [1, 4] {
         let p = compile_with_options(
             source,

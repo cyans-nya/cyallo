@@ -344,7 +344,7 @@ let weak = owner.downgrade()
 std::io::print(weak.upgrade().is_some(), ":", owner.strong_count())
 owner.clone()
 std::io::print(owner.strong_count())
-for i = 0 to 3 {
+for i in 0..=3 {
     let local = owner.clone()
     std::io::print(local.strong_count())
     if i == 0 { continue }

@@ -11,8 +11,9 @@ proc announce(message: &string) {
     std::io::print(std::string::upper(std::string::trim(*message)))
 }
 
-// FOR includes both bounds. Continue skips 2; break stops before adding 5.
-for i = 0 to limit {
+// `0..=limit` includes both bounds; `0..limit` would stop before `limit`.
+// Continue skips 2; break stops before adding 5.
+for i in 0..=limit {
     if i == 2 { continue }
     if i == 5 { break }
     total += square(i)
@@ -20,6 +21,6 @@ for i = 0 to limit {
 
 announce(&names[0])
 std::io::print("squares: ", total)
-// std::collections::Vec::from(1..5) excludes 5, unlike FOR.
+// `1..5` excludes 5, exactly as it would in a `for` loop.
 std::io::print("range sum: ", std::array::sum(std::collections::Vec::from(1..5)))
 std::io::print("names: ", std::array::len(names))

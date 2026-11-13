@@ -37,7 +37,7 @@ use std::{array, io, num, string}
 fn square(n: i64) -> i64 { return n * n }
 let mut total = 0
 let names = ["  Ada  ", "Grace", "Linus"]
-for i = 1 to 4 { total += square(i) }
+for i in 1..=4 { total += square(i) }
 io::print(string::upper(string::trim(names[0])))
 io::print(total, ":", array::sum(array::from(1..5)), ":", names.len())
 ```
@@ -45,6 +45,13 @@ io::print(total, ":", array::sum(array::from(1..5)), ":", names.len())
 Names and imports are case sensitive. `let` introduces an immutable binding;
 `let mut` permits reassignment and mutable borrowing. `const` evaluates at compile
 time. Blocks introduce lexical scopes. Assignment requires an existing binding.
+
+`for i in a..b` counts from `a` up to, but not including, `b`; `a..=b` includes
+`b`, and `(a..b).rev()` counts down. The loop variable is immutable, bounds are
+evaluated once, and the counter never steps past the last value, so ranges ending
+at an integer type's limit are safe. Strings concatenate with `+`. Comparisons do
+not chain (`a < b < c` is rejected), and `as` binds looser than unary operators:
+`-x as u8` is `(-x) as u8`. Syntax may nest up to 256 levels.
 
 Integers use `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `isize`, or
 `usize`; floats use `f32` or `f64`. Unsuffixed literals take their context's numeric

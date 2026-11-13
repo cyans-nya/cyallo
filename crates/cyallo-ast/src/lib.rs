@@ -242,7 +242,10 @@ pub enum StmtKind {
     If(Expr, Vec<Stmt>, Vec<Stmt>),
     While(Expr, Vec<Stmt>),
     Repeat(Vec<Stmt>, Expr),
+    /// CAIE `FOR name <- first TO last [STEP step]`: inclusive, signed step.
     For(Box<str>, Expr, Expr, Option<Expr>, Vec<Stmt>),
+    /// `for name in iterable { body }`; the iterable is a range expression.
+    ForIn(Box<str>, Expr, Vec<Stmt>),
     Case(Expr, Vec<(CaseLabel, Vec<Stmt>)>, Vec<Stmt>),
     Call(Box<str>, Vec<Expr>),
     Return(Expr),
@@ -497,6 +500,15 @@ impl GetSpanMut for Param {
 }
 
 pub mod visit;
+/// Runs one level of a recursive syntax pass, growing the stack first if it
+/// is nearly exhausted. Every pass that recurses over the AST calls this at
+/// its expression and block descent, so syntax nesting is limited only by the
+/// parser's explicit depth limit, never by the caller's thread stack.
+pub fn with_stack<R>(f: impl FnOnce() -> R) -> R {
+    const RED_ZONE: usize = 256 * 1024;
+    const SEGMENT: usize = 4 * 1024 * 1024;
+    stacker::maybe_grow(RED_ZONE, SEGMENT, f)
+}
 pub type Callable<'a> = (RoutineKind, &'a [(Type, bool)], &'a Type);
 pub fn callable(ty: &Type) -> Option<Callable<'_>> {
     match ty {

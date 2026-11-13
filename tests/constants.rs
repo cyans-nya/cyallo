@@ -80,7 +80,7 @@ fn failures_and_evaluator_limits_are_compile_time_diagnostics() {
         "fn forever() -> i64 { return forever() }\nconst n = forever()\n",
         "fn forever() -> i64 { while true {}; return 1 }\nconst n = forever()\n",
         "const n = std::collections::Vec::from(0..100000)\n",
-        "fn grow() -> string { let mut s = \"x\"; for i = 1 to 100 { s = s & s }; return s }\nconst s = grow()\n",
+        "fn grow() -> string { let mut s = \"x\"; for i in 1..=100 { s = s + s }; return s }\nconst s = grow()\n",
     ] {
         let error = compile(source).unwrap_err();
         assert_eq!(error.code, "E104", "{error}");

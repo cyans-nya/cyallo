@@ -19,15 +19,15 @@ fn main() {
     for (name, source) in [
         (
             "scalar",
-            "let mut total = 0\nfor i = 0 to 100000 { total += i }\nstd::io::print(total)\n",
+            "let mut total = 0\nfor i in 0..=100000 { total += i }\nstd::io::print(total)\n",
         ),
         (
             "short-lived",
-            "fn work(n: i64) -> i64 { let a = [n,n+1]; let b = a; return b[0]+b[1] }\nlet mut total = 0\nfor i = 0 to 5000 { total += work(i) }\nstd::io::print(total)\n",
+            "fn work(n: i64) -> i64 { let a = [n,n+1]; let b = a; return b[0]+b[1] }\nlet mut total = 0\nfor i in 0..=5000 { total += work(i) }\nstd::io::print(total)\n",
         ),
         (
             "high-survival-copy",
-            "proc copy(data: &mut []i64, n: i64) { let other = std::mem::clone(&data[1]); data[0] = other+n }\nlet mut data = std::collections::Vec::from(0..512)\nfor i = 0 to 100 { copy(&mut data,i) }\nstd::io::print(data[0])\n",
+            "proc copy(data: &mut []i64, n: i64) { let other = std::mem::clone(&data[1]); data[0] = other+n }\nlet mut data = std::collections::Vec::from(0..512)\nfor i in 0..=100 { copy(&mut data,i) }\nstd::io::print(data[0])\n",
         ),
     ] {
         let program = Arc::new(compile(source).unwrap());

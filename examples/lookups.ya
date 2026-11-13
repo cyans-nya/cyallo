@@ -7,7 +7,7 @@ record Directory {
 }
 proc locate(directory: @gc Directory, key: string) -> StoragePath<@gc Cell<i64>> {
     let names = *directory.names
-    for i = 0 to (names.len() as i64) - 1 {
+    for i in 0..=(names.len() as i64) - 1 {
         if names[i] == key {
             return std::lookup::path(directory).target().field("cells").target().target().element(i)
         }

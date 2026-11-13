@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 oxc_span = "0.157"
+stacker = "0.1.21"

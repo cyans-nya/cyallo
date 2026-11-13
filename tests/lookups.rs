@@ -340,8 +340,8 @@ fn bounded_cases_do_not_grow_for_megamorphic_sites() {
 proc route(values: @gc Cell<Vec<i64>>, key: i64) -> std::lookup::StoragePath<i64> { return std::lookup::path(values).target().target().element(key) }
 proc query(values: @gc Cell<Vec<i64>>, key: i64) -> i64 { return std::lookup::mapped(values, key, route).unwrap() }
 let values = @gc Cell::new(Vec::from(0..6))
-for i = 0 to 5 { std::io::print(query(values, i)) }
-for i = 0 to 5 { std::io::print(query(values, i)) }
+for i in 0..=5 { std::io::print(query(values, i)) }
+for i in 0..=5 { std::io::print(query(values, i)) }
 "#;
     let p = parity(source, "0\n1\n2\n3\n4\n5\n0\n1\n2\n3\n4\n5\n");
     let mut s = Session::new(p).unwrap();

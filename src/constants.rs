@@ -90,7 +90,7 @@ fn shadow(body: &[Stmt], env: &mut Environment) {
                 shadow(b, env);
             }
             StmtKind::While(_, b) | StmtKind::Repeat(b, _) => shadow(b, env),
-            StmtKind::For(name, _, _, _, b) => {
+            StmtKind::For(name, _, _, _, b) | StmtKind::ForIn(name, _, b) => {
                 env.entry(key(name)).or_insert(None);
                 shadow(b, env);
             }
@@ -112,79 +112,85 @@ fn block(
     options: CompileOptions,
     globals: Option<&Environment>,
 ) -> Result<()> {
-    for stmt in body {
-        match &mut stmt.kind {
-            StmtKind::Binding(name, ty, true, _, expr) => {
-                rewrite(expr, env, true)?;
-                let (value, inferred) = evaluate_one(
-                    source,
-                    template,
-                    globals.unwrap_or(env),
-                    expr,
-                    ty.clone(),
-                    options,
-                )?;
-                *expr = value.clone();
-                *ty = Some(inferred);
-                env.insert(key(name), Some(value));
-            }
-            StmtKind::Binding(_, _, false, _, expr)
-            | StmtKind::Evaluate(expr)
-            | StmtKind::Return(expr) => rewrite(expr, env, false)?,
-            StmtKind::Constant(name, expr) => {
-                rewrite(expr, env, true)?;
-                let (value, _) = evaluate_one(
-                    source,
-                    template,
-                    globals.unwrap_or(env),
-                    expr,
-                    None,
-                    options,
-                )?;
-                *expr = value.clone();
-                env.insert(key(name), Some(value));
-            }
-            StmtKind::Assign(target, value) | StmtKind::Compound(target, _, value) => {
-                rewrite_target(target, env)?;
-                rewrite(value, env, false)?;
-            }
-            StmtKind::Output(values) | StmtKind::Call(_, values) => {
-                for value in values {
+    cyallo_ast::with_stack(|| {
+        for stmt in body {
+            match &mut stmt.kind {
+                StmtKind::Binding(name, ty, true, _, expr) => {
+                    rewrite(expr, env, true)?;
+                    let (value, inferred) = evaluate_one(
+                        source,
+                        template,
+                        globals.unwrap_or(env),
+                        expr,
+                        ty.clone(),
+                        options,
+                    )?;
+                    *expr = value.clone();
+                    *ty = Some(inferred);
+                    env.insert(key(name), Some(value));
+                }
+                StmtKind::Binding(_, _, false, _, expr)
+                | StmtKind::Evaluate(expr)
+                | StmtKind::Return(expr) => rewrite(expr, env, false)?,
+                StmtKind::Constant(name, expr) => {
+                    rewrite(expr, env, true)?;
+                    let (value, _) = evaluate_one(
+                        source,
+                        template,
+                        globals.unwrap_or(env),
+                        expr,
+                        None,
+                        options,
+                    )?;
+                    *expr = value.clone();
+                    env.insert(key(name), Some(value));
+                }
+                StmtKind::Assign(target, value) | StmtKind::Compound(target, _, value) => {
+                    rewrite_target(target, env)?;
                     rewrite(value, env, false)?;
                 }
-            }
-            StmtKind::If(condition, yes, no) => {
-                rewrite(condition, env, false)?;
-                block(source, template, yes, env, options, globals)?;
-                block(source, template, no, env, options, globals)?;
-            }
-            StmtKind::While(condition, body) | StmtKind::Repeat(body, condition) => {
-                rewrite(condition, env, false)?;
-                block(source, template, body, env, options, globals)?;
-            }
-            StmtKind::For(_, start, end, step, body) => {
-                rewrite(start, env, false)?;
-                rewrite(end, env, false)?;
-                if let Some(step) = step {
-                    rewrite(step, env, false)?;
-                }
-                block(source, template, body, env, options, globals)?;
-            }
-            StmtKind::Case(value, arms, other) => {
-                rewrite(value, env, false)?;
-                for (label, arm) in arms {
-                    rewrite(&mut label.lower, env, false)?;
-                    if let Some(upper) = &mut label.upper {
-                        rewrite(upper, env, false)?;
+                StmtKind::Output(values) | StmtKind::Call(_, values) => {
+                    for value in values {
+                        rewrite(value, env, false)?;
                     }
-                    block(source, template, arm, env, options, globals)?;
                 }
-                block(source, template, other, env, options, globals)?;
+                StmtKind::If(condition, yes, no) => {
+                    rewrite(condition, env, false)?;
+                    block(source, template, yes, env, options, globals)?;
+                    block(source, template, no, env, options, globals)?;
+                }
+                StmtKind::While(condition, body) | StmtKind::Repeat(body, condition) => {
+                    rewrite(condition, env, false)?;
+                    block(source, template, body, env, options, globals)?;
+                }
+                StmtKind::For(_, start, end, step, body) => {
+                    rewrite(start, env, false)?;
+                    rewrite(end, env, false)?;
+                    if let Some(step) = step {
+                        rewrite(step, env, false)?;
+                    }
+                    block(source, template, body, env, options, globals)?;
+                }
+                StmtKind::ForIn(_, iterable, body) => {
+                    rewrite(iterable, env, false)?;
+                    block(source, template, body, env, options, globals)?;
+                }
+                StmtKind::Case(value, arms, other) => {
+                    rewrite(value, env, false)?;
+                    for (label, arm) in arms {
+                        rewrite(&mut label.lower, env, false)?;
+                        if let Some(upper) = &mut label.upper {
+                            rewrite(upper, env, false)?;
+                        }
+                        block(source, template, arm, env, options, globals)?;
+                    }
+                    block(source, template, other, env, options, globals)?;
+                }
+                _ => {}
             }
-            _ => {}
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 fn rewrite_target(expr: &mut Expr, env: &Environment) -> Result<()> {
     match &mut expr.kind {
@@ -203,161 +209,169 @@ fn rewrite_target(expr: &mut Expr, env: &Environment) -> Result<()> {
     Ok(())
 }
 fn rewrite(expr: &mut Expr, env: &Environment, require_constant: bool) -> Result<()> {
-    match &mut expr.kind {
-        ExprKind::Yield(value, _) => rewrite(value, env, require_constant)?,
-        ExprKind::ManagedNew(_, allocator, value) => {
-            if let Some(allocator) = allocator {
-                rewrite(allocator, env, require_constant)?;
+    cyallo_ast::with_stack(|| {
+        match &mut expr.kind {
+            ExprKind::Yield(value, _) => rewrite(value, env, require_constant)?,
+            ExprKind::ManagedNew(_, allocator, value) => {
+                if let Some(allocator) = allocator {
+                    rewrite(allocator, env, require_constant)?;
+                }
+                rewrite(value, env, require_constant)?;
             }
-            rewrite(value, env, require_constant)?;
-        }
 
-        ExprKind::IntrinsicCall(_, _, arguments) => {
-            for argument in arguments {
-                rewrite(argument, env, require_constant)?;
-            }
-        }
-
-        ExprKind::Name(name) => match env.get(&key(name)) {
-            Some(Some(value)) => {
-                let span = expr.span;
-                *expr = value.clone();
-                // A service key is a declaration identity, not a fresh key at
-                // each use. Its source identity survives constant substitution.
-                if !matches!(&expr.kind, ExprKind::IntrinsicCall(id, _, _) if *id == cyallo_ir::intrinsic::Intrinsic::ServiceKeyNew.id())
-                {
-                    expr.span = span;
+            ExprKind::IntrinsicCall(_, _, arguments) => {
+                for argument in arguments {
+                    rewrite(argument, env, require_constant)?;
                 }
             }
-            Some(None) if require_constant => {
-                return Err(error(
-                    format!("const cannot depend on runtime binding {name}"),
-                    expr.span,
-                ));
-            }
-            _ => {}
-        },
-        ExprKind::Call(name, args) => {
-            for arg in args.iter_mut() {
-                rewrite(arg, env, require_constant)?;
-            }
-            match env.get(&key(name)) {
+
+            ExprKind::Name(name) => match env.get(&key(name)) {
                 Some(Some(value)) => {
-                    expr.kind = ExprKind::Invoke(Box::new(value.clone()), std::mem::take(args))
+                    let span = expr.span;
+                    *expr = value.clone();
+                    // A service key is a declaration identity, not a fresh key at
+                    // each use. Its source identity survives constant substitution.
+                    if !matches!(&expr.kind, ExprKind::IntrinsicCall(id, _, _) if *id == cyallo_ir::intrinsic::Intrinsic::ServiceKeyNew.id())
+                    {
+                        expr.span = span;
+                    }
                 }
                 Some(None) if require_constant => {
                     return Err(error(
-                        format!("const cannot call runtime binding {name}"),
+                        format!("const cannot depend on runtime binding {name}"),
                         expr.span,
                     ));
                 }
                 _ => {}
+            },
+            ExprKind::Call(name, args) => {
+                for arg in args.iter_mut() {
+                    rewrite(arg, env, require_constant)?;
+                }
+                match env.get(&key(name)) {
+                    Some(Some(value)) => {
+                        expr.kind = ExprKind::Invoke(Box::new(value.clone()), std::mem::take(args))
+                    }
+                    Some(None) if require_constant => {
+                        return Err(error(
+                            format!("const cannot call runtime binding {name}"),
+                            expr.span,
+                        ));
+                    }
+                    _ => {}
+                }
             }
-        }
-        ExprKind::Unary(_, e)
-        | ExprKind::Parenthesized(e)
-        | ExprKind::Cast(e, _)
-        | ExprKind::Field(e, _)
-        | ExprKind::TupleField(e, _)
-        | ExprKind::ExtensionField(e, _, _) => rewrite(e, env, require_constant)?,
-        ExprKind::Binary(_, a, b) => {
-            rewrite(a, env, require_constant)?;
-            rewrite(b, env, require_constant)?;
-        }
-        ExprKind::Invoke(callee, args) | ExprKind::Index(callee, args) => {
-            rewrite(callee, env, require_constant)?;
-            for arg in args {
-                rewrite(arg, env, require_constant)?;
+            ExprKind::Unary(_, e)
+            | ExprKind::Parenthesized(e)
+            | ExprKind::Cast(e, _)
+            | ExprKind::Field(e, _)
+            | ExprKind::TupleField(e, _)
+            | ExprKind::ExtensionField(e, _, _) => rewrite(e, env, require_constant)?,
+            ExprKind::Binary(_, a, b) => {
+                rewrite(a, env, require_constant)?;
+                rewrite(b, env, require_constant)?;
             }
-        }
-        ExprKind::ArrayLiteral(args)
-        | ExprKind::Tuple(args)
-        | ExprKind::TypedCollection(_, _, args)
-        | ExprKind::GenericCall(_, _, args) => {
-            for arg in args {
-                rewrite(arg, env, require_constant)?;
+            ExprKind::Invoke(callee, args) | ExprKind::Index(callee, args) => {
+                rewrite(callee, env, require_constant)?;
+                for arg in args {
+                    rewrite(arg, env, require_constant)?;
+                }
             }
-        }
-        ExprKind::Record(_, fields) | ExprKind::GenericRecord(_, _, fields) => {
-            for (_, value) in fields {
-                rewrite(value, env, require_constant)?;
+            ExprKind::ArrayLiteral(args)
+            | ExprKind::Tuple(args)
+            | ExprKind::TypedCollection(_, _, args)
+            | ExprKind::GenericCall(_, _, args) => {
+                for arg in args {
+                    rewrite(arg, env, require_constant)?;
+                }
             }
-        }
-        ExprKind::Closure(function, _) => {
-            if require_constant {
-                return Err(error(
-                    "const closures are not supported yet; use a named stateless routine",
-                    expr.span,
-                ));
+            ExprKind::Record(_, fields) | ExprKind::GenericRecord(_, _, fields) => {
+                for (_, value) in fields {
+                    rewrite(value, env, require_constant)?;
+                }
             }
-            // A closure's parameters and locals shadow outer constants.
-            let mut captures = env.clone();
-            for param in &function.params {
-                captures.insert(key(&param.name), None);
+            ExprKind::Closure(function, _) => {
+                if require_constant {
+                    return Err(error(
+                        "const closures are not supported yet; use a named stateless routine",
+                        expr.span,
+                    ));
+                }
+                // A closure's parameters and locals shadow outer constants.
+                let mut captures = env.clone();
+                for param in &function.params {
+                    captures.insert(key(&param.name), None);
+                }
+                shadow(&function.body, &mut captures);
+                // Constant declarations in closures are checked separately below by
+                // the same evaluator, including their runtime capture dependencies.
+                rewrite_closure_body(&mut function.body, &captures)?;
             }
-            shadow(&function.body, &mut captures);
-            // Constant declarations in closures are checked separately below by
-            // the same evaluator, including their runtime capture dependencies.
-            rewrite_closure_body(&mut function.body, &captures)?;
-        }
-        ExprKind::ClosureValue(_, captures, _) => {
-            for value in captures {
-                rewrite(value, env, require_constant)?;
+            ExprKind::ClosureValue(_, captures, _) => {
+                for value in captures {
+                    rewrite(value, env, require_constant)?;
+                }
             }
+            ExprKind::Literal(_) | ExprKind::Frozen(..) | ExprKind::Invalid(_) => {}
         }
-        ExprKind::Literal(_) | ExprKind::Frozen(..) | ExprKind::Invalid(_) => {}
-    }
-    Ok(())
+        Ok(())
+    })
 }
 fn rewrite_closure_body(body: &mut [Stmt], env: &Environment) -> Result<()> {
-    // Closure bodies must not evade compile-time validation. The main pass can
-    // evaluate their constants after closure conversion in a later extension.
-    for stmt in body {
-        match &mut stmt.kind {
-            StmtKind::Binding(_, _, true, _, _) | StmtKind::Constant(..) => {
-                return Err(error(
-                    "const declarations in closures are not supported yet; use a named routine",
-                    stmt.span,
-                ));
-            }
-            StmtKind::Return(e)
-            | StmtKind::Evaluate(e)
-            | StmtKind::Binding(_, _, false, _, e)
-            | StmtKind::Assign(_, e)
-            | StmtKind::Compound(_, _, e) => rewrite(e, env, false)?,
-            StmtKind::If(e, a, b) => {
-                rewrite(e, env, false)?;
-                rewrite_closure_body(a, env)?;
-                rewrite_closure_body(b, env)?;
-            }
-            StmtKind::While(e, b) | StmtKind::Repeat(b, e) => {
-                rewrite(e, env, false)?;
-                rewrite_closure_body(b, env)?;
-            }
-            StmtKind::For(_, a, b, step, body) => {
-                rewrite(a, env, false)?;
-                rewrite(b, env, false)?;
-                if let Some(e) = step {
-                    rewrite(e, env, false)?;
+    cyallo_ast::with_stack(|| {
+        // Closure bodies must not evade compile-time validation. The main pass can
+        // evaluate their constants after closure conversion in a later extension.
+        for stmt in body {
+            match &mut stmt.kind {
+                StmtKind::Binding(_, _, true, _, _) | StmtKind::Constant(..) => {
+                    return Err(error(
+                        "const declarations in closures are not supported yet; use a named routine",
+                        stmt.span,
+                    ));
                 }
-                rewrite_closure_body(body, env)?;
-            }
-            StmtKind::Case(e, arms, b) => {
-                rewrite(e, env, false)?;
-                for (_, a) in arms {
+                StmtKind::Return(e)
+                | StmtKind::Evaluate(e)
+                | StmtKind::Binding(_, _, false, _, e)
+                | StmtKind::Assign(_, e)
+                | StmtKind::Compound(_, _, e) => rewrite(e, env, false)?,
+                StmtKind::If(e, a, b) => {
+                    rewrite(e, env, false)?;
                     rewrite_closure_body(a, env)?;
+                    rewrite_closure_body(b, env)?;
                 }
-                rewrite_closure_body(b, env)?;
-            }
-            StmtKind::Output(es) | StmtKind::Call(_, es) => {
-                for e in es {
+                StmtKind::While(e, b) | StmtKind::Repeat(b, e) => {
                     rewrite(e, env, false)?;
+                    rewrite_closure_body(b, env)?;
                 }
+                StmtKind::For(_, a, b, step, body) => {
+                    rewrite(a, env, false)?;
+                    rewrite(b, env, false)?;
+                    if let Some(e) = step {
+                        rewrite(e, env, false)?;
+                    }
+                    rewrite_closure_body(body, env)?;
+                }
+                StmtKind::ForIn(_, iterable, body) => {
+                    rewrite(iterable, env, false)?;
+                    rewrite_closure_body(body, env)?;
+                }
+                StmtKind::Case(e, arms, b) => {
+                    rewrite(e, env, false)?;
+                    for (_, a) in arms {
+                        rewrite_closure_body(a, env)?;
+                    }
+                    rewrite_closure_body(b, env)?;
+                }
+                StmtKind::Output(es) | StmtKind::Call(_, es) => {
+                    for e in es {
+                        rewrite(e, env, false)?;
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 fn evaluate_one(
     source: &str,

@@ -29,6 +29,14 @@ impl<T: std::fmt::Display> std::fmt::Display for GeneratorStep<T> {
         }
     }
 }
+/// A range of integers. `reversed` iterates from the end towards the start.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RangeValue {
+    pub start: cyallo_ast::Number,
+    pub end: cyallo_ast::Number,
+    pub inclusive: bool,
+    pub reversed: bool,
+}
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Concurrent(cyallo_concurrent_values::Handle),
@@ -50,7 +58,7 @@ pub enum Value {
     String(std::sync::Arc<str>),
     Array(Vec<usize>),
     Deque(std::collections::VecDeque<usize>),
-    Range(cyallo_ast::Number, cyallo_ast::Number, bool),
+    Range(RangeValue),
     ArraySnapshot(Vec<Value>),
     SparseArray(BTreeMap<u32, usize>, u64),
     SparseSnapshot(BTreeMap<u32, Value>, u64),
@@ -132,8 +140,13 @@ impl std::fmt::Display for Value {
             Self::String(v) => write!(f, "{v}"),
             Self::Array(v) => write!(f, "<array: {} elements>", v.len()),
             Self::Deque(v) => write!(f, "<deque: {} elements>", v.len()),
-            Self::Range(a, b, inclusive) => {
-                write!(f, "{a}..{}{b}", if *inclusive { "=" } else { "" })
+            Self::Range(range) => {
+                let operator = if range.inclusive { "..=" } else { ".." };
+                if range.reversed {
+                    write!(f, "({}{operator}{}).rev()", range.start, range.end)
+                } else {
+                    write!(f, "{}{operator}{}", range.start, range.end)
+                }
             }
             Self::ArraySnapshot(v) => write!(f, "<array: {} elements>", v.len()),
             Self::SparseArray(_, length) | Self::SparseSnapshot(_, length) => {

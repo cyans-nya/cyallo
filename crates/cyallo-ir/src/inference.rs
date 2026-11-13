@@ -37,62 +37,68 @@ pub fn infer(
     fn gather<'a>(
         body: &'a [Stmt],
         candidates: &mut Vec<Candidate<'a>>,
-        loops: &mut Vec<(&'a str, Span)>,
+        loops: &mut Vec<(&'a str, Option<&'a Expr>, Span)>,
     ) {
-        for s in body {
-            match &s.kind {
-                StmtKind::Binding(name, _, constant, mutable, value) => {
-                    candidates.push(Candidate {
-                        name,
-                        depth: 0,
-                        span: s.span,
-                        constant: *constant || !*mutable,
-                        binding: true,
-                        value: Some(value),
-                    })
-                }
-                StmtKind::Assign(target, value) => {
-                    if let Some((name, depth)) = root(target) {
+        cyallo_ast::with_stack(|| {
+            for s in body {
+                match &s.kind {
+                    StmtKind::Binding(name, _, constant, mutable, value) => {
                         candidates.push(Candidate {
                             name,
-                            depth,
-                            span: target.span,
-                            constant: false,
-                            binding: false,
+                            depth: 0,
+                            span: s.span,
+                            constant: *constant || !*mutable,
+                            binding: true,
                             value: Some(value),
-                        });
+                        })
                     }
-                }
-                StmtKind::Input(target) => {
-                    if let Some((name, depth)) = root(target) {
-                        candidates.push(Candidate {
-                            name,
-                            depth,
-                            span: target.span,
-                            constant: false,
-                            binding: false,
-                            value: None,
-                        });
+                    StmtKind::Assign(target, value) => {
+                        if let Some((name, depth)) = root(target) {
+                            candidates.push(Candidate {
+                                name,
+                                depth,
+                                span: target.span,
+                                constant: false,
+                                binding: false,
+                                value: Some(value),
+                            });
+                        }
                     }
-                }
-                StmtKind::For(n, _, _, _, b) => {
-                    loops.push((n, s.span));
-                    gather(b, candidates, loops);
-                }
-                StmtKind::If(_, a, b) => {
-                    gather(a, candidates, loops);
-                    gather(b, candidates, loops);
-                }
-                StmtKind::While(_, b) | StmtKind::Repeat(b, _) => gather(b, candidates, loops),
-                StmtKind::Case(_, arms, b) => {
-                    for (_, b) in arms {
+                    StmtKind::Input(target) => {
+                        if let Some((name, depth)) = root(target) {
+                            candidates.push(Candidate {
+                                name,
+                                depth,
+                                span: target.span,
+                                constant: false,
+                                binding: false,
+                                value: None,
+                            });
+                        }
+                    }
+                    StmtKind::For(n, _, _, _, b) => {
+                        loops.push((n, None, s.span));
                         gather(b, candidates, loops);
                     }
-                    gather(b, candidates, loops);
+                    StmtKind::ForIn(n, iterable, b) => {
+                        loops.push((n, Some(iterable), s.span));
+                        gather(b, candidates, loops);
+                    }
+                    StmtKind::If(_, a, b) => {
+                        gather(a, candidates, loops);
+                        gather(b, candidates, loops);
+                    }
+                    StmtKind::While(_, b) | StmtKind::Repeat(b, _) => gather(b, candidates, loops),
+                    StmtKind::Case(_, arms, b) => {
+                        for (_, b) in arms {
+                            gather(b, candidates, loops);
+                        }
+                        gather(b, candidates, loops);
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
+        })
     }
     let mut candidates = vec![];
     let mut loops = vec![];
@@ -107,20 +113,46 @@ pub fn infer(
             known.remove(&key(candidate.name));
         }
     }
-    for (n, span) in loops {
-        if let std::collections::hash_map::Entry::Vacant(entry) = known.entry(key(n)) {
-            entry.insert(Type::Integer);
-            locals.push(Local {
-                display_name: Some(n.into()),
-                name: n.into(),
-                ty: Type::Integer,
-                constant: false,
-                span,
-            });
+    let mut range_loops = vec![];
+    for (n, iterable, span) in loops {
+        match iterable {
+            // CAIE FOR counters are INTEGER.
+            None => {
+                if let std::collections::hash_map::Entry::Vacant(entry) = known.entry(key(n)) {
+                    entry.insert(Type::Integer);
+                    locals.push(Local {
+                        display_name: Some(n.into()),
+                        name: n.into(),
+                        ty: Type::Integer,
+                        constant: false,
+                        span,
+                    });
+                }
+            }
+            Some(iterable) => range_loops.push((n, iterable, span)),
         }
     }
     loop {
         let mut changed = false;
+        // A range loop variable has the range's element type once that is known.
+        for &(name, iterable, span) in &range_loops {
+            if known.contains_key(&key(name)) {
+                continue;
+            }
+            if let Ok(Type::Storage(StorageKind::Range, element)) =
+                expression_type(iterable, &known, routines)
+            {
+                known.insert(key(name), (*element).clone());
+                locals.push(Local {
+                    display_name: Some(name.into()),
+                    name: name.into(),
+                    ty: *element,
+                    constant: false,
+                    span,
+                });
+                changed = true;
+            }
+        }
         for c in &candidates {
             let (name, depth) = (c.name, c.depth);
             if known.contains_key(&key(name)) {
@@ -184,7 +216,7 @@ fn expression_type_inner(
     known: &HashMap<String, Type>,
     routines: &HashMap<String, Type>,
 ) -> Result<Type, Diagnostic> {
-    match &e.kind {
+    cyallo_ast::with_stack(|| match &e.kind {
         ExprKind::Yield(value, delegate) => {
             if *delegate {
                 return crate::generator::parts(&expression_type(value, known, routines)?)
@@ -416,5 +448,5 @@ fn expression_type_inner(
                 e.span,
             ))
         }
-    }
+    })
 }

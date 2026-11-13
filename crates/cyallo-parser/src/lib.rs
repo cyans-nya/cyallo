@@ -25,6 +25,7 @@ fn parse_whole(source: &str, repl: bool) -> Result<Ast, Diagnostic> {
         pos: 0,
         expression_statements: repl,
         nesting: 0,
+        depth: 0,
         condition: false,
     }
     .program()
@@ -33,10 +34,36 @@ struct Parser<'src> {
     tokens: Lexed<'src>,
     pos: usize,
     expression_statements: bool,
+    /// Open parentheses/brackets in the current expression; newlines are insignificant inside.
     nesting: usize,
+    /// Syntactic recursion depth, bounded by [`MAX_DEPTH`].
+    depth: usize,
     condition: bool,
 }
+/// Deeper nesting is rejected with a diagnostic instead of exhausting the stack.
+/// Later passes recurse over the same tree, so this also bounds them.
+const MAX_DEPTH: usize = 256;
+/// Unary operands bind tighter than `as`, which binds tighter than every binary operator.
+const CAST_PRECEDENCE: u8 = 7;
+const UNARY_OPERAND: u8 = CAST_PRECEDENCE + 1;
 impl<'src> Parser<'src> {
+    /// Runs `parse` one level deeper, failing past [`MAX_DEPTH`].
+    fn nested<T>(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Result<T, Diagnostic>,
+    ) -> Result<T, Diagnostic> {
+        if self.depth >= MAX_DEPTH {
+            return Err(Diagnostic::new(
+                "E002",
+                format!("nesting exceeds the limit of {MAX_DEPTH} levels"),
+                self.token().span,
+            ));
+        }
+        self.depth += 1;
+        let result = cyallo_ast::with_stack(|| parse(self));
+        self.depth -= 1;
+        result
+    }
     fn finish_span(&self, start: Span) -> Span {
         Span::new(
             start.start,
@@ -203,6 +230,9 @@ impl<'src> Parser<'src> {
         }
     }
     fn ty(&mut self) -> Result<Type, Diagnostic> {
+        self.nested(Self::ty_inner)
+    }
+    fn ty_inner(&mut self) -> Result<Type, Diagnostic> {
         if self.token().kind == TokenKind::Lifetime {
             let lifetime = self.token_text()[1..].into();
             self.pos += 1;
@@ -346,8 +376,9 @@ impl<'src> Parser<'src> {
         let kind = if self.take("return") {
             StmtKind::Return(self.expr(0)?)
         } else {
-            let start = self.pos;
-            let target = self.expr(4)?;
+            // Parse once: the target of an assignment is an ordinary expression,
+            // and semantic analysis checks that it is assignable.
+            let target = self.expr(0)?;
             if self.take("=") {
                 StmtKind::Assign(target, self.expr(0)?)
             } else if matches!(
@@ -366,8 +397,7 @@ impl<'src> Parser<'src> {
                 self.pos += 1;
                 StmtKind::Compound(target, op, self.expr(0)?)
             } else {
-                self.pos = start;
-                let value = self.expr(0)?;
+                let value = target;
                 if self.expression_statements {
                     StmtKind::Output(vec![value])
                 } else if matches!(
@@ -388,6 +418,9 @@ impl<'src> Parser<'src> {
         Ok(Stmt { kind, span })
     }
     fn expr(&mut self, min: u8) -> Result<Expr, Diagnostic> {
+        self.nested(|parser| parser.expr_inner(min))
+    }
+    fn expr_inner(&mut self, min: u8) -> Result<Expr, Diagnostic> {
         if self.nesting > 0 {
             self.newlines();
         }
@@ -417,12 +450,12 @@ impl<'src> Parser<'src> {
                         | TokenKind::Minus
                         | TokenKind::Plus
                 ) {
-                    (Some(Box::new(inner)), Box::new(self.expr(7)?))
+                    (Some(Box::new(inner)), Box::new(self.expr(UNARY_OPERAND)?))
                 } else {
                     (None, Box::new(inner))
                 }
             } else {
-                (None, Box::new(self.expr(7)?))
+                (None, Box::new(self.expr(UNARY_OPERAND)?))
             };
             Expr {
                 kind: ExprKind::ManagedNew(kind, allocator, value),
@@ -455,16 +488,16 @@ impl<'src> Parser<'src> {
                 Operator::Borrow
             };
             Expr {
-                kind: ExprKind::Unary(op, Box::new(self.expr(7)?)),
+                kind: ExprKind::Unary(op, Box::new(self.expr(UNARY_OPERAND)?)),
                 span: self.finish_span(span),
             }
         } else if self.take("*") {
             Expr {
-                kind: ExprKind::Unary(Operator::Dereference, Box::new(self.expr(7)?)),
+                kind: ExprKind::Unary(Operator::Dereference, Box::new(self.expr(UNARY_OPERAND)?)),
                 span: self.finish_span(span),
             }
         } else if self.take("-") {
-            if self.token().kind == TokenKind::Integer {
+            if matches!(self.token().kind, TokenKind::Integer | TokenKind::Real) {
                 let literal = self.number_literal(true)?;
                 self.pos += 1;
                 Expr {
@@ -473,18 +506,18 @@ impl<'src> Parser<'src> {
                 }
             } else {
                 Expr {
-                    kind: ExprKind::Unary(Operator::Subtract, Box::new(self.expr(7)?)),
+                    kind: ExprKind::Unary(Operator::Subtract, Box::new(self.expr(UNARY_OPERAND)?)),
                     span,
                 }
             }
         } else if self.take("+") {
             Expr {
-                kind: ExprKind::Unary(Operator::Add, Box::new(self.expr(7)?)),
+                kind: ExprKind::Unary(Operator::Add, Box::new(self.expr(UNARY_OPERAND)?)),
                 span,
             }
         } else if self.take("!") {
             Expr {
-                kind: ExprKind::Unary(Operator::Not, Box::new(self.expr(7)?)),
+                kind: ExprKind::Unary(Operator::Not, Box::new(self.expr(UNARY_OPERAND)?)),
                 span,
             }
         } else if self.take("(") {
@@ -584,7 +617,7 @@ impl<'src> Parser<'src> {
             if self.nesting > 0 {
                 self.newlines();
             }
-            if self.word("as") {
+            if min <= CAST_PRECEDENCE && self.word("as") {
                 let ty = self.ty()?;
                 lhs = Expr {
                     kind: ExprKind::Cast(Box::new(lhs), ty),
@@ -731,11 +764,24 @@ impl<'src> Parser<'src> {
                     continue;
                 }
             }
+            if self.token().kind == TokenKind::Ampersand {
+                return Err(
+                    self.error("binary `&` is not an operator; use `+` to concatenate strings")
+                );
+            }
             let Some((op, prec)) = self.token().kind.binary_op() else {
                 break;
             };
             if prec < min {
                 break;
+            }
+            if op.is_comparison()
+                && let ExprKind::Binary(previous, ..) = &lhs.kind
+                && previous.is_comparison()
+            {
+                return Err(
+                    self.error("comparison operators cannot be chained; use `a < b && b < c`")
+                );
             }
             self.pos += 1;
             let rhs = self.expr(prec + 1)?;

@@ -228,7 +228,7 @@ impl Allocator for Pool {
 }
 let system = @gc Cell::new(0)
 let mut pool = Pool { free: Vec<Allocation>[], system: system }
-for i = 0 to 9 {
+for i in 0..=9 {
     let owner = @rc(&mut pool) i
     std::io::print(*owner)
 }

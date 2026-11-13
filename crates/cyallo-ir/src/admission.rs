@@ -23,7 +23,7 @@ pub fn estimate(function: &Function) -> Estimate {
                 S::Binding(n, ..) | S::Declare(n, _) | S::Constant(n, _) => {
                     names.insert(n.to_string());
                 }
-                S::For(n, _, _, _, b) => {
+                S::For(n, _, _, _, b) | S::ForIn(n, _, b) => {
                     names.insert(n.to_string());
                     bindings(b, names);
                 }
@@ -49,125 +49,134 @@ pub fn estimate(function: &Function) -> Estimate {
 }
 impl Estimate {
     fn expr(&mut self, e: &Expr) {
-        self.nodes += 1;
-        match &e.kind {
-            E::Call(name, args)
-            | E::TypedCollection(name, _, args)
-            | E::GenericCall(name, _, args) => {
-                self.calls.push(name.clone());
-                self.shape.calls = true;
-                for a in args {
-                    self.expr(a);
-                }
-            }
-            E::IntrinsicCall(_, _, args) => {
-                self.shape.calls = true;
-                for a in args {
-                    self.expr(a);
-                }
-            }
-            E::ArrayLiteral(args) | E::Tuple(args) => {
-                for a in args {
-                    self.expr(a);
-                }
-            }
-            E::Index(a, indices) => {
-                self.expr(a);
-                for i in indices {
-                    self.expr(i);
-                }
-            }
-            E::Yield(a, _)
-            | E::Parenthesized(a)
-            | E::Unary(_, a)
-            | E::Field(a, _)
-            | E::TupleField(a, _)
-            | E::Cast(a, _)
-            | E::ExtensionField(a, _, _) => self.expr(a),
-            E::Record(_, fs) | E::GenericRecord(_, _, fs) => {
-                for (_, e) in fs {
-                    self.expr(e);
-                }
-            }
-            E::Invoke(a, args) => {
-                self.shape.calls = true;
-                self.expr(a);
-                for e in args {
-                    self.expr(e);
-                }
-            }
-            E::ClosureValue(_, captures, _) => {
-                for e in captures {
-                    self.expr(e);
-                }
-            }
-            E::ManagedNew(_, allocator, value) => {
-                if let Some(allocator) = allocator {
-                    self.expr(allocator);
-                }
-                self.expr(value);
-            }
-            E::Closure(..) => {}
-            E::Binary(_, a, b) => {
-                self.expr(a);
-                self.expr(b);
-            }
-            E::Literal(_) | E::Frozen(..) | E::Name(_) | E::Invalid(_) => {}
-        }
-    }
-    fn block(&mut self, body: &[Stmt]) {
-        for s in body {
+        cyallo_ast::with_stack(|| {
             self.nodes += 1;
-            match &s.kind {
-                S::While(c, b) | S::Repeat(b, c) => {
-                    self.shape.loops = true;
-                    self.expr(c);
-                    self.block(b);
-                }
-                S::For(_, a, b, step, body) => {
-                    self.shape.loops = true;
-                    self.expr(a);
-                    self.expr(b);
-                    if let Some(s) = step {
-                        self.expr(s)
-                    };
-                    self.block(body);
-                }
-                S::If(c, a, b) => {
-                    self.expr(c);
-                    self.block(a);
-                    self.block(b);
-                }
-                S::Case(c, arms, other) => {
-                    self.expr(c);
-                    for (_, b) in arms {
-                        self.block(b)
-                    }
-                    self.block(other);
-                }
-                S::Call(name, args) => {
+            match &e.kind {
+                E::Call(name, args)
+                | E::TypedCollection(name, _, args)
+                | E::GenericCall(name, _, args) => {
                     self.calls.push(name.clone());
                     self.shape.calls = true;
                     for a in args {
                         self.expr(a);
                     }
                 }
-                S::Assign(a, b) | S::Compound(a, _, b) => {
-                    self.expr(a);
-                    self.expr(b);
+                E::IntrinsicCall(_, _, args) => {
+                    self.shape.calls = true;
+                    for a in args {
+                        self.expr(a);
+                    }
                 }
-                S::Binding(_, _, _, _, e)
-                | S::Constant(_, e)
-                | S::Evaluate(e)
-                | S::Return(e)
-                | S::Input(e) => self.expr(e),
-                S::Output(es) => {
-                    for e in es {
+                E::ArrayLiteral(args) | E::Tuple(args) => {
+                    for a in args {
+                        self.expr(a);
+                    }
+                }
+                E::Index(a, indices) => {
+                    self.expr(a);
+                    for i in indices {
+                        self.expr(i);
+                    }
+                }
+                E::Yield(a, _)
+                | E::Parenthesized(a)
+                | E::Unary(_, a)
+                | E::Field(a, _)
+                | E::TupleField(a, _)
+                | E::Cast(a, _)
+                | E::ExtensionField(a, _, _) => self.expr(a),
+                E::Record(_, fs) | E::GenericRecord(_, _, fs) => {
+                    for (_, e) in fs {
                         self.expr(e);
                     }
                 }
-                S::Declare(..) | S::ReturnVoid | S::Break | S::Continue => {}
+                E::Invoke(a, args) => {
+                    self.shape.calls = true;
+                    self.expr(a);
+                    for e in args {
+                        self.expr(e);
+                    }
+                }
+                E::ClosureValue(_, captures, _) => {
+                    for e in captures {
+                        self.expr(e);
+                    }
+                }
+                E::ManagedNew(_, allocator, value) => {
+                    if let Some(allocator) = allocator {
+                        self.expr(allocator);
+                    }
+                    self.expr(value);
+                }
+                E::Closure(..) => {}
+                E::Binary(_, a, b) => {
+                    self.expr(a);
+                    self.expr(b);
+                }
+                E::Literal(_) | E::Frozen(..) | E::Name(_) | E::Invalid(_) => {}
             }
-        }
+        })
+    }
+    fn block(&mut self, body: &[Stmt]) {
+        cyallo_ast::with_stack(|| {
+            for s in body {
+                self.nodes += 1;
+                match &s.kind {
+                    S::While(c, b) | S::Repeat(b, c) => {
+                        self.shape.loops = true;
+                        self.expr(c);
+                        self.block(b);
+                    }
+                    S::For(_, a, b, step, body) => {
+                        self.shape.loops = true;
+                        self.expr(a);
+                        self.expr(b);
+                        if let Some(s) = step {
+                            self.expr(s)
+                        };
+                        self.block(body);
+                    }
+                    S::ForIn(_, iterable, body) => {
+                        self.shape.loops = true;
+                        self.expr(iterable);
+                        self.block(body);
+                    }
+                    S::If(c, a, b) => {
+                        self.expr(c);
+                        self.block(a);
+                        self.block(b);
+                    }
+                    S::Case(c, arms, other) => {
+                        self.expr(c);
+                        for (_, b) in arms {
+                            self.block(b)
+                        }
+                        self.block(other);
+                    }
+                    S::Call(name, args) => {
+                        self.calls.push(name.clone());
+                        self.shape.calls = true;
+                        for a in args {
+                            self.expr(a);
+                        }
+                    }
+                    S::Assign(a, b) | S::Compound(a, _, b) => {
+                        self.expr(a);
+                        self.expr(b);
+                    }
+                    S::Binding(_, _, _, _, e)
+                    | S::Constant(_, e)
+                    | S::Evaluate(e)
+                    | S::Return(e)
+                    | S::Input(e) => self.expr(e),
+                    S::Output(es) => {
+                        for e in es {
+                            self.expr(e);
+                        }
+                    }
+                    S::Declare(..) | S::ReturnVoid | S::Break | S::Continue => {}
+                }
+            }
+        })
     }
 }

@@ -80,7 +80,7 @@ fn recursive_managed_graphs_retain_live_cycles_and_collect_unreachable_cycles() 
 }
 #[test]
 fn repeated_calls_collect_inside_construction_and_copy_helpers() {
-    let p=Arc::new(compile("let mut saved = Vec[0]\nproc work(n: i64) -> i64 { let a = [n, n+1]; let b = a; saved[0] = b[1]; return b[0] + b[1] }\nlet mut total = 0\nfor i = 0 to 200 { total += work(i) }\nstd::io::print(total)\n").unwrap());
+    let p=Arc::new(compile("let mut saved = Vec[0]\nproc work(n: i64) -> i64 { let a = [n, n+1]; let b = a; saved[0] = b[1]; return b[0] + b[1] }\nlet mut total = 0\nfor i in 0..=200 { total += work(i) }\nstd::io::print(total)\n").unwrap());
     let mut reference = Session::new(p.clone()).unwrap();
     reference.run(100000);
     assert_eq!(reference.context.output, "40401\n");
@@ -109,7 +109,7 @@ fn aliases_and_sparse_nested_values_survive_every_allocation() {
 proc change(a: &mut i64) { let b = a; let temp = [1,2,3]; *a += temp[0]; *b += 2 }
 proc compute() -> i64 {
     let mut n = 0
-    for i = 1 to 20 { change(&mut n) }
+    for i in 1..=20 { change(&mut n) }
     return n
 }
 let mut n = compute()
@@ -243,7 +243,7 @@ fn repl_replacement_keeps_global_roots_and_discards_old_frame_roots() {
     for line in [
         "let mut a = [1,2]",
         "fn work(n: i64) -> i64 { let temp = [n,n+1]; return temp[1] }",
-        "for i = 1 to 100 { a[0] = work(i) }",
+        "for i in 1..=100 { a[0] = work(i) }",
         "std::io::print(a[0])",
     ] {
         repl.push_line(line).unwrap();
@@ -282,7 +282,7 @@ fn host_roots_survive_movement_and_release_on_drop() {
 fn cell_limit_collects_before_failing_and_keeps_failed_locals_inspectable() {
     let p = Arc::new(
         compile(
-            "let mut data = std::collections::Vec::from(0..0)\nfor i = 0 to 100 { data.push(i) }\n",
+            "let mut data = std::collections::Vec::from(0..0)\nfor i in 0..=100 { data.push(i) }\n",
         )
         .unwrap(),
     );
@@ -363,7 +363,7 @@ fn dead_temporaries_release_replaced_array_cells_in_a_suspended_frame() {
 #[test]
 fn native_tiers_keep_their_continuations_through_collection_and_budget_exits() {
     use cyallo::metrics::ExecutionEngine;
-    let p=Arc::new(compile("fn work(n: i64) -> i64 { let a = [n,n+1]; return a[0]+a[1] }\nlet mut total = 0\nfor i = 0 to 12 { total += work(i) }\nstd::io::print(total)\n").unwrap());
+    let p=Arc::new(compile("fn work(n: i64) -> i64 { let a = [n,n+1]; return a[0]+a[1] }\nlet mut total = 0\nfor i in 0..=12 { total += work(i) }\nstd::io::print(total)\n").unwrap());
     let mut reference = Session::new(p.clone()).unwrap();
     reference.run(100000);
     for (engine, expected) in engines(&p).into_iter().zip([

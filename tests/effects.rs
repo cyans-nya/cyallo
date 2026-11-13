@@ -4,7 +4,7 @@ use cyallo::{
 use std::sync::Arc;
 #[test]
 fn returning_procedures_and_private_mutation() {
-    let source = "let mut counter = 0\nproc advance(n: &mut i64) -> i64 { *n += 1; return *n }\nfn work(n: i64) -> i64 { let mut copy = [n,2]; copy[0] += 3; let mut x = 0; for i = 1 to 3 { x += i }; return copy[0] + x }\nstd::io::print(advance(&mut counter), work(1), counter)\nadvance(&mut counter)\nadvance(&mut counter)\nstd::io::print(counter)\n";
+    let source = "let mut counter = 0\nproc advance(n: &mut i64) -> i64 { *n += 1; return *n }\nfn work(n: i64) -> i64 { let mut copy = [n,2]; copy[0] += 3; let mut x = 0; for i in 1..=3 { x += i }; return copy[0] + x }\nstd::io::print(advance(&mut counter), work(1), counter)\nadvance(&mut counter)\nadvance(&mut counter)\nstd::io::print(counter)\n";
     let program = Arc::new(compile(source).unwrap());
     assert_eq!(program.functions()[1].kind, RoutineKind::Procedure);
     assert!(program.functions()[1].effects.writes_references);

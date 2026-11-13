@@ -67,39 +67,42 @@ fn shift_ast(ast: &mut Ast, offset: u32) -> Result<(), Diagnostic> {
         s.end += o;
     }
     fn block(body: &mut [Stmt], o: u32) -> Result<(), Diagnostic> {
-        fn statements(body: &mut [Stmt], o: u32) {
-            for s in body {
-                span(&mut s.span, o);
-                match &mut s.kind {
-                    StmtKind::If(_, a, b) => {
-                        statements(a, o);
-                        statements(b, o);
-                    }
-                    StmtKind::While(_, b)
-                    | StmtKind::Repeat(b, _)
-                    | StmtKind::For(_, _, _, _, b) => statements(b, o),
-                    StmtKind::Case(_, arms, b) => {
-                        for (_, b) in arms {
+        cyallo_ast::with_stack(|| {
+            fn statements(body: &mut [Stmt], o: u32) {
+                for s in body {
+                    span(&mut s.span, o);
+                    match &mut s.kind {
+                        StmtKind::If(_, a, b) => {
+                            statements(a, o);
                             statements(b, o);
                         }
-                        statements(b, o);
+                        StmtKind::While(_, b)
+                        | StmtKind::Repeat(b, _)
+                        | StmtKind::For(_, _, _, _, b)
+                        | StmtKind::ForIn(_, _, b) => statements(b, o),
+                        StmtKind::Case(_, arms, b) => {
+                            for (_, b) in arms {
+                                statements(b, o);
+                            }
+                            statements(b, o);
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
-        }
-        statements(body, o);
-        cyallo_ast::visit::visit_block(
-            body,
-            &mut |e| {
-                span(&mut e.span, o);
-                if let ExprKind::Closure(f, _) = &mut e.kind {
-                    function(f, o)?;
-                }
-                Ok(())
-            },
-            &mut |_, _| Ok(()),
-        )
+            statements(body, o);
+            cyallo_ast::visit::visit_block(
+                body,
+                &mut |e| {
+                    span(&mut e.span, o);
+                    if let ExprKind::Closure(f, _) = &mut e.kind {
+                        function(f, o)?;
+                    }
+                    Ok(())
+                },
+                &mut |_, _| Ok(()),
+            )
+        })
     }
     fn function(f: &mut Function, o: u32) -> Result<(), Diagnostic> {
         span(&mut f.span, o);

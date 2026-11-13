@@ -135,7 +135,7 @@ let make = gen proc() -> Generator<@gc Item, (), i64> {
 let mut values = make()
 let item = values.resume()
 let saved = item.yielded()
-for i = 0 to 30 { let garbage = @gc Item { number: i } }
+for i in 0..=30 { let garbage = @gc Item { number: i } }
 std::io::print(saved.number)
 let finished = values.resume()
 std::io::print(finished.completed())

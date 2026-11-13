@@ -91,7 +91,7 @@ fn native_winch_requests_fast_at_the_warm_threshold() {
     for reporting in [false, true] {
         for budget in [128, 1_000_000] {
             native_fast_request(
-                "let mut total = 0\nfor i = 1 to 100000 { total += i }\nstd::io::print(total)\n",
+                "let mut total = 0\nfor i in 1..=100000 { total += i }\nstd::io::print(total)\n",
                 0,
                 Tier::Winch,
                 budget,
@@ -103,7 +103,7 @@ fn native_winch_requests_fast_at_the_warm_threshold() {
 
 #[test]
 fn native_callees_request_fast_without_returning_to_the_driver() {
-    let source = "fn leaf(n: i64) -> i64 { return n + 1 }\nfn middle(n: i64) -> i64 { return leaf(n) }\nlet mut total = 0\nfor i = 1 to 100000 { total += middle(i) }\nstd::io::print(total)\n";
+    let source = "fn leaf(n: i64) -> i64 { return n + 1 }\nfn middle(n: i64) -> i64 { return leaf(n) }\nlet mut total = 0\nfor i in 1..=100000 { total += middle(i) }\nstd::io::print(total)\n";
     for caller_tier in [Tier::Winch, Tier::CraneliftFast] {
         for reporting in [false, true] {
             for target in [1, 2] {
@@ -202,7 +202,7 @@ fn lower_requests_cannot_downgrade_installed_optimized_code() {
 fn compilation_runs_on_dedicated_worker_and_all_tiers_execute() {
     for tier in [Tier::Winch, Tier::CraneliftFast, Tier::CraneliftSpeed] {
         let program = Arc::new(
-            compile("let mut n = 0\nfor i = 1 to 10 { n += i }\nstd::io::print(n)\n").unwrap(),
+            compile("let mut n = 0\nfor i in 1..=10 { n += i }\nstd::io::print(n)\n").unwrap(),
         );
         let artifact = TieredBackend::default().compile(program.clone()).unwrap();
         assert!(artifact.wait_for_compilation(Duration::from_secs(30)));

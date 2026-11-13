@@ -26,5 +26,5 @@ proc temporary_cycle(value: i64) {
 }
 
 show_cycle()
-for i = 0 to 127 { temporary_cycle(i) }
+for i in 0..=127 { temporary_cycle(i) }
 std::io::print("temporary cycles: 128")

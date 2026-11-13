@@ -33,7 +33,7 @@ its run command and comments explaining the behavior.
 
 | Example | What it demonstrates |
 | --- | --- |
-| [tour.ya](tour.ya) | Small functions, procedures, arrays, inclusive loops, break/continue, and string utilities |
+| [tour.ya](tour.ya) | Small functions, procedures, arrays, range loops, break/continue, and string utilities |
 | [composites.ya](composites.ya) | Records, tuples, callbacks, returning owned closures, and explicit `&mut` captures |
 | [generics.ya](generics.ya) | Generic records, inferred/explicit type arguments, an array transform, and specialized closures |
 | [traits.ya](traits.ya) | Concrete method calls, `dyn` dispatch, owned conversion, and aliases to an erased object |

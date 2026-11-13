@@ -607,7 +607,7 @@ mod tests {
     use super::*;
     #[test]
     fn repeated_ownership_cycles_reuse_metadata_without_reusing_identity() {
-        let program = Arc::new(crate::compile("for i = 0 to 999 { let owner = @rc i; let weak = owner.downgrade(); std::mem::drop(owner); let missing = weak.upgrade().is_none() }\n").unwrap());
+        let program = Arc::new(crate::compile("for i in 0..=999 { let owner = @rc i; let weak = owner.downgrade(); std::mem::drop(owner); let missing = weak.upgrade().is_none() }\n").unwrap());
         let mut session = Session::new(program).unwrap();
         session.run(100_000);
         assert_eq!(session.status(), &Status::Finished);

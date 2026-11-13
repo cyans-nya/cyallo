@@ -4,7 +4,7 @@ use cyallo::backend::{
 use cyallo::{Context, Session, Status, compile};
 use std::sync::Arc;
 
-const CHAIN: &str = "fn square(n: i64) -> i64 { return n * n }\nfn cube(n: i64) -> i64 { let value = square(n); return value * n }\nproc scalar(n: i64) -> i64 { let value = n + 1; return cube(value) }\nlet mut total = 0\nfor i = 1 to 20 { total += scalar(i) }\nstd::io::print(total)\n";
+const CHAIN: &str = "fn square(n: i64) -> i64 { return n * n }\nfn cube(n: i64) -> i64 { let value = square(n); return value * n }\nproc scalar(n: i64) -> i64 { let value = n + 1; return cube(value) }\nlet mut total = 0\nfor i in 1..=20 { total += scalar(i) }\nstd::io::print(total)\n";
 fn same(a: &Session, b: &Session) {
     assert_eq!(a.status(), b.status());
     assert_eq!(a.instruction_count(), b.instruction_count());
@@ -131,7 +131,7 @@ fn reports_use_real_frames_and_dynamic_targets_remain_dynamic() {
 fn reported_procedures_keep_caller_accounting_with_embedded_code_available() {
     let p = Arc::new(
         compile(
-            "proc bump(n: &mut i64) { *n += 1 }\nlet mut n = 0\nfor i = 1 to 3 { bump(&mut n) }\nstd::io::print(n)\n",
+            "proc bump(n: &mut i64) { *n += 1 }\nlet mut n = 0\nfor i in 1..=3 { bump(&mut n) }\nstd::io::print(n)\n",
         )
         .unwrap(),
     );

@@ -39,6 +39,19 @@ struct Lower<'a> {
     block_depth: usize,
     drop_scopes: Vec<Vec<(Slot, Type)>>,
 }
+struct RangeIteration<'e> {
+    start: &'e Expr,
+    end: &'e Expr,
+    inclusive: bool,
+    reversed: bool,
+}
+fn not_a_range(span: Span) -> Diagnostic {
+    Diagnostic::new(
+        "E109",
+        "for-in iterates over a range: `a..b`, `a..=b`, or `(a..b).rev()`",
+        span,
+    )
+}
 struct LoopScope {
     drop_depth: usize,
     breaks: Vec<usize>,
@@ -676,9 +689,10 @@ pub fn collect(body: &[Stmt], params: &[Param]) -> Result<Vec<ir::Local>> {
                     walk(a, locals, seen)?;
                     walk(b, locals, seen)?;
                 }
-                StmtKind::While(_, b) | StmtKind::Repeat(b, _) | StmtKind::For(_, _, _, _, b) => {
-                    walk(b, locals, seen)?
-                }
+                StmtKind::While(_, b)
+                | StmtKind::Repeat(b, _)
+                | StmtKind::For(_, _, _, _, b)
+                | StmtKind::ForIn(_, _, b) => walk(b, locals, seen)?,
                 StmtKind::Case(_, arms, b) => {
                     for (_, b) in arms {
                         walk(b, locals, seen)?;
@@ -857,6 +871,13 @@ fn assignable(e: &Expr) -> bool {
         _ => false,
     }
 }
+/// The operation a typed binary operator performs: `+` producing a string is concatenation.
+fn specialized_operator(op: Operator, result: &Type) -> Operator {
+    match (op, result) {
+        (Operator::Add, Type::String) => Operator::Concat,
+        _ => op,
+    }
+}
 pub fn binary_type(op: cyallo_ast::Operator, a: &Type, b: &Type, span: Span) -> Result<Type> {
     if matches!(a, Type::Numeric(_)) || matches!(b, Type::Numeric(_)) {
         if a != b {
@@ -888,6 +909,15 @@ pub fn binary_type(op: cyallo_ast::Operator, a: &Type, b: &Type, span: Span) -> 
         }
         Operator::Concat
             if matches!(a, Type::String | Type::Char) && matches!(b, Type::String | Type::Char) =>
+        {
+            Some(Type::String)
+        }
+        // `+` concatenates when either side is a string; char + char stays an error.
+        Operator::Add
+            if matches!(
+                (a, b),
+                (Type::String, Type::String | Type::Char) | (Type::Char, Type::String)
+            ) =>
         {
             Some(Type::String)
         }
@@ -1386,6 +1416,47 @@ impl Lower<'_> {
         }
         Ok(())
     }
+    /// The bounds and direction of a `for … in` iterable. The iterable is a range
+    /// expression, optionally reversed through the resolved `Range::rev` member.
+    fn range_iteration<'e>(&self, iterable: &'e Expr) -> Result<RangeIteration<'e>> {
+        match &iterable.kind {
+            ExprKind::Parenthesized(inner) => self.range_iteration(inner),
+            ExprKind::Binary(op @ (Operator::Range | Operator::RangeInclusive), start, end) => {
+                Ok(RangeIteration {
+                    start,
+                    end,
+                    inclusive: *op == Operator::RangeInclusive,
+                    reversed: false,
+                })
+            }
+            ExprKind::Invoke(callee, arguments) if arguments.is_empty() => {
+                let ExprKind::Field(base, name) = &callee.kind else {
+                    return Err(not_a_range(iterable.span));
+                };
+                let known = self
+                    .globals
+                    .iter()
+                    .chain(self.function.locals.iter())
+                    .map(|local| (key(&local.name), local.ty.clone()))
+                    .collect();
+                let receiver = crate::inference::expression_type(base, &known, self.types)?;
+                match crate::lookup::method(&receiver, name, &[], None) {
+                    Some(crate::lookup::Method {
+                        operation: crate::lookup::Operation::RangeReverse,
+                        ..
+                    }) => {
+                        let inner = self.range_iteration(base)?;
+                        Ok(RangeIteration {
+                            reversed: !inner.reversed,
+                            ..inner
+                        })
+                    }
+                    _ => Err(not_a_range(iterable.span)),
+                }
+            }
+            _ => Err(not_a_range(iterable.span)),
+        }
+    }
     fn close_loop(&mut self, end: usize, next: usize) {
         let scope = self.loops.pop().unwrap();
         for at in scope.breaks {
@@ -1509,106 +1580,178 @@ impl Lower<'_> {
         )
     }
     fn address(&mut self, e: &Expr, write: bool) -> Result<(Reg, Type)> {
-        self.span = e.span;
-        if self.cell_target(e)?.is_some() {
-            return Err(Diagnostic::new(
-                "E107",
-                "Cell contents do not expose a reference or support compound assignment; use *cell = value or cell.replace(value)",
-                e.span,
-            ));
-        }
-        match &e.kind {
-            ExprKind::Unary(Operator::Dereference, base) => {
-                let (reference, ty) = self.expr(base)?;
-                let (mutable, pointee) = match ty {
-                    Type::Reference {
-                        mutable, pointee, ..
-                    } => (mutable, pointee),
-                    Type::Managed { pointee, .. } => {
-                        if write {
+        cyallo_ast::with_stack(|| {
+            self.span = e.span;
+            if self.cell_target(e)?.is_some() {
+                return Err(Diagnostic::new(
+                    "E107",
+                    "Cell contents do not expose a reference or support compound assignment; use *cell = value or cell.replace(value)",
+                    e.span,
+                ));
+            }
+            match &e.kind {
+                ExprKind::Unary(Operator::Dereference, base) => {
+                    let (reference, ty) = self.expr(base)?;
+                    let (mutable, pointee) = match ty {
+                        Type::Reference {
+                            mutable, pointee, ..
+                        } => (mutable, pointee),
+                        Type::Managed { pointee, .. } => {
+                            if write {
+                                return Err(Diagnostic::new(
+                                    "E107",
+                                    "shared managed storage requires interior mutability",
+                                    e.span,
+                                ));
+                            }
+                            let address = self.reg(*pointee.clone());
+                            self.emit(Op::ManagedAddress(address, reference));
+                            return Ok((address, *pointee));
+                        }
+                        _ => {
                             return Err(Diagnostic::new(
-                                "E107",
-                                "shared managed storage requires interior mutability",
+                                "E109",
+                                "dereference requires a reference or managed owner",
                                 e.span,
                             ));
                         }
-                        let address = self.reg(*pointee.clone());
-                        self.emit(Op::ManagedAddress(address, reference));
-                        return Ok((address, *pointee));
-                    }
-                    _ => {
+                    };
+                    if write && !mutable {
                         return Err(Diagnostic::new(
-                            "E109",
-                            "dereference requires a reference or managed owner",
+                            "E107",
+                            "cannot write through a read-only reference",
                             e.span,
                         ));
                     }
-                };
-                if write && !mutable {
-                    return Err(Diagnostic::new(
-                        "E107",
-                        "cannot write through a read-only reference",
-                        e.span,
-                    ));
+                    Ok((reference, *pointee))
                 }
-                Ok((reference, *pointee))
-            }
-            ExprKind::ExtensionField(base, name, _) => {
-                let known = self
-                    .globals
-                    .iter()
-                    .chain(self.function.locals.iter())
-                    .map(|l| (key(&l.name), l.ty.clone()))
-                    .collect();
-                if let Type::Record(_, fields) =
-                    crate::inference::expression_type(base, &known, self.types)?
-                    && fields.iter().any(|(n, _)| n.eq_identifier(name))
+                ExprKind::ExtensionField(base, name, _) => {
+                    let known = self
+                        .globals
+                        .iter()
+                        .chain(self.function.locals.iter())
+                        .map(|l| (key(&l.name), l.ty.clone()))
+                        .collect();
+                    if let Type::Record(_, fields) =
+                        crate::inference::expression_type(base, &known, self.types)?
+                        && fields.iter().any(|(n, _)| n.eq_identifier(name))
+                    {
+                        self.address(
+                            &Expr {
+                                kind: ExprKind::Field(base.clone(), name.clone()),
+                                span: e.span,
+                            },
+                            write,
+                        )
+                    } else {
+                        Err(Diagnostic::new(
+                            "E108",
+                            "extension properties are read-only",
+                            e.span,
+                        ))
+                    }
+                }
+                ExprKind::Field(base, _) | ExprKind::TupleField(base, _) => {
+                    let (a, t) = self.projection_address(base, write)?;
+                    let (index, ty) = self.field_type(&t, &e.kind, e.span)?;
+                    let r = self.reg(ty.clone());
+                    self.span = e.span;
+                    self.emit(Op::Field(r, a, index));
+                    Ok((r, ty))
+                }
+                ExprKind::Parenthesized(inner) => self.address(inner, write),
+                ExprKind::Name(n) => {
+                    let (s, l) = self.lookup(n)?;
+                    if write && l.constant {
+                        return Err(Diagnostic::new("E107", "cannot modify a constant", e.span));
+                    }
+                    let r = self.reg(l.ty.clone());
+                    self.emit(Op::Address(r, s));
+                    Ok((r, l.ty))
+                }
+                ExprKind::Index(base, indices) => {
+                    let (a, t) = if !write && !assignable(base) {
+                        // Value expressions (including substituted constant arrays)
+                        // need a rooted temporary for the ordinary indexing helper.
+                        let (value, ty) = self.expr(base)?;
+                        let index = self.function.locals.len();
+                        self.function.locals.push(ir::Local {
+                            display_name: None,
+                            name: format!("$index_value${index}").into(),
+                            ty: ty.clone(),
+                            constant: true,
+                            span: base.span,
+                        });
+                        let address = self.reg(ty.clone());
+                        self.emit(Op::Address(
+                            address,
+                            Slot {
+                                global: false,
+                                index,
+                            },
+                        ));
+                        self.emit(Op::Store(address, value));
+                        (address, ty)
+                    } else {
+                        self.projection_address(base, write)?
+                    };
+                    let (dimensions, element) = match t {
+                        Type::Array(bounds, element) => (bounds.len(), element),
+                        Type::SparseArray(element) | Type::Slice(element) => (1, element),
+                        Type::Storage(
+                            cyallo_ast::StorageKind::Vec | cyallo_ast::StorageKind::VecDeque,
+                            element,
+                        ) => (1, element),
+                        _ => {
+                            return Err(Diagnostic::new(
+                                "E108",
+                                "indexing requires an array",
+                                e.span,
+                            ));
+                        }
+                    };
+                    if dimensions != indices.len() {
+                        return Err(Diagnostic::new(
+                            "E108",
+                            "incorrect number of array indices",
+                            e.span,
+                        ));
+                    }
+                    let mut rs = vec![];
+                    for e in indices {
+                        let (r, t) = self.expr(e)?;
+                        if t.number_kind().is_none_or(|kind| kind.float()) {
+                            return Err(Diagnostic::new(
+                                "E109",
+                                "index requires an integer",
+                                e.span,
+                            ));
+                        }
+                        rs.push(r);
+                    }
+                    let r = self.reg(*element.clone());
+                    self.span = e.span;
+                    self.emit(Op::Index(r, a, rs, write));
+                    Ok((r, *element))
+                }
+                _ if !write
+                    && matches!(
+                        e.kind,
+                        ExprKind::Literal(_)
+                            | ExprKind::Frozen(..)
+                            | ExprKind::ArrayLiteral(_)
+                            | ExprKind::Record(..)
+                            | ExprKind::Tuple(_)
+                    ) =>
                 {
-                    self.address(
-                        &Expr {
-                            kind: ExprKind::Field(base.clone(), name.clone()),
-                            span: e.span,
-                        },
-                        write,
-                    )
-                } else {
-                    Err(Diagnostic::new(
-                        "E108",
-                        "extension properties are read-only",
-                        e.span,
-                    ))
-                }
-            }
-            ExprKind::Field(base, _) | ExprKind::TupleField(base, _) => {
-                let (a, t) = self.projection_address(base, write)?;
-                let (index, ty) = self.field_type(&t, &e.kind, e.span)?;
-                let r = self.reg(ty.clone());
-                self.span = e.span;
-                self.emit(Op::Field(r, a, index));
-                Ok((r, ty))
-            }
-            ExprKind::Parenthesized(inner) => self.address(inner, write),
-            ExprKind::Name(n) => {
-                let (s, l) = self.lookup(n)?;
-                if write && l.constant {
-                    return Err(Diagnostic::new("E107", "cannot modify a constant", e.span));
-                }
-                let r = self.reg(l.ty.clone());
-                self.emit(Op::Address(r, s));
-                Ok((r, l.ty))
-            }
-            ExprKind::Index(base, indices) => {
-                let (a, t) = if !write && !assignable(base) {
-                    // Value expressions (including substituted constant arrays)
-                    // need a rooted temporary for the ordinary indexing helper.
-                    let (value, ty) = self.expr(base)?;
+                    let (value, ty) = self.expr(e)?;
                     let index = self.function.locals.len();
                     self.function.locals.push(ir::Local {
                         display_name: None,
-                        name: format!("$index_value${index}").into(),
+                        name: format!("$temporary{index}").into(),
                         ty: ty.clone(),
                         constant: true,
-                        span: base.span,
+                        span: e.span,
                     });
                     let address = self.reg(ty.clone());
                     self.emit(Op::Address(
@@ -1619,81 +1762,15 @@ impl Lower<'_> {
                         },
                     ));
                     self.emit(Op::Store(address, value));
-                    (address, ty)
-                } else {
-                    self.projection_address(base, write)?
-                };
-                let (dimensions, element) = match t {
-                    Type::Array(bounds, element) => (bounds.len(), element),
-                    Type::SparseArray(element) | Type::Slice(element) => (1, element),
-                    Type::Storage(
-                        cyallo_ast::StorageKind::Vec | cyallo_ast::StorageKind::VecDeque,
-                        element,
-                    ) => (1, element),
-                    _ => {
-                        return Err(Diagnostic::new(
-                            "E108",
-                            "indexing requires an array",
-                            e.span,
-                        ));
-                    }
-                };
-                if dimensions != indices.len() {
-                    return Err(Diagnostic::new(
-                        "E108",
-                        "incorrect number of array indices",
-                        e.span,
-                    ));
+                    Ok((address, ty))
                 }
-                let mut rs = vec![];
-                for e in indices {
-                    let (r, t) = self.expr(e)?;
-                    if t.number_kind().is_none_or(|kind| kind.float()) {
-                        return Err(Diagnostic::new("E109", "index requires an integer", e.span));
-                    }
-                    rs.push(r);
-                }
-                let r = self.reg(*element.clone());
-                self.span = e.span;
-                self.emit(Op::Index(r, a, rs, write));
-                Ok((r, *element))
+                _ => Err(Diagnostic::new(
+                    "E108",
+                    "expected assignable variable or array element",
+                    e.span,
+                )),
             }
-            _ if !write
-                && matches!(
-                    e.kind,
-                    ExprKind::Literal(_)
-                        | ExprKind::Frozen(..)
-                        | ExprKind::ArrayLiteral(_)
-                        | ExprKind::Record(..)
-                        | ExprKind::Tuple(_)
-                ) =>
-            {
-                let (value, ty) = self.expr(e)?;
-                let index = self.function.locals.len();
-                self.function.locals.push(ir::Local {
-                    display_name: None,
-                    name: format!("$temporary{index}").into(),
-                    ty: ty.clone(),
-                    constant: true,
-                    span: e.span,
-                });
-                let address = self.reg(ty.clone());
-                self.emit(Op::Address(
-                    address,
-                    Slot {
-                        global: false,
-                        index,
-                    },
-                ));
-                self.emit(Op::Store(address, value));
-                Ok((address, ty))
-            }
-            _ => Err(Diagnostic::new(
-                "E108",
-                "expected assignable variable or array element",
-                e.span,
-            )),
-        }
+        })
     }
     fn require(&self, want: &Type, got: &Type, span: Span) -> Result<()> {
         if crate::memory::same_regions(want, got)
@@ -1896,281 +1973,365 @@ impl Lower<'_> {
         Ok((result, returned.clone()))
     }
     fn expr(&mut self, e: &Expr) -> Result<(Reg, Type)> {
-        self.span = e.span;
-        match &e.kind {
-            ExprKind::Yield(value, delegate) => self.yield_expr(value, *delegate, e.span),
-            ExprKind::Invalid(diagnostic) => Err(diagnostic.clone()),
-            ExprKind::ManagedNew(kind, allocator, value) => {
-                let allocator = allocator
-                    .as_ref()
-                    .map(|allocator| self.expr(allocator))
-                    .transpose()?;
-                let (value, ty) = self.expr(value)?;
-                if let Some((allocator, allocator_ty)) = allocator {
-                    if *kind != MemoryKind::Rc {
+        cyallo_ast::with_stack(|| {
+            self.span = e.span;
+            match &e.kind {
+                ExprKind::Yield(value, delegate) => self.yield_expr(value, *delegate, e.span),
+                ExprKind::Invalid(diagnostic) => Err(diagnostic.clone()),
+                ExprKind::ManagedNew(kind, allocator, value) => {
+                    let allocator = allocator
+                        .as_ref()
+                        .map(|allocator| self.expr(allocator))
+                        .transpose()?;
+                    let (value, ty) = self.expr(value)?;
+                    if let Some((allocator, allocator_ty)) = allocator {
+                        if *kind != MemoryKind::Rc {
+                            return Err(Diagnostic::new(
+                                "E109",
+                                "custom allocation requires @rc",
+                                e.span,
+                            ));
+                        }
+                        return self.rc_new_in(value, ty, allocator, allocator_ty, false, e.span);
+                    }
+                    self.lookup_op(
+                        crate::lookup::Operation::ManagedNew(*kind, false),
+                        crate::memory::managed_type(*kind, None, ty),
+                        vec![value],
+                        e.span,
+                    )
+                }
+
+                ExprKind::Frozen(value, ty) => {
+                    let r = self.reg(ty.clone());
+                    self.emit(Op::Frozen(r, value.clone()));
+                    Ok((r, ty.clone()))
+                }
+                ExprKind::GenericCall(..) | ExprKind::GenericRecord(..) => Err(Diagnostic::new(
+                    "E151",
+                    "cannot infer generic arguments; supply explicit type arguments",
+                    e.span,
+                )),
+                ExprKind::IntrinsicCall(id, type_args, args) => {
+                    let intrinsic = Intrinsic::from_id(*id).ok_or_else(|| {
+                        Diagnostic::new("E112", "invalid intrinsic identity", e.span)
+                    })?;
+                    let known = self
+                        .globals
+                        .iter()
+                        .chain(self.function.locals.iter())
+                        .map(|local| (key(&local.name), local.ty.clone()))
+                        .collect();
+                    let arguments =
+                        intrinsic_arguments(intrinsic, type_args, args, &known, self.types)?;
+                    let mut registers = Vec::new();
+                    let mut operands = Vec::new();
+                    for argument in &arguments {
+                        let (register, ty) = self.expr(argument)?;
+                        registers.push(register);
+                        operands.push(ty);
+                    }
+                    let call = crate::intrinsic::resolve_at_call(
+                        intrinsic, type_args, args, &operands, e.span,
+                    )?;
+                    match call.lowering {
+                        Lowering::AddressLength => {
+                            let result = self.reg(Type::Integer);
+                            self.emit(Op::Length(result, registers[0]));
+                            Ok((result, Type::Integer))
+                        }
+                        Lowering::RcTryNewIn => self.rc_new_in(
+                            registers[0],
+                            operands[0].clone(),
+                            registers[1],
+                            operands[1].clone(),
+                            true,
+                            e.span,
+                        ),
+                        Lowering::Print => {
+                            self.emit(Op::Output(registers));
+                            Ok((self.reg(Type::Void), Type::Void))
+                        }
+                        Lowering::Input => {
+                            let Type::Reference { pointee, .. } = &operands[0] else {
+                                unreachable!("checked input signature");
+                            };
+                            self.emit(Op::Input(registers[0], *pointee.clone()));
+                            Ok((self.reg(Type::Void), Type::Void))
+                        }
+                        Lowering::Storage(op) => self.lookup_op(op, call.result, registers, e.span),
+                        Lowering::Context => {
+                            let r = self.reg(call.result.clone());
+                            self.emit(Op::Service(
+                                r,
+                                crate::services::Operation::Context,
+                                registers,
+                            ));
+                            Ok((r, call.result))
+                        }
+                        Lowering::ServiceKey => {
+                            let key = self
+                                .services
+                                .keys
+                                .iter()
+                                .position(|k| k.span == e.span.start)
+                                .ok_or_else(|| {
+                                    Diagnostic::new("E131", "undeclared service key", e.span)
+                                })?;
+                            let r = self.reg(call.result.clone());
+                            self.emit(Op::ServiceKey(r, key));
+                            Ok((r, call.result))
+                        }
+                        Lowering::Utility(id) => {
+                            if matches!(
+                                self.options.dialect,
+                                Dialect::Compatibility | Dialect::Strict
+                            ) && !self.options.convenience_builtins
+                            {
+                                if !crate::builtins::standard_id(id) {
+                                    return Err(Diagnostic::new(
+                                        "E112",
+                                        "utility requires explicit convenience builtins",
+                                        e.span,
+                                    ));
+                                }
+                                if id == Intrinsic::Length && operands != [Type::String] {
+                                    return Err(Diagnostic::new(
+                                        "E112",
+                                        "CAIE LENGTH requires STRING",
+                                        e.span,
+                                    ));
+                                }
+                            }
+                            let r = self.reg(call.result.clone());
+                            self.emit(Op::Builtin(r, id, registers));
+                            Ok((r, call.result))
+                        }
+                    }
+                }
+                ExprKind::TypedCollection(..) => Err(Diagnostic::new(
+                    "E151",
+                    "unresolved collection initializer",
+                    e.span,
+                )),
+                ExprKind::Cast(base, wanted) if wanted.number_kind().is_some() => {
+                    let (value, got) = self.expr(base)?;
+                    if got.number_kind().is_none() {
                         return Err(Diagnostic::new(
                             "E109",
-                            "custom allocation requires @rc",
+                            "numeric cast requires a numeric value",
                             e.span,
                         ));
                     }
-                    return self.rc_new_in(value, ty, allocator, allocator_ty, false, e.span);
-                }
-                self.lookup_op(
-                    crate::lookup::Operation::ManagedNew(*kind, false),
-                    crate::memory::managed_type(*kind, None, ty),
-                    vec![value],
-                    e.span,
-                )
-            }
-
-            ExprKind::Frozen(value, ty) => {
-                let r = self.reg(ty.clone());
-                self.emit(Op::Frozen(r, value.clone()));
-                Ok((r, ty.clone()))
-            }
-            ExprKind::GenericCall(..) | ExprKind::GenericRecord(..) => Err(Diagnostic::new(
-                "E151",
-                "cannot infer generic arguments; supply explicit type arguments",
-                e.span,
-            )),
-            ExprKind::IntrinsicCall(id, type_args, args) => {
-                let intrinsic = Intrinsic::from_id(*id)
-                    .ok_or_else(|| Diagnostic::new("E112", "invalid intrinsic identity", e.span))?;
-                let known = self
-                    .globals
-                    .iter()
-                    .chain(self.function.locals.iter())
-                    .map(|local| (key(&local.name), local.ty.clone()))
-                    .collect();
-                let arguments =
-                    intrinsic_arguments(intrinsic, type_args, args, &known, self.types)?;
-                let mut registers = Vec::new();
-                let mut operands = Vec::new();
-                for argument in &arguments {
-                    let (register, ty) = self.expr(argument)?;
-                    registers.push(register);
-                    operands.push(ty);
-                }
-                let call = crate::intrinsic::resolve_at_call(
-                    intrinsic, type_args, args, &operands, e.span,
-                )?;
-                match call.lowering {
-                    Lowering::AddressLength => {
-                        let result = self.reg(Type::Integer);
-                        self.emit(Op::Length(result, registers[0]));
-                        Ok((result, Type::Integer))
-                    }
-                    Lowering::RcTryNewIn => self.rc_new_in(
-                        registers[0],
-                        operands[0].clone(),
-                        registers[1],
-                        operands[1].clone(),
-                        true,
-                        e.span,
-                    ),
-                    Lowering::Print => {
-                        self.emit(Op::Output(registers));
-                        Ok((self.reg(Type::Void), Type::Void))
-                    }
-                    Lowering::Input => {
-                        let Type::Reference { pointee, .. } = &operands[0] else {
-                            unreachable!("checked input signature");
-                        };
-                        self.emit(Op::Input(registers[0], *pointee.clone()));
-                        Ok((self.reg(Type::Void), Type::Void))
-                    }
-                    Lowering::Storage(op) => self.lookup_op(op, call.result, registers, e.span),
-                    Lowering::Context => {
-                        let r = self.reg(call.result.clone());
-                        self.emit(Op::Service(
-                            r,
-                            crate::services::Operation::Context,
-                            registers,
-                        ));
-                        Ok((r, call.result))
-                    }
-                    Lowering::ServiceKey => {
-                        let key = self
-                            .services
-                            .keys
-                            .iter()
-                            .position(|k| k.span == e.span.start)
-                            .ok_or_else(|| {
-                                Diagnostic::new("E131", "undeclared service key", e.span)
-                            })?;
-                        let r = self.reg(call.result.clone());
-                        self.emit(Op::ServiceKey(r, key));
-                        Ok((r, call.result))
-                    }
-                    Lowering::Utility(id) => {
-                        if matches!(
-                            self.options.dialect,
-                            Dialect::Compatibility | Dialect::Strict
-                        ) && !self.options.convenience_builtins
-                        {
-                            if !crate::builtins::standard_id(id) {
-                                return Err(Diagnostic::new(
-                                    "E112",
-                                    "utility requires explicit convenience builtins",
-                                    e.span,
-                                ));
-                            }
-                            if id == Intrinsic::Length && operands != [Type::String] {
-                                return Err(Diagnostic::new(
-                                    "E112",
-                                    "CAIE LENGTH requires STRING",
-                                    e.span,
-                                ));
-                            }
-                        }
-                        let r = self.reg(call.result.clone());
-                        self.emit(Op::Builtin(r, id, registers));
-                        Ok((r, call.result))
-                    }
-                }
-            }
-            ExprKind::TypedCollection(..) => Err(Diagnostic::new(
-                "E151",
-                "unresolved collection initializer",
-                e.span,
-            )),
-            ExprKind::Cast(base, wanted) if wanted.number_kind().is_some() => {
-                let (value, got) = self.expr(base)?;
-                if got.number_kind().is_none() {
-                    return Err(Diagnostic::new(
-                        "E109",
-                        "numeric cast requires a numeric value",
-                        e.span,
+                    let r = self.reg(wanted.clone());
+                    self.emit(Op::Builtin(
+                        r,
+                        Intrinsic::cast(wanted.number_kind().unwrap()),
+                        vec![value],
                     ));
+                    Ok((r, wanted.clone()))
                 }
-                let r = self.reg(wanted.clone());
-                self.emit(Op::Builtin(
-                    r,
-                    Intrinsic::cast(wanted.number_kind().unwrap()),
-                    vec![value],
-                ));
-                Ok((r, wanted.clone()))
-            }
-            ExprKind::Cast(base, Type::TraitObject(name)) => {
-                let (value, ty) = self.expr(base)?;
-                if crate::composites::borrowed(&ty) {
-                    return Err(Diagnostic::new(
-                        "E117",
-                        "borrowed value cannot escape into an owned trait object",
-                        e.span,
-                    ));
-                }
-                let trait_id = self
-                    .services
-                    .trait_id(name)
-                    .ok_or_else(|| Diagnostic::new("E130", "unknown trait", e.span))?;
-                let implementation = self
-                    .services
-                    .implementations
-                    .iter()
-                    .position(|i| i.trait_id == trait_id && i.receiver == ty)
-                    .ok_or_else(|| {
-                        Diagnostic::new("E130", "type does not implement trait", e.span)
-                    })?;
-                let t = Type::TraitObject(name.clone());
-                let r = self.reg(t.clone());
-                self.span = e.span;
-                self.emit(Op::TraitBox(r, value, implementation));
-                Ok((r, t))
-            }
-            ExprKind::Cast(..) => Err(Diagnostic::new(
-                "E130",
-                "only implemented trait-object conversions are supported",
-                e.span,
-            )),
-            ExprKind::ExtensionField(base, name, getter) => {
-                let known = self
-                    .globals
-                    .iter()
-                    .chain(self.function.locals.iter())
-                    .map(|l| (key(&l.name), l.ty.clone()))
-                    .collect();
-                if let Type::Record(_, fields) =
-                    crate::inference::expression_type(base, &known, self.types)?
-                    && fields.iter().any(|(n, _)| n.eq_identifier(name))
-                {
-                    return self.expr(&Expr {
-                        kind: ExprKind::Field(base.clone(), name.clone()),
-                        span: e.span,
-                    });
-                }
-                let call = Expr {
-                    kind: ExprKind::Call(getter.clone(), vec![*base.clone()]),
-                    span: e.span,
-                };
-                self.expr(&call)
-            }
-
-            ExprKind::Closure(..) => unreachable!("closures have been converted"),
-            ExprKind::ClosureValue(name, captures, ty) => {
-                let id = self.signatures[&key(name)].id;
-                let mut rs = vec![];
-                for capture in captures {
-                    rs.push(self.expr(capture)?.0);
-                }
-                let r = self.reg(ty.clone());
-                self.span = e.span;
-                self.emit(Op::FunctionValue(r, id, rs));
-                Ok((r, ty.clone()))
-            }
-            ExprKind::Tuple(es) => {
-                let mut rs = vec![];
-                let mut ts = vec![];
-                for e in es {
-                    let (r, t) = self.expr(e)?;
-                    rs.push(r);
-                    ts.push(t);
-                }
-                let ty = Type::Tuple(ts);
-                let r = self.reg(ty.clone());
-                self.span = e.span;
-                self.emit(Op::Aggregate(r, rs));
-                Ok((r, ty))
-            }
-            ExprKind::Record(name, fields) => {
-                let ty = self
-                    .types
-                    .get(&key(name))
-                    .cloned()
-                    .ok_or_else(|| Diagnostic::new("E116", "unknown record type", e.span))?;
-                let Type::Record(_, declared) = &ty else {
-                    return Err(Diagnostic::new("E116", "expected record type", e.span));
-                };
-                let mut rs = vec![None; declared.len()];
-                for (name, value) in fields {
-                    let index = declared
-                        .iter()
-                        .position(|(n, _)| n.eq_identifier(name))
-                        .ok_or_else(|| {
-                            Diagnostic::new("E116", format!("unknown field {name}"), value.span)
-                        })?;
-                    if rs[index].is_some() {
+                ExprKind::Cast(base, Type::TraitObject(name)) => {
+                    let (value, ty) = self.expr(base)?;
+                    if crate::composites::borrowed(&ty) {
                         return Err(Diagnostic::new(
-                            "E101",
-                            "duplicate record field",
-                            value.span,
+                            "E117",
+                            "borrowed value cannot escape into an owned trait object",
+                            e.span,
                         ));
                     }
-                    let (r, t) = self.expr_expected(value, &declared[index].1)?;
-                    self.require(&declared[index].1, &t, value.span)?;
-                    rs[index] = Some(r);
+                    let trait_id = self
+                        .services
+                        .trait_id(name)
+                        .ok_or_else(|| Diagnostic::new("E130", "unknown trait", e.span))?;
+                    let implementation = self
+                        .services
+                        .implementations
+                        .iter()
+                        .position(|i| i.trait_id == trait_id && i.receiver == ty)
+                        .ok_or_else(|| {
+                            Diagnostic::new("E130", "type does not implement trait", e.span)
+                        })?;
+                    let t = Type::TraitObject(name.clone());
+                    let r = self.reg(t.clone());
+                    self.span = e.span;
+                    self.emit(Op::TraitBox(r, value, implementation));
+                    Ok((r, t))
                 }
-                let rs = rs.into_iter().collect::<Option<Vec<_>>>().ok_or_else(|| {
-                    Diagnostic::new("E116", "record literal must initialize every field", e.span)
-                })?;
-                let r = self.reg(ty.clone());
-                self.span = e.span;
-                self.emit(Op::Aggregate(r, rs));
-                Ok((r, ty))
-            }
-            ExprKind::Field(base, _) | ExprKind::TupleField(base, _) => {
-                if assignable(base) {
+                ExprKind::Cast(..) => Err(Diagnostic::new(
+                    "E130",
+                    "only implemented trait-object conversions are supported",
+                    e.span,
+                )),
+                ExprKind::ExtensionField(base, name, getter) => {
+                    let known = self
+                        .globals
+                        .iter()
+                        .chain(self.function.locals.iter())
+                        .map(|l| (key(&l.name), l.ty.clone()))
+                        .collect();
+                    if let Type::Record(_, fields) =
+                        crate::inference::expression_type(base, &known, self.types)?
+                        && fields.iter().any(|(n, _)| n.eq_identifier(name))
+                    {
+                        return self.expr(&Expr {
+                            kind: ExprKind::Field(base.clone(), name.clone()),
+                            span: e.span,
+                        });
+                    }
+                    let call = Expr {
+                        kind: ExprKind::Call(getter.clone(), vec![*base.clone()]),
+                        span: e.span,
+                    };
+                    self.expr(&call)
+                }
+
+                ExprKind::Closure(..) => unreachable!("closures have been converted"),
+                ExprKind::ClosureValue(name, captures, ty) => {
+                    let id = self.signatures[&key(name)].id;
+                    let mut rs = vec![];
+                    for capture in captures {
+                        rs.push(self.expr(capture)?.0);
+                    }
+                    let r = self.reg(ty.clone());
+                    self.span = e.span;
+                    self.emit(Op::FunctionValue(r, id, rs));
+                    Ok((r, ty.clone()))
+                }
+                ExprKind::Tuple(es) => {
+                    let mut rs = vec![];
+                    let mut ts = vec![];
+                    for e in es {
+                        let (r, t) = self.expr(e)?;
+                        rs.push(r);
+                        ts.push(t);
+                    }
+                    let ty = Type::Tuple(ts);
+                    let r = self.reg(ty.clone());
+                    self.span = e.span;
+                    self.emit(Op::Aggregate(r, rs));
+                    Ok((r, ty))
+                }
+                ExprKind::Record(name, fields) => {
+                    let ty =
+                        self.types.get(&key(name)).cloned().ok_or_else(|| {
+                            Diagnostic::new("E116", "unknown record type", e.span)
+                        })?;
+                    let Type::Record(_, declared) = &ty else {
+                        return Err(Diagnostic::new("E116", "expected record type", e.span));
+                    };
+                    let mut rs = vec![None; declared.len()];
+                    for (name, value) in fields {
+                        let index = declared
+                            .iter()
+                            .position(|(n, _)| n.eq_identifier(name))
+                            .ok_or_else(|| {
+                                Diagnostic::new("E116", format!("unknown field {name}"), value.span)
+                            })?;
+                        if rs[index].is_some() {
+                            return Err(Diagnostic::new(
+                                "E101",
+                                "duplicate record field",
+                                value.span,
+                            ));
+                        }
+                        let (r, t) = self.expr_expected(value, &declared[index].1)?;
+                        self.require(&declared[index].1, &t, value.span)?;
+                        rs[index] = Some(r);
+                    }
+                    let rs = rs.into_iter().collect::<Option<Vec<_>>>().ok_or_else(|| {
+                        Diagnostic::new(
+                            "E116",
+                            "record literal must initialize every field",
+                            e.span,
+                        )
+                    })?;
+                    let r = self.reg(ty.clone());
+                    self.span = e.span;
+                    self.emit(Op::Aggregate(r, rs));
+                    Ok((r, ty))
+                }
+                ExprKind::Field(base, _) | ExprKind::TupleField(base, _) => {
+                    if assignable(base) {
+                        let (a, t) = self.address(e, false)?;
+                        let r = self.reg(t.clone());
+                        self.emit(if self.moves.contains(&(e.span.start, e.span.end)) {
+                            Op::Take(r, a)
+                        } else {
+                            Op::Load(r, a)
+                        });
+                        Ok((r, t))
+                    } else {
+                        let (a, t) = self.expr(base)?;
+                        let (i, ty) = self.field_type(&t, &e.kind, e.span)?;
+                        let r = self.reg(ty.clone());
+                        self.span = e.span;
+                        self.emit(Op::Extract(r, a, i));
+                        Ok((r, ty))
+                    }
+                }
+                ExprKind::Invoke(callee, args) => self.invoke(callee, args, e.span, false),
+                ExprKind::Name(n)
+                    if self.options.dialect == Dialect::Modern
+                        && self.lookup(n).is_err()
+                        && self.signatures.contains_key(&key(n)) =>
+                {
+                    let sig = &self.signatures[&key(n)];
+                    let ty = self.types[&key(n)].clone();
+                    let id = sig.id;
+                    let r = self.reg(ty.clone());
+                    self.emit(Op::FunctionValue(r, id, vec![]));
+                    Ok((r, ty))
+                }
+                ExprKind::Parenthesized(inner) => self.expr(inner),
+                ExprKind::ArrayLiteral(values) => {
+                    let mut regs = vec![];
+                    let mut element = None;
+                    for value in values {
+                        let (r, t) = self.expr(value)?;
+                        if let Some(want) = &element {
+                            if !crate::memory::same_regions(want, &t) {
+                                return Err(Diagnostic::new(
+                                    "E109",
+                                    "array literal elements must have the same type",
+                                    value.span,
+                                ));
+                            }
+                        } else {
+                            element = Some(t);
+                        }
+                        regs.push(r);
+                    }
+                    let element = element.ok_or_else(|| {
+                        Diagnostic::new(
+                            "E114",
+                            "cannot infer an empty array; initialize an indexed element first",
+                            e.span,
+                        )
+                    })?;
+                    let t = Type::Array(vec![(0, values.len() as i64 - 1)], Box::new(element));
+                    let r = self.reg(t.clone());
+                    self.span = e.span;
+                    self.emit(Op::ArrayLiteral(r, regs));
+                    Ok((r, t))
+                }
+                ExprKind::Literal(l) => {
+                    let t = literal_type(l);
+                    let r = self.reg(t.clone());
+                    if let Literal::String(text) = l {
+                        self.emit(Op::LiteralString(r, std::sync::Arc::from(text.as_ref())));
+                    } else {
+                        self.emit(Op::Literal(
+                            r,
+                            match l {
+                                Literal::Number(n) => Literal::number(*n),
+                                _ => l.clone(),
+                            },
+                        ));
+                    }
+                    Ok((r, t))
+                }
+                ExprKind::Name(_) | ExprKind::Index(..) => {
                     let (a, t) = self.address(e, false)?;
                     let r = self.reg(t.clone());
                     self.emit(if self.moves.contains(&(e.span.start, e.span.end)) {
@@ -2179,244 +2340,166 @@ impl Lower<'_> {
                         Op::Load(r, a)
                     });
                     Ok((r, t))
-                } else {
-                    let (a, t) = self.expr(base)?;
-                    let (i, ty) = self.field_type(&t, &e.kind, e.span)?;
+                }
+                ExprKind::Unary(Operator::Borrow | Operator::BorrowMut, a) => {
+                    let mutable = matches!(e.kind, ExprKind::Unary(Operator::BorrowMut, _));
+                    let (address, pointee) = self.address(a, mutable)?;
+                    let ty = Type::Reference {
+                        mutable,
+                        lifetime: None,
+                        pointee: Box::new(pointee),
+                    };
                     let r = self.reg(ty.clone());
-                    self.span = e.span;
-                    self.emit(Op::Extract(r, a, i));
+                    self.emit(Op::Move(r, address));
                     Ok((r, ty))
                 }
-            }
-            ExprKind::Invoke(callee, args) => self.invoke(callee, args, e.span, false),
-            ExprKind::Name(n)
-                if self.options.dialect == Dialect::Modern
-                    && self.lookup(n).is_err()
-                    && self.signatures.contains_key(&key(n)) =>
-            {
-                let sig = &self.signatures[&key(n)];
-                let ty = self.types[&key(n)].clone();
-                let id = sig.id;
-                let r = self.reg(ty.clone());
-                self.emit(Op::FunctionValue(r, id, vec![]));
-                Ok((r, ty))
-            }
-            ExprKind::Parenthesized(inner) => self.expr(inner),
-            ExprKind::ArrayLiteral(values) => {
-                let mut regs = vec![];
-                let mut element = None;
-                for value in values {
-                    let (r, t) = self.expr(value)?;
-                    if let Some(want) = &element {
-                        if !crate::memory::same_regions(want, &t) {
+                ExprKind::Unary(Operator::Dereference, _) => {
+                    if let Some((base, ty)) = self.cell_target(e)? {
+                        if !crate::ownership::copy(&ty)
+                            || matches!(ty, Type::Reference { mutable: true, .. })
+                        {
                             return Err(Diagnostic::new(
                                 "E109",
-                                "array literal elements must have the same type",
-                                value.span,
+                                "Cell dereference reads require Copy contents; use cell.replace(value) to transfer ownership",
+                                e.span,
                             ));
                         }
-                    } else {
-                        element = Some(t);
+                        let (address, _) = self.address(base, false)?;
+                        return self.lookup_op(
+                            crate::lookup::Operation::CellRead,
+                            ty,
+                            vec![address],
+                            e.span,
+                        );
                     }
-                    regs.push(r);
+                    let (address, ty) = self.address(e, false)?;
+                    let r = self.reg(ty.clone());
+                    self.emit(Op::Load(r, address));
+                    Ok((r, ty))
                 }
-                let element = element.ok_or_else(|| {
-                    Diagnostic::new(
-                        "E114",
-                        "cannot infer an empty array; initialize an indexed element first",
-                        e.span,
-                    )
-                })?;
-                let t = Type::Array(vec![(0, values.len() as i64 - 1)], Box::new(element));
-                let r = self.reg(t.clone());
-                self.span = e.span;
-                self.emit(Op::ArrayLiteral(r, regs));
-                Ok((r, t))
-            }
-            ExprKind::Literal(l) => {
-                let t = literal_type(l);
-                let r = self.reg(t.clone());
-                if let Literal::String(text) = l {
-                    self.emit(Op::LiteralString(r, std::sync::Arc::from(text.as_ref())));
-                } else {
-                    self.emit(Op::Literal(
-                        r,
-                        match l {
-                            Literal::Number(n) => Literal::number(*n),
-                            _ => l.clone(),
-                        },
-                    ));
+                ExprKind::Unary(op, a) => {
+                    let (a, t) = self.expr(a)?;
+                    if !(if *op == Operator::Not {
+                        t == Type::Boolean
+                    } else {
+                        numeric(&t)
+                    }) {
+                        return Err(Diagnostic::new("E105", "invalid unary operand", e.span));
+                    }
+                    let r = self.reg(t.clone());
+                    self.span = e.span;
+                    self.emit(Op::Unary(r, *op, a));
+                    Ok((r, t))
                 }
-                Ok((r, t))
-            }
-            ExprKind::Name(_) | ExprKind::Index(..) => {
-                let (a, t) = self.address(e, false)?;
-                let r = self.reg(t.clone());
-                self.emit(if self.moves.contains(&(e.span.start, e.span.end)) {
-                    Op::Take(r, a)
-                } else {
-                    Op::Load(r, a)
-                });
-                Ok((r, t))
-            }
-            ExprKind::Unary(Operator::Borrow | Operator::BorrowMut, a) => {
-                let mutable = matches!(e.kind, ExprKind::Unary(Operator::BorrowMut, _));
-                let (address, pointee) = self.address(a, mutable)?;
-                let ty = Type::Reference {
-                    mutable,
-                    lifetime: None,
-                    pointee: Box::new(pointee),
-                };
-                let r = self.reg(ty.clone());
-                self.emit(Op::Move(r, address));
-                Ok((r, ty))
-            }
-            ExprKind::Unary(Operator::Dereference, _) => {
-                if let Some((base, ty)) = self.cell_target(e)? {
-                    if !crate::ownership::copy(&ty)
-                        || matches!(ty, Type::Reference { mutable: true, .. })
+                ExprKind::Binary(op, a, b) => {
+                    let known = self
+                        .globals
+                        .iter()
+                        .chain(self.function.locals.iter())
+                        .map(|l| (key(&l.name), l.ty.clone()))
+                        .collect();
+                    let ta = crate::inference::expression_type(a, &known, self.types).ok();
+                    let tb = crate::inference::expression_type(b, &known, self.types).ok();
+                    let context = ta
+                        .as_ref()
+                        .zip(tb.as_ref())
+                        .filter(|(a, b)| numeric(a) && numeric(b))
+                        .map(|(ta, tb)| numeric_context(a, ta, b, tb));
+                    let a = context
+                        .as_ref()
+                        .map(|ty| contextualize(a, ty))
+                        .transpose()?
+                        .unwrap_or_else(|| *a.clone());
+                    let b = context
+                        .as_ref()
+                        .map(|ty| contextualize(b, ty))
+                        .transpose()?
+                        .unwrap_or_else(|| *b.clone());
+                    let a = &a;
+                    let b = &b;
+                    let (a, ta) = self.expr(a)?;
+                    let r = self.reg(ta.clone());
+                    if *op == Operator::And || *op == Operator::Or {
+                        self.require(&Type::Boolean, &ta, e.span)?;
+                        self.emit(Op::Move(r, a));
+                        let branch = self.emit(Op::Statement);
+                        let rhs = self.function.code.len();
+                        let (b, tb) = self.expr(b)?;
+                        self.require(&Type::Boolean, &tb, e.span)?;
+                        self.emit(Op::Move(r, b));
+                        let end = self.function.code.len();
+                        self.function.code[branch].op = if *op == Operator::And {
+                            Op::Branch(a, rhs, end)
+                        } else {
+                            Op::Branch(a, end, rhs)
+                        };
+                        return Ok((r, Type::Boolean));
+                    }
+                    let (b, tb) = self.expr(b)?;
+                    if matches!(op, Operator::Range | Operator::RangeInclusive) {
+                        self.require(&ta, &tb, e.span)?;
+                        if ta.number_kind().is_none_or(|kind| kind.float()) {
+                            return Err(Diagnostic::new(
+                                "E109",
+                                "range bounds require integers",
+                                e.span,
+                            ));
+                        }
+                        return self.lookup_op(
+                            crate::lookup::Operation::Range(*op == Operator::RangeInclusive),
+                            Type::Storage(cyallo_ast::StorageKind::Range, Box::new(ta)),
+                            vec![a, b],
+                            e.span,
+                        );
+                    }
+                    if self.options.dialect == Dialect::Modern
+                        && numeric(&ta)
+                        && numeric(&tb)
+                        && ta != tb
                     {
                         return Err(Diagnostic::new(
                             "E109",
-                            "Cell dereference reads require Copy contents; use cell.replace(value) to transfer ownership",
+                            "numeric operands require identical types; use a checked cast",
                             e.span,
                         ));
                     }
-                    let (address, _) = self.address(base, false)?;
-                    return self.lookup_op(
-                        crate::lookup::Operation::CellRead,
-                        ty,
-                        vec![address],
-                        e.span,
-                    );
-                }
-                let (address, ty) = self.address(e, false)?;
-                let r = self.reg(ty.clone());
-                self.emit(Op::Load(r, address));
-                Ok((r, ty))
-            }
-            ExprKind::Unary(op, a) => {
-                let (a, t) = self.expr(a)?;
-                if !(if *op == Operator::Not {
-                    t == Type::Boolean
-                } else {
-                    numeric(&t)
-                }) {
-                    return Err(Diagnostic::new("E105", "invalid unary operand", e.span));
-                }
-                let r = self.reg(t.clone());
-                self.span = e.span;
-                self.emit(Op::Unary(r, *op, a));
-                Ok((r, t))
-            }
-            ExprKind::Binary(op, a, b) => {
-                let known = self
-                    .globals
-                    .iter()
-                    .chain(self.function.locals.iter())
-                    .map(|l| (key(&l.name), l.ty.clone()))
-                    .collect();
-                let ta = crate::inference::expression_type(a, &known, self.types).ok();
-                let tb = crate::inference::expression_type(b, &known, self.types).ok();
-                let context = ta
-                    .as_ref()
-                    .zip(tb.as_ref())
-                    .filter(|(a, b)| numeric(a) && numeric(b))
-                    .map(|(ta, tb)| numeric_context(a, ta, b, tb));
-                let a = context
-                    .as_ref()
-                    .map(|ty| contextualize(a, ty))
-                    .transpose()?
-                    .unwrap_or_else(|| *a.clone());
-                let b = context
-                    .as_ref()
-                    .map(|ty| contextualize(b, ty))
-                    .transpose()?
-                    .unwrap_or_else(|| *b.clone());
-                let a = &a;
-                let b = &b;
-                let (a, ta) = self.expr(a)?;
-                let r = self.reg(ta.clone());
-                if *op == Operator::And || *op == Operator::Or {
-                    self.require(&Type::Boolean, &ta, e.span)?;
-                    self.emit(Op::Move(r, a));
-                    let branch = self.emit(Op::Statement);
-                    let rhs = self.function.code.len();
-                    let (b, tb) = self.expr(b)?;
-                    self.require(&Type::Boolean, &tb, e.span)?;
-                    self.emit(Op::Move(r, b));
-                    let end = self.function.code.len();
-                    self.function.code[branch].op = if *op == Operator::And {
-                        Op::Branch(a, rhs, end)
-                    } else {
-                        Op::Branch(a, end, rhs)
-                    };
-                    return Ok((r, Type::Boolean));
-                }
-                let (b, tb) = self.expr(b)?;
-                if matches!(op, Operator::Range | Operator::RangeInclusive) {
-                    self.require(&ta, &tb, e.span)?;
-                    if ta.number_kind().is_none_or(|kind| kind.float()) {
-                        return Err(Diagnostic::new(
-                            "E109",
-                            "range bounds require integers",
-                            e.span,
-                        ));
-                    }
-                    return self.lookup_op(
-                        crate::lookup::Operation::Range(*op == Operator::RangeInclusive),
-                        Type::Storage(cyallo_ast::StorageKind::Range, Box::new(ta)),
-                        vec![a, b],
-                        e.span,
-                    );
-                }
-                if self.options.dialect == Dialect::Modern
-                    && numeric(&ta)
-                    && numeric(&tb)
-                    && ta != tb
-                {
-                    return Err(Diagnostic::new(
-                        "E109",
-                        "numeric operands require identical types; use a checked cast",
-                        e.span,
-                    ));
-                }
-                let t = binary_type(*op, &ta, &tb, e.span)?;
-                self.function.registers[r] = t.clone();
-                self.span = e.span;
-                self.emit(Op::Binary(r, *op, a, b));
-                Ok((r, t))
-            }
-            ExprKind::Call(n, args) => {
-                if self.options.dialect == Dialect::Modern && self.lookup(n).is_ok() {
-                    let callee = Expr {
-                        kind: ExprKind::Name(n.clone()),
-                        span: e.span,
-                    };
-                    return self.invoke(&callee, args, e.span, false);
-                }
-                if let Some(sig) = self.signatures.get(&key(n)).cloned() {
-                    if sig.result == Type::Void {
-                        return Err(Diagnostic::new(
-                            "E110",
-                            "procedure cannot be used as an expression",
-                            e.span,
-                        ));
-                    }
-                    let rs = self.arguments(&sig, args)?;
-                    let r = self.reg(sig.result.clone());
+                    let t = binary_type(*op, &ta, &tb, e.span)?;
+                    self.function.registers[r] = t.clone();
                     self.span = e.span;
-                    self.emit(Op::Call(Some(r), sig.id, rs));
-                    Ok((r, sig.result))
-                } else {
-                    Err(Diagnostic::new(
-                        "E106",
-                        format!("unresolved callable {n}"),
-                        e.span,
-                    ))
+                    self.emit(Op::Binary(r, specialized_operator(*op, &t), a, b));
+                    Ok((r, t))
+                }
+                ExprKind::Call(n, args) => {
+                    if self.options.dialect == Dialect::Modern && self.lookup(n).is_ok() {
+                        let callee = Expr {
+                            kind: ExprKind::Name(n.clone()),
+                            span: e.span,
+                        };
+                        return self.invoke(&callee, args, e.span, false);
+                    }
+                    if let Some(sig) = self.signatures.get(&key(n)).cloned() {
+                        if sig.result == Type::Void {
+                            return Err(Diagnostic::new(
+                                "E110",
+                                "procedure cannot be used as an expression",
+                                e.span,
+                            ));
+                        }
+                        let rs = self.arguments(&sig, args)?;
+                        let r = self.reg(sig.result.clone());
+                        self.span = e.span;
+                        self.emit(Op::Call(Some(r), sig.id, rs));
+                        Ok((r, sig.result))
+                    } else {
+                        Err(Diagnostic::new(
+                            "E106",
+                            format!("unresolved callable {n}"),
+                            e.span,
+                        ))
+                    }
                 }
             }
-        }
+        })
     }
     fn arguments(&mut self, sig: &Signature, args: &[Expr]) -> Result<Vec<Reg>> {
         if args.len() != sig.params.len() {
@@ -2453,15 +2536,17 @@ impl Lower<'_> {
         }
     }
     fn block(&mut self, body: &[Stmt]) -> Result<()> {
-        self.block_depth += 1;
-        self.drop_scopes.push(vec![]);
-        for statement in body {
-            self.statement(statement)?;
-        }
-        let slots = self.drop_scopes.pop().expect("active block");
-        self.drop_slots(slots);
-        self.block_depth -= 1;
-        Ok(())
+        cyallo_ast::with_stack(|| {
+            self.block_depth += 1;
+            self.drop_scopes.push(vec![]);
+            for statement in body {
+                self.statement(statement)?;
+            }
+            let slots = self.drop_scopes.pop().expect("active block");
+            self.drop_slots(slots);
+            self.block_depth -= 1;
+            Ok(())
+        })
     }
     fn condition(&mut self, e: &Expr) -> Result<Reg> {
         let (r, t) = self.expr(e)?;
@@ -2496,9 +2581,10 @@ impl Lower<'_> {
                 let (rhs, rty) = self.expr(&contextualize(value, &ty)?)?;
                 let result = binary_type(*op, &ty, &rty, s.span)?;
                 self.require(&ty, &result, s.span)?;
+                let operator = specialized_operator(*op, &result);
                 let r = self.reg(result);
                 self.span = s.span;
-                self.emit(Op::Binary(r, *op, old, rhs));
+                self.emit(Op::Binary(r, operator, old, rhs));
                 self.emit(Op::Store(addr, r));
             }
             StmtKind::Evaluate(e) => {
@@ -2831,6 +2917,78 @@ impl Lower<'_> {
                 self.function.code[join].op = Op::Jump(test);
                 self.function.code[branch].op = Op::Branch(cond, yes, end);
                 self.function.code[skip_increment].op = Op::Branch(finished, end, advance);
+                self.close_loop(end, increment);
+            }
+            StmtKind::ForIn(n, iterable, b) => {
+                let range = self.range_iteration(iterable)?;
+                let (first, t) = self.expr(range.start)?;
+                let (last, end_type) = self.expr(range.end)?;
+                self.require(&t, &end_type, range.end.span)?;
+                let Some(kind) = t.number_kind().filter(|kind| !kind.float()) else {
+                    return Err(Diagnostic::new(
+                        "E109",
+                        "for-in ranges require integer bounds",
+                        iterable.span,
+                    ));
+                };
+                let target = Expr {
+                    kind: ExprKind::Name(n.clone()),
+                    span: s.span,
+                };
+                let (addr, variable) = self.address(&target, true)?;
+                self.require(&t, &variable, s.span)?;
+                let one = self.reg(t.clone());
+                let unit = cyallo_ast::Number::integer(kind, 1).map_err(|error| {
+                    cyallo_ast::diagnostic::invalid_numeric_literal(error, s.span)
+                })?;
+                self.emit(Op::Literal(one, Literal::number(unit)));
+                // An empty range skips the body. An exclusive bound becomes
+                // inclusive by stepping back once, which cannot overflow
+                // because the range is non-empty.
+                let empty = self.reg(Type::Boolean);
+                let empty_test = if range.inclusive {
+                    Operator::Greater
+                } else {
+                    Operator::GreaterEqual
+                };
+                self.emit(Op::Binary(empty, empty_test, first, last));
+                let skip = self.emit(Op::Statement);
+                let bound = if range.inclusive {
+                    last
+                } else {
+                    let bound = self.reg(t.clone());
+                    self.emit(Op::Binary(bound, Operator::Subtract, last, one));
+                    bound
+                };
+                let (from, to, advance_by) = if range.reversed {
+                    (bound, first, Operator::Subtract)
+                } else {
+                    (first, bound, Operator::Add)
+                };
+                self.emit(Op::Store(addr, from));
+                let start = self.function.code.len();
+                self.loops.push(LoopScope {
+                    drop_depth: self.drop_scopes.len(),
+                    breaks: vec![],
+                    continues: vec![],
+                });
+                self.block(b)?;
+                // The counter stops on equality, so it never steps past `to`.
+                let increment = self.function.code.len();
+                self.span = s.span;
+                let current = self.reg(t.clone());
+                self.emit(Op::Load(current, addr));
+                let finished = self.reg(Type::Boolean);
+                self.emit(Op::Binary(finished, Operator::Equal, current, to));
+                let test = self.emit(Op::Statement);
+                let advance = self.function.code.len();
+                let next = self.reg(t);
+                self.emit(Op::Binary(next, advance_by, current, one));
+                self.emit(Op::Store(addr, next));
+                self.emit(Op::Jump(start));
+                let end = self.function.code.len();
+                self.function.code[skip].op = Op::Branch(empty, end, skip + 1);
+                self.function.code[test].op = Op::Branch(finished, end, advance);
                 self.close_loop(end, increment);
             }
             StmtKind::Case(e, arms, fallback) => {

@@ -928,7 +928,7 @@ proc work(n: &mut i64) {
     *n = incremented
 }
 let mut n = 0
-for i = 0 to 4 { work(&mut n) }
+for i in 0..=4 { work(&mut n) }
 std::runtime::caie::input(&mut n)
 "#,
             )

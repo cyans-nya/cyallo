@@ -104,7 +104,7 @@ proc run() -> i64 {
     let mut count = 0
     let bump = proc[&mut count]() { let garbage = [1,2,3]; count += garbage[0] }
     let functions = (make(4), bump)
-    for i = 1 to 12 { functions.1() }
+    for i in 1..=12 { functions.1() }
     return functions.0(count)
 }
 std::io::print(run())

@@ -16,6 +16,7 @@ fn parse_mode(source: &str, expression_statements: bool) -> Result<Ast, Diagnost
         pos: 0,
         expression_statements,
         source_names: Default::default(),
+        depth: 0,
     }
     .program()
 }
@@ -24,8 +25,28 @@ struct Parser<'a> {
     pos: usize,
     expression_statements: bool,
     source_names: std::collections::HashMap<Box<str>, Box<str>>,
+    /// Syntactic recursion depth, bounded by [`MAX_DEPTH`].
+    depth: usize,
 }
+/// Deeper nesting is a diagnostic rather than an exhausted stack.
+const MAX_DEPTH: usize = 256;
 impl Parser<'_> {
+    fn nested<T>(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Result<T, Diagnostic>,
+    ) -> Result<T, Diagnostic> {
+        if self.depth >= MAX_DEPTH {
+            return Err(Diagnostic::new(
+                "E002",
+                format!("nesting exceeds the limit of {MAX_DEPTH} levels"),
+                self.token().span,
+            ));
+        }
+        self.depth += 1;
+        let result = cyallo_ast::with_stack(|| parse(self));
+        self.depth -= 1;
+        result
+    }
     fn token(&self) -> &Token {
         &self.tokens[self.pos]
     }
@@ -232,6 +253,9 @@ impl Parser<'_> {
         })
     }
     fn block(&mut self, ends: &[&str]) -> Result<Vec<Stmt>, Diagnostic> {
+        self.nested(|parser| parser.block_inner(ends))
+    }
+    fn block_inner(&mut self, ends: &[&str]) -> Result<Vec<Stmt>, Diagnostic> {
         let mut b = vec![];
         self.newlines();
         while !ends.iter().any(|e| self.at(e)) {
@@ -396,6 +420,9 @@ impl Parser<'_> {
         Ok(v)
     }
     fn expr(&mut self, min: u8) -> Result<Expr, Diagnostic> {
+        self.nested(|parser| parser.expr_inner(min))
+    }
+    fn expr_inner(&mut self, min: u8) -> Result<Expr, Diagnostic> {
         let span = self.token().span;
         let mut lhs = if self.take("-") {
             if self.token().kind == TokenKind::Integer {

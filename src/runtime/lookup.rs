@@ -147,11 +147,14 @@ impl Session {
                 out.push(Atom::Tag(38, 0));
                 out.push(Atom::Text(message.clone()));
             }
-            Value::Range(a, b, inclusive) => {
-                out.push(Atom::Tag(32, a.kind as u64));
-                out.push(Atom::Tag(33, a.bits));
-                out.push(Atom::Tag(34, b.bits));
-                out.push(Atom::Tag(35, u64::from(*inclusive)));
+            Value::Range(range) => {
+                out.push(Atom::Tag(32, range.start.kind as u64));
+                out.push(Atom::Tag(33, range.start.bits));
+                out.push(Atom::Tag(34, range.end.bits));
+                out.push(Atom::Tag(
+                    35,
+                    u64::from(range.inclusive) | (u64::from(range.reversed) << 1),
+                ));
             }
             Value::Deque(ids) => {
                 out.push(Atom::Tag(36, ids.len() as u64));
@@ -581,26 +584,47 @@ impl Session {
             }
             Operation::CollectionLiteral(_) => Value::ArraySnapshot(values),
             Operation::Range(inclusive) => {
-                let a = values[0].as_number().ok_or(expected(ValueKind::Integer))?;
-                let b = values[1].as_number().ok_or(expected(ValueKind::Integer))?;
-                Value::Range(a, b, inclusive)
+                let start = values[0].as_number().ok_or(expected(ValueKind::Integer))?;
+                let end = values[1].as_number().ok_or(expected(ValueKind::Integer))?;
+                Value::Range(cyallo_values::RangeValue {
+                    start,
+                    end,
+                    inclusive,
+                    reversed: false,
+                })
             }
-            Operation::CollectionFrom(_) | Operation::ArrayFrom => {
-                let Value::Range(a, b, inclusive) = values[0] else {
+            Operation::RangeReverse => {
+                let Value::Range(range) = values[0] else {
                     return Err(expected(ValueKind::Range));
                 };
-                let end = b.int() + i128::from(inclusive);
-                let count = (end - a.int()).max(0);
+                Value::Range(cyallo_values::RangeValue {
+                    reversed: !range.reversed,
+                    ..range
+                })
+            }
+            Operation::CollectionFrom(_) | Operation::ArrayFrom => {
+                let Value::Range(range) = values[0] else {
+                    return Err(expected(ValueKind::Range));
+                };
+                let start = range.start.int();
+                let end = range.end.int() + i128::from(range.inclusive);
+                let count = (end - start).max(0);
                 if count > self.context.max_cells as i128 {
                     return Err(ResourceLimit::Storage.into());
                 }
-                let elements = (a.int()..end)
-                    .map(|n| {
-                        cyallo_ast::Number::integer(a.kind, n)
-                            .map(Value::from_number)
-                            .map_err(RuntimeError::from)
-                    })
-                    .collect::<RunResult<Vec<_>>>()?;
+                let number = |n| {
+                    cyallo_ast::Number::integer(range.start.kind, n)
+                        .map(Value::from_number)
+                        .map_err(RuntimeError::from)
+                };
+                let elements = if range.reversed {
+                    (start..end)
+                        .rev()
+                        .map(number)
+                        .collect::<RunResult<Vec<_>>>()?
+                } else {
+                    (start..end).map(number).collect::<RunResult<Vec<_>>>()?
+                };
                 Value::ArraySnapshot(elements)
             }
             Operation::CollectionLength => {

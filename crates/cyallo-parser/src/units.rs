@@ -27,6 +27,7 @@ impl<'src> IndexedSource<'src> {
             pos: 0,
             expression_statements: repl,
             nesting: 0,
+            depth: 0,
             condition: false,
         }
         .program()

@@ -46,9 +46,10 @@ fn bound_names(f: &Function) -> HashSet<String> {
                     block(a, names);
                     block(b, names);
                 }
-                StmtKind::While(_, b) | StmtKind::Repeat(b, _) | StmtKind::For(_, _, _, _, b) => {
-                    block(b, names)
-                }
+                StmtKind::While(_, b)
+                | StmtKind::Repeat(b, _)
+                | StmtKind::For(_, _, _, _, b)
+                | StmtKind::ForIn(_, _, b) => block(b, names),
                 StmtKind::Case(_, arms, b) => {
                     for (_, b) in arms {
                         block(b, names);

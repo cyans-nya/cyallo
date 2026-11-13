@@ -150,7 +150,7 @@ fn clif_finalization_drains_pending_jobs_without_checking_unrelated_bodies() {
     let source = scratch.0.join("source.ya");
     let dump = scratch.0.join("dump");
     // Enough loop work to cross the default Cranelift-fast threshold.
-    std::fs::write(&source,"fn work(n: i64) -> i64 { let mut sum = 0; for i = 1 to n { sum += i }; return sum }\nfn unused() -> i64 { return missing }\nstd::io::print(work(100000))\n").unwrap();
+    std::fs::write(&source,"fn work(n: i64) -> i64 { let mut sum = 0; for i in 1..=n { sum += i }; return sum }\nfn unused() -> i64 { return missing }\nstd::io::print(work(100000))\n").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_cyallo"))
         .args([
             "run",

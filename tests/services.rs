@@ -130,7 +130,7 @@ let ctx = std::service::Context::new()
 let live = ctx.service(LOGGER)
 proc log(logger: &std::service::ServiceRef<dyn Logger>, message: string) {{ logger.info(message) }}
 let mut registration = ctx.provide(LOGGER,Console {{ prefix: "A" }} as dyn Logger)
-for i = 0 to 3 {{ log(&live, "1") }}
+for i in 0..=3 {{ log(&live, "1") }}
 registration.dispose()
 registration = ctx.provide(LOGGER,Console {{ prefix: "B" }} as dyn Logger)
 log(&live, "2")
@@ -198,10 +198,10 @@ let ctx = std::service::Context::new()
 let mut registration = ctx.provide(LOGGER,Console {{ prefix: "" }} as dyn Logger)
 let live = ctx.service(LOGGER)
 proc emit(logger: &std::service::ServiceRef<dyn Logger>, message: string) {{ logger.info(message) }}
-for i = 1 to 20 {{ emit(&live, "x") }}
+for i in 1..=20 {{ emit(&live, "x") }}
 registration.dispose()
 registration = ctx.provide(LOGGER,Console {{ prefix: "" }} as dyn Logger)
-for i = 1 to 20 {{ emit(&live, "y") }}
+for i in 1..=20 {{ emit(&live, "y") }}
 registration.dispose()
 "#
     );

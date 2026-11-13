@@ -14,7 +14,7 @@ proc increment(counter: @gc Counter) {
 }
 
 proc churn() {
-    for i = 0 to 31 {
+    for i in 0..=31 {
         let temporary = make_counter(i)
     }
 }

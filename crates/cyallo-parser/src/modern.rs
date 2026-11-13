@@ -285,6 +285,9 @@ impl Parser<'_> {
         Ok(values)
     }
     pub(super) fn braces(&mut self) -> Result<Vec<Stmt>, Diagnostic> {
+        self.nested(Self::braces_inner)
+    }
+    fn braces_inner(&mut self) -> Result<Vec<Stmt>, Diagnostic> {
         let outer_nesting = self.nesting;
         let outer_condition = self.condition;
         self.condition = false;
@@ -442,17 +445,10 @@ impl Parser<'_> {
         }
         if self.take("for") {
             let name = self.name()?;
-            self.expect("=")?;
-            let first = self.expr(0)?;
-            self.expect("to")?;
-            let last = self.condition_expr()?;
-            let step = if self.take("step") {
-                Some(self.condition_expr()?)
-            } else {
-                None
-            };
+            self.expect("in")?;
+            let iterable = self.condition_expr()?;
             let body = self.braces()?;
-            return Ok(Some(StmtKind::For(name, first, last, step, body)));
+            return Ok(Some(StmtKind::ForIn(name, iterable, body)));
         }
         Ok(None)
     }

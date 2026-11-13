@@ -11,7 +11,7 @@ fn pair_of<A, B>(first: A, second: B) -> Pair<A, B> {
 
 fn transform<A, B>(items: &[]A, convert: fn(A) -> B) -> std::collections::Vec<B> {
     let mut result = std::collections::Vec<B>[]
-    for i = 0 to std::array::len(items) - 1 {
+    for i in 0..=std::array::len(items) - 1 {
         result.push(convert(std::mem::clone(&items[i])))
     }
     return result
@@ -25,7 +25,7 @@ fn keep<T>(value: T) -> fn() -> T {
 // A and B are inferred from the borrowed slice and callback.
 let values = [1, 2, 3]
 let labels = transform(&values, fn(n: i64) -> string {
-    return "item-" & std::string::from(n)
+    return "item-" + std::string::from(n)
 })
 let summary = pair_of<string, i64>("items", std::array::len(labels))
 std::io::print(summary.first, ":", summary.second)

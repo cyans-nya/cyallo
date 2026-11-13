@@ -590,176 +590,183 @@ impl Resolver {
         scopes: &mut Vec<HashMap<String, Local>>,
         params: &[Box<str>],
     ) -> Result<()> {
-        let constructor = match &e.kind {
-            ExprKind::Index(base, _) => match &base.kind {
-                ExprKind::Name(n) if Self::local(scopes, n).is_none() => Some(n.as_ref()),
+        cyallo_ast::with_stack(|| {
+            let constructor = match &e.kind {
+                ExprKind::Index(base, _) => match &base.kind {
+                    ExprKind::Name(n) if Self::local(scopes, n).is_none() => Some(n.as_ref()),
+                    _ => None,
+                },
+                ExprKind::TypedCollection(n, _, _) => Some(n.as_ref()),
                 _ => None,
-            },
-            ExprKind::TypedCollection(n, _, _) => Some(n.as_ref()),
-            _ => None,
-        }
-        .and_then(|name| self.path(module, name, Some(Kind::Type)))
-        .and_then(|symbol| match stdlib::item(&symbol.target) {
-            Some(Item::Type(BuiltinType::Storage(StorageKind::Vec))) => Some(Intrinsic::VecLiteral),
-            Some(Item::Type(BuiltinType::Storage(StorageKind::VecDeque))) => {
-                Some(Intrinsic::DequeLiteral)
             }
-            _ => None,
-        });
-        if let Some(id) = constructor {
+            .and_then(|name| self.path(module, name, Some(Kind::Type)))
+            .and_then(|symbol| match stdlib::item(&symbol.target) {
+                Some(Item::Type(BuiltinType::Storage(StorageKind::Vec))) => {
+                    Some(Intrinsic::VecLiteral)
+                }
+                Some(Item::Type(BuiltinType::Storage(StorageKind::VecDeque))) => {
+                    Some(Intrinsic::DequeLiteral)
+                }
+                _ => None,
+            });
+            if let Some(id) = constructor {
+                match &mut e.kind {
+                    ExprKind::Index(_, args) => {
+                        e.kind = ExprKind::IntrinsicCall(id.id(), vec![], std::mem::take(args))
+                    }
+                    ExprKind::TypedCollection(_, types, args) => {
+                        e.kind = ExprKind::IntrinsicCall(
+                            id.id(),
+                            std::mem::take(types),
+                            std::mem::take(args),
+                        )
+                    }
+                    _ => {}
+                }
+            }
             match &mut e.kind {
-                ExprKind::Index(_, args) => {
-                    e.kind = ExprKind::IntrinsicCall(id.id(), vec![], std::mem::take(args))
+                ExprKind::Yield(value, _) => self.expr(module, value, scopes, params)?,
+                ExprKind::ManagedNew(_, allocator, value) => {
+                    if let Some(allocator) = allocator {
+                        self.expr(module, allocator, scopes, params)?;
+                    }
+                    self.expr(module, value, scopes, params)?;
                 }
-                ExprKind::TypedCollection(_, types, args) => {
-                    e.kind = ExprKind::IntrinsicCall(
-                        id.id(),
-                        std::mem::take(types),
-                        std::mem::take(args),
-                    )
-                }
-                _ => {}
-            }
-        }
-        match &mut e.kind {
-            ExprKind::Yield(value, _) => self.expr(module, value, scopes, params)?,
-            ExprKind::ManagedNew(_, allocator, value) => {
-                if let Some(allocator) = allocator {
-                    self.expr(module, allocator, scopes, params)?;
-                }
-                self.expr(module, value, scopes, params)?;
-            }
-            ExprKind::TypedCollection(..) => {
-                return Err(error(
-                    "type does not define a collection initializer",
-                    e.span,
-                ));
-            }
-            ExprKind::IntrinsicCall(_, types, arguments) => {
-                for t in types {
-                    self.ty(module, t, params, e.span)?;
-                }
-                for a in arguments {
-                    self.expr(module, a, scopes, params)?;
-                }
-            }
-            ExprKind::Name(n) => {
-                *n = if let Some(local) = Self::local(scopes, n) {
-                    local.target
-                } else if let Some(symbol) = self.path(module, n, Some(Kind::Value)) {
-                    symbol.target
-                } else {
-                    e.kind = ExprKind::Invalid(Diagnostic::new(
-                        "E106",
-                        format!("undeclared identifier {n}"),
+                ExprKind::TypedCollection(..) => {
+                    return Err(error(
+                        "type does not define a collection initializer",
                         e.span,
                     ));
-                    return Ok(());
                 }
-            }
-            ExprKind::Call(n, args) | ExprKind::GenericCall(n, _, args) => {
-                let symbol = if Self::local(scopes, n).is_none() {
-                    self.path(module, n, Some(Kind::Value))
-                } else {
-                    None
-                };
-                for a in args.iter_mut() {
-                    self.expr(module, a, scopes, params)?;
-                }
-                let mut types = match &mut e.kind {
-                    ExprKind::GenericCall(_, ts, _) => ts.clone(),
-                    _ => vec![],
-                };
-                for t in &mut types {
-                    self.ty(module, t, params, e.span)?;
-                }
-                if let Some(id) = symbol.as_ref().and_then(|s| s.intrinsic) {
-                    let args = match &mut e.kind {
-                        ExprKind::Call(_, a) | ExprKind::GenericCall(_, _, a) => std::mem::take(a),
-                        _ => unreachable!(),
-                    };
-                    e.kind = ExprKind::IntrinsicCall(id.id(), types, args);
-                } else {
-                    let name = match &mut e.kind {
-                        ExprKind::Call(n, _) | ExprKind::GenericCall(n, _, _) => n,
-                        _ => unreachable!(),
-                    };
-                    *name = if let Some(local) = Self::local(scopes, name) {
-                        local.target
-                    } else {
-                        if let Some(symbol) = symbol {
-                            symbol.target
-                        } else {
-                            e.kind = ExprKind::Invalid(Diagnostic::new(
-                                "E106",
-                                format!("undeclared function {name}"),
-                                e.span,
-                            ));
-                            return Ok(());
-                        }
-                    };
-                    if let ExprKind::GenericCall(_, ts, _) = &mut e.kind {
-                        *ts = types
-                    }
-                }
-            }
-            ExprKind::Record(n, fs) | ExprKind::GenericRecord(n, _, fs) => {
-                *n = self.symbol(module, n, Kind::Type, e.span)?;
-                for (_, value) in fs {
-                    self.expr(module, value, scopes, params)?;
-                }
-                if let ExprKind::GenericRecord(_, ts, _) = &mut e.kind {
-                    for t in ts {
+                ExprKind::IntrinsicCall(_, types, arguments) => {
+                    for t in types {
                         self.ty(module, t, params, e.span)?;
                     }
+                    for a in arguments {
+                        self.expr(module, a, scopes, params)?;
+                    }
                 }
-            }
-            ExprKind::ArrayLiteral(es) | ExprKind::Tuple(es) => {
-                for value in es {
-                    self.expr(module, value, scopes, params)?;
-                }
-            }
-            ExprKind::Field(base, name) => {
-                self.expr(module, base, scopes, params)?;
-                if let Some(property) = self.path(module, name, Some(Kind::Property)) {
-                    e.kind = ExprKind::ExtensionField(base.clone(), name.clone(), property.target);
-                }
-            }
-            ExprKind::Parenthesized(base)
-            | ExprKind::Unary(_, base)
-            | ExprKind::TupleField(base, _) => self.expr(module, base, scopes, params)?,
-            ExprKind::Cast(base, t) => {
-                self.expr(module, base, scopes, params)?;
-                self.ty(module, t, params, e.span)?;
-            }
-            ExprKind::Binary(_, a, b) => {
-                self.expr(module, a, scopes, params)?;
-                self.expr(module, b, scopes, params)?;
-            }
-            ExprKind::Index(base, indices) | ExprKind::Invoke(base, indices) => {
-                self.expr(module, base, scopes, params)?;
-                for index in indices {
-                    self.expr(module, index, scopes, params)?;
-                }
-            }
-            ExprKind::Closure(f, refs) => {
-                for capture in refs {
-                    let n = &mut capture.name;
+                ExprKind::Name(n) => {
                     *n = if let Some(local) = Self::local(scopes, n) {
                         local.target
+                    } else if let Some(symbol) = self.path(module, n, Some(Kind::Value)) {
+                        symbol.target
                     } else {
-                        self.symbol(module, n, Kind::Value, e.span)?
-                    };
+                        e.kind = ExprKind::Invalid(Diagnostic::new(
+                            "E106",
+                            format!("undeclared identifier {n}"),
+                            e.span,
+                        ));
+                        return Ok(());
+                    }
                 }
-                self.function(module, f, scopes, params)?;
+                ExprKind::Call(n, args) | ExprKind::GenericCall(n, _, args) => {
+                    let symbol = if Self::local(scopes, n).is_none() {
+                        self.path(module, n, Some(Kind::Value))
+                    } else {
+                        None
+                    };
+                    for a in args.iter_mut() {
+                        self.expr(module, a, scopes, params)?;
+                    }
+                    let mut types = match &mut e.kind {
+                        ExprKind::GenericCall(_, ts, _) => ts.clone(),
+                        _ => vec![],
+                    };
+                    for t in &mut types {
+                        self.ty(module, t, params, e.span)?;
+                    }
+                    if let Some(id) = symbol.as_ref().and_then(|s| s.intrinsic) {
+                        let args = match &mut e.kind {
+                            ExprKind::Call(_, a) | ExprKind::GenericCall(_, _, a) => {
+                                std::mem::take(a)
+                            }
+                            _ => unreachable!(),
+                        };
+                        e.kind = ExprKind::IntrinsicCall(id.id(), types, args);
+                    } else {
+                        let name = match &mut e.kind {
+                            ExprKind::Call(n, _) | ExprKind::GenericCall(n, _, _) => n,
+                            _ => unreachable!(),
+                        };
+                        *name = if let Some(local) = Self::local(scopes, name) {
+                            local.target
+                        } else {
+                            if let Some(symbol) = symbol {
+                                symbol.target
+                            } else {
+                                e.kind = ExprKind::Invalid(Diagnostic::new(
+                                    "E106",
+                                    format!("undeclared function {name}"),
+                                    e.span,
+                                ));
+                                return Ok(());
+                            }
+                        };
+                        if let ExprKind::GenericCall(_, ts, _) = &mut e.kind {
+                            *ts = types
+                        }
+                    }
+                }
+                ExprKind::Record(n, fs) | ExprKind::GenericRecord(n, _, fs) => {
+                    *n = self.symbol(module, n, Kind::Type, e.span)?;
+                    for (_, value) in fs {
+                        self.expr(module, value, scopes, params)?;
+                    }
+                    if let ExprKind::GenericRecord(_, ts, _) = &mut e.kind {
+                        for t in ts {
+                            self.ty(module, t, params, e.span)?;
+                        }
+                    }
+                }
+                ExprKind::ArrayLiteral(es) | ExprKind::Tuple(es) => {
+                    for value in es {
+                        self.expr(module, value, scopes, params)?;
+                    }
+                }
+                ExprKind::Field(base, name) => {
+                    self.expr(module, base, scopes, params)?;
+                    if let Some(property) = self.path(module, name, Some(Kind::Property)) {
+                        e.kind =
+                            ExprKind::ExtensionField(base.clone(), name.clone(), property.target);
+                    }
+                }
+                ExprKind::Parenthesized(base)
+                | ExprKind::Unary(_, base)
+                | ExprKind::TupleField(base, _) => self.expr(module, base, scopes, params)?,
+                ExprKind::Cast(base, t) => {
+                    self.expr(module, base, scopes, params)?;
+                    self.ty(module, t, params, e.span)?;
+                }
+                ExprKind::Binary(_, a, b) => {
+                    self.expr(module, a, scopes, params)?;
+                    self.expr(module, b, scopes, params)?;
+                }
+                ExprKind::Index(base, indices) | ExprKind::Invoke(base, indices) => {
+                    self.expr(module, base, scopes, params)?;
+                    for index in indices {
+                        self.expr(module, index, scopes, params)?;
+                    }
+                }
+                ExprKind::Closure(f, refs) => {
+                    for capture in refs {
+                        let n = &mut capture.name;
+                        *n = if let Some(local) = Self::local(scopes, n) {
+                            local.target
+                        } else {
+                            self.symbol(module, n, Kind::Value, e.span)?
+                        };
+                    }
+                    self.function(module, f, scopes, params)?;
+                }
+                ExprKind::Frozen(_, t) => self.ty(module, t, params, e.span)?,
+                ExprKind::Literal(_)
+                | ExprKind::ClosureValue(..)
+                | ExprKind::ExtensionField(..)
+                | ExprKind::Invalid(_) => {}
             }
-            ExprKind::Frozen(_, t) => self.ty(module, t, params, e.span)?,
-            ExprKind::Literal(_)
-            | ExprKind::ClosureValue(..)
-            | ExprKind::ExtensionField(..)
-            | ExprKind::Invalid(_) => {}
-        }
-        Ok(())
+            Ok(())
+        })
     }
     fn block(
         &mut self,
@@ -769,121 +776,137 @@ impl Resolver {
         params: &[Box<str>],
         top: bool,
     ) -> Result<()> {
-        scopes.push(HashMap::new());
-        for s in body {
-            match &mut s.kind {
-                StmtKind::Binding(name, ty, _, mutable, value) => {
-                    if let Some(t) = ty {
-                        self.ty(module, t, params, s.span)?;
+        cyallo_ast::with_stack(|| {
+            scopes.push(HashMap::new());
+            for s in body {
+                match &mut s.kind {
+                    StmtKind::Binding(name, ty, _, mutable, value) => {
+                        if let Some(t) = ty {
+                            self.ty(module, t, params, s.span)?;
+                        }
+                        self.expr(module, value, scopes, params)?;
+                        let target = if top {
+                            self.nodes[module]
+                                .bindings
+                                .get(&s.span.start)
+                                .cloned()
+                                .expect("declared binding")
+                        } else {
+                            self.fresh(name)
+                        };
+                        let writable = *mutable
+                            || matches!(ty, Some(Type::Reference { mutable: true, .. }))
+                            || matches!(value.kind, ExprKind::Unary(Operator::BorrowMut, _));
+                        scopes.last_mut().unwrap().insert(
+                            name.to_string(),
+                            Local {
+                                target: target.clone(),
+                                writable,
+                            },
+                        );
+                        *name = target;
                     }
-                    self.expr(module, value, scopes, params)?;
-                    let target = if top {
-                        self.nodes[module]
-                            .bindings
-                            .get(&s.span.start)
-                            .cloned()
-                            .expect("declared binding")
-                    } else {
-                        self.fresh(name)
-                    };
-                    let writable = *mutable
-                        || matches!(ty, Some(Type::Reference { mutable: true, .. }))
-                        || matches!(value.kind, ExprKind::Unary(Operator::BorrowMut, _));
-                    scopes.last_mut().unwrap().insert(
-                        name.to_string(),
-                        Local {
-                            target: target.clone(),
-                            writable,
-                        },
-                    );
-                    *name = target;
-                }
-                StmtKind::Constant(name, value) => {
-                    self.expr(module, value, scopes, params)?;
-                    let target = if top {
-                        self.symbol(module, name, Kind::Value, s.span)?
-                    } else {
-                        self.fresh(name)
-                    };
-                    scopes.last_mut().unwrap().insert(
-                        name.to_string(),
-                        Local {
-                            target: target.clone(),
-                            writable: false,
-                        },
-                    );
-                    *name = target;
-                }
-                StmtKind::Assign(target, value) | StmtKind::Compound(target, _, value) => {
-                    fn root(e: &Expr) -> Option<&str> {
-                        match &e.kind {
-                            ExprKind::Name(n) => Some(n),
-                            ExprKind::Parenthesized(b) => root(b),
-                            _ => None,
+                    StmtKind::Constant(name, value) => {
+                        self.expr(module, value, scopes, params)?;
+                        let target = if top {
+                            self.symbol(module, name, Kind::Value, s.span)?
+                        } else {
+                            self.fresh(name)
+                        };
+                        scopes.last_mut().unwrap().insert(
+                            name.to_string(),
+                            Local {
+                                target: target.clone(),
+                                writable: false,
+                            },
+                        );
+                        *name = target;
+                    }
+                    StmtKind::Assign(target, value) | StmtKind::Compound(target, _, value) => {
+                        fn root(e: &Expr) -> Option<&str> {
+                            match &e.kind {
+                                ExprKind::Name(n) => Some(n),
+                                ExprKind::Parenthesized(b) => root(b),
+                                _ => None,
+                            }
+                        }
+                        if let Some(name) = root(target)
+                            && let Some(local) = Self::local(scopes, name)
+                            && !local.writable
+                        {
+                            return Err(Diagnostic::new(
+                                "E107",
+                                "cannot modify an immutable binding",
+                                target.span,
+                            ));
+                        }
+                        self.expr(module, target, scopes, params)?;
+                        self.expr(module, value, scopes, params)?;
+                    }
+                    StmtKind::Evaluate(e) | StmtKind::Return(e) | StmtKind::Input(e) => {
+                        self.expr(module, e, scopes, params)?
+                    }
+                    StmtKind::Output(es) => {
+                        for e in es {
+                            self.expr(module, e, scopes, params)?;
                         }
                     }
-                    if let Some(name) = root(target)
-                        && let Some(local) = Self::local(scopes, name)
-                        && !local.writable
-                    {
-                        return Err(Diagnostic::new(
-                            "E107",
-                            "cannot modify an immutable binding",
-                            target.span,
-                        ));
+                    StmtKind::Call(n, es) => {
+                        *n = self.symbol(module, n, Kind::Value, s.span)?;
+                        for e in es {
+                            self.expr(module, e, scopes, params)?;
+                        }
                     }
-                    self.expr(module, target, scopes, params)?;
-                    self.expr(module, value, scopes, params)?;
-                }
-                StmtKind::Evaluate(e) | StmtKind::Return(e) | StmtKind::Input(e) => {
-                    self.expr(module, e, scopes, params)?
-                }
-                StmtKind::Output(es) => {
-                    for e in es {
-                        self.expr(module, e, scopes, params)?;
+                    StmtKind::If(condition, a, b) => {
+                        self.expr(module, condition, scopes, params)?;
+                        self.block(module, a, scopes, params, false)?;
+                        self.block(module, b, scopes, params, false)?;
                     }
-                }
-                StmtKind::Call(n, es) => {
-                    *n = self.symbol(module, n, Kind::Value, s.span)?;
-                    for e in es {
-                        self.expr(module, e, scopes, params)?;
+                    StmtKind::While(condition, b) | StmtKind::Repeat(b, condition) => {
+                        self.expr(module, condition, scopes, params)?;
+                        self.block(module, b, scopes, params, false)?;
                     }
-                }
-                StmtKind::If(condition, a, b) => {
-                    self.expr(module, condition, scopes, params)?;
-                    self.block(module, a, scopes, params, false)?;
-                    self.block(module, b, scopes, params, false)?;
-                }
-                StmtKind::While(condition, b) | StmtKind::Repeat(b, condition) => {
-                    self.expr(module, condition, scopes, params)?;
-                    self.block(module, b, scopes, params, false)?;
-                }
-                StmtKind::For(name, first, last, step, b) => {
-                    self.expr(module, first, scopes, params)?;
-                    self.expr(module, last, scopes, params)?;
-                    if let Some(e) = step {
-                        self.expr(module, e, scopes, params)?;
+                    StmtKind::ForIn(name, iterable, b) => {
+                        self.expr(module, iterable, scopes, params)?;
+                        let target = self.fresh(name);
+                        scopes.push(HashMap::from([(
+                            name.to_string(),
+                            Local {
+                                target: target.clone(),
+                                writable: false,
+                            },
+                        )]));
+                        *name = target;
+                        self.block(module, b, scopes, params, false)?;
+                        scopes.pop();
                     }
-                    let target = self.fresh(name);
-                    scopes.push(HashMap::from([(
-                        name.to_string(),
-                        Local {
-                            target: target.clone(),
-                            writable: false,
-                        },
-                    )]));
-                    *name = target;
-                    self.block(module, b, scopes, params, false)?;
-                    scopes.pop();
+                    StmtKind::For(name, first, last, step, b) => {
+                        self.expr(module, first, scopes, params)?;
+                        self.expr(module, last, scopes, params)?;
+                        if let Some(e) = step {
+                            self.expr(module, e, scopes, params)?;
+                        }
+                        let target = self.fresh(name);
+                        scopes.push(HashMap::from([(
+                            name.to_string(),
+                            Local {
+                                target: target.clone(),
+                                writable: false,
+                            },
+                        )]));
+                        *name = target;
+                        self.block(module, b, scopes, params, false)?;
+                        scopes.pop();
+                    }
+                    StmtKind::Case(..) | StmtKind::Declare(..) => {
+                        return Err(error("unsupported modern statement", s.span));
+                    }
+                    StmtKind::Break | StmtKind::Continue | StmtKind::ReturnVoid => {}
                 }
-                StmtKind::Case(..) | StmtKind::Declare(..) => {
-                    return Err(error("unsupported modern statement", s.span));
-                }
-                StmtKind::Break | StmtKind::Continue | StmtKind::ReturnVoid => {}
             }
-        }
-        scopes.pop();
-        Ok(())
+            scopes.pop();
+            Ok(())
+        })
     }
     fn function(
         &mut self,

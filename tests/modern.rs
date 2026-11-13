@@ -206,3 +206,59 @@ fn invalid_utility_domains_match() {
         assert_eq!(a.status(), b.status());
     }
 }
+#[test]
+fn for_in_ranges_iterate_without_overflow_in_both_directions() {
+    output(
+        "let mut up = \"\"\nfor i in 0..4 { up = up + std::string::from(i) }\nlet mut down = \"\"\nfor i in (0..4).rev() { down = down + std::string::from(i) }\nlet mut closed = \"\"\nfor i in (1..=3).rev() { closed = closed + std::string::from(i) }\nstd::io::print(up, \":\", down, \":\", closed)\n",
+        "0123:3210:321\n",
+    );
+    // Empty ranges skip the body; bounds at the integer limits never step past them.
+    output(
+        "let mut n = 0\nfor i in 5..5 { n += 1 }\nfor i in 5..=4 { n += 1 }\nfor i in (3..3).rev() { n += 1 }\nfor i in 9223372036854775806..=9223372036854775807 { n += 1 }\nfor i in (-9223372036854775807 - 1..=-9223372036854775807).rev() { n += 1 }\nstd::io::print(n)\n",
+        "4\n",
+    );
+    output(
+        "let mut total: u8 = 0u8\nfor i in 250u8..=255u8 { total = i }\nstd::io::print(total)\n",
+        "255\n",
+    );
+    output(
+        "let mut seen = 0\nfor i in 0..10 { if i == 2 { continue }\n if i == 5 { break }\n seen += i }\nstd::io::print(seen)\n",
+        "8\n",
+    );
+    output(
+        "let v = std::collections::Vec::from((1..=3).rev())\nstd::io::print(v[0], v[1], v[2])\n",
+        "321\n",
+    );
+}
+#[test]
+fn for_in_rejects_non_ranges_and_mutating_its_variable() {
+    for source in [
+        "let a = [1, 2]\nfor i in a { std::io::print(i) }\n",
+        "for i in 0.5..2.5 { std::io::print(i) }\n",
+        "for i in 0..3 { i = 2 }\n",
+        "for i = 0 to 3 { std::io::print(i) }\n",
+    ] {
+        assert!(compile(source).is_err(), "accepted {source}");
+    }
+}
+#[test]
+fn casts_bind_looser_than_unary_operators() {
+    output(
+        "let x: i64 = -5\nlet y: f64 = 2.5\nstd::io::print(-x as u8, \":\", -5 as i32, \":\", -y as i64)\n",
+        "5:-5:-2\n",
+    );
+}
+#[test]
+fn strings_concatenate_with_plus() {
+    output(
+        "let mut s = \"a\" + \"b\"\ns += \"c\"\ns = s + 'd'\nstd::io::print(s)\n",
+        "abcd\n",
+    );
+    for source in [
+        "let s = \"a\" & \"b\"\n",
+        "let c = 'a' + 'b'\n",
+        "let x = 3\nlet ok = 1 < x < 5\n",
+    ] {
+        assert!(compile(source).is_err(), "accepted {source}");
+    }
+}
