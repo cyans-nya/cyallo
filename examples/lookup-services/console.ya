@@ -1,0 +1,10 @@
+use crate::registry::{Directory, Lease, provide}
+use crate::logging::{Logger, LOGGER}
+
+record ConsoleLogger { prefix: string }
+impl Logger for ConsoleLogger {
+    proc info(self: &Self, message: string) { std::io::print(self.prefix, message) }
+}
+pub proc install(ctx: @gc Directory, prefix: string) -> Lease {
+    return provide(ctx, LOGGER, ConsoleLogger { prefix: prefix } as dyn Logger)
+}

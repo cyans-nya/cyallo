@@ -1,0 +1,443 @@
+{
+  "date": "2026-11-12",
+  "platform": "ARM64 macOS",
+  "runtime_samples": 15,
+  "sessions_per_sample": 5,
+  "codegen_samples": 7,
+  "workloads": {
+    "tiny-leaves": {
+      "runtime": {
+        "interpreter": {
+          "median_ms": 131.523917,
+          "p95_ms": 135.17975
+        },
+        "direct-fast": {
+          "median_ms": 1.592791,
+          "p95_ms": 1.607042
+        },
+        "direct-speed": {
+          "median_ms": 1.414792,
+          "p95_ms": 1.450167
+        },
+        "Winch": {
+          "median_ms": 67.955042,
+          "p95_ms": 69.165667
+        },
+        "CraneliftFast": {
+          "median_ms": 1.679459,
+          "p95_ms": 1.702958
+        },
+        "CraneliftSpeed": {
+          "median_ms": 1.548292,
+          "p95_ms": 1.567
+        },
+        "no-inline-None": {
+          "median_ms": 68.591875,
+          "p95_ms": 69.145542
+        },
+        "procedure-bodies-None": {
+          "median_ms": 1.589208,
+          "p95_ms": 1.608708
+        },
+        "no-inline-Speed": {
+          "median_ms": 68.315,
+          "p95_ms": 71.165709
+        },
+        "procedure-bodies-Speed": {
+          "median_ms": 1.411,
+          "p95_ms": 1.704625
+        }
+      },
+      "code_bytes": {
+        "direct-fast": 9288,
+        "direct-speed": 8752,
+        "no-inline-None": 8580,
+        "procedure-bodies-None": 9288,
+        "no-inline-Speed": 8164,
+        "procedure-bodies-Speed": 8752
+      },
+      "codegen": {
+        "None inline=false procedures=false": {
+          "median_ms": 1.626375,
+          "p95_ms": 2.330917
+        },
+        "None inline=true procedures=false": {
+          "median_ms": 1.718917,
+          "p95_ms": 3.262333
+        },
+        "None inline=true procedures=true": {
+          "median_ms": 1.833667,
+          "p95_ms": 2.990708
+        },
+        "Speed inline=false procedures=false": {
+          "median_ms": 2.312333,
+          "p95_ms": 3.599875
+        },
+        "Speed inline=true procedures=false": {
+          "median_ms": 2.323333,
+          "p95_ms": 3.80875
+        },
+        "Speed inline=true procedures=true": {
+          "median_ms": 2.337958,
+          "p95_ms": 3.47175
+        }
+      },
+      "probes": {
+        "interpreter": {
+          "instructions": 1212429,
+          "frameless_calls": 0,
+          "embedded_calls": 0
+        },
+        "direct-fast": {
+          "instructions": 1212429,
+          "frameless_calls": 65536,
+          "embedded_calls": 0
+        },
+        "direct-speed": {
+          "instructions": 1212429,
+          "frameless_calls": 65536,
+          "embedded_calls": 0
+        },
+        "Winch": {
+          "instructions": 1212429,
+          "frameless_calls": 0,
+          "embedded_calls": 0
+        },
+        "CraneliftFast": {
+          "instructions": 1212429,
+          "frameless_calls": 65536,
+          "embedded_calls": 0
+        },
+        "CraneliftSpeed": {
+          "instructions": 1212429,
+          "frameless_calls": 65536,
+          "embedded_calls": 0
+        },
+        "no-inline-None": {
+          "instructions": 1212429,
+          "frameless_calls": 0,
+          "embedded_calls": 0
+        },
+        "procedure-bodies-None": {
+          "instructions": 1212429,
+          "frameless_calls": 65536,
+          "embedded_calls": 0
+        },
+        "no-inline-Speed": {
+          "instructions": 1212429,
+          "frameless_calls": 0,
+          "embedded_calls": 0
+        },
+        "procedure-bodies-Speed": {
+          "instructions": 1212429,
+          "frameless_calls": 65536,
+          "embedded_calls": 0
+        }
+      }
+    },
+    "modern": {
+      "runtime": {
+        "interpreter": {
+          "median_ms": 152.290792,
+          "p95_ms": 154.166458
+        },
+        "direct-fast": {
+          "median_ms": 2.229792,
+          "p95_ms": 2.253
+        },
+        "direct-speed": {
+          "median_ms": 1.988667,
+          "p95_ms": 2.003625
+        },
+        "Winch": {
+          "median_ms": 72.152542,
+          "p95_ms": 73.118458
+        },
+        "CraneliftFast": {
+          "median_ms": 2.314584,
+          "p95_ms": 2.367417
+        },
+        "CraneliftSpeed": {
+          "median_ms": 2.157834,
+          "p95_ms": 2.200166
+        },
+        "no-inline-None": {
+          "median_ms": 71.932709,
+          "p95_ms": 74.296541
+        },
+        "procedure-bodies-None": {
+          "median_ms": 2.621334,
+          "p95_ms": 2.643625
+        },
+        "no-inline-Speed": {
+          "median_ms": 71.71475,
+          "p95_ms": 72.853583
+        },
+        "procedure-bodies-Speed": {
+          "median_ms": 1.990167,
+          "p95_ms": 2.002833
+        }
+      },
+      "code_bytes": {
+        "direct-fast": 16064,
+        "direct-speed": 14812,
+        "no-inline-None": 14820,
+        "procedure-bodies-None": 18564,
+        "no-inline-Speed": 14224,
+        "procedure-bodies-Speed": 15580
+      },
+      "codegen": {
+        "None inline=false procedures=false": {
+          "median_ms": 2.794042,
+          "p95_ms": 2.918541
+        },
+        "None inline=true procedures=false": {
+          "median_ms": 2.919167,
+          "p95_ms": 2.951084
+        },
+        "None inline=true procedures=true": {
+          "median_ms": 3.362041,
+          "p95_ms": 3.485375
+        },
+        "Speed inline=false procedures=false": {
+          "median_ms": 3.706041,
+          "p95_ms": 3.752834
+        },
+        "Speed inline=true procedures=false": {
+          "median_ms": 3.852167,
+          "p95_ms": 3.947209
+        },
+        "Speed inline=true procedures=true": {
+          "median_ms": 4.347125,
+          "p95_ms": 4.414333
+        }
+      },
+      "probes": {
+        "interpreter": {
+          "instructions": 1605675,
+          "frameless_calls": 0,
+          "embedded_calls": 0
+        },
+        "direct-fast": {
+          "instructions": 1605675,
+          "frameless_calls": 65534,
+          "embedded_calls": 0
+        },
+        "direct-speed": {
+          "instructions": 1605675,
+          "frameless_calls": 65534,
+          "embedded_calls": 0
+        },
+        "Winch": {
+          "instructions": 1605675,
+          "frameless_calls": 0,
+          "embedded_calls": 0
+        },
+        "CraneliftFast": {
+          "instructions": 1605675,
+          "frameless_calls": 65534,
+          "embedded_calls": 0
+        },
+        "CraneliftSpeed": {
+          "instructions": 1605675,
+          "frameless_calls": 65534,
+          "embedded_calls": 0
+        },
+        "no-inline-None": {
+          "instructions": 1605675,
+          "frameless_calls": 0,
+          "embedded_calls": 0
+        },
+        "procedure-bodies-None": {
+          "instructions": 1605675,
+          "frameless_calls": 65534,
+          "embedded_calls": 1
+        },
+        "no-inline-Speed": {
+          "instructions": 1605675,
+          "frameless_calls": 0,
+          "embedded_calls": 0
+        },
+        "procedure-bodies-Speed": {
+          "instructions": 1605675,
+          "frameless_calls": 65534,
+          "embedded_calls": 1
+        }
+      }
+    },
+    "procedure-calls": {
+      "runtime": {
+        "interpreter": {
+          "median_ms": 69.533958,
+          "p95_ms": 70.090833
+        },
+        "direct-fast": {
+          "median_ms": 32.329625,
+          "p95_ms": 32.824792
+        },
+        "direct-speed": {
+          "median_ms": 32.650334,
+          "p95_ms": 33.155667
+        },
+        "Winch": {
+          "median_ms": 33.592208,
+          "p95_ms": 33.959208
+        },
+        "CraneliftFast": {
+          "median_ms": 32.59125,
+          "p95_ms": 34.008875
+        },
+        "CraneliftSpeed": {
+          "median_ms": 32.643917,
+          "p95_ms": 32.909083
+        },
+        "no-inline-None": {
+          "median_ms": 32.561042,
+          "p95_ms": 32.930875
+        },
+        "procedure-bodies-None": {
+          "median_ms": 32.825125,
+          "p95_ms": 33.490916
+        },
+        "no-inline-Speed": {
+          "median_ms": 32.687416,
+          "p95_ms": 33.062834
+        },
+        "procedure-bodies-Speed": {
+          "median_ms": 32.912917,
+          "p95_ms": 34.003917
+        }
+      },
+      "code_bytes": {
+        "direct-fast": 6128,
+        "direct-speed": 5852,
+        "no-inline-None": 6128,
+        "procedure-bodies-None": 7924,
+        "no-inline-Speed": 5856,
+        "procedure-bodies-Speed": 6860
+      },
+      "codegen": {
+        "None inline=false procedures=false": {
+          "median_ms": 1.247708,
+          "p95_ms": 2.246791
+        },
+        "None inline=true procedures=false": {
+          "median_ms": 1.203708,
+          "p95_ms": 2.137875
+        },
+        "None inline=true procedures=true": {
+          "median_ms": 1.562834,
+          "p95_ms": 2.633584
+        },
+        "Speed inline=false procedures=false": {
+          "median_ms": 1.768958,
+          "p95_ms": 2.724834
+        },
+        "Speed inline=true procedures=false": {
+          "median_ms": 1.653208,
+          "p95_ms": 2.390792
+        },
+        "Speed inline=true procedures=true": {
+          "median_ms": 2.084875,
+          "p95_ms": 2.968959
+        }
+      },
+      "probes": {
+        "interpreter": {
+          "instructions": 786445,
+          "frameless_calls": 0,
+          "embedded_calls": 0
+        },
+        "direct-fast": {
+          "instructions": 786445,
+          "frameless_calls": 0,
+          "embedded_calls": 0
+        },
+        "direct-speed": {
+          "instructions": 786445,
+          "frameless_calls": 0,
+          "embedded_calls": 0
+        },
+        "Winch": {
+          "instructions": 786445,
+          "frameless_calls": 0,
+          "embedded_calls": 0
+        },
+        "CraneliftFast": {
+          "instructions": 786445,
+          "frameless_calls": 0,
+          "embedded_calls": 0
+        },
+        "CraneliftSpeed": {
+          "instructions": 786445,
+          "frameless_calls": 0,
+          "embedded_calls": 0
+        },
+        "no-inline-None": {
+          "instructions": 786445,
+          "frameless_calls": 0,
+          "embedded_calls": 0
+        },
+        "procedure-bodies-None": {
+          "instructions": 786445,
+          "frameless_calls": 0,
+          "embedded_calls": 32768
+        },
+        "no-inline-Speed": {
+          "instructions": 786445,
+          "frameless_calls": 0,
+          "embedded_calls": 0
+        },
+        "procedure-bodies-Speed": {
+          "instructions": 786445,
+          "frameless_calls": 0,
+          "embedded_calls": 32768
+        }
+      }
+    }
+  },
+  "cold_cli": [
+    {
+      "engine": "jit",
+      "inlining": false,
+      "samples": 30,
+      "median_ms": 17.578208,
+      "p95_ms": 18.537917
+    },
+    {
+      "engine": "jit",
+      "inlining": true,
+      "samples": 30,
+      "median_ms": 6.5763964999999995,
+      "p95_ms": 7.222875
+    },
+    {
+      "engine": "cranelift",
+      "inlining": false,
+      "samples": 30,
+      "median_ms": 20.3456255,
+      "p95_ms": 25.44125
+    },
+    {
+      "engine": "cranelift",
+      "inlining": true,
+      "samples": 30,
+      "median_ms": 7.042729,
+      "p95_ms": 7.763333
+    },
+    {
+      "engine": "cranelift_speed",
+      "inlining": false,
+      "samples": 30,
+      "median_ms": 21.247625,
+      "p95_ms": 21.873334
+    },
+    {
+      "engine": "cranelift_speed",
+      "inlining": true,
+      "samples": 30,
+      "median_ms": 7.9867705,
+      "p95_ms": 8.263666
+    }
+  ]
+}

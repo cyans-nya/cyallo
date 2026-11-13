@@ -1,0 +1,9 @@
+[package]
+name = "cyallo-channel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[dev-dependencies]
+cyallo-scheduler = { path = "../cyallo-scheduler" }

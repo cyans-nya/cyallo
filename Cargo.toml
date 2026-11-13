@@ -1,0 +1,47 @@
+[workspace]
+members = ["crates/cyallo-compile-jobs", "crates/cyallo-ast", "crates/cyallo-parser", "crates/caie-int-parser", "crates/cyallo-ir", "crates/cyallo-values", "crates/cyallo-concurrent-values", "crates/cyallo-scheduler", "crates/cyallo-channel", "crates/cyallo-io", "crates/cyallo-clock", "crates/cyallo-host", "xtask"]
+exclude = ["vendor/winch-codegen"]
+resolver = "3"
+
+[package]
+name = "cyallo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cyallo-ir = { path = "crates/cyallo-ir" }
+caie-int-parser = { path = "crates/caie-int-parser" }
+cyallo-compile-jobs = { path = "crates/cyallo-compile-jobs" }
+cyallo-values = { path = "crates/cyallo-values" }
+cyallo-concurrent-values = { path = "crates/cyallo-concurrent-values" }
+cyallo-ast = { path = "crates/cyallo-ast" }
+cyallo-parser = { path = "crates/cyallo-parser" }
+cyallo-scheduler = { path = "crates/cyallo-scheduler" }
+cyallo-channel = { path = "crates/cyallo-channel" }
+color-eyre = "0.6.5"
+mimalloc = { version = "0.1.52", default-features = false }
+kanal = { version = "0.1.1", default-features = false }
+smallvec = "1.16.5"
+winch-codegen = { version = "=50.0.1", features = ["all-arch"] }
+cranelift = "0.137.1"
+cranelift-jit = "0.137.1"
+cranelift-module = "0.137.1"
+clap = { version = "4.5", features = ["derive"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "layout-cache"] }
+crossterm = "0.29"
+oxc_diagnostics = "0.157"
+wasmtime = { version = "50.0.1", optional = true, default-features = false, features = ["runtime", "winch", "std", "wat"] }
+
+[features]
+wasm-adapter = ["dep:wasmtime"]
+
+[[bench]]
+name = "engines"
+harness = false
+
+[[bench]]
+name = "gc"
+harness = false
+
+[patch.crates-io]
+winch-codegen = { path = "vendor/winch-codegen" }

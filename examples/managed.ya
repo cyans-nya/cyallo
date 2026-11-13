@@ -1,0 +1,21 @@
+// Run: cargo run -- run examples/managed.ya --gc-stress
+use std::mem::{Allocator, Layout, Allocation, AllocError}
+
+record Counting { releases: @gc Cell<i64> }
+impl Allocator for Counting {
+    proc allocate(self: &mut Self, layout: Layout) -> Result<Allocation, AllocError> {
+        return std::mem::allocate(layout)
+    }
+    proc deallocate(self: &mut Self, allocation: Allocation) {
+        **self.releases = **self.releases + 1
+        std::mem::deallocate(allocation)
+    }
+}
+
+let releases = @gc Cell::new(0)
+let owner = @rc(Counting { releases: releases }) "owned"
+let weak = owner.downgrade()
+std::io::print(*owner, ":", owner.strong_count())
+std::mem::drop(owner)
+std::io::print(**releases, ":", weak.upgrade().is_some())
+std::mem::drop(weak)

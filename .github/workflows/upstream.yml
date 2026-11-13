@@ -1,0 +1,19 @@
+name: Winch upstream watch
+on:
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo xtask vendor-winch check --fetch
+      - run: cargo xtask vendor-winch check-upstream --output upstream-candidate.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winch-upstream-candidate
+          path: upstream-candidate.md

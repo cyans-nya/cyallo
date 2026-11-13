@@ -1,0 +1,67 @@
+use std::any::Any
+use std::lookup::StoragePath
+
+pub record Key<T> { id: string }
+pub record Binding { generation: i64, current: Option<Any> }
+pub record Directory {
+    layout: Cell<@gc Vec<string>>,
+    entries: Cell<@gc Vec<@gc Cell<@gc Binding>>>
+}
+pub record ServiceHandle<T> { binding: @gc Cell<@gc Binding> }
+pub record Lease { binding: @gc Cell<@gc Binding>, generation: i64 }
+
+pub proc context() -> @gc Directory {
+    return @gc Directory {
+        layout: Cell::new(@gc Vec<string>[]),
+        entries: Cell::new(@gc Vec<@gc Cell<@gc Binding>>[])
+    }
+}
+proc locate(ctx: @gc Directory, key: string) -> StoragePath<@gc Cell<@gc Binding>> {
+    let keys = *ctx.layout
+    let mut i: usize = 0
+    while i < keys.len() {
+        if keys[i] == key {
+            return std::lookup::path(ctx).target().field("entries").target().target().element(i)
+        }
+        i += 1
+    }
+    return std::lookup::missing<@gc Cell<@gc Binding>>()
+}
+pub proc service<T>(ctx: @gc Directory, key: Key<T>) -> ServiceHandle<T> {
+    let binding = std::lookup::mapped(ctx, std::mem::clone(&key.id), locate).or_fail("unknown service")
+    return ServiceHandle<T> { binding: binding }
+}
+pub proc acquire<T>(handle: &ServiceHandle<T>) -> T {
+    let binding = **handle.binding
+    return std::any::checked<T>(std::mem::clone(&binding.current).or_fail("service unavailable"))
+}
+proc ensure_entry(ctx: @gc Directory, key: string) -> @gc Cell<@gc Binding> {
+    let mut keys = std::mem::clone(&*(*ctx.layout))
+    let mut entries = std::mem::clone(&*(*ctx.entries))
+    let mut i: usize = 0
+    while i < keys.len() {
+        if keys[i] == key { return entries[i] }
+        i += 1
+    }
+    let binding = @gc Cell::new(@gc Binding { generation: 0, current: std::option::none<Any>() })
+    entries.push(binding)
+    *ctx.entries = @gc entries
+    keys.push(key)
+    *ctx.layout = @gc keys
+    return binding
+}
+pub proc provide<T>(ctx: @gc Directory, key: Key<T>, value: T) -> Lease {
+    let binding = ensure_entry(ctx, std::mem::clone(&key.id))
+    let generation = (**binding).generation + 1
+    **binding = @gc Binding { generation: generation, current: std::option::some(std::any::erase(value)) }
+    return Lease { binding: binding, generation: generation }
+}
+pub proc dispose(lease: &Lease) {
+    let binding = **lease.binding
+    if binding.generation == lease.generation {
+        **lease.binding = @gc Binding { generation: binding.generation, current: std::option::none<Any>() }
+    }
+}
+pub proc available<T>(handle: &ServiceHandle<T>) -> bool {
+    return (**handle.binding).current.is_some()
+}

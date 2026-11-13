@@ -1,0 +1,13 @@
+# Flat string fields, verified by cargo xtask vendor-winch check.
+repository = "https://github.com/bytecodealliance/wasmtime"
+version = "50.0.1"
+commit = "c307ec81de02852d815e9849f7c89d955c03c30d"
+subdirectory = "winch/codegen"
+source = "https://static.crates.io/crates/winch-codegen/winch-codegen-50.0.1.crate"
+source_sha256 = "92cb941fbc1f9a2435620e9bd65830bdba8b21bdcadef701b9e6366981bea0ac"
+patch_series_sha256 = "efeab229787e8e9c20a42259fa67a80adbd1288eeedccb182d07540383a89682"
+license = "Apache-2.0 WITH LLVM-exception; winch-codegen/LICENSE"
+features = "all-arch (arm64,x64)"
+compiler_cohort = "Winch/Wasmtime internals 50.0.1; Cranelift codegen/module/JIT 0.137.1; Cargo.lock"
+toolchain = "Rust 1.101.0-nightly; edition 2024"
+import_files = "Cargo.toml,Cargo.toml.orig,build.rs,LICENSE,src"

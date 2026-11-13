@@ -1,0 +1,25 @@
+[
+  {
+    "mode": "plain",
+    "samples": 21,
+    "median_process_ms": 7.516875,
+    "p95_process_ms": 7.780125,
+    "report_lines": 0
+  },
+  {
+    "mode": "summary",
+    "samples": 21,
+    "median_process_ms": 7.343959,
+    "p95_process_ms": 7.873875,
+    "report_lines": 43,
+    "median_reported_vm_ms": 3.566
+  },
+  {
+    "mode": "trace",
+    "samples": 21,
+    "median_process_ms": 31.8015,
+    "p95_process_ms": 32.62125,
+    "report_lines": 4153,
+    "median_reported_vm_ms": 27.072
+  }
+]

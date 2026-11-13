@@ -1,0 +1,9 @@
+use std::service::{Context, ServiceKey, ServiceRef}
+
+pub trait Logger {
+    proc info(self: &Self, message: string)
+}
+pub const LOGGER = ServiceKey::new<dyn Logger>("app.logging.logger")
+pub property Context.logger: ServiceRef<dyn Logger> {
+    proc get() { return self.service(LOGGER) }
+}

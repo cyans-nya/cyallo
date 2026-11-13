@@ -1,0 +1,18 @@
+mod registry;
+mod logging;
+mod console;
+use crate::registry::{context, dispose, available}
+use crate::logging::{Logger, logger}
+use crate::console::install
+
+let ctx = context()
+let first = install(ctx, "first: ")
+let live = ctx.logger as dyn Logger
+live.info("ready")
+let second = install(ctx, "second: ")
+dispose(&first)
+live.info("replacement")
+ctx.logger.info("cached lookup")
+dispose(&second)
+let current = ctx.logger
+std::io::print(available(&current))

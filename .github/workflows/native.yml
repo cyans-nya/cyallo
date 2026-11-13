@@ -1,0 +1,30 @@
+name: Native compiler validation
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+      - run: test "$(uname -m)" = "${{ matrix.arch }}"
+      - run: cargo xtask vendor-winch check --fetch
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features --locked
+      - run: cargo bench --bench engines --features wasm-adapter > native-benchmarks.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-benchmarks-${{ matrix.arch }}
+          path: native-benchmarks.txt

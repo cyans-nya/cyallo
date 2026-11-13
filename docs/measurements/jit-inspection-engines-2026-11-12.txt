@@ -1,0 +1,233 @@
+binary target/release/build/caie-int/18aa51dcdab09e8d/out/engines-18aa51dcdab09e8d
+modern direct-fast compile 4.749417ms; code 16032 bytes; CraneliftConfig { optimization: None, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: false }
+modern direct-speed compile 5.383958ms; code 14812 bytes; CraneliftConfig { optimization: Speed, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: false }
+modern Winch prewarm 301.334µs
+modern CraneliftFast prewarm 3.855125ms
+modern CraneliftSpeed prewarm 8.97825ms
+modern no-inline-None compile 3.276667ms; code 14820 bytes; CraneliftConfig { optimization: None, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: false, procedure_inlining: false }
+modern procedure-bodies-None compile 3.835292ms; code 17896 bytes; CraneliftConfig { optimization: None, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: true }
+modern no-inline-Speed compile 3.740666ms; code 14224 bytes; CraneliftConfig { optimization: Speed, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: false, procedure_inlining: false }
+modern procedure-bodies-Speed compile 4.425958ms; code 15576 bytes; CraneliftConfig { optimization: Speed, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: true }
+modern matched-codegen None inline=false procedures=false median 2.317375ms; p95 2.573375ms
+modern matched-codegen None inline=true procedures=false median 2.450375ms; p95 2.712625ms
+modern matched-codegen None inline=true procedures=true median 2.793709ms; p95 3.22975ms
+modern matched-codegen Speed inline=false procedures=false median 3.024458ms; p95 3.132292ms
+modern matched-codegen Speed inline=true procedures=false median 3.067417ms; p95 3.434334ms
+modern matched-codegen Speed inline=true procedures=true median 3.620292ms; p95 3.704666ms
+modern interpreter logical work 1605675; frameless calls 0; embedded procedure calls 0
+modern direct-fast logical work 1605675; frameless calls 65534; embedded procedure calls 0
+modern direct-speed logical work 1605675; frameless calls 65534; embedded procedure calls 0
+modern Winch logical work 1605675; frameless calls 0; embedded procedure calls 0
+modern CraneliftFast logical work 1605675; frameless calls 65534; embedded procedure calls 0
+modern CraneliftSpeed logical work 1605675; frameless calls 65534; embedded procedure calls 0
+modern no-inline-None logical work 1605675; frameless calls 0; embedded procedure calls 0
+modern procedure-bodies-None logical work 1605675; frameless calls 65534; embedded procedure calls 1
+modern no-inline-Speed logical work 1605675; frameless calls 0; embedded procedure calls 0
+modern procedure-bodies-Speed logical work 1605675; frameless calls 65534; embedded procedure calls 1
+modern interpreter median 159.517792ms; p95 162.52875ms / 5
+modern direct-fast median 2.259666ms; p95 2.468792ms / 5
+modern direct-speed median 2.054584ms; p95 2.160417ms / 5
+modern Winch median 73.810292ms; p95 76.927333ms / 5
+modern CraneliftFast median 2.414333ms; p95 2.566709ms / 5
+modern CraneliftSpeed median 2.102625ms; p95 2.271417ms / 5
+modern no-inline-None median 72.853042ms; p95 77.485834ms / 5
+modern procedure-bodies-None median 2.692291ms; p95 2.914375ms / 5
+modern no-inline-Speed median 73.388167ms; p95 74.434959ms / 5
+modern procedure-bodies-Speed median 2.024709ms; p95 2.211209ms / 5
+modern fresh-artifact-jit median 3.209125ms; p95 3.583792ms / 1; includes backend/session setup; excludes frontend; compiler service retained
+
+hot-loop direct-fast compile 1.350167ms; code 5208 bytes; CraneliftConfig { optimization: None, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: false }
+hot-loop direct-speed compile 1.502209ms; code 5036 bytes; CraneliftConfig { optimization: Speed, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: false }
+hot-loop Winch prewarm 139.209µs
+hot-loop CraneliftFast prewarm 1.374042ms
+hot-loop CraneliftSpeed prewarm 3.381334ms
+hot-loop no-inline-None compile 1.148209ms; code 5208 bytes; CraneliftConfig { optimization: None, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: false, procedure_inlining: false }
+hot-loop procedure-bodies-None compile 1.039167ms; code 5208 bytes; CraneliftConfig { optimization: None, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: true }
+hot-loop no-inline-Speed compile 1.392417ms; code 5036 bytes; CraneliftConfig { optimization: Speed, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: false, procedure_inlining: false }
+hot-loop procedure-bodies-Speed compile 1.392834ms; code 5036 bytes; CraneliftConfig { optimization: Speed, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: true }
+hot-loop matched-codegen None inline=false procedures=false median 1.027375ms; p95 1.109791ms
+hot-loop matched-codegen None inline=true procedures=false median 1.036458ms; p95 1.182709ms
+hot-loop matched-codegen None inline=true procedures=true median 1.022917ms; p95 1.1145ms
+hot-loop matched-codegen Speed inline=false procedures=false median 1.323458ms; p95 1.475542ms
+hot-loop matched-codegen Speed inline=true procedures=false median 1.321208ms; p95 1.374334ms
+hot-loop matched-codegen Speed inline=true procedures=true median 1.315708ms; p95 1.418666ms
+hot-loop interpreter logical work 210013; frameless calls 0; embedded procedure calls 0
+hot-loop direct-fast logical work 210013; frameless calls 0; embedded procedure calls 0
+hot-loop direct-speed logical work 210013; frameless calls 0; embedded procedure calls 0
+hot-loop Winch logical work 210013; frameless calls 0; embedded procedure calls 0
+hot-loop CraneliftFast logical work 210013; frameless calls 0; embedded procedure calls 0
+hot-loop CraneliftSpeed logical work 210013; frameless calls 0; embedded procedure calls 0
+hot-loop no-inline-None logical work 210013; frameless calls 0; embedded procedure calls 0
+hot-loop procedure-bodies-None logical work 210013; frameless calls 0; embedded procedure calls 0
+hot-loop no-inline-Speed logical work 210013; frameless calls 0; embedded procedure calls 0
+hot-loop procedure-bodies-Speed logical work 210013; frameless calls 0; embedded procedure calls 0
+hot-loop interpreter median 338.253334ms; p95 350.074166ms / 100
+hot-loop direct-fast median 8.275958ms; p95 8.904084ms / 100
+hot-loop direct-speed median 7.336792ms; p95 7.613084ms / 100
+hot-loop Winch median 12.016625ms; p95 13.153417ms / 100
+hot-loop CraneliftFast median 8.3165ms; p95 8.867417ms / 100
+hot-loop CraneliftSpeed median 6.980375ms; p95 7.595375ms / 100
+hot-loop no-inline-None median 8.320584ms; p95 9.370459ms / 100
+hot-loop procedure-bodies-None median 8.294834ms; p95 9.135625ms / 100
+hot-loop no-inline-Speed median 7.35875ms; p95 7.772625ms / 100
+hot-loop procedure-bodies-Speed median 7.412917ms; p95 8.066541ms / 100
+hot-loop fresh-artifact-jit median 196.708µs; p95 1.899ms / 1; includes backend/session setup; excludes frontend; compiler service retained
+
+tiny-leaves direct-fast compile 2.767583ms; code 9256 bytes; CraneliftConfig { optimization: None, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: false }
+tiny-leaves direct-speed compile 2.563333ms; code 8752 bytes; CraneliftConfig { optimization: Speed, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: false }
+tiny-leaves Winch prewarm 221.875µs
+tiny-leaves CraneliftFast prewarm 1.578333ms
+tiny-leaves CraneliftSpeed prewarm 3.61625ms
+tiny-leaves no-inline-None compile 1.899375ms; code 8580 bytes; CraneliftConfig { optimization: None, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: false, procedure_inlining: false }
+tiny-leaves procedure-bodies-None compile 1.866417ms; code 9256 bytes; CraneliftConfig { optimization: None, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: true }
+tiny-leaves no-inline-Speed compile 2.419416ms; code 8164 bytes; CraneliftConfig { optimization: Speed, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: false, procedure_inlining: false }
+tiny-leaves procedure-bodies-Speed compile 2.631208ms; code 8752 bytes; CraneliftConfig { optimization: Speed, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: true }
+tiny-leaves matched-codegen None inline=false procedures=false median 1.690375ms; p95 1.8475ms
+tiny-leaves matched-codegen None inline=true procedures=false median 1.800542ms; p95 1.924333ms
+tiny-leaves matched-codegen None inline=true procedures=true median 1.768458ms; p95 1.814625ms
+tiny-leaves matched-codegen Speed inline=false procedures=false median 2.2415ms; p95 2.394166ms
+tiny-leaves matched-codegen Speed inline=true procedures=false median 2.37525ms; p95 2.417834ms
+tiny-leaves matched-codegen Speed inline=true procedures=true median 2.339125ms; p95 2.590708ms
+tiny-leaves interpreter logical work 1212429; frameless calls 0; embedded procedure calls 0
+tiny-leaves direct-fast logical work 1212429; frameless calls 65536; embedded procedure calls 0
+tiny-leaves direct-speed logical work 1212429; frameless calls 65536; embedded procedure calls 0
+tiny-leaves Winch logical work 1212429; frameless calls 0; embedded procedure calls 0
+tiny-leaves CraneliftFast logical work 1212429; frameless calls 65536; embedded procedure calls 0
+tiny-leaves CraneliftSpeed logical work 1212429; frameless calls 65536; embedded procedure calls 0
+tiny-leaves no-inline-None logical work 1212429; frameless calls 0; embedded procedure calls 0
+tiny-leaves procedure-bodies-None logical work 1212429; frameless calls 65536; embedded procedure calls 0
+tiny-leaves no-inline-Speed logical work 1212429; frameless calls 0; embedded procedure calls 0
+tiny-leaves procedure-bodies-Speed logical work 1212429; frameless calls 65536; embedded procedure calls 0
+tiny-leaves interpreter median 128.811083ms; p95 132.6385ms / 5
+tiny-leaves direct-fast median 1.60625ms; p95 1.729958ms / 5
+tiny-leaves direct-speed median 1.419ms; p95 1.506625ms / 5
+tiny-leaves Winch median 68.529667ms; p95 71.663833ms / 5
+tiny-leaves CraneliftFast median 1.724959ms; p95 1.909459ms / 5
+tiny-leaves CraneliftSpeed median 1.602792ms; p95 1.821ms / 5
+tiny-leaves no-inline-None median 68.110708ms; p95 69.734458ms / 5
+tiny-leaves procedure-bodies-None median 1.59525ms; p95 1.796042ms / 5
+tiny-leaves no-inline-Speed median 67.942791ms; p95 69.217958ms / 5
+tiny-leaves procedure-bodies-Speed median 1.423625ms; p95 1.522208ms / 5
+tiny-leaves fresh-artifact-jit median 1.727125ms; p95 1.934125ms / 1; includes backend/session setup; excludes frontend; compiler service retained
+
+procedure-calls direct-fast compile 1.661708ms; code 6128 bytes; CraneliftConfig { optimization: None, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: false }
+procedure-calls direct-speed compile 1.914917ms; code 5852 bytes; CraneliftConfig { optimization: Speed, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: false }
+procedure-calls Winch prewarm 194.167µs
+procedure-calls CraneliftFast prewarm 1.361625ms
+procedure-calls CraneliftSpeed prewarm 2.806708ms
+procedure-calls no-inline-None compile 1.230958ms; code 6128 bytes; CraneliftConfig { optimization: None, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: false, procedure_inlining: false }
+procedure-calls procedure-bodies-None compile 1.661666ms; code 7924 bytes; CraneliftConfig { optimization: None, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: true }
+procedure-calls no-inline-Speed compile 1.692625ms; code 5856 bytes; CraneliftConfig { optimization: Speed, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: false, procedure_inlining: false }
+procedure-calls procedure-bodies-Speed compile 2.037167ms; code 6860 bytes; CraneliftConfig { optimization: Speed, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: true }
+procedure-calls matched-codegen None inline=false procedures=false median 1.218167ms; p95 1.279208ms
+procedure-calls matched-codegen None inline=true procedures=false median 1.182542ms; p95 1.33875ms
+procedure-calls matched-codegen None inline=true procedures=true median 1.560333ms; p95 1.617916ms
+procedure-calls matched-codegen Speed inline=false procedures=false median 1.672666ms; p95 1.7895ms
+procedure-calls matched-codegen Speed inline=true procedures=false median 1.63875ms; p95 1.976041ms
+procedure-calls matched-codegen Speed inline=true procedures=true median 2.021041ms; p95 2.282625ms
+procedure-calls interpreter logical work 786445; frameless calls 0; embedded procedure calls 0
+procedure-calls direct-fast logical work 786445; frameless calls 0; embedded procedure calls 0
+procedure-calls direct-speed logical work 786445; frameless calls 0; embedded procedure calls 0
+procedure-calls Winch logical work 786445; frameless calls 0; embedded procedure calls 0
+procedure-calls CraneliftFast logical work 786445; frameless calls 0; embedded procedure calls 0
+procedure-calls CraneliftSpeed logical work 786445; frameless calls 0; embedded procedure calls 0
+procedure-calls no-inline-None logical work 786445; frameless calls 0; embedded procedure calls 0
+procedure-calls procedure-bodies-None logical work 786445; frameless calls 0; embedded procedure calls 32768
+procedure-calls no-inline-Speed logical work 786445; frameless calls 0; embedded procedure calls 0
+procedure-calls procedure-bodies-Speed logical work 786445; frameless calls 0; embedded procedure calls 32768
+procedure-calls interpreter median 72.523625ms; p95 75.096ms / 5
+procedure-calls direct-fast median 33.122875ms; p95 34.884208ms / 5
+procedure-calls direct-speed median 33.228625ms; p95 34.189417ms / 5
+procedure-calls Winch median 33.803792ms; p95 35.139667ms / 5
+procedure-calls CraneliftFast median 33.304125ms; p95 35.080417ms / 5
+procedure-calls CraneliftSpeed median 33.325541ms; p95 34.052ms / 5
+procedure-calls no-inline-None median 33.206875ms; p95 34.105083ms / 5
+procedure-calls procedure-bodies-None median 33.22775ms; p95 33.729125ms / 5
+procedure-calls no-inline-Speed median 33.554792ms; p95 35.832416ms / 5
+procedure-calls procedure-bodies-Speed median 33.185458ms; p95 34.639875ms / 5
+procedure-calls fresh-artifact-jit median 6.561416ms; p95 6.965625ms / 1; includes backend/session setup; excludes frontend; compiler service retained
+
+codegen-size-100 direct-fast compile 7.93475ms; code 121444 bytes; CraneliftConfig { optimization: None, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: false }
+codegen-size-100 direct-speed compile 10.43975ms; code 114532 bytes; CraneliftConfig { optimization: Speed, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: false }
+codegen-size-100 Winch prewarm 685.375µs
+codegen-size-100 CraneliftFast prewarm 8.180667ms
+codegen-size-100 CraneliftSpeed prewarm 17.691791ms
+codegen-size-100 no-inline-None compile 7.587791ms; code 121128 bytes; CraneliftConfig { optimization: None, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: false, procedure_inlining: false }
+codegen-size-100 procedure-bodies-None compile 7.560209ms; code 121444 bytes; CraneliftConfig { optimization: None, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: true }
+codegen-size-100 no-inline-Speed compile 9.776417ms; code 114292 bytes; CraneliftConfig { optimization: Speed, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: false, procedure_inlining: false }
+codegen-size-100 procedure-bodies-Speed compile 9.845583ms; code 114532 bytes; CraneliftConfig { optimization: Speed, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: true }
+codegen-size-100 matched-codegen None inline=false procedures=false median 7.507916ms; p95 7.536791ms
+codegen-size-100 matched-codegen None inline=true procedures=false median 7.484291ms; p95 7.867917ms
+codegen-size-100 matched-codegen None inline=true procedures=true median 7.481917ms; p95 7.661083ms
+codegen-size-100 matched-codegen Speed inline=false procedures=false median 9.634667ms; p95 10.132625ms
+codegen-size-100 matched-codegen Speed inline=true procedures=false median 9.645ms; p95 10.366584ms
+codegen-size-100 matched-codegen Speed inline=true procedures=true median 9.978833ms; p95 10.189542ms
+codegen-size-100 interpreter logical work 11; frameless calls 0; embedded procedure calls 0
+codegen-size-100 direct-fast logical work 11; frameless calls 1; embedded procedure calls 0
+codegen-size-100 direct-speed logical work 11; frameless calls 1; embedded procedure calls 0
+codegen-size-100 Winch logical work 11; frameless calls 0; embedded procedure calls 0
+codegen-size-100 CraneliftFast logical work 11; frameless calls 1; embedded procedure calls 0
+codegen-size-100 CraneliftSpeed logical work 11; frameless calls 1; embedded procedure calls 0
+codegen-size-100 no-inline-None logical work 11; frameless calls 0; embedded procedure calls 0
+codegen-size-100 procedure-bodies-None logical work 11; frameless calls 1; embedded procedure calls 0
+codegen-size-100 no-inline-Speed logical work 11; frameless calls 0; embedded procedure calls 0
+codegen-size-100 procedure-bodies-Speed logical work 11; frameless calls 1; embedded procedure calls 0
+codegen-size-100 interpreter median 666ns; p95 1.25µs / 1
+codegen-size-100 direct-fast median 667ns; p95 750ns / 1
+codegen-size-100 direct-speed median 625ns; p95 791ns / 1
+codegen-size-100 Winch median 1.75µs; p95 1.959µs / 1
+codegen-size-100 CraneliftFast median 1.25µs; p95 1.417µs / 1
+codegen-size-100 CraneliftSpeed median 1.375µs; p95 1.417µs / 1
+codegen-size-100 no-inline-None median 1.041µs; p95 1.125µs / 1
+codegen-size-100 procedure-bodies-None median 750ns; p95 10.625µs / 1
+codegen-size-100 no-inline-Speed median 1µs; p95 1.167µs / 1
+codegen-size-100 procedure-bodies-Speed median 667ns; p95 709ns / 1
+codegen-size-100 fresh-artifact-jit median 8.416µs; p95 14.333µs / 1; includes backend/session setup; excludes frontend; compiler service retained
+codegen-size-500 direct-fast compile 37.934458ms; code 601436 bytes; CraneliftConfig { optimization: None, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: false }
+codegen-size-500 direct-speed compile 48.693667ms; code 567320 bytes; CraneliftConfig { optimization: Speed, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: false }
+codegen-size-500 Winch prewarm 2.812791ms
+codegen-size-500 CraneliftFast prewarm 37.248125ms
+codegen-size-500 CraneliftSpeed prewarm 83.109792ms
+codegen-size-500 no-inline-None compile 37.292292ms; code 601120 bytes; CraneliftConfig { optimization: None, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: false, procedure_inlining: false }
+codegen-size-500 procedure-bodies-None compile 39.261292ms; code 601436 bytes; CraneliftConfig { optimization: None, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: true }
+codegen-size-500 no-inline-Speed compile 47.404458ms; code 567080 bytes; CraneliftConfig { optimization: Speed, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: false, procedure_inlining: false }
+codegen-size-500 procedure-bodies-Speed compile 46.910125ms; code 567320 bytes; CraneliftConfig { optimization: Speed, scope: PerRoutine, resume: AllPcs, backtracking: true, inlining: true, procedure_inlining: true }
+codegen-size-500 matched-codegen None inline=false procedures=false median 37.381875ms; p95 38.958417ms
+codegen-size-500 matched-codegen None inline=true procedures=false median 38.427709ms; p95 39.117041ms
+codegen-size-500 matched-codegen None inline=true procedures=true median 37.283167ms; p95 39.232541ms
+codegen-size-500 matched-codegen Speed inline=false procedures=false median 48.218292ms; p95 49.41325ms
+codegen-size-500 matched-codegen Speed inline=true procedures=false median 48.296375ms; p95 50.711875ms
+codegen-size-500 matched-codegen Speed inline=true procedures=true median 48.309708ms; p95 50.822834ms
+codegen-size-500 interpreter logical work 11; frameless calls 0; embedded procedure calls 0
+codegen-size-500 direct-fast logical work 11; frameless calls 1; embedded procedure calls 0
+codegen-size-500 direct-speed logical work 11; frameless calls 1; embedded procedure calls 0
+codegen-size-500 Winch logical work 11; frameless calls 0; embedded procedure calls 0
+codegen-size-500 CraneliftFast logical work 11; frameless calls 1; embedded procedure calls 0
+codegen-size-500 CraneliftSpeed logical work 11; frameless calls 1; embedded procedure calls 0
+codegen-size-500 no-inline-None logical work 11; frameless calls 0; embedded procedure calls 0
+codegen-size-500 procedure-bodies-None logical work 11; frameless calls 1; embedded procedure calls 0
+codegen-size-500 no-inline-Speed logical work 11; frameless calls 0; embedded procedure calls 0
+codegen-size-500 procedure-bodies-Speed logical work 11; frameless calls 1; embedded procedure calls 0
+codegen-size-500 interpreter median 1.375µs; p95 2.167µs / 1
+codegen-size-500 direct-fast median 1.708µs; p95 1.917µs / 1
+codegen-size-500 direct-speed median 1.875µs; p95 1.916µs / 1
+codegen-size-500 Winch median 5.833µs; p95 5.875µs / 1
+codegen-size-500 CraneliftFast median 5.208µs; p95 5.375µs / 1
+codegen-size-500 CraneliftSpeed median 5.333µs; p95 5.708µs / 1
+codegen-size-500 no-inline-None median 2.458µs; p95 2.625µs / 1
+codegen-size-500 procedure-bodies-None median 1.792µs; p95 1.833µs / 1
+codegen-size-500 no-inline-Speed median 2.166µs; p95 3.25µs / 1
+codegen-size-500 procedure-bodies-Speed median 1.708µs; p95 1.709µs / 1
+codegen-size-500 fresh-artifact-jit median 29.5µs; p95 34.833µs / 1; includes backend/session setup; excludes frontend; compiler service retained
+
+modern eager=false median 3.320667ms; p95 3.738708ms; includes frontend, backend, session and execution; retained compiler service
+modern eager=true median 3.129125ms; p95 3.595833ms; includes frontend, backend, session and execution; retained compiler service
+
+hot-loop eager=false median 233.458µs; p95 259.459µs; includes frontend, backend, session and execution; retained compiler service
+hot-loop eager=true median 207.709µs; p95 223.791µs; includes frontend, backend, session and execution; retained compiler service
+
+codegen-size-100 eager=false median 374.75µs; p95 405.833µs; includes frontend, backend, session and execution; retained compiler service
+codegen-size-100 eager=true median 378.875µs; p95 451.542µs; includes frontend, backend, session and execution; retained compiler service
+codegen-size-500 eager=false median 828.959µs; p95 926.291µs; includes frontend, backend, session and execution; retained compiler service
+codegen-size-500 eager=true median 836.917µs; p95 1.001792ms; includes frontend, backend, session and execution; retained compiler service
+

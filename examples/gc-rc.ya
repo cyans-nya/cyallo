@@ -1,0 +1,30 @@
+// Run: cargo run -- run examples/gc-rc.ya --gc-stress
+// Independent RC allocations can share a traced, interior-mutable GC value.
+use std::cell::Cell
+
+record View { label: string, state: @gc Cell<i64> }
+
+proc read(view: &@rc View) -> i64 {
+    // Cell reads observe mutable state, so this routine is a proc.
+    return **(**view).state
+}
+
+let state = @gc Cell::new(1)
+let first = @rc View { label: "first", state: state }
+let second = @rc View { label: "second", state: state }
+let weak_first = std::rc::downgrade(&first)
+
+**first.state = 7
+std::io::print(first.label, ": ", read(&first))
+std::io::print(second.label, ": ", read(&second))
+
+std::mem::drop(first)
+**state = 9
+std::io::print("first expired: ", std::rc::upgrade(&weak_first).is_none())
+std::io::print("second survives: ", read(&second))
+
+std::mem::drop(second)
+// This GC reference still retains the shared cell after both RC owners expire.
+**state = 11
+std::io::print("gc survives: ", **state)
+std::mem::drop(weak_first)

@@ -1,0 +1,3 @@
+# Root scopes survive native calls and use explicit GC capabilities
+
+Native root scopes belong to resumable VM frames, so budget exits, input suspension, and tier changes cannot release references still needed by an invocation; helpers use shorter scopes and return values transfer to caller roots before callee roots are released. Rust helpers distinguish collecting capabilities, non-collecting borrows, and rooted values, while generated code explicitly publishes live references and reloads them after collection without stack scanning or a tier downgrade. Dead temporary roots are removed, but named locals remain rooted until frame discard to preserve inspection, accepting retention until return instead of changing the debugger contract in the first collector.

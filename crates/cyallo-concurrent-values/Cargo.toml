@@ -1,0 +1,9 @@
+[package]
+name = "cyallo-concurrent-values"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cyallo-ast = { path = "../cyallo-ast" }
+cyallo-channel = { path = "../cyallo-channel" }
+cyallo-scheduler = { path = "../cyallo-scheduler" }

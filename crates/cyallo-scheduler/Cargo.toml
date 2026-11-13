@@ -1,0 +1,9 @@
+[package]
+name = "cyallo-scheduler"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cyallo-io = { path = "../cyallo-io" }
+cyallo-clock = { path = "../cyallo-clock" }
+cyallo-host = { path = "../cyallo-host" }

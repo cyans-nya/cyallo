@@ -1,0 +1,2 @@
+100 {"('cranelift', 1)": {'median': 24.6, 'p95': 25.795}, "('cranelift', 0)": {'median': 12.834, 'p95': 13.549}, "('cranelift_speed', 1)": {'median': 30.52, 'p95': 32.936}, "('cranelift_speed', 0)": {'median': 15.213, 'p95': 15.821}}
+500 {"('cranelift', 1)": {'median': 107.596, 'p95': 109.03}, "('cranelift', 0)": {'median': 44.352, 'p95': 45.23}, "('cranelift_speed', 1)": {'median': 138.029, 'p95': 141.027}, "('cranelift_speed', 0)": {'median': 55.66, 'p95': 56.961}}

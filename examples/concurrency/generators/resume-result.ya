@@ -1,0 +1,27 @@
+// Run: cargo run -- run examples/concurrency/generators/resume-result.ya
+// Resume inputs are ordinary values, including Result, with no exception injection.
+use std::generator::Generator
+use std::result::{Result, ok, err}
+use std::io::print
+
+let request = gen proc() -> Generator<string, Result<i64, string>, i64> {
+    let reply = yield "request"
+    if reply.is_ok() {
+        return reply.unwrap()
+    } else {
+        print("error: ", reply.unwrap_err())
+        return -1
+    }
+}
+
+let mut success = request()
+let waiting = success.resume()
+print(waiting.yielded())
+let finished = success.resume(ok<i64, string>(42))
+print("complete: ", finished.completed())
+
+let mut failure = request()
+let waiting = failure.resume()
+print(waiting.yielded())
+let finished = failure.resume(err<i64, string>("unavailable"))
+print("complete: ", finished.completed())

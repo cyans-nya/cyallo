@@ -1,0 +1,12 @@
+use crate::logging::{Logger, LOGGER}
+use std::service::{Context, Registration}
+
+record ConsoleLogger { prefix: string }
+impl Logger for ConsoleLogger {
+    proc info(self: &Self, message: string) {
+        std::io::print(self.prefix, message)
+    }
+}
+pub proc install(ctx: &Context, prefix: string) -> Registration {
+    return ctx.provide(LOGGER, ConsoleLogger { prefix: prefix } as dyn Logger)
+}

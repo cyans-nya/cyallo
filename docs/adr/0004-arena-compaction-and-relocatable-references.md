@@ -1,0 +1,3 @@
+# Compact typed arenas with relocatable references
+
+Following the user's delegation of the remaining GC choices, use stop-the-world mark/compact over typed arenas, repairing ordinary object indices in roots and heap fields; reserve stable indirection for explicitly registered root slots. Chunked arena storage permits packing survivors and releasing empty chunks without a full semispace reserve, while pre-reserved marking/relocation metadata keeps collection itself free of fallible allocation. This replaces the earlier semispace/per-object-table proposal to fit the existing indexed heap, accepting complete reference repair as the cost; allocation, dereference, and collection performance remain rollout gates rather than assumed advantages.

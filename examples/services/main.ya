@@ -1,0 +1,16 @@
+mod logging;
+mod console;
+use crate::logging::{logger, LOGGER}
+use crate::console::install
+
+let ctx = std::service::Context::new()
+let mut registration = install(&ctx, "first: ")
+ctx.inject(LOGGER, proc(scoped: std::service::Context) {
+    scoped.logger.info("ready")
+    scoped.on_dispose(proc() { scoped.logger.info("cleanup") })
+})
+registration.dispose()
+registration = install(&ctx, "second: ")
+ctx.logger.info("ready")
+registration.dispose()
+std::io::print(ctx.available(LOGGER))
