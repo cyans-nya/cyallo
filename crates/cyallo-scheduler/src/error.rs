@@ -6,14 +6,26 @@ pub enum Failure {
     Guest(Arc<dyn Error + Send + Sync>),
     Panic(PanicPayload),
     Destructor(PanicPayload),
-    Cleanup { cause: Box<Failure>, cleanup: Box<Failure> },
+    Cleanup {
+        cause: Box<Failure>,
+        cleanup: Box<Failure>,
+    },
 }
 impl PartialEq for Failure {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Guest(a), Self::Guest(b)) => Arc::ptr_eq(a, b),
             (Self::Panic(a), Self::Panic(b)) | (Self::Destructor(a), Self::Destructor(b)) => a == b,
-            (Self::Cleanup { cause: a, cleanup: b }, Self::Cleanup { cause: c, cleanup: d }) => a == c && b == d,
+            (
+                Self::Cleanup {
+                    cause: a,
+                    cleanup: b,
+                },
+                Self::Cleanup {
+                    cause: c,
+                    cleanup: d,
+                },
+            ) => a == c && b == d,
             _ => false,
         }
     }
@@ -32,7 +44,12 @@ impl fmt::Display for Failure {
 impl Error for Failure {}
 
 #[derive(Debug)]
-pub enum StartError { ZeroLimit, Host(cyallo_host::StartError), Timer(std::io::Error), Thread(std::io::Error) }
+pub enum StartError {
+    ZeroLimit,
+    Host(cyallo_host::StartError),
+    Timer(std::io::Error),
+    Thread(std::io::Error),
+}
 impl fmt::Display for StartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

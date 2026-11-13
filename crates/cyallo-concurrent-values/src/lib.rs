@@ -1,12 +1,16 @@
 //! Heap-independent payloads and logical capability ownership for guest Cs.
 //! A payload never contains a Session-relative cell index or borrowed VM pointer.
 mod error;
-pub use error::{ResourceError, ResourceKind};
-pub use cyallo_scheduler::Outcome as TaskOutcome;
-pub use cyallo_channel::{SendError, SendFailure};
 use cyallo_channel::{Factory, Offer, Receiver, Sender};
+pub use cyallo_channel::{SendError, SendFailure};
+pub use cyallo_scheduler::Outcome as TaskOutcome;
 use cyallo_scheduler::{Clock, Group, Task};
-use std::{collections::BTreeMap, fmt, sync::{Arc, Mutex}};
+pub use error::{ResourceError, ResourceKind};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 #[derive(Debug)]
 pub enum Payload {
@@ -29,11 +33,19 @@ pub enum Payload {
 #[derive(Debug)]
 pub struct OwnedHandle(Option<Handle>);
 impl OwnedHandle {
-    pub fn new(handle: Handle) -> Self { Self(Some(handle)) }
-    pub fn into_handle(mut self) -> Handle { self.0.take().unwrap() }
+    pub fn new(handle: Handle) -> Self {
+        Self(Some(handle))
+    }
+    pub fn into_handle(mut self) -> Handle {
+        self.0.take().unwrap()
+    }
 }
 impl Drop for OwnedHandle {
-    fn drop(&mut self) { if let Some(handle) = self.0.take() { handle.release(); } }
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.release();
+        }
+    }
 }
 
 pub enum Resource {
@@ -51,14 +63,20 @@ pub enum Resource {
 #[derive(Clone)]
 pub struct Handle(Arc<Mutex<Option<Resource>>>);
 impl PartialEq for Handle {
-    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 impl Eq for Handle {}
 impl fmt::Debug for Handle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "<capability {:p}>", Arc::as_ptr(&self.0)) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<capability {:p}>", Arc::as_ptr(&self.0))
+    }
 }
 impl Handle {
-    pub fn new(resource: Resource) -> Self { Self(Arc::new(Mutex::new(Some(resource)))) }
+    pub fn new(resource: Resource) -> Self {
+        Self(Arc::new(Mutex::new(Some(resource))))
+    }
     pub fn release(&self) {
         let resource = self.0.lock().unwrap().take();
         // Endpoint drop can wake another C; never run it under the handle lock.
@@ -66,14 +84,16 @@ impl Handle {
     }
     pub fn duplicate(&self) -> Result<Self, ResourceError> {
         let resource = self.0.lock().unwrap();
-        Ok(Self::new(match resource.as_ref().ok_or(ResourceError::Released)? {
-            Resource::Sender(sender) => Resource::Sender(sender.clone()),
-            Resource::Receiver(receiver) => Resource::Receiver(receiver.clone()),
-            Resource::Group(group) => Resource::Group(group.clone()),
-            Resource::Clock(clock) => Resource::Clock(clock.clone()),
-            Resource::Factory(factory) => Resource::Factory(factory.clone()),
-            Resource::Task(_) | Resource::Offer(_) => return Err(ResourceError::MoveOnly),
-        }))
+        Ok(Self::new(
+            match resource.as_ref().ok_or(ResourceError::Released)? {
+                Resource::Sender(sender) => Resource::Sender(sender.clone()),
+                Resource::Receiver(receiver) => Resource::Receiver(receiver.clone()),
+                Resource::Group(group) => Resource::Group(group.clone()),
+                Resource::Clock(clock) => Resource::Clock(clock.clone()),
+                Resource::Factory(factory) => Resource::Factory(factory.clone()),
+                Resource::Task(_) | Resource::Offer(_) => return Err(ResourceError::MoveOnly),
+            },
+        ))
     }
     pub fn sender(&self) -> Result<Sender<Payload>, ResourceError> {
         match self.0.lock().unwrap().as_ref() {
@@ -113,7 +133,10 @@ impl Handle {
     }
     pub fn cancel_task(&self) -> Result<(), ResourceError> {
         match self.0.lock().unwrap().as_ref() {
-            Some(Resource::Task(Some(task))) => { task.cancel(); Ok(()) }
+            Some(Resource::Task(Some(task))) => {
+                task.cancel();
+                Ok(())
+            }
             _ => Err(ResourceError::Expected(ResourceKind::Task)),
         }
     }

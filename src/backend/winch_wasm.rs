@@ -1,6 +1,6 @@
 //! Winch's supported input is Wasm; the register-bytecode adapter supplies per-routine modules.
-use super::abi;
 use super::CompileError;
+use super::abi;
 use crate::{
     ir::Program,
     runtime::{EngineError, Session},
@@ -18,38 +18,36 @@ pub(super) struct WinchUnit {
     entry: TypedFunc<i64, ()>,
 }
 impl WinchUnit {
-    fn compile(engine: &Engine, program: Arc<Program>, function: usize) -> Result<Self, CompileError> {
+    fn compile(
+        engine: &Engine,
+        program: Arc<Program>,
+        function: usize,
+    ) -> Result<Self, CompileError> {
         let wasm = program.bytecode.functions[function]
             .wasm_text(function, &program.functions[function].registers);
         let module = Module::new(engine, wasm)?;
         let mut linker = Linker::<usize>::new(engine);
         // The slot holds an exclusively borrowed Session only during run(). It is cleared
         // before run returns, including trap paths; no guest memory contains a host pointer.
-        linker
-            .func_wrap("caie", "state", |caller: Caller<'_, usize>| unsafe {
-                abi::state(*caller.data() as *mut Session)
-            })?;
-        linker
-            .func_wrap("caie", "step", |caller: Caller<'_, usize>| unsafe {
-                abi::step(*caller.data() as *mut Session)
-            })?;
-        linker
-            .func_wrap("caie", "get", |caller: Caller<'_, usize>, r: i64| unsafe {
-                abi::get(*caller.data() as *mut Session, r)
-            })?;
-        linker
-            .func_wrap(
-                "caie",
-                "put",
-                |caller: Caller<'_, usize>, r: i64, bits: i64, overflow: i64| unsafe {
-                    abi::put(*caller.data() as *mut Session, r, bits, overflow)
-                },
-            )?;
+        linker.func_wrap("caie", "state", |caller: Caller<'_, usize>| unsafe {
+            abi::state(*caller.data() as *mut Session)
+        })?;
+        linker.func_wrap("caie", "step", |caller: Caller<'_, usize>| unsafe {
+            abi::step(*caller.data() as *mut Session)
+        })?;
+        linker.func_wrap("caie", "get", |caller: Caller<'_, usize>, r: i64| unsafe {
+            abi::get(*caller.data() as *mut Session, r)
+        })?;
+        linker.func_wrap(
+            "caie",
+            "put",
+            |caller: Caller<'_, usize>, r: i64, bits: i64, overflow: i64| unsafe {
+                abi::put(*caller.data() as *mut Session, r, bits, overflow)
+            },
+        )?;
         let mut store = Store::new(engine, 0);
-        let instance = linker
-            .instantiate(&mut store, &module)?;
-        let entry = instance
-            .get_typed_func::<i64, ()>(&mut store, "run")?;
+        let instance = linker.instantiate(&mut store, &module)?;
+        let entry = instance.get_typed_func::<i64, ()>(&mut store, "run")?;
         Ok(Self { store, entry })
     }
     fn run(&mut self, session: &mut Session, budget: usize) -> Result<(), EngineError> {

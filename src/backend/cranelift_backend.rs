@@ -1151,8 +1151,7 @@ fn compile_part(
         Default::default()
     };
     let flags = config.flags();
-    let mut jit =
-        JITBuilder::with_flags(&flags, default_libcall_names())?;
+    let mut jit = JITBuilder::with_flags(&flags, default_libcall_names())?;
     jit.symbol("caie_native_step", native_step as *const u8)
         .symbol("caie_native_flush", native_flush as *const u8)
         .symbol("caie_native_enter", native_enter as *const u8);
@@ -1172,8 +1171,7 @@ fn compile_part(
         AbiParam::new(types::I64),
     ];
     ctx.func.signature.returns = vec![AbiParam::new(types::I64)];
-    let id = module
-        .declare_function("caie_entry", Linkage::Local, &ctx.func.signature)?;
+    let id = module.declare_function("caie_entry", Linkage::Local, &ctx.func.signature)?;
     let step = module.declare_func_in_func(step_id, &mut ctx.func);
     let flush = module.declare_func_in_func(flush_id, &mut ctx.func);
     let enter = module.declare_func_in_func(enter_id, &mut ctx.func);
@@ -1591,8 +1589,7 @@ fn compile_part(
             &ctx.func.display().to_string(),
         );
     }
-    module
-        .define_function(id, &mut ctx)?;
+    module.define_function(id, &mut ctx)?;
     if let Some(observer) = observer
         && observer.options.emit_clif
     {

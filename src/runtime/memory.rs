@@ -146,8 +146,8 @@ impl Session {
             return Err(ResourceLimit::Allocation.into());
         }
         // SAFETY: Layout validates size/alignment. Null is a recoverable failure.
-        let pointer =
-            NonNull::new(unsafe { alloc::alloc_zeroed(layout) }).ok_or(AllocatorError::AllocationFailed)?;
+        let pointer = NonNull::new(unsafe { alloc::alloc_zeroed(layout) })
+            .ok_or(AllocatorError::AllocationFailed)?;
         self.memory.allocated_bytes = total;
         let id = self
             .memory
@@ -309,8 +309,12 @@ impl Session {
             Value::Allocation(_) => return Err(OwnershipError::MoveOnlyAllocation.into()),
             Value::Generator(_) => return Err(OwnershipError::MoveOnlyGenerator.into()),
             Value::GeneratorStep(step) => Value::GeneratorStep(match step {
-                cyallo_values::GeneratorStep::Yielded(value) => cyallo_values::GeneratorStep::Yielded(Box::new(self.clone_value(*value)?)),
-                cyallo_values::GeneratorStep::Complete(value) => cyallo_values::GeneratorStep::Complete(Box::new(self.clone_value(*value)?)),
+                cyallo_values::GeneratorStep::Yielded(value) => {
+                    cyallo_values::GeneratorStep::Yielded(Box::new(self.clone_value(*value)?))
+                }
+                cyallo_values::GeneratorStep::Complete(value) => {
+                    cyallo_values::GeneratorStep::Complete(Box::new(self.clone_value(*value)?))
+                }
             }),
             value @ (Value::Rc(_) | Value::Weak(_)) => self.rc_clone(&value, false, false)?,
             Value::Cell(value) => Value::Cell(Box::new(self.clone_value(*value)?)),
@@ -442,7 +446,10 @@ impl Session {
             return Ok(Value::Optional(None));
         }
         if weak {
-            control.weak = control.weak.checked_add(1).ok_or(OwnershipError::WeakCountOverflow)?;
+            control.weak = control
+                .weak
+                .checked_add(1)
+                .ok_or(OwnershipError::WeakCountOverflow)?;
         } else {
             control.strong = control
                 .strong
@@ -506,7 +513,9 @@ impl Session {
     pub(super) fn drop_value(&mut self, value: Value) -> RunResult<()> {
         match value {
             Value::Concurrent(handle) => handle.release(),
-            Value::TaskOutcome(cyallo_concurrent_values::TaskOutcome::Completed(value)) => self.drop_value(*value)?,
+            Value::TaskOutcome(cyallo_concurrent_values::TaskOutcome::Completed(value)) => {
+                self.drop_value(*value)?
+            }
             Value::SendError(error) => self.drop_value(*error.value)?,
             Value::Generator(id) => self.close_generator(id)?,
             Value::Rc(index) | Value::Weak(index) => self.release_rc(index)?,
@@ -536,7 +545,11 @@ impl Session {
                     self.drop_value(value)?;
                 }
             }
-            Value::GeneratorStep(cyallo_values::GeneratorStep::Yielded(value) | cyallo_values::GeneratorStep::Complete(value)) | Value::Cell(value)
+            Value::GeneratorStep(
+                cyallo_values::GeneratorStep::Yielded(value)
+                | cyallo_values::GeneratorStep::Complete(value),
+            )
+            | Value::Cell(value)
             | Value::Optional(Some(value))
             | Value::Result(Ok(value) | Err(value))
             | Value::Erased(_, value)

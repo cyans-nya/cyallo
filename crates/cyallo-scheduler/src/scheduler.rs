@@ -1,5 +1,5 @@
-use cyallo_clock::{Clock, TimerService};
 use super::{Failure, StartError};
+use cyallo_clock::{Clock, TimerService};
 use cyallo_host::BlockingPool;
 use std::{
     any::Any,
@@ -345,7 +345,10 @@ impl Core {
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(machine))) {
             let error = Failure::Destructor(payload.into());
             outcome = Outcome::Failed(match outcome {
-                Outcome::Failed(cause) => Failure::Cleanup { cause: Box::new(cause), cleanup: Box::new(error) },
+                Outcome::Failed(cause) => Failure::Cleanup {
+                    cause: Box::new(cause),
+                    cleanup: Box::new(error),
+                },
                 _ => error,
             });
         }
@@ -471,7 +474,10 @@ impl Core {
                 let failure = c.execution.lock().unwrap().failure.take();
                 let error = failure.map_or_else(
                     || error.clone(),
-                    |original| Failure::Cleanup { cause: Box::new(original), cleanup: Box::new(error.clone()) },
+                    |original| Failure::Cleanup {
+                        cause: Box::new(original),
+                        cleanup: Box::new(error.clone()),
+                    },
                 );
                 self.finish(&c, Outcome::Failed(error), machine);
             }
@@ -566,13 +572,20 @@ pub struct ExecutionPermit {
     thread: u64,
 }
 impl ExecutionPermit {
-    pub fn processor(&self) -> usize { self.processor }
+    pub fn processor(&self) -> usize {
+        self.processor
+    }
 }
 impl Drop for ExecutionPermit {
     fn drop(&mut self) {
         self.core.running.fetch_sub(1, Ordering::AcqRel);
         let mut state = self.core.scheduling.lock().unwrap();
-        assert_eq!(self.core.processors[self.processor].owner.swap(0, Ordering::AcqRel), self.thread);
+        assert_eq!(
+            self.core.processors[self.processor]
+                .owner
+                .swap(0, Ordering::AcqRel),
+            self.thread
+        );
         state.idle.push(self.processor);
         state.epoch = state.epoch.wrapping_add(1);
         self.core.wake.notify_all();
@@ -600,7 +613,8 @@ impl Runtime {
             config.blocking_threads,
             config.max_blocking_jobs,
             operations.clone(),
-        ).map_err(StartError::Host)?;
+        )
+        .map_err(StartError::Host)?;
         let next_thread = config.processors as u64 + 1;
         let core = Arc::new(Core {
             processors: (0..config.processors)
@@ -656,7 +670,9 @@ impl Runtime {
     /// through its Context and must not acquire another permit.
     pub fn enter(&self) -> Result<ExecutionPermit, SpawnError> {
         let core = &self.owner.core;
-        let thread = core.next_thread.try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        let thread = core
+            .next_thread
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("execution thread identity space exhausted");
         let mut state = core.scheduling.lock().unwrap();
         state.external_waiters += 1;
@@ -670,11 +686,20 @@ impl Runtime {
             return Err(SpawnError::Stopped);
         }
         let processor = state.idle.pop().unwrap();
-        assert_eq!(core.processors[processor].owner.swap(thread, Ordering::AcqRel), 0);
+        assert_eq!(
+            core.processors[processor]
+                .owner
+                .swap(thread, Ordering::AcqRel),
+            0
+        );
         let running = core.running.fetch_add(1, Ordering::AcqRel) + 1;
         core.peak_running.fetch_max(running, Ordering::Relaxed);
         core.wake.notify_all();
-        Ok(ExecutionPermit { core: core.clone(), processor, thread })
+        Ok(ExecutionPermit {
+            core: core.clone(),
+            processor,
+            thread,
+        })
     }
     pub fn spawn<C: Coroutine>(&self, c: C) -> Result<Task<C::Output>, SpawnError> {
         self.spawner().spawn(c)
@@ -775,7 +800,9 @@ fn run_t(core: Arc<Core>, t: u64) {
                 if core.stopped.load(Ordering::Acquire) {
                     return;
                 }
-                if s.external_waiters == 0 && let Some(p) = s.idle.pop() {
+                if s.external_waiters == 0
+                    && let Some(p) = s.idle.pop()
+                {
                     break p;
                 }
                 s = core.wake.wait(s).unwrap();

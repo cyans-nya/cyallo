@@ -22,9 +22,10 @@ fn queue_is_bounded_and_shutdown_cancels_queued_work() {
     let rejected = pool.submit(|| 43);
     let mut rejected = pin!(rejected);
     let mut cx = Context::from_waker(Waker::noop());
-    assert!(
-        matches!(rejected.as_mut().poll(&mut cx), Poll::Ready(Ok(Err(cyallo_host::HostError::QueueFull))))
-    );
+    assert!(matches!(
+        rejected.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(Err(cyallo_host::HostError::QueueFull)))
+    ));
     pool.stop();
     let mut queued = pin!(queued);
     assert_eq!(queued.as_mut().poll(&mut cx), Poll::Ready(Err(Cancelled)));

@@ -1,11 +1,11 @@
 //! Safe storage, checked operations, and resumable interpreter state.
 use cyallo_ast::IdentifierEq as _;
 use cyallo_ast::Operator;
-pub mod gc;
 mod error;
+pub mod gc;
+mod generator;
 mod lookup;
 mod memory;
-mod generator;
 pub(crate) mod native;
 pub(crate) mod services;
 mod utilities;
@@ -13,13 +13,12 @@ use crate::ir::{LocalStorage, Op, Program, Reg};
 use crate::metrics::{ExecutionEngine, ExecutionReport, FrameMetrics};
 use cyallo_ast::{Diagnostic, Span, Type};
 pub use cyallo_values::Value;
+use error::expected;
 pub use error::{
     AllocatorError, ArithmeticError, BoundsError, EngineError, GcError, GeneratorError,
-    IdentitySpace, InputError, Invariant, LookupError, OwnershipError, ResourceLimit,
-    RuntimeError, RuntimeFailure, ServiceError, TextError, UninitializedRead, UnwrapError,
-    ValueKind,
+    IdentitySpace, InputError, Invariant, LookupError, OwnershipError, ResourceLimit, RuntimeError,
+    RuntimeFailure, ServiceError, TextError, UninitializedRead, UnwrapError, ValueKind,
 };
-use error::expected;
 pub use lookup::LookupStats;
 use native::{NativeSlot, NativeStorage, NativeView};
 pub use services::ServiceStats;
@@ -1046,9 +1045,7 @@ impl Session {
             if cyallo_ir::ownership::effectful_lifecycle(&self.heap[id].ty) {
                 self.drop_cell(id)?;
             }
-            let len = roots
-                .array_len(source)
-                .ok_or(expected(ValueKind::Array))?;
+            let len = roots.array_len(source).ok_or(expected(ValueKind::Array))?;
             self.heap[roots.cell_id(target)].value = if kind == cyallo_ast::StorageKind::Vec {
                 Value::Array(Vec::new())
             } else {
@@ -1153,8 +1150,11 @@ impl Session {
             self.fail_check(error);
             return Ok(());
         }
-        if routine.generator.is_some() { self.construct_generator(function, args, result) }
-        else { self.push_frame(function, args, result) }
+        if routine.generator.is_some() {
+            self.construct_generator(function, args, result)
+        } else {
+            self.push_frame(function, args, result)
+        }
     }
     fn execute(&mut self) -> RunResult<()> {
         let f = self.frames.last().unwrap();
@@ -1312,7 +1312,10 @@ impl Session {
                     let index = usize::try_from(requested)
                         .ok()
                         .filter(|index| *index < length)
-                        .ok_or(BoundsError::Slice { index: requested, length })?;
+                        .ok_or(BoundsError::Slice {
+                            index: requested,
+                            length,
+                        })?;
                     let Value::Array(elements) = &self.heap[owner].value else {
                         return Err(Invariant::InvalidSliceStorage.into());
                     };
@@ -1320,7 +1323,10 @@ impl Session {
                     let element = offset
                         .checked_add(index)
                         .and_then(|position| elements.get(position))
-                        .ok_or(BoundsError::Slice { index: requested, length })?;
+                        .ok_or(BoundsError::Slice {
+                            index: requested,
+                            length,
+                        })?;
                     self.set(r, Value::Address(*element));
                     return Ok(());
                 }
@@ -1447,7 +1453,9 @@ impl Session {
                 let mut value = r.map(|r| self.register(r));
                 if lookup_return.is_some() {
                     value =
-                        Some(self.finish_lookup(value.take().ok_or(LookupError::MapperReturnedNothing)?)?);
+                        Some(self.finish_lookup(
+                            value.take().ok_or(LookupError::MapperReturnedNothing)?,
+                        )?);
                 }
                 let returned = self.root_scope();
                 let returned_value = value.take().map(|value| returned.value(value));
@@ -1594,9 +1602,12 @@ impl Session {
 }
 fn remap_functions(value: &mut Value, remap: &[usize]) {
     match value {
-        Value::GeneratorStep(cyallo_values::GeneratorStep::Yielded(v) | cyallo_values::GeneratorStep::Complete(v)) | Value::Optional(Some(v)) | Value::Erased(_, v) | Value::StoragePath(v, _) => {
-            remap_functions(v, remap)
-        }
+        Value::GeneratorStep(
+            cyallo_values::GeneratorStep::Yielded(v) | cyallo_values::GeneratorStep::Complete(v),
+        )
+        | Value::Optional(Some(v))
+        | Value::Erased(_, v)
+        | Value::StoragePath(v, _) => remap_functions(v, remap),
         Value::Function(id, captures) => {
             *id = remap[*id];
             for v in captures {
@@ -1618,9 +1629,12 @@ fn remap_functions(value: &mut Value, remap: &[usize]) {
 }
 fn remap_service_keys(value: &mut Value, remap: &[usize]) {
     match value {
-        Value::GeneratorStep(cyallo_values::GeneratorStep::Yielded(v) | cyallo_values::GeneratorStep::Complete(v)) | Value::Optional(Some(v)) | Value::Erased(_, v) | Value::StoragePath(v, _) => {
-            remap_service_keys(v, remap)
-        }
+        Value::GeneratorStep(
+            cyallo_values::GeneratorStep::Yielded(v) | cyallo_values::GeneratorStep::Complete(v),
+        )
+        | Value::Optional(Some(v))
+        | Value::Erased(_, v)
+        | Value::StoragePath(v, _) => remap_service_keys(v, remap),
         Value::ServiceKey(key) | Value::ServiceRef(_, key) => *key = remap[*key],
         Value::Function(_, values) | Value::ArraySnapshot(values) => {
             for v in values {
@@ -1666,9 +1680,10 @@ fn boolean(v: Value) -> RunResult<bool> {
 }
 fn unary(op: cyallo_ast::Operator, v: Value) -> RunResult<Value> {
     match (op, v) {
-        (Operator::Subtract, Value::Number(n)) => {
-            n.negate().map(Value::from_number).map_err(RuntimeError::from)
-        }
+        (Operator::Subtract, Value::Number(n)) => n
+            .negate()
+            .map(Value::from_number)
+            .map_err(RuntimeError::from),
         (Operator::Not, Value::Boolean(b)) => Ok(Value::Boolean(!b)),
         (Operator::Subtract, Value::Integer(n)) => n
             .checked_neg()
@@ -1692,9 +1707,13 @@ fn binary(op: cyallo_ast::Operator, a: Value, b: Value) -> RunResult<Value> {
                 | Operator::LessEqual
                 | Operator::GreaterEqual
         ) {
-            x.compare(y, op).map(Value::Boolean).map_err(RuntimeError::from)
+            x.compare(y, op)
+                .map(Value::Boolean)
+                .map_err(RuntimeError::from)
         } else {
-            x.binary(y, op).map(Value::from_number).map_err(RuntimeError::from)
+            x.binary(y, op)
+                .map(Value::from_number)
+                .map_err(RuntimeError::from)
         };
     }
     if let (Value::Integer(x), Value::Integer(y)) = (&a, &b) {

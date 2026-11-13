@@ -83,7 +83,9 @@ impl<'src> Parser<'src> {
                     Literal::number(n)
                 }
             })
-            .map_err(|error| cyallo_ast::diagnostic::invalid_numeric_literal(error, self.token().span))
+            .map_err(|error| {
+                cyallo_ast::diagnostic::invalid_numeric_literal(error, self.token().span)
+            })
     }
     fn at(&self, s: &str) -> bool {
         TokenKind::from_spelling(s) == Some(self.token().kind)
@@ -370,7 +372,10 @@ impl<'src> Parser<'src> {
                     StmtKind::Output(vec![value])
                 } else if matches!(
                     value.kind,
-                    ExprKind::Call(..) | ExprKind::GenericCall(..) | ExprKind::Invoke(..) | ExprKind::Yield(..)
+                    ExprKind::Call(..)
+                        | ExprKind::GenericCall(..)
+                        | ExprKind::Invoke(..)
+                        | ExprKind::Yield(..)
                 ) {
                     StmtKind::Evaluate(value)
                 } else {
@@ -426,11 +431,17 @@ impl<'src> Parser<'src> {
         } else if self.take("gen") {
             let (mut function, refs) = self.closure()?;
             function.generator = true;
-            Expr { kind: ExprKind::Closure(Box::new(function), refs), span: self.finish_span(span) }
+            Expr {
+                kind: ExprKind::Closure(Box::new(function), refs),
+                span: self.finish_span(span),
+            }
         } else if self.take("yield") {
             let delegate = self.word("from");
             let value = self.expr(0)?;
-            Expr { kind: ExprKind::Yield(Box::new(value), delegate), span: self.finish_span(span) }
+            Expr {
+                kind: ExprKind::Yield(Box::new(value), delegate),
+                span: self.finish_span(span),
+            }
         } else if self.at("fn") || self.at("proc") {
             let (function, refs) = self.closure()?;
             Expr {

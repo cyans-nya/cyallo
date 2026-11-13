@@ -2,16 +2,32 @@
 use cyallo_ast::Literal;
 use std::collections::BTreeMap;
 #[derive(Debug, Clone, PartialEq)]
-pub enum GeneratorStep<T> { Yielded(T), Complete(T) }
+pub enum GeneratorStep<T> {
+    Yielded(T),
+    Complete(T),
+}
 impl<T> GeneratorStep<T> {
-    pub fn value(&self) -> &T { match self { Self::Yielded(value) | Self::Complete(value) => value } }
-    pub fn value_mut(&mut self) -> &mut T { match self { Self::Yielded(value) | Self::Complete(value) => value } }
-    pub fn is_complete(&self) -> bool { matches!(self, Self::Complete(_)) }
+    pub fn value(&self) -> &T {
+        match self {
+            Self::Yielded(value) | Self::Complete(value) => value,
+        }
+    }
+    pub fn value_mut(&mut self) -> &mut T {
+        match self {
+            Self::Yielded(value) | Self::Complete(value) => value,
+        }
+    }
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete(_))
+    }
 }
 impl<T: std::fmt::Display> std::fmt::Display for GeneratorStep<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { match self {
-        Self::Yielded(value) => write!(f, "Yielded({value})"), Self::Complete(value) => write!(f, "Complete({value})"),
-    } }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Yielded(value) => write!(f, "Yielded({value})"),
+            Self::Complete(value) => write!(f, "Complete({value})"),
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -93,8 +109,12 @@ impl std::fmt::Display for Value {
         match self {
             Self::Concurrent(handle) => write!(f, "{handle:?}"),
             Self::TaskOutcome(outcome) => match outcome {
-                cyallo_concurrent_values::TaskOutcome::Completed(value) => write!(f, "Completed({value})"),
-                cyallo_concurrent_values::TaskOutcome::Failed(error) => write!(f, "Failed({error})"),
+                cyallo_concurrent_values::TaskOutcome::Completed(value) => {
+                    write!(f, "Completed({value})")
+                }
+                cyallo_concurrent_values::TaskOutcome::Failed(error) => {
+                    write!(f, "Failed({error})")
+                }
                 cyallo_concurrent_values::TaskOutcome::Cancelled => f.write_str("Cancelled"),
                 cyallo_concurrent_values::TaskOutcome::Stopped => f.write_str("Stopped"),
             },

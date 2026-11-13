@@ -114,9 +114,13 @@ pub fn effectful_lifecycle(ty: &Type) -> bool {
             ..
         } => true,
         Type::Managed { pointee, .. } => effectful_lifecycle(pointee),
-        Type::Storage(StorageKind::Weak | StorageKind::ArenaCell | StorageKind::Allocation | StorageKind::Generator, _) => {
-            true
-        }
+        Type::Storage(
+            StorageKind::Weak
+            | StorageKind::ArenaCell
+            | StorageKind::Allocation
+            | StorageKind::Generator,
+            _,
+        ) => true,
         Type::Context | Type::Registration | Type::ServiceRef(_) | Type::TraitObject(_) => true,
         Type::Array(_, inner)
         | Type::SparseArray(inner)
@@ -128,14 +132,17 @@ pub fn effectful_lifecycle(ty: &Type) -> bool {
     }
 }
 pub fn needs_drop(ty: &Type) -> bool {
-    effectful_lifecycle(ty) || match ty {
-        Type::Function(..) => true,
-        Type::Storage(StorageKind::Generator | StorageKind::PureGenerator, _) => true,
-        Type::Storage(_, inner) | Type::Array(_, inner) | Type::SparseArray(inner) => needs_drop(inner),
-        Type::Tuple(ts) => ts.iter().any(needs_drop),
-        Type::Record(_, fs) => fs.iter().any(|(_, t)| needs_drop(t)),
-        _ => false,
-    }
+    effectful_lifecycle(ty)
+        || match ty {
+            Type::Function(..) => true,
+            Type::Storage(StorageKind::Generator | StorageKind::PureGenerator, _) => true,
+            Type::Storage(_, inner) | Type::Array(_, inner) | Type::SparseArray(inner) => {
+                needs_drop(inner)
+            }
+            Type::Tuple(ts) => ts.iter().any(needs_drop),
+            Type::Record(_, fs) => fs.iter().any(|(_, t)| needs_drop(t)),
+            _ => false,
+        }
 }
 fn error(message: impl Into<String>, span: Span) -> Diagnostic {
     Diagnostic::new("E118", message, span)
@@ -386,7 +393,9 @@ impl Checker<'_> {
         }
         let mut result = ValueInfo::default();
         match &expression.kind {
-            ExprKind::Yield(value, _) => { result.extend(self.expression(value, Use::Move)?); }
+            ExprKind::Yield(value, _) => {
+                result.extend(self.expression(value, Use::Move)?);
+            }
             ExprKind::Invalid(diagnostic) => return Err(diagnostic.clone()),
             ExprKind::ManagedNew(_, allocator, value) => {
                 if let Some(allocator) = allocator {

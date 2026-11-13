@@ -1,6 +1,6 @@
-use crate::runtime::{EngineError, Session};
 #[cfg(feature = "wasm-adapter")]
 use crate::runtime::Status;
+use crate::runtime::{EngineError, Session};
 // Private ABI v1: session is borrowed exclusively for each callback. Scalars use
 // i64 bits (binary64 for REAL). Helpers never retain pointers or unwind into JIT.
 #[cfg(feature = "wasm-adapter")]

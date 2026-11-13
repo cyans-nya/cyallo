@@ -189,7 +189,11 @@ enum Compiled {
     Tiered(Box<TieredArtifact>),
 }
 impl Compiled {
-    fn run(&self, session: &mut Session, budget: usize) -> Result<(), cyallo::runtime::EngineError> {
+    fn run(
+        &self,
+        session: &mut Session,
+        budget: usize,
+    ) -> Result<(), cyallo::runtime::EngineError> {
         match self {
             Self::Direct(unit) => unit.run(session, budget),
             Self::Tiered(unit) => unit.run(session, budget),

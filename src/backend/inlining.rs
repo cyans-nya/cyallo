@@ -34,7 +34,8 @@ fn plan(program: &Program, function: usize, stack: &mut Vec<usize>) -> Option<Pl
         return None;
     }
     let f = program.functions[function].checked().ok()?;
-    if f.generator.is_some() || f.params.iter().any(|r| *r)
+    if f.generator.is_some()
+        || f.params.iter().any(|r| *r)
         || (!primitive(&f.result) && f.result != Type::Void)
         || !f.registers.iter().all(primitive)
         || f.local_storage

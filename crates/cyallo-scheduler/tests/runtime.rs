@@ -1,8 +1,14 @@
 use cyallo_scheduler::{Config, Context, Coroutine, Outcome, Runtime};
 #[derive(Debug, PartialEq, Eq)]
-enum TestError { GuestFailure }
+enum TestError {
+    GuestFailure,
+}
 impl std::fmt::Display for TestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { match self { Self::GuestFailure => f.write_str("guest failure") } }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GuestFailure => f.write_str("guest failure"),
+        }
+    }
 }
 impl std::error::Error for TestError {}
 use std::{
@@ -188,7 +194,10 @@ fn failures_do_not_stop_independent_coroutines() {
     let r = runtime(2);
     let failed = r.spawn_future(async { panic!("source failure") }).unwrap();
     let healthy = r.spawn_future(async { 42 }).unwrap();
-    assert!(matches!(failed.join(), Outcome::Failed(cyallo_scheduler::Failure::Panic(_))));
+    assert!(matches!(
+        failed.join(),
+        Outcome::Failed(cyallo_scheduler::Failure::Panic(_))
+    ));
     assert_eq!(healthy.join(), Outcome::Completed(42));
     assert_eq!(r.failures().len(), 1);
 }
@@ -303,7 +312,9 @@ fn a_trap_cancels_siblings_before_waiting_for_cleanup() {
     let (cleanup, complete) = r.operation();
     let sibling = group.spawn(Sibling(Some(complete))).unwrap();
     let failed = group.spawn(Trap { cleanup }).unwrap();
-    assert!(matches!(failed.join(), Outcome::Failed(cyallo_scheduler::Failure::Guest(error)) if error.downcast_ref::<TestError>() == Some(&TestError::GuestFailure)));
+    assert!(
+        matches!(failed.join(), Outcome::Failed(cyallo_scheduler::Failure::Guest(error)) if error.downcast_ref::<TestError>() == Some(&TestError::GuestFailure))
+    );
     assert_eq!(sibling.join(), Outcome::Cancelled);
     assert_eq!(group.wait().len(), 1);
 }
@@ -325,7 +336,11 @@ fn host_execution_uses_the_same_processor_budget() {
     let permit = r.enter().unwrap();
     let ran = Arc::new(AtomicUsize::new(0));
     let observed = ran.clone();
-    let child = r.spawn_future(async move { observed.fetch_add(1, Ordering::SeqCst); }).unwrap();
+    let child = r
+        .spawn_future(async move {
+            observed.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
     assert_eq!(ran.load(Ordering::SeqCst), 0);
     assert_eq!(r.stats().running, 1);
     drop(permit);
@@ -343,8 +358,12 @@ fn a_busy_coroutine_hands_its_processor_to_a_host_waiter() {
     impl Coroutine for Busy {
         type Output = ();
         fn resume(&mut self, cx: &mut Context) -> Poll<()> {
-            if let Some(started) = self.started.take() { started.send(()).unwrap(); }
-            if self.finish.load(Ordering::SeqCst) != 0 { return Poll::Ready(()); }
+            if let Some(started) = self.started.take() {
+                started.send(()).unwrap();
+            }
+            if self.finish.load(Ordering::SeqCst) != 0 {
+                return Poll::Ready(());
+            }
             cx.yield_now();
             Poll::Pending
         }
@@ -352,7 +371,12 @@ fn a_busy_coroutine_hands_its_processor_to_a_host_waiter() {
     let r = runtime(1);
     let (started, receive) = std::sync::mpsc::channel();
     let finish = Arc::new(AtomicUsize::new(0));
-    let child = r.spawn(Busy { started: Some(started), finish: finish.clone() }).unwrap();
+    let child = r
+        .spawn(Busy {
+            started: Some(started),
+            finish: finish.clone(),
+        })
+        .unwrap();
     receive.recv_timeout(Duration::from_secs(1)).unwrap();
     let permit = r.enter().unwrap();
     finish.store(1, Ordering::SeqCst);

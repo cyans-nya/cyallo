@@ -63,7 +63,10 @@ const MODULES: &[&str] = &[
 ];
 const TRAITS: &[&str] = &["std::mem::Allocator"];
 const TYPES: &[(&str, BuiltinType)] = &[
-    ("std::generator::Generator", BuiltinType::Storage(StorageKind::Generator)),
+    (
+        "std::generator::Generator",
+        BuiltinType::Storage(StorageKind::Generator),
+    ),
     (
         "std::mem::Layout",
         BuiltinType::Storage(StorageKind::Layout),

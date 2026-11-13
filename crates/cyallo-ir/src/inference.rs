@@ -191,7 +191,9 @@ fn expression_type_inner(
                     .map(|(_, _, returned)| returned.clone())
                     .ok_or_else(|| cyallo_ast::diagnostic::generator_delegate_required(e.span));
             }
-            known.get(crate::generator::INPUT).cloned()
+            known
+                .get(crate::generator::INPUT)
+                .cloned()
                 .ok_or_else(|| cyallo_ast::diagnostic::yield_outside_generator(e.span))
         }
         ExprKind::Invalid(diagnostic) => Err(diagnostic.clone()),

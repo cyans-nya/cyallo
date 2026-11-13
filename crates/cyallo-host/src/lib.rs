@@ -1,8 +1,8 @@
 //! Blocking host work runs on bounded OS Ts without a P. These callbacks own
 //! their arguments and must never borrow guest execution/heap storage.
 mod error;
-pub use error::{HostError, StartError};
 use cyallo_io::{Operation, OperationRegistry};
+pub use error::{HostError, StartError};
 use std::{
     collections::VecDeque,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -93,7 +93,8 @@ impl BlockingPool {
             if completion.is_cancelled() {
                 return;
             }
-            let result = catch_unwind(AssertUnwindSafe(work)).map_err(|error| HostError::Panicked(error.into()));
+            let result = catch_unwind(AssertUnwindSafe(work))
+                .map_err(|error| HostError::Panicked(error.into()));
             let _ = completion.complete(result);
         });
         s.jobs.push_back(job);

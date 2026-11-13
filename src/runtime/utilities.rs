@@ -52,10 +52,7 @@ pub(super) fn call(
                     choose(first, second, false)?
                 } else {
                     let third = args[2].as_number().ok_or(expected(ValueKind::Number))?;
-                    if second
-                        .compare(third, Operator::Greater)
-?
-                    {
+                    if second.compare(third, Operator::Greater)? {
                         return Err(ArithmeticError::ClampBoundsReversed.into());
                     }
                     choose(choose(first, second, false)?, third, true)?
@@ -85,17 +82,14 @@ pub(super) fn call(
                         _ => value.powf(real(args[1].clone())?),
                     }
                 };
-                Some(
-                    Number::floating(
-                        if first.kind.float() {
-                            first.kind
-                        } else {
-                            NumberKind::F64
-                        },
-                        value,
-                    )
-?,
-                )
+                Some(Number::floating(
+                    if first.kind.float() {
+                        first.kind
+                    } else {
+                        NumberKind::F64
+                    },
+                    value,
+                )?)
             }
             _ => None,
         };
@@ -126,7 +120,9 @@ pub(super) fn call(
                 .into(),
         ),
         cyallo_ir::intrinsic::Intrinsic::Abs => match &args[0] {
-            Value::Integer(n) => Value::Integer(n.checked_abs().ok_or(ArithmeticError::IntegerOverflow)?),
+            Value::Integer(n) => {
+                Value::Integer(n.checked_abs().ok_or(ArithmeticError::IntegerOverflow)?)
+            }
             v => Value::Real(real(v.clone())?.abs()),
         },
         cyallo_ir::intrinsic::Intrinsic::Min

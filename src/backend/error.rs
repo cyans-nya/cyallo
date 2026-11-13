@@ -22,7 +22,9 @@ impl fmt::Display for CompileError {
         match self {
             Self::Check(diagnostic) => diagnostic.fmt(f),
             Self::AlwaysLazy => f.write_str("opt(always_lazy) forbids native compilation"),
-            Self::UnsupportedTarget => f.write_str("native code generation does not support this target"),
+            Self::UnsupportedTarget => {
+                f.write_str("native code generation does not support this target")
+            }
             Self::PointerWidth => f.write_str("native ABI requires 64-bit pointers"),
             Self::UnknownFunction(function) => write!(f, "unknown routine {function}"),
             Self::InvalidTierPolicy => f.write_str("invalid tier policy"),

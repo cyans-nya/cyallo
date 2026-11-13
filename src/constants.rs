@@ -493,8 +493,10 @@ fn evaluate_one(
     match session.status() {
         Status::Finished => {}
         Status::Failed(failure) => {
-            return Err(error(format!("const evaluation: {}", failure.error), failure.span)
-                .with_related(expr.span, "constant initializer"));
+            return Err(
+                error(format!("const evaluation: {}", failure.error), failure.span)
+                    .with_related(expr.span, "constant initializer"),
+            );
         }
         _ => return Err(error("const evaluation exceeded its work limit", expr.span)),
     }

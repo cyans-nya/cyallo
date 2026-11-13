@@ -98,7 +98,9 @@ impl fmt::Display for RuntimeError {
             Self::Service(error) => error.fmt(f),
             Self::Lookup(error) => error.fmt(f),
             Self::Allocator(error) => error.fmt(f),
-            Self::CheckedTypeMismatch => f.write_str("checked conversion found a different runtime type"),
+            Self::CheckedTypeMismatch => {
+                f.write_str("checked conversion found a different runtime type")
+            }
             Self::Limit(error) => error.fmt(f),
             Self::Exhausted(error) => error.fmt(f),
             Self::Gc(error) => error.fmt(f),
@@ -177,7 +179,9 @@ impl fmt::Display for ArithmeticError {
             Self::DivisionByZero => f.write_str("division by zero"),
             Self::ZeroStep => f.write_str("loop step must not be zero"),
             Self::NonFiniteResult(function) => write!(f, "{function} result is not finite"),
-            Self::TruncationOutOfRange => f.write_str("truncated value is outside the integer range"),
+            Self::TruncationOutOfRange => {
+                f.write_str("truncated value is outside the integer range")
+            }
             Self::ClampBoundsReversed => f.write_str("clamp lower bound exceeds upper bound"),
             Self::RandomBound => f.write_str("random bound must be positive and finite"),
         }
@@ -199,7 +203,11 @@ pub enum BoundsError {
 impl fmt::Display for BoundsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Array { index, lower, upper } => {
+            Self::Array {
+                index,
+                lower,
+                upper,
+            } => {
                 write!(f, "array index {index} outside {lower}..={upper}")
             }
             Self::Collection { index, length } => {
@@ -479,7 +487,9 @@ pub enum GcError {
     Disabled,
     ForeignRoot,
     /// A root or heap edge points past the heap. `edge` distinguishes heap edges.
-    DanglingReference { edge: bool },
+    DanglingReference {
+        edge: bool,
+    },
 }
 impl fmt::Display for GcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -606,7 +616,10 @@ mod tests {
         assert_eq!(diagnostic.span, span);
         assert_eq!(diagnostic.message, "integer overflow");
         assert_eq!(RuntimeError::from(InputError::EndOfInput).code(), "R002");
-        assert_eq!(RuntimeError::from(Invariant::UnknownFunction).code(), "R901");
+        assert_eq!(
+            RuntimeError::from(Invariant::UnknownFunction).code(),
+            "R901"
+        );
     }
 
     #[test]

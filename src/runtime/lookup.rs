@@ -66,9 +66,14 @@ impl Session {
         }
         let frame = self.frames.last().unwrap();
         let span = self.program.functions[frame.function].code[frame.pc.saturating_sub(1)].span;
-        let body = self.program.functions[function].checked().map_err(|diagnostic| {
-            RuntimeFailure::new(RuntimeError::DeferredCheck(diagnostic.clone()), diagnostic.span)
-        })?;
+        let body = self.program.functions[function]
+            .checked()
+            .map_err(|diagnostic| {
+                RuntimeFailure::new(
+                    RuntimeError::DeferredCheck(diagnostic.clone()),
+                    diagnostic.span,
+                )
+            })?;
         let invalid = |error: LookupError| RuntimeFailure::new(error.into(), span);
         if !crate::effects::readonly_body(body, &self.program.functions[0], &self.program.services)
         {
@@ -102,7 +107,10 @@ impl Session {
     fn lookup_fingerprint(&self, value: &Value, out: &mut Guard) -> RunResult<()> {
         match value {
             Value::Generator(id) => out.push(Atom::Tag(48, *id as u64)),
-            Value::GeneratorStep(step) => { out.push(Atom::Tag(49, u64::from(step.is_complete()))); self.lookup_fingerprint(step.value(), out)?; }
+            Value::GeneratorStep(step) => {
+                out.push(Atom::Tag(49, u64::from(step.is_complete())));
+                self.lookup_fingerprint(step.value(), out)?;
+            }
             Value::Layout { size, align } => {
                 out.push(Atom::Tag(44, *size as u64));
                 out.push(Atom::Tag(45, *align as u64));
@@ -204,7 +212,10 @@ impl Session {
                 out.push(Atom::Tag(19, *view as u64));
                 out.push(Atom::Tag(20, *key as u64));
             }
-            Value::Concurrent(_) | Value::TaskOutcome(_) | Value::SendError(_) | Value::Address(_)
+            Value::Concurrent(_)
+            | Value::TaskOutcome(_)
+            | Value::SendError(_)
+            | Value::Address(_)
             | Value::Array(_)
             | Value::SparseArray(..)
             | Value::StoragePath(..)
@@ -380,7 +391,11 @@ impl Session {
         let value = match operation {
             Operation::GeneratorResume(with_input) => {
                 let id = self.generator_id(&values[0])?;
-                return self.resume_generator(id, with_input.then(|| values[1].clone()), destination);
+                return self.resume_generator(
+                    id,
+                    with_input.then(|| values[1].clone()),
+                    destination,
+                );
             }
             Operation::GeneratorClose => {
                 let id = self.generator_id(&values[0])?;
@@ -388,14 +403,23 @@ impl Session {
                 Value::Uninitialized
             }
             Operation::GeneratorIsComplete | Operation::GeneratorIsYielded => {
-                let Value::GeneratorStep(step) = &values[0] else { return Err(expected(ValueKind::GeneratorStep)); };
-                Value::Boolean(step.is_complete() == matches!(operation, Operation::GeneratorIsComplete))
+                let Value::GeneratorStep(step) = &values[0] else {
+                    return Err(expected(ValueKind::GeneratorStep));
+                };
+                Value::Boolean(
+                    step.is_complete() == matches!(operation, Operation::GeneratorIsComplete),
+                )
             }
             Operation::GeneratorYielded | Operation::GeneratorCompleted => {
-                let Value::GeneratorStep(step) = values[0].clone() else { return Err(expected(ValueKind::GeneratorStep)); };
+                let Value::GeneratorStep(step) = values[0].clone() else {
+                    return Err(expected(ValueKind::GeneratorStep));
+                };
                 match (step, operation) {
                     (cyallo_values::GeneratorStep::Yielded(value), Operation::GeneratorYielded)
-                    | (cyallo_values::GeneratorStep::Complete(value), Operation::GeneratorCompleted) => *value,
+                    | (
+                        cyallo_values::GeneratorStep::Complete(value),
+                        Operation::GeneratorCompleted,
+                    ) => *value,
                     _ => return Err(UnwrapError::StepVariant.into()),
                 }
             }
@@ -404,8 +428,8 @@ impl Session {
                 align: std::mem::align_of::<usize>(),
             },
             Operation::LayoutNew => {
-                let size =
-                    usize::try_from(integer(values[0].clone())?).map_err(|_| AllocatorError::InvalidSize)?;
+                let size = usize::try_from(integer(values[0].clone())?)
+                    .map_err(|_| AllocatorError::InvalidSize)?;
                 let align = usize::try_from(integer(values[1].clone())?)
                     .map_err(|_| AllocatorError::InvalidAlignment)?;
                 Value::Result(
@@ -418,17 +442,14 @@ impl Session {
                 let Value::Layout { size, align } = values[0] else {
                     return Err(expected(ValueKind::Layout));
                 };
-                Value::from_number(
-                    cyallo_ast::Number::integer(
-                        cyallo_ast::NumberKind::Usize,
-                        if matches!(operation, Operation::LayoutSize) {
-                            size
-                        } else {
-                            align
-                        } as i128,
-                    )
-?,
-                )
+                Value::from_number(cyallo_ast::Number::integer(
+                    cyallo_ast::NumberKind::Usize,
+                    if matches!(operation, Operation::LayoutSize) {
+                        size
+                    } else {
+                        align
+                    } as i128,
+                )?)
             }
             Operation::Allocate => {
                 let Value::Layout { size, align } = values[0] else {
@@ -499,13 +520,12 @@ impl Session {
             }
             Operation::RcDowngrade => self.rc_clone(&values[0], true, false)?,
             Operation::RcUpgrade => self.rc_clone(&values[0], false, true)?,
-            Operation::RcStrongCount | Operation::RcWeakCount => Value::from_number(
-                cyallo_ast::Number::integer(
+            Operation::RcStrongCount | Operation::RcWeakCount => {
+                Value::from_number(cyallo_ast::Number::integer(
                     cyallo_ast::NumberKind::Usize,
                     self.rc_count(&values[0], matches!(operation, Operation::RcWeakCount))? as i128,
-                )
-?,
-            ),
+                )?)
+            }
             Operation::GcClone => self.owner_value(&values[0])?,
             Operation::DropValue => {
                 self.drop_value(values[0].clone())?;
@@ -587,13 +607,10 @@ impl Session {
                 if let Value::Slice { length, .. } = values[0] {
                     self.set(
                         destination,
-                        Value::from_number(
-                            cyallo_ast::Number::integer(
-                                cyallo_ast::NumberKind::Usize,
-                                length as i128,
-                            )
-?,
-                        ),
+                        Value::from_number(cyallo_ast::Number::integer(
+                            cyallo_ast::NumberKind::Usize,
+                            length as i128,
+                        )?),
                     );
                     return Ok(());
                 }
@@ -605,10 +622,10 @@ impl Session {
                     Value::Deque(ids) => ids.len(),
                     _ => return Err(UninitializedRead::Collection.into()),
                 };
-                Value::from_number(
-                    cyallo_ast::Number::integer(cyallo_ast::NumberKind::Usize, len as i128)
-?,
-                )
+                Value::from_number(cyallo_ast::Number::integer(
+                    cyallo_ast::NumberKind::Usize,
+                    len as i128,
+                )?)
             }
             Operation::CollectionPush(front) => {
                 let Value::Address(id) = values[0] else {

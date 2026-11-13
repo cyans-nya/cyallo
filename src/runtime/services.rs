@@ -1,6 +1,6 @@
 //! Session-owned resolution slots. Provider churn changes data, never bytecode.
-use super::{RunResult, Session, Value, gc};
 use super::error::{AllocatorError, Invariant, ResourceLimit, ServiceError, ValueKind, expected};
+use super::{RunResult, Session, Value, gc};
 use crate::{ir::Reg, services::Operation};
 use std::collections::HashMap;
 #[derive(Debug, Clone, Default)]
@@ -31,10 +31,14 @@ pub(super) struct NativePointers(Vec<*const NativeBinding>);
 unsafe impl Send for NativePointers {}
 impl std::ops::Deref for NativePointers {
     type Target = Vec<*const NativeBinding>;
-    fn deref(&self) -> &Self::Target { &self.0 }
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 impl std::ops::DerefMut for NativePointers {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]

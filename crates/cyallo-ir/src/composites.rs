@@ -391,7 +391,9 @@ pub fn lift(
                         continue;
                     }
                     if f.generator && f.kind == RoutineKind::Function {
-                        return Err(cyallo_ast::diagnostic::generator_capture_requires_proc(e.span));
+                        return Err(cyallo_ast::diagnostic::generator_capture_requires_proc(
+                            e.span,
+                        ));
                     }
                     let reference = reference_captures.get(&key(&local.name)).copied();
                     if reference == Some(true) && local.constant {

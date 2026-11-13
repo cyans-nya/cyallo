@@ -1,8 +1,8 @@
 //! Native bytecode frontend using the vendored Winch assembler, without Wasm.
 use crate::{
+    backend::CompileError,
     ir::Program,
     metrics::ExecutionEngine,
-    backend::CompileError,
     runtime::{EngineError, Session, native::NativeView},
 };
 use cranelift::{codegen::ir::Signature, prelude::*};
@@ -28,7 +28,8 @@ impl WinchUnit {
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
             let bytes = emit::compile(&program, function, super::next_code_version());
-            let builder = JITBuilder::with_flags(&[("opt_level", "none")], default_libcall_names())?;
+            let builder =
+                JITBuilder::with_flags(&[("opt_level", "none")], default_libcall_names())?;
             let mut module = JITModule::new(builder);
             let ptr = module.target_config().pointer_type();
             if ptr != types::I64 {
@@ -41,10 +42,8 @@ impl WinchUnit {
                 AbiParam::new(types::I64),
             ];
             signature.returns = vec![AbiParam::new(types::I64)];
-            let id = module
-                .declare_function("caie_winch_native", Linkage::Local, &signature)?;
-            module
-                .define_function_bytes(id, 32, &bytes, &[])?;
+            let id = module.declare_function("caie_winch_native", Linkage::Local, &signature)?;
+            module.define_function_bytes(id, 32, &bytes, &[])?;
             module.finalize_definitions()?;
             // SAFETY: emit's prologue/epilogue implement this exact C ABI.
             let entry = unsafe {

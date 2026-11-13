@@ -139,7 +139,13 @@ pub fn constructor(name: Intrinsic, ty: &Type, args: &[Type]) -> Option<(Operati
     valid.then_some((op, result))
 }
 pub fn call(name: Intrinsic, args: &[Type]) -> Option<(Operation, Type)> {
-    if name == Intrinsic::CloneValue && args.first().is_some_and(|ty| crate::generator::parts(ty.pointee_or_self()).is_some()) { return None; }
+    if name == Intrinsic::CloneValue
+        && args
+            .first()
+            .is_some_and(|ty| crate::generator::parts(ty.pointee_or_self()).is_some())
+    {
+        return None;
+    }
     if let [argument] = args {
         if name == Intrinsic::CloneValue
             && let Type::Reference { pointee, .. } = argument
@@ -351,9 +357,11 @@ pub fn method(receiver: &Type, name: &str, args: &[Type], field: Option<&str>) -
     }
     let (operation, result) = method_signature(receiver.pointee_or_self(), name, args, field)?;
     let receiver = match operation {
-        Operation::GeneratorResume(_) | Operation::GeneratorClose | Operation::CollectionPush(_) | Operation::CollectionPop(_) | Operation::Slice(true) => {
-            ReceiverMode::Mutable
-        }
+        Operation::GeneratorResume(_)
+        | Operation::GeneratorClose
+        | Operation::CollectionPush(_)
+        | Operation::CollectionPop(_)
+        | Operation::Slice(true) => ReceiverMode::Mutable,
         Operation::CollectionLength | Operation::Slice(false) | Operation::CellReplace => {
             ReceiverMode::Shared
         }
@@ -374,7 +382,11 @@ pub fn method(receiver: &Type, name: &str, args: &[Type], field: Option<&str>) -
     })
 }
 pub fn parameter_types(receiver: &Type, name: &str) -> Option<Vec<Type>> {
-    if name == "resume" && let Some((_, input, _)) = crate::generator::parts(receiver.pointee_or_self()) { return Some(vec![input.clone()]); }
+    if name == "resume"
+        && let Some((_, input, _)) = crate::generator::parts(receiver.pointee_or_self())
+    {
+        return Some(vec![input.clone()]);
+    }
     match (receiver.pointee_or_self(), name) {
         (
             Type::Storage(
@@ -401,14 +413,24 @@ fn method_signature(
 ) -> Option<(Operation, Type)> {
     if let Some((_, input, _)) = crate::generator::parts(receiver) {
         return match (name, args) {
-            ("resume", []) | ("next", []) if name == "resume" || crate::generator::unit(input) => Some((Operation::GeneratorResume(false), crate::generator::step(receiver)?)),
-            ("resume", [actual]) if crate::memory::same_regions(input, actual) => Some((Operation::GeneratorResume(true), crate::generator::step(receiver)?)),
+            ("resume", []) | ("next", []) if name == "resume" || crate::generator::unit(input) => {
+                Some((
+                    Operation::GeneratorResume(false),
+                    crate::generator::step(receiver)?,
+                ))
+            }
+            ("resume", [actual]) if crate::memory::same_regions(input, actual) => Some((
+                Operation::GeneratorResume(true),
+                crate::generator::step(receiver)?,
+            )),
             ("close", []) => Some((Operation::GeneratorClose, Type::Void)),
             _ => None,
         };
     }
     if let Type::Storage(cyallo_ast::StorageKind::GeneratorStep, types) = receiver
-        && let Type::Tuple(types) = types.as_ref() && let [yielded, returned] = types.as_slice() {
+        && let Type::Tuple(types) = types.as_ref()
+        && let [yielded, returned] = types.as_slice()
+    {
         return match (name, args) {
             ("is_yielded", []) => Some((Operation::GeneratorIsYielded, Type::Boolean)),
             ("is_complete", []) => Some((Operation::GeneratorIsComplete, Type::Boolean)),

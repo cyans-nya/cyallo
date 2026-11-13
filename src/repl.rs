@@ -1,6 +1,6 @@
 //! Persistent submissions; old statements are never replayed.
-use crate::{CompileOptions, Diagnostic, Dialect, Session, Status, compiler::compile_source};
 use crate::runtime::ResourceLimit;
+use crate::{CompileOptions, Diagnostic, Dialect, Session, Status, compiler::compile_source};
 use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Submission {

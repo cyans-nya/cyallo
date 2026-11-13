@@ -28,7 +28,9 @@ pub struct OperationId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cancelled;
 impl std::fmt::Display for Cancelled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("operation cancelled") }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("operation cancelled")
+    }
 }
 impl std::error::Error for Cancelled {}
 struct State<T> {

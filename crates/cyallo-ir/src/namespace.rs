@@ -502,8 +502,16 @@ impl Resolver {
                 let target = self.symbol(module, n, Kind::Type, span)?;
                 if let Some(Item::Type(id)) = stdlib::item(&target) {
                     if id == BuiltinType::Storage(StorageKind::Generator) {
-                        if arguments.len() != 3 { return Err(error("Generator requires yield, resume, and return types", span)); }
-                        *ty = Type::Storage(StorageKind::Generator, Box::new(Type::Tuple(std::mem::take(arguments))));
+                        if arguments.len() != 3 {
+                            return Err(error(
+                                "Generator requires yield, resume, and return types",
+                                span,
+                            ));
+                        }
+                        *ty = Type::Storage(
+                            StorageKind::Generator,
+                            Box::new(Type::Tuple(std::mem::take(arguments))),
+                        );
                         return Ok(());
                     }
                     if id == BuiltinType::Storage(StorageKind::Result) {

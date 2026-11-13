@@ -21,6 +21,10 @@ impl From<Box<dyn Any + Send>> for PanicPayload {
 }
 impl fmt::Display for PanicPayload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self { Self::Static(message) => f.write_str(message), Self::Owned(message) => f.write_str(message), Self::Opaque => f.write_str("non-text panic payload") }
+        match self {
+            Self::Static(message) => f.write_str(message),
+            Self::Owned(message) => f.write_str(message),
+            Self::Opaque => f.write_str("non-text panic payload"),
+        }
     }
 }

@@ -77,7 +77,8 @@ impl Estimate {
                     self.expr(i);
                 }
             }
-            E::Yield(a, _) | E::Parenthesized(a)
+            E::Yield(a, _)
+            | E::Parenthesized(a)
             | E::Unary(_, a)
             | E::Field(a, _)
             | E::TupleField(a, _)

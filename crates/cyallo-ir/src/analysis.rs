@@ -356,7 +356,10 @@ fn lower_routine(
     };
     lower.moves = moves;
     lower.block(&f.body)?;
-    if lower.function.result != Type::Void && !(f.generator && crate::generator::unit(&lower.function.result)) && !returns(&f.body) {
+    if lower.function.result != Type::Void
+        && !(f.generator && crate::generator::unit(&lower.function.result))
+        && !returns(&f.body)
+    {
         return Err(Diagnostic::new(
             "E103",
             "non-void routine must return a value on every path",
@@ -787,11 +790,9 @@ pub fn contextualize(expression: &Expr, wanted: &Type) -> Result<Expr> {
                     e.span,
                 ));
             }
-            e.kind = ExprKind::Literal(Literal::number(
-                number
-                    .cast(kind)
-                    .map_err(|error| cyallo_ast::diagnostic::numeric_conversion_failed(error, e.span))?,
-            ));
+            e.kind = ExprKind::Literal(Literal::number(number.cast(kind).map_err(|error| {
+                cyallo_ast::diagnostic::numeric_conversion_failed(error, e.span)
+            })?));
         } else if let ExprKind::Binary(op, a, b) = &mut e.kind
             && matches!(
                 *op,
@@ -1825,9 +1826,15 @@ impl Lower<'_> {
         )
     }
     fn yield_expr(&mut self, value: &Expr, delegate: bool, span: Span) -> Result<(Reg, Type)> {
-        let factory = self.function.generator.clone().ok_or_else(|| cyallo_ast::diagnostic::yield_outside_generator(span))?;
+        let factory = self
+            .function
+            .generator
+            .clone()
+            .ok_or_else(|| cyallo_ast::diagnostic::yield_outside_generator(span))?;
         let (yielded, input, _) = crate::generator::parts(&factory).unwrap();
-        if crate::generator::borrowed(yielded) { return Err(cyallo_ast::diagnostic::borrowed_generator_yield(span)); }
+        if crate::generator::borrowed(yielded) {
+            return Err(cyallo_ast::diagnostic::borrowed_generator_yield(span));
+        }
         if !delegate {
             let (value, actual) = self.expr_expected(value, yielded)?;
             self.require(yielded, &actual, span)?;
@@ -1836,29 +1843,54 @@ impl Lower<'_> {
             return Ok((result, input.clone()));
         }
         let (child, child_type) = self.expr(value)?;
-        let (child_yield, child_input, returned) = crate::generator::parts(&child_type).ok_or_else(|| cyallo_ast::diagnostic::generator_delegate_required(span))?;
+        let (child_yield, child_input, returned) = crate::generator::parts(&child_type)
+            .ok_or_else(|| cyallo_ast::diagnostic::generator_delegate_required(span))?;
         self.require(yielded, child_yield, span)?;
         self.require(input, child_input, span)?;
         let step_type = crate::generator::step(&child_type).unwrap();
         let step = self.reg(step_type);
-        self.emit(Op::Lookup(step, crate::lookup::Operation::GeneratorResume(false), vec![child]));
+        self.emit(Op::Lookup(
+            step,
+            crate::lookup::Operation::GeneratorResume(false),
+            vec![child],
+        ));
         let test_pc = self.function.code.len();
         let complete = self.reg(Type::Boolean);
-        self.emit(Op::Lookup(complete, crate::lookup::Operation::GeneratorIsComplete, vec![step]));
+        self.emit(Op::Lookup(
+            complete,
+            crate::lookup::Operation::GeneratorIsComplete,
+            vec![step],
+        ));
         let branch = self.function.code.len();
         self.emit(Op::Branch(complete, 0, branch + 1));
         let value = self.reg(yielded.clone());
-        self.emit(Op::Lookup(value, crate::lookup::Operation::GeneratorYielded, vec![step]));
+        self.emit(Op::Lookup(
+            value,
+            crate::lookup::Operation::GeneratorYielded,
+            vec![step],
+        ));
         let reply = self.reg(input.clone());
         self.emit(Op::Yield(reply, value));
-        self.emit(Op::Lookup(step, crate::lookup::Operation::GeneratorResume(true), vec![child, reply]));
+        self.emit(Op::Lookup(
+            step,
+            crate::lookup::Operation::GeneratorResume(true),
+            vec![child, reply],
+        ));
         self.emit(Op::Jump(test_pc));
         let finish = self.function.code.len();
         self.function.code[branch].op = Op::Branch(complete, finish, branch + 1);
         let result = self.reg(returned.clone());
-        self.emit(Op::Lookup(result, crate::lookup::Operation::GeneratorCompleted, vec![step]));
+        self.emit(Op::Lookup(
+            result,
+            crate::lookup::Operation::GeneratorCompleted,
+            vec![step],
+        ));
         let closed = self.reg(Type::Void);
-        self.emit(Op::Lookup(closed, crate::lookup::Operation::GeneratorClose, vec![child]));
+        self.emit(Op::Lookup(
+            closed,
+            crate::lookup::Operation::GeneratorClose,
+            vec![child],
+        ));
         Ok((result, returned.clone()))
     }
     fn expr(&mut self, e: &Expr) -> Result<(Reg, Type)> {

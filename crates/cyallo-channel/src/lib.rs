@@ -99,18 +99,27 @@ pub enum ReceiveError {
     Empty,
 }
 impl std::fmt::Display for SendFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(match self {
-        Self::Closed => "channel closed", Self::Full => "channel full", Self::Limit => "channel buffer quota exceeded",
-    }) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Closed => "channel closed",
+            Self::Full => "channel full",
+            Self::Limit => "channel buffer quota exceeded",
+        })
+    }
 }
 impl<T> std::fmt::Display for SendError<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.kind.fmt(f) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.kind.fmt(f)
+    }
 }
 impl<T: std::fmt::Debug> std::error::Error for SendError<T> {}
 impl std::fmt::Display for ReceiveError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(match self {
-        Self::Closed => "channel closed", Self::Empty => "channel empty",
-    }) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Closed => "channel closed",
+            Self::Empty => "channel empty",
+        })
+    }
 }
 impl std::error::Error for ReceiveError {}
 
@@ -590,9 +599,12 @@ pub enum SelectError {
     DifferentFactories,
 }
 impl std::fmt::Display for SelectError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(match self {
-        Self::Empty => "selection requires at least one offer", Self::DifferentFactories => "selection offers belong to different channel factories",
-    }) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Empty => "selection requires at least one offer",
+            Self::DifferentFactories => "selection offers belong to different channel factories",
+        })
+    }
 }
 impl std::error::Error for SelectError {}
 pub struct Select<T> {

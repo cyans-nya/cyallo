@@ -1,7 +1,7 @@
 //! Explicit-root moving cell collector. Native registers and machine stacks are
 //! never scanned. The current binding is opt-in while byte accounting matures.
-use super::{Cell, Session, Value};
 use super::error::{GcError, RuntimeError};
+use super::{Cell, Session, Value};
 use smallvec::SmallVec;
 use std::cell::UnsafeCell;
 use std::{
@@ -502,11 +502,7 @@ impl Collector {
             assert_ne!(new, u32::MAX, "live reference must have been marked");
             *id = new as usize;
         };
-        for slot in lock(&self.roots)
-            .slots
-            .iter_mut()
-            .filter(|s| s.active)
-        {
+        for slot in lock(&self.roots).slots.iter_mut().filter(|s| s.active) {
             if let Some(value) = &mut slot.value {
                 match value {
                     RootValue::Cell(id) => rewrite(id),
@@ -518,11 +514,7 @@ impl Collector {
             }
         }
         // Dead register slots must not keep old indices that can later be reused.
-        for slot in lock(&self.roots)
-            .slots
-            .iter_mut()
-            .filter(|s| !s.active)
-        {
+        for slot in lock(&self.roots).slots.iter_mut().filter(|s| !s.active) {
             if let Some(RootValue::ValueSlot(ptr)) = &mut slot.value {
                 unsafe {
                     **ptr = Value::Uninitialized;
@@ -535,9 +527,11 @@ impl Collector {
             } else {
                 fn owners(value: &Value, pending: &mut Vec<Value>) {
                     match value {
-                        Value::Concurrent(_) | Value::Rc(_) | Value::Weak(_) | Value::Allocation(_) | Value::Generator(_) => {
-                            pending.push(value.clone())
-                        }
+                        Value::Concurrent(_)
+                        | Value::Rc(_)
+                        | Value::Weak(_)
+                        | Value::Allocation(_)
+                        | Value::Generator(_) => pending.push(value.clone()),
                         Value::ArraySnapshot(values) | Value::Function(_, values) => {
                             for value in values {
                                 owners(value, pending);
@@ -548,7 +542,11 @@ impl Collector {
                                 owners(value, pending);
                             }
                         }
-                        Value::GeneratorStep(cyallo_values::GeneratorStep::Yielded(value) | cyallo_values::GeneratorStep::Complete(value)) | Value::Cell(value)
+                        Value::GeneratorStep(
+                            cyallo_values::GeneratorStep::Yielded(value)
+                            | cyallo_values::GeneratorStep::Complete(value),
+                        )
+                        | Value::Cell(value)
                         | Value::Optional(Some(value))
                         | Value::Result(Ok(value) | Err(value))
                         | Value::Erased(_, value)
@@ -576,11 +574,17 @@ impl Collector {
         Ok(())
     }
 }
-fn trace(value: &Value, visit: &mut impl FnMut(usize) -> Result<(), RuntimeError>) -> Result<(), RuntimeError> {
+fn trace(
+    value: &Value,
+    visit: &mut impl FnMut(usize) -> Result<(), RuntimeError>,
+) -> Result<(), RuntimeError> {
     match value {
         Value::Managed(id) | Value::Address(id) | Value::TraitObject(id, _) => visit(*id)?,
         Value::Slice { owner, .. } => visit(*owner)?,
-        Value::GeneratorStep(cyallo_values::GeneratorStep::Yielded(v) | cyallo_values::GeneratorStep::Complete(v)) | Value::Cell(v)
+        Value::GeneratorStep(
+            cyallo_values::GeneratorStep::Yielded(v) | cyallo_values::GeneratorStep::Complete(v),
+        )
+        | Value::Cell(v)
         | Value::Optional(Some(v))
         | Value::Result(Ok(v) | Err(v))
         | Value::Erased(_, v)
@@ -618,7 +622,10 @@ fn relocate(value: &mut Value, rewrite: &impl Fn(&mut usize)) {
     match value {
         Value::Managed(id) | Value::Address(id) | Value::TraitObject(id, _) => rewrite(id),
         Value::Slice { owner, .. } => rewrite(owner),
-        Value::GeneratorStep(cyallo_values::GeneratorStep::Yielded(v) | cyallo_values::GeneratorStep::Complete(v)) | Value::Cell(v)
+        Value::GeneratorStep(
+            cyallo_values::GeneratorStep::Yielded(v) | cyallo_values::GeneratorStep::Complete(v),
+        )
+        | Value::Cell(v)
         | Value::Optional(Some(v))
         | Value::Result(Ok(v) | Err(v))
         | Value::Erased(_, v)
@@ -781,9 +788,9 @@ impl NoGcScope<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
     use super::*;
     use crate::Type;
+    use std::rc::Rc;
 
     fn cell(value: Value) -> Cell {
         Cell {

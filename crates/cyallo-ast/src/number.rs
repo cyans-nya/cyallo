@@ -1,19 +1,36 @@
 //! Sized numeric values shared by constant evaluation and execution engines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NumberError {
-    OutOfRange, NonFiniteConversion, InvalidSyntax, InvalidIntegerSyntaxOrRange,
-    ConversionOutOfRange, UnsignedNegation, OperandTypeMismatch, InvalidComparison,
-    DivisionByZero, InvalidFloatingOperation, InvalidIntegerOperation, IntegerOverflow,
+    OutOfRange,
+    NonFiniteConversion,
+    InvalidSyntax,
+    InvalidIntegerSyntaxOrRange,
+    ConversionOutOfRange,
+    UnsignedNegation,
+    OperandTypeMismatch,
+    InvalidComparison,
+    DivisionByZero,
+    InvalidFloatingOperation,
+    InvalidIntegerOperation,
+    IntegerOverflow,
 }
 impl std::fmt::Display for NumberError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(match self {
-        Self::OutOfRange => "numeric value out of range", Self::NonFiniteConversion => "non-finite numeric conversion",
-        Self::InvalidSyntax => "invalid numeric syntax", Self::InvalidIntegerSyntaxOrRange => "invalid integer syntax or range",
-        Self::ConversionOutOfRange => "numeric conversion out of range", Self::UnsignedNegation => "cannot negate an unsigned integer",
-        Self::OperandTypeMismatch => "numeric operands require identical types", Self::InvalidComparison => "invalid comparison",
-        Self::DivisionByZero => "division by zero", Self::InvalidFloatingOperation => "invalid floating operation",
-        Self::InvalidIntegerOperation => "invalid integer operation", Self::IntegerOverflow => "integer overflow",
-    }) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::OutOfRange => "numeric value out of range",
+            Self::NonFiniteConversion => "non-finite numeric conversion",
+            Self::InvalidSyntax => "invalid numeric syntax",
+            Self::InvalidIntegerSyntaxOrRange => "invalid integer syntax or range",
+            Self::ConversionOutOfRange => "numeric conversion out of range",
+            Self::UnsignedNegation => "cannot negate an unsigned integer",
+            Self::OperandTypeMismatch => "numeric operands require identical types",
+            Self::InvalidComparison => "invalid comparison",
+            Self::DivisionByZero => "division by zero",
+            Self::InvalidFloatingOperation => "invalid floating operation",
+            Self::InvalidIntegerOperation => "invalid integer operation",
+            Self::IntegerOverflow => "integer overflow",
+        })
+    }
 }
 impl std::error::Error for NumberError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

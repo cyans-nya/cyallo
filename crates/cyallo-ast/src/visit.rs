@@ -23,7 +23,8 @@ pub fn visit_expr(e: &mut Expr, f: &mut impl FnMut(&mut Expr) -> Result<()>) -> 
                 visit_expr(e, f)?;
             }
         }
-        ExprKind::Yield(a, _) | ExprKind::Parenthesized(a)
+        ExprKind::Yield(a, _)
+        | ExprKind::Parenthesized(a)
         | ExprKind::Unary(_, a)
         | ExprKind::Field(a, _)
         | ExprKind::ExtensionField(a, _, _)
