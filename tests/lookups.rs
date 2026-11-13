@@ -1,6 +1,7 @@
 use cyallo::backend::{
     CraneliftBackend, CraneliftSpeedBackend, Executable, NativeBackend, Tier, TieredBackend,
 };
+use cyallo::runtime::{LookupError, RuntimeError};
 use cyallo::{Context, Session, Status, compile, runtime::gc::GcConfig};
 use std::sync::Arc;
 const BAG: &str = r#"
@@ -211,13 +212,19 @@ std::io::print(std::lookup::mapped(a, b, wrong).unwrap())
 "#;
     let mut s = Session::new(Arc::new(compile(source).unwrap())).unwrap();
     s.run(10000);
-    assert!(matches!(s.status(),Status::Failed(d) if d.message.contains("different receiver")));
+    assert!(matches!(
+        s.status(),
+        Status::Failed(failure) if failure.error == RuntimeError::Lookup(LookupError::ForeignPlan)
+    ));
     let mut s = Session::new(Arc::new(
         compile("let value = std::any::checked<string>(std::any::erase(1))\n").unwrap(),
     ))
     .unwrap();
     s.run(10000);
-    assert!(matches!(s.status(),Status::Failed(d) if d.message.contains("type mismatch")));
+    assert!(matches!(
+        s.status(),
+        Status::Failed(failure) if failure.error == RuntimeError::CheckedTypeMismatch
+    ));
 }
 #[test]
 fn mapper_effects_and_escaping_borrows_are_rejected() {
@@ -240,7 +247,11 @@ fn mapper_effects_and_escaping_borrows_are_rejected() {
         let mut s = Session::new(Arc::new(compile(&source).unwrap())).unwrap();
         s.run(10000);
         assert!(
-            matches!(s.status(), Status::Failed(d) if d.message.contains("readonly")),
+            matches!(
+                s.status(),
+                Status::Failed(failure)
+                    if failure.error == RuntimeError::Lookup(LookupError::MapperNotReadonly)
+            ),
             "{:?}",
             s.status()
         );
@@ -254,7 +265,11 @@ fn deferred_mapper_errors_keep_the_original_diagnostic() {
     let p = Arc::new(cyallo::compile_for_execution(source, Default::default()).unwrap());
     let mut s = Session::new(p).unwrap();
     s.run(1000);
-    assert_eq!(s.status(), &Status::Failed(expected));
+    let Status::Failed(failure) = s.status() else {
+        panic!("expected a deferred mapper failure")
+    };
+    assert_eq!(failure.error, RuntimeError::DeferredCheck(expected.clone()));
+    assert_eq!(failure.diagnostic(), expected);
     assert!(s.context.output.is_empty());
 }
 #[test]

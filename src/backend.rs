@@ -1,5 +1,7 @@
 //! Backend-independent native compilation contracts.
 mod abi;
+mod error;
+pub use error::CompileError;
 mod tiered;
 pub use crate::admission::{EagerDecision, EagerPolicy};
 pub use tiered::compiler_worker_count;
@@ -13,7 +15,10 @@ pub use tiered::{
 pub use winch_wasm::WasmBackend;
 mod cranelift_backend;
 mod inlining;
-use crate::{ir::Program, runtime::Session};
+use crate::{
+    ir::Program,
+    runtime::{EngineError, Session},
+};
 pub use cranelift_backend::{
     CompilationScope, CraneliftArtifact, CraneliftBackend, CraneliftConfig, CraneliftSpeedBackend,
     EagerCraneliftArtifact, EagerSpeedArtifact, OptimizationLevel, ResumeStrategy,
@@ -24,9 +29,9 @@ fn next_code_version() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 pub trait Executable {
-    fn run(&self, session: &mut Session, budget: usize) -> Result<(), String>;
+    fn run(&self, session: &mut Session, budget: usize) -> Result<(), EngineError>;
 }
 pub trait NativeBackend {
     type Artifact: Executable;
-    fn compile(&self, program: Arc<Program>) -> Result<Self::Artifact, String>;
+    fn compile(&self, program: Arc<Program>) -> Result<Self::Artifact, CompileError>;
 }

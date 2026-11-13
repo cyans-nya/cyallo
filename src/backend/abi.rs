@@ -1,4 +1,4 @@
-use crate::runtime::Session;
+use crate::runtime::{EngineError, Session};
 #[cfg(feature = "wasm-adapter")]
 use crate::runtime::Status;
 // Private ABI v1: session is borrowed exclusively for each callback. Scalars use
@@ -25,7 +25,7 @@ pub(super) unsafe extern "C" fn step(session: *mut Session) {
     }
     let span = s.current_span().unwrap_or_default();
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.step())).is_err() {
-        s.fail("internal runtime failure", span);
+        s.fail(EngineError::Panic, span);
     }
 }
 #[cfg(feature = "wasm-adapter")]

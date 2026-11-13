@@ -1,3 +1,4 @@
+use cyallo::runtime::{GcError, ResourceLimit, RuntimeError};
 use cyallo::{
     Context, Session, Status,
     backend::{
@@ -270,13 +271,9 @@ fn host_roots_survive_movement_and_release_on_drop() {
     assert_eq!(s.heap_cell_count(), 1);
     assert!(s.gc_stats().moved_cells > 0);
     let mut other = Session::with_context(p, context()).unwrap();
-    assert!(
-        other
-            .gc_scope()
-            .no_gc()
-            .get(&live)
-            .unwrap_err()
-            .contains("different Session")
+    assert_eq!(
+        other.gc_scope().no_gc().get(&live).unwrap_err(),
+        RuntimeError::Gc(GcError::ForeignRoot)
     );
     drop(live);
     s.collect_garbage().unwrap();
@@ -306,7 +303,10 @@ fn cell_limit_collects_before_failing_and_keeps_failed_locals_inspectable() {
         )
         .unwrap();
         engine.run(&mut s, 100000).unwrap();
-        assert!(matches!(s.status(),Status::Failed(d) if d.message.contains("storage limit")));
+        assert!(matches!(
+            s.status(),
+            Status::Failed(failure) if failure.error == RuntimeError::Limit(ResourceLimit::Storage)
+        ));
         assert!(s.gc_stats().collections > 0);
         assert_eq!(s.heap_cell_count(), 16);
         let before = s.globals();

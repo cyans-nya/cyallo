@@ -1,6 +1,7 @@
 //! Explicit-root moving cell collector. Native registers and machine stacks are
 //! never scanned. The current binding is opt-in while byte accounting matures.
 use super::{Cell, Session, Value};
+use super::error::{GcError, RuntimeError};
 use smallvec::SmallVec;
 use std::cell::UnsafeCell;
 use std::{
@@ -437,7 +438,7 @@ impl Collector {
             .collect();
         Some(FrameRoots { scope, registers })
     }
-    fn collect(&mut self, heap: &mut Arena<Cell>, interval: usize) -> Result<(), String> {
+    fn collect(&mut self, heap: &mut Arena<Cell>, interval: usize) -> Result<(), RuntimeError> {
         let before = heap.len();
         debug_assert!(self.forward.len() >= before && self.work.capacity() >= before);
         self.marked.fill(0);
@@ -445,9 +446,9 @@ impl Collector {
         let roots = lock(&self.roots);
         let marked = &mut self.marked;
         let work = &mut self.work;
-        let mut visit = |id: usize| -> Result<(), String> {
+        let mut visit = |id: usize| -> Result<(), RuntimeError> {
             if id >= before {
-                return Err("invalid managed reference".into());
+                return Err(GcError::DanglingReference { edge: false }.into());
             }
             let mask = 1u64 << (id % 64);
             if marked[id / 64] & mask == 0 {
@@ -472,7 +473,7 @@ impl Collector {
             let work = &mut self.work;
             trace(&heap[id].value, &mut |id| {
                 if id >= before {
-                    return Err("invalid managed heap edge".into());
+                    return Err(GcError::DanglingReference { edge: true }.into());
                 }
                 let mask = 1u64 << (id % 64);
                 if marked[id / 64] & mask == 0 {
@@ -575,7 +576,7 @@ impl Collector {
         Ok(())
     }
 }
-fn trace(value: &Value, visit: &mut impl FnMut(usize) -> Result<(), String>) -> Result<(), String> {
+fn trace(value: &Value, visit: &mut impl FnMut(usize) -> Result<(), RuntimeError>) -> Result<(), RuntimeError> {
     match value {
         Value::Managed(id) | Value::Address(id) | Value::TraitObject(id, _) => visit(*id)?,
         Value::Slice { owner, .. } => visit(*owner)?,
@@ -676,10 +677,10 @@ impl Session {
         }
     }
     /// Collect at an explicitly stopped VM boundary, without executing bytecode.
-    pub fn collect_garbage(&mut self) -> Result<(), String> {
+    pub fn collect_garbage(&mut self) -> Result<(), RuntimeError> {
         self.publish_generator_roots();
         if !self.gc_config.enabled {
-            return Err("garbage collection is not enabled for this Session".into());
+            return Err(GcError::Disabled.into());
         }
         debug_assert_eq!(self.native_view.pending, 0);
         let started = Instant::now();
@@ -711,7 +712,7 @@ impl Session {
         self.collector.stats.pause_time += started.elapsed();
         result
     }
-    pub(super) fn maybe_collect(&mut self) -> Result<(), String> {
+    pub(super) fn maybe_collect(&mut self) -> Result<(), RuntimeError> {
         if self.gc_config.enabled
             && (self.heap.len() >= self.context.max_cells
                 || self.collector.due(self.heap.len(), self.gc_config))
@@ -754,12 +755,12 @@ impl GcScope<'_> {
             session: self.session,
         }
     }
-    pub fn collect(&mut self) -> Result<(), String> {
+    pub fn collect(&mut self) -> Result<(), RuntimeError> {
         self.session.collect_garbage()
     }
     /// Initial host allocation API; complex object constructors remain internal
     /// until their typed public contracts are implemented.
-    pub fn allocate_integer(&mut self, value: i64) -> Result<RootedCell, String> {
+    pub fn allocate_integer(&mut self, value: i64) -> Result<RootedCell, RuntimeError> {
         let scope = self.session.root_scope();
         let root = scope.value(Value::Uninitialized);
         let id = self.session.alloc(&crate::Type::Integer)?;
@@ -769,9 +770,9 @@ impl GcScope<'_> {
     }
 }
 impl NoGcScope<'_> {
-    pub fn get(&self, root: &RootedCell) -> Result<&Value, String> {
+    pub fn get(&self, root: &RootedCell) -> Result<&Value, RuntimeError> {
         if !Arc::ptr_eq(&root.scope.registry, &self.session.collector.roots) {
-            return Err("root belongs to a different Session".into());
+            return Err(GcError::ForeignRoot.into());
         }
         let id = root.scope.cell_id(root.id);
         Ok(&self.session.heap[id].value)

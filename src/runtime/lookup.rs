@@ -60,42 +60,36 @@ impl Session {
         &self,
         function: usize,
         seen: &mut [bool],
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), RuntimeFailure> {
         if std::mem::replace(&mut seen[function], true) {
             return Ok(());
         }
-        let body = self.program.functions[function]
-            .checked()
-            .map_err(Clone::clone)?;
         let frame = self.frames.last().unwrap();
         let span = self.program.functions[frame.function].code[frame.pc.saturating_sub(1)].span;
-        let invalid = |message: &str| Diagnostic::new("R001", message, span);
+        let body = self.program.functions[function].checked().map_err(|diagnostic| {
+            RuntimeFailure::new(RuntimeError::DeferredCheck(diagnostic.clone()), diagnostic.span)
+        })?;
+        let invalid = |error: LookupError| RuntimeFailure::new(error.into(), span);
         if !crate::effects::readonly_body(body, &self.program.functions[0], &self.program.services)
         {
-            return Err(invalid(
-                "lookup mapper must be readonly: no mutable globals, writes, I/O or nondeterminism",
-            ));
+            return Err(invalid(LookupError::MapperNotReadonly));
         }
         for instruction in &body.code {
             match &instruction.op {
                 crate::ir::Op::Call(_, to, _) => self.check_lookup_mapper(*to, seen)?,
                 crate::ir::Op::Service(..) => {
-                    return Err(invalid("lookup mapper cannot invoke a service"));
+                    return Err(invalid(LookupError::MapperInvokesService));
                 }
                 crate::ir::Op::TraitCall(_, receiver, _, _)
                     if matches!(body.registers[*receiver], Type::ServiceRef(_)) =>
                 {
-                    return Err(invalid(
-                        "lookup mapper cannot resolve a mutable service binding",
-                    ));
+                    return Err(invalid(LookupError::MapperResolvesServiceBinding));
                 }
                 crate::ir::Op::Invoke(_, target, _)
                     if cyallo_ast::callable(&body.registers[*target])
                         .is_none_or(|(kind, _, _)| kind != cyallo_ast::RoutineKind::Function) =>
                 {
-                    return Err(invalid(
-                        "lookup mapper cannot invoke an unchecked procedure value",
-                    ));
+                    return Err(invalid(LookupError::MapperInvokesProcedure));
                 }
                 _ => {}
             }
@@ -216,7 +210,7 @@ impl Session {
             | Value::StoragePath(..)
             | Value::MissingStoragePath
             | Value::Uninitialized => {
-                return Err("lookup guards require initialized owned values".into());
+                return Err(LookupError::UninitializedGuard.into());
             }
         }
         Ok(())
@@ -261,7 +255,7 @@ impl Session {
                             Value::Managed(cell) => Cursor::Cell(cell),
                             value @ Value::Rc(_) => Cursor::Cell(self.rc_address(&value)?),
                             Value::Cell(value) => Cursor::Value(*value),
-                            _ => return Err("storage path target requires an owner or Cell".into()),
+                            _ => return Err(expected(ValueKind::Cell)),
                         }
                     } else {
                         let index = step & !ELEMENT;
@@ -269,14 +263,11 @@ impl Session {
                             Value::Array(values) => values.get(index),
                             Value::Deque(values) if step & ELEMENT != 0 => values.get(index),
                             _ => {
-                                return Err(
-                                    "storage path projection requires a record or collection"
-                                        .into(),
-                                );
+                                return Err(Invariant::InvalidStorage.into());
                             }
                         }
                         .copied()
-                        .ok_or("storage path projection out of bounds")?;
+                        .ok_or(BoundsError::StoragePath)?;
                         Cursor::Cell(cell)
                     }
                 }
@@ -288,9 +279,9 @@ impl Session {
                         values
                             .get(index & !ELEMENT)
                             .cloned()
-                            .ok_or("storage path projection out of bounds")?,
+                            .ok_or(BoundsError::StoragePath)?,
                     ),
-                    _ => return Err("invalid storage path projection".into()),
+                    _ => return Err(Invariant::InvalidStorage.into()),
                 },
             };
         }
@@ -311,11 +302,11 @@ impl Session {
                 let mut guard = Guard::new();
                 self.lookup_fingerprint(&root, &mut guard)?;
                 if guard != pending.receiver_guard {
-                    return Err("lookup plan belongs to a different receiver".into());
+                    return Err(LookupError::ForeignPlan.into());
                 }
                 Some(path.into_iter().collect::<Path>())
             }
-            _ => return Err("mapper must return a lookup plan".into()),
+            _ => return Err(LookupError::MapperResultNotPlan.into()),
         };
         let receiver = pending.roots.value_copy(pending.receiver);
         let result = self.apply_lookup(receiver, path.as_deref())?;
@@ -397,15 +388,15 @@ impl Session {
                 Value::Uninitialized
             }
             Operation::GeneratorIsComplete | Operation::GeneratorIsYielded => {
-                let Value::GeneratorStep(step) = &values[0] else { return Err("expected generator step".into()); };
+                let Value::GeneratorStep(step) = &values[0] else { return Err(expected(ValueKind::GeneratorStep)); };
                 Value::Boolean(step.is_complete() == matches!(operation, Operation::GeneratorIsComplete))
             }
             Operation::GeneratorYielded | Operation::GeneratorCompleted => {
-                let Value::GeneratorStep(step) = values[0].clone() else { return Err("expected generator step".into()); };
+                let Value::GeneratorStep(step) = values[0].clone() else { return Err(expected(ValueKind::GeneratorStep)); };
                 match (step, operation) {
                     (cyallo_values::GeneratorStep::Yielded(value), Operation::GeneratorYielded)
                     | (cyallo_values::GeneratorStep::Complete(value), Operation::GeneratorCompleted) => *value,
-                    _ => return Err("generator step has the other variant".into()),
+                    _ => return Err(UnwrapError::StepVariant.into()),
                 }
             }
             Operation::LayoutForRc => Value::Layout {
@@ -414,9 +405,9 @@ impl Session {
             },
             Operation::LayoutNew => {
                 let size =
-                    usize::try_from(integer(values[0].clone())?).map_err(|_| "invalid size")?;
+                    usize::try_from(integer(values[0].clone())?).map_err(|_| AllocatorError::InvalidSize)?;
                 let align = usize::try_from(integer(values[1].clone())?)
-                    .map_err(|_| "invalid alignment")?;
+                    .map_err(|_| AllocatorError::InvalidAlignment)?;
                 Value::Result(
                     std::alloc::Layout::from_size_align(size, align)
                         .map(|_| Box::new(Value::Layout { size, align }))
@@ -425,7 +416,7 @@ impl Session {
             }
             Operation::LayoutSize | Operation::LayoutAlign => {
                 let Value::Layout { size, align } = values[0] else {
-                    return Err("expected Layout".into());
+                    return Err(expected(ValueKind::Layout));
                 };
                 Value::from_number(
                     cyallo_ast::Number::integer(
@@ -436,29 +427,29 @@ impl Session {
                             align
                         } as i128,
                     )
-                    .map_err(|e| e.to_string())?,
+?,
                 )
             }
             Operation::Allocate => {
                 let Value::Layout { size, align } = values[0] else {
-                    return Err("expected Layout".into());
+                    return Err(expected(ValueKind::Layout));
                 };
                 Value::Result(
                     self.allocate_backing(size, align)
                         .map(|id| Box::new(Value::Allocation(id)))
-                        .map_err(|message| Box::new(Value::AllocError(message.into()))),
+                        .map_err(|error| Box::new(Value::AllocError(error.to_string().into()))),
                 )
             }
             Operation::Deallocate => {
                 let Value::Allocation(id) = values[0] else {
-                    return Err("expected Allocation".into());
+                    return Err(expected(ValueKind::Allocation));
                 };
                 self.deallocate_backing(id);
                 Value::Uninitialized
             }
             Operation::AllocErrorNew => {
                 let Value::String(message) = &values[0] else {
-                    return Err("expected allocation error message".into());
+                    return Err(expected(ValueKind::AllocError));
                 };
                 Value::AllocError(message.clone())
             }
@@ -474,17 +465,17 @@ impl Session {
             } => {
                 let owner_ty = if fallible {
                     let Type::Storage(cyallo_ast::StorageKind::Result, inner) = &ty else {
-                        return Err("invalid allocation result".into());
+                        return Err(AllocatorError::ResultNotAllocation.into());
                     };
                     let Type::Tuple(types) = inner.as_ref() else {
-                        return Err("invalid allocation result".into());
+                        return Err(AllocatorError::ResultNotAllocation.into());
                     };
                     &types[0]
                 } else {
                     &ty
                 };
                 let Type::Managed { pointee, .. } = owner_ty else {
-                    return Err("invalid RC allocation type".into());
+                    return Err(Invariant::InvalidManagedType.into());
                 };
                 let allocator_ty = self.program.functions[function].registers[args[0]].clone();
                 self.managed_new_in(
@@ -513,7 +504,7 @@ impl Session {
                     cyallo_ast::NumberKind::Usize,
                     self.rc_count(&values[0], matches!(operation, Operation::RcWeakCount))? as i128,
                 )
-                .map_err(|e| e.to_string())?,
+?,
             ),
             Operation::GcClone => self.owner_value(&values[0])?,
             Operation::DropValue => {
@@ -522,7 +513,7 @@ impl Session {
             }
             Operation::ManagedNew(kind, _) => {
                 let Type::Managed { pointee, .. } = &ty else {
-                    return Err("invalid managed allocation type".into());
+                    return Err(Invariant::InvalidManagedType.into());
                 };
                 self.managed_new(kind, pointee, values[0].clone())?
             }
@@ -530,7 +521,7 @@ impl Session {
                 Value::Slice { .. } => values[0].clone(),
                 Value::Address(owner) => {
                     let Value::Array(elements) = &self.heap[owner].value else {
-                        return Err("slice requires contiguous array storage".into());
+                        return Err(Invariant::InvalidSliceStorage.into());
                     };
                     Value::Slice {
                         owner,
@@ -538,7 +529,7 @@ impl Session {
                         length: elements.len(),
                     }
                 }
-                _ => return Err("slice construction requires borrowed storage".into()),
+                _ => return Err(expected(ValueKind::Address)),
             },
             Operation::Parse(kind) => {
                 let source = text(&values[0])?;
@@ -550,42 +541,44 @@ impl Session {
             }
             Operation::IsOk | Operation::IsErr => {
                 let Value::Result(result) = &values[0] else {
-                    return Err("expected Result".into());
+                    return Err(expected(ValueKind::Result));
                 };
                 Value::Boolean(result.is_ok() != matches!(operation, Operation::IsErr))
             }
             Operation::UnwrapOk | Operation::UnwrapErr => {
                 let Value::Result(result) = &values[0] else {
-                    return Err("expected Result".into());
+                    return Err(expected(ValueKind::Result));
                 };
                 match (result, operation) {
                     (Ok(value), Operation::UnwrapOk) | (Err(value), Operation::UnwrapErr) => {
                         *value.clone()
                     }
-                    (Err(error), _) => return Err(format!("unwrap failed: {error}")),
-                    (Ok(_), _) => return Err("unwrap_err called on Ok".into()),
+                    (Err(error), _) => {
+                        return Err(UnwrapError::Err(error.to_string().into()).into());
+                    }
+                    (Ok(_), _) => return Err(UnwrapError::UnwrapErrOnOk.into()),
                 }
             }
             Operation::CollectionLiteral(_) => Value::ArraySnapshot(values),
             Operation::Range(inclusive) => {
-                let a = values[0].as_number().ok_or("range requires integers")?;
-                let b = values[1].as_number().ok_or("range requires integers")?;
+                let a = values[0].as_number().ok_or(expected(ValueKind::Integer))?;
+                let b = values[1].as_number().ok_or(expected(ValueKind::Integer))?;
                 Value::Range(a, b, inclusive)
             }
             Operation::CollectionFrom(_) | Operation::ArrayFrom => {
                 let Value::Range(a, b, inclusive) = values[0] else {
-                    return Err("construction requires a range".into());
+                    return Err(expected(ValueKind::Range));
                 };
                 let end = b.int() + i128::from(inclusive);
                 let count = (end - a.int()).max(0);
                 if count > self.context.max_cells as i128 {
-                    return Err("collection exceeds execution storage limit".into());
+                    return Err(ResourceLimit::Storage.into());
                 }
                 let elements = (a.int()..end)
                     .map(|n| {
                         cyallo_ast::Number::integer(a.kind, n)
                             .map(Value::from_number)
-                            .map_err(|e| e.to_string())
+                            .map_err(RuntimeError::from)
                     })
                     .collect::<RunResult<Vec<_>>>()?;
                 Value::ArraySnapshot(elements)
@@ -599,30 +592,30 @@ impl Session {
                                 cyallo_ast::NumberKind::Usize,
                                 length as i128,
                             )
-                            .map_err(|e| e.to_string())?,
+?,
                         ),
                     );
                     return Ok(());
                 }
                 let Value::Address(id) = values[0] else {
-                    return Err("collection receiver requires a reference".into());
+                    return Err(expected(ValueKind::Address));
                 };
                 let len = match &self.heap[id].value {
                     Value::Array(ids) => ids.len(),
                     Value::Deque(ids) => ids.len(),
-                    _ => return Err("uninitialized collection".into()),
+                    _ => return Err(UninitializedRead::Collection.into()),
                 };
                 Value::from_number(
                     cyallo_ast::Number::integer(cyallo_ast::NumberKind::Usize, len as i128)
-                        .map_err(|e| e.to_string())?,
+?,
                 )
             }
             Operation::CollectionPush(front) => {
                 let Value::Address(id) = values[0] else {
-                    return Err("collection receiver requires a mutable reference".into());
+                    return Err(expected(ValueKind::Address));
                 };
                 let Type::Storage(_, element) = self.heap[id].ty.clone() else {
-                    return Err("invalid collection type".into());
+                    return Err(Invariant::InvalidCollectionType.into());
                 };
                 let roots = self.root_scope();
                 let parent = roots.cell(id);
@@ -638,7 +631,7 @@ impl Session {
                             ids.push_back(child)
                         }
                     }
-                    _ => return Err("invalid collection receiver".into()),
+                    _ => return Err(Invariant::InvalidCollectionType.into()),
                 }
                 self.store(child, roots.value_copy(source))?;
                 self.bump_cell_version(roots.cell_id(parent))?;
@@ -646,7 +639,7 @@ impl Session {
             }
             Operation::CollectionPop(front) => {
                 let Value::Address(id) = values[0] else {
-                    return Err("collection receiver requires a mutable reference".into());
+                    return Err(expected(ValueKind::Address));
                 };
                 let child = match &mut self.heap[id].value {
                     Value::Array(ids) if !front => ids.pop(),
@@ -657,7 +650,7 @@ impl Session {
                             ids.pop_back()
                         }
                     }
-                    _ => return Err("invalid collection receiver".into()),
+                    _ => return Err(Invariant::InvalidCollectionType.into()),
                 };
                 self.bump_cell_version(id)?;
                 Value::Optional(
@@ -671,7 +664,7 @@ impl Session {
                 self.next_symbol = self
                     .next_symbol
                     .checked_add(1)
-                    .ok_or("symbol space exhausted")?;
+                    .ok_or(IdentitySpace::Symbol)?;
                 Value::Symbol(id)
             }
             Operation::Some => Value::Optional(Some(Box::new(values[0].clone()))),
@@ -683,44 +676,43 @@ impl Session {
             ),
             Operation::Checked => {
                 let Value::Erased(actual, v) = &values[0] else {
-                    return Err("checked requires Any".into());
+                    return Err(expected(ValueKind::Any));
                 };
                 if !cyallo_ir::memory::same_regions(actual, &ty) {
-                    return Err("checked Any type mismatch".into());
+                    return Err(RuntimeError::CheckedTypeMismatch);
                 }
                 *v.clone()
             }
             Operation::IsSome | Operation::IsNone => {
                 let Value::Optional(v) = &values[0] else {
-                    return Err("expected Option".into());
+                    return Err(expected(ValueKind::Option));
                 };
                 Value::Boolean(v.is_some() != matches!(operation, Operation::IsNone))
             }
             Operation::Unwrap => {
                 let Value::Optional(v) = &values[0] else {
-                    return Err("expected Option".into());
+                    return Err(expected(ValueKind::Option));
                 };
-                *v.clone().ok_or_else(|| {
-                    values
-                        .get(1)
-                        .map_or("empty option".into(), ToString::to_string)
+                *v.clone().ok_or_else(|| match values.get(1) {
+                    Some(message) => UnwrapError::Expect(message.to_string().into()),
+                    None => UnwrapError::NoneValue,
                 })?
             }
             Operation::CellNew => Value::Cell(Box::new(values[0].clone())),
             Operation::CellRead => {
                 let Value::Address(cell) = values[0] else {
-                    return Err("cell access requires a reference".into());
+                    return Err(expected(ValueKind::Address));
                 };
                 self.observe_lookup_read(cell);
                 let Value::Cell(value) = &self.heap[cell].value else {
-                    return Err("expected Cell".into());
+                    return Err(expected(ValueKind::Cell));
                 };
                 // Type analysis permits only Copy contents here.
                 *value.clone()
             }
             Operation::CellWrite | Operation::CellReplace => {
                 let Value::Address(cell) = values[0] else {
-                    return Err("cell access requires a reference".into());
+                    return Err(expected(ValueKind::Address));
                 };
                 let old = std::mem::replace(
                     &mut self.heap[cell].value,
@@ -729,7 +721,7 @@ impl Session {
                 self.bump_cell_version(cell)?;
                 if matches!(operation, Operation::CellReplace) {
                     let Value::Cell(value) = old else {
-                        return Err("expected Cell".into());
+                        return Err(expected(ValueKind::Cell));
                     };
                     *value
                 } else {
@@ -739,7 +731,7 @@ impl Session {
             }
             Operation::LocationLoad => {
                 let Value::Managed(id) = values[0] else {
-                    return Err("expected location".into());
+                    return Err(expected(ValueKind::Location));
                 };
                 self.observe_lookup_read(id);
                 let value = self.read(id)?;
@@ -747,7 +739,7 @@ impl Session {
             }
             Operation::LocationStore => {
                 let Value::Managed(id) = values[0] else {
-                    return Err("expected location".into());
+                    return Err(expected(ValueKind::Location));
                 };
                 self.store(id, values[1].clone())?;
                 Value::Uninitialized
@@ -756,7 +748,7 @@ impl Session {
             Operation::Missing => Value::MissingStoragePath,
             Operation::Target => {
                 let Value::StoragePath(root, mut path) = values[0].clone() else {
-                    return Err("cannot project a missing plan".into());
+                    return Err(LookupError::MissingPlan.into());
                 };
                 path.push(TARGET);
                 Value::StoragePath(root, path)
@@ -771,7 +763,7 @@ impl Session {
                     Operation::Field(index) => index,
                     _ => {
                         usize::try_from(integer(values[1].clone())?)
-                            .map_err(|_| "negative plan index")?
+                            .map_err(|_| LookupError::NegativePlanIndex)?
                             | ELEMENT
                     }
                 };
@@ -780,15 +772,15 @@ impl Session {
             }
             Operation::Field(index) => {
                 let Value::Managed(parent) = self.owner_value(&values[0])? else {
-                    return Err("field location requires a managed record".into());
+                    return Err(expected(ValueKind::Record));
                 };
                 let Value::Array(fields) = &self.heap[parent].value else {
-                    return Err("field location requires a record".into());
+                    return Err(expected(ValueKind::Record));
                 };
-                Value::Managed(*fields.get(index).ok_or("unknown record field")?)
+                Value::Managed(*fields.get(index).ok_or(Invariant::UnknownRecordField)?)
             }
             Operation::Element => {
-                return Err("cannot project a missing lookup plan".into());
+                return Err(LookupError::MissingPlan.into());
             }
             Operation::Mapped => {
                 let mut guard = Guard::new();
@@ -833,12 +825,12 @@ impl Session {
                 self.lookups.stats.misses += 1;
                 self.lookups.stats.mapper_calls += 1;
                 let Value::Function(mapper, mut captures) = values[2].clone() else {
-                    return Err("mapper must be an owned readonly routine".into());
+                    return Err(expected(ValueKind::Callable));
                 };
-                if let Err(diagnostic) =
+                if let Err(failure) =
                     self.check_lookup_mapper(mapper, &mut vec![false; self.program.functions.len()])
                 {
-                    self.status = Status::Failed(diagnostic);
+                    self.status = Status::Failed(failure);
                     return Ok(());
                 }
                 let mut receiver_guard = Guard::new();

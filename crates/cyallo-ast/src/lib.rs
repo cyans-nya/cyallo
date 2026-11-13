@@ -407,15 +407,24 @@ impl GetSpan for Param {
     }
 }
 /// One source owns its line index. Spans remain half-open UTF-8 byte ranges.
+/// Spans are u32 byte offsets, so one source is limited to 4 GiB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceTooLarge;
+impl std::fmt::Display for SourceTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("source exceeds the 4 GiB span limit")
+    }
+}
+impl std::error::Error for SourceTooLarge {}
 #[derive(Debug, Clone)]
 pub struct SourceFile {
     text: Box<str>,
     line_starts: Box<[u32]>,
 }
 impl SourceFile {
-    pub fn new(text: String) -> Result<Self, &'static str> {
+    pub fn new(text: String) -> Result<Self, SourceTooLarge> {
         if text.len() > u32::MAX as usize {
-            return Err("source exceeds 4 GiB span limit");
+            return Err(SourceTooLarge);
         }
         let mut line_starts = vec![0];
         for (i, b) in text.bytes().enumerate() {

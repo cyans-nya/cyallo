@@ -1,5 +1,5 @@
 use super::{
-    Executable, NativeBackend,
+    CompileError, Executable, NativeBackend,
     abi::{native_enter, native_flush, native_step},
 };
 use crate::{
@@ -7,8 +7,8 @@ use crate::{
     ir::{Op, Program},
     metrics::ExecutionEngine,
     runtime::{
-        Session,
-        native::{self, ExitReason, NativeSlot, NativeView},
+        EngineError, Session,
+        native::{self, ExitReason, NativeFault, NativeSlot, NativeView},
     },
 };
 use cranelift::{
@@ -182,14 +182,14 @@ impl CraneliftUnit {
     }
 }
 impl Executable for CraneliftUnit {
-    fn run(&self, session: &mut Session, budget: usize) -> Result<(), String> {
+    fn run(&self, session: &mut Session, budget: usize) -> Result<(), EngineError> {
         if !Arc::ptr_eq(&self.program, &session.program) {
             self.program.notice(
                 "invalidation",
                 0,
                 "stale Program artifact rejected before execution; no frame reconstruction",
             );
-            return Err("artifact belongs to a different validated program".into());
+            return Err(EngineError::ForeignProgram);
         }
         if budget == 0 {
             return Ok(());
@@ -215,7 +215,7 @@ impl Executable for CraneliftUnit {
                     && let Some(continuation) = &self.continuation
                 {
                     let remaining = continuation.invoke(session, budget);
-                    if session.native_exit_reason() != ExitReason::Continuation as u64 {
+                    if session.native_exit_reason() != Some(ExitReason::Continuation) {
                         return Ok(());
                     }
                     budget = remaining as usize;
@@ -250,29 +250,29 @@ fn import(
     module: &mut JITModule,
     name: &str,
     ptr: cranelift::prelude::Type,
-) -> Result<cranelift_module::FuncId, String> {
+) -> Result<cranelift_module::FuncId, CompileError> {
     let mut sig = module.make_signature();
     sig.params.push(AbiParam::new(ptr));
     module
         .declare_function(name, Linkage::Import, &sig)
-        .map_err(|e| e.to_string())
+        .map_err(CompileError::from)
 }
 impl NativeBackend for CraneliftBackend {
     type Artifact = CraneliftArtifact;
-    fn compile(&self, program: Arc<Program>) -> Result<Self::Artifact, String> {
+    fn compile(&self, program: Arc<Program>) -> Result<Self::Artifact, CompileError> {
         CraneliftConfig::fast().compile(program)
     }
 }
 impl NativeBackend for CraneliftSpeedBackend {
     type Artifact = EagerSpeedArtifact;
-    fn compile(&self, program: Arc<Program>) -> Result<Self::Artifact, String> {
+    fn compile(&self, program: Arc<Program>) -> Result<Self::Artifact, CompileError> {
         CraneliftConfig::speed().compile(program)
     }
 }
 impl NativeBackend for CraneliftConfig {
     type Artifact = EagerCraneliftArtifact;
-    fn compile(&self, program: Arc<Program>) -> Result<Self::Artifact, String> {
-        program.validate_all().map_err(|error| error.to_string())?;
+    fn compile(&self, program: Arc<Program>) -> Result<Self::Artifact, CompileError> {
+        program.validate_all()?;
         let units = match self.scope {
             CompilationScope::Combined => {
                 vec![Some(compile_configured(program.clone(), None, *self)?)]
@@ -287,7 +287,7 @@ impl NativeBackend for CraneliftConfig {
                     }
                 })
                 .into_iter()
-                .collect::<Result<Vec<_>, String>>()?,
+                .collect::<Result<Vec<_>, CompileError>>()?,
         };
         let entries = units
             .iter()
@@ -325,14 +325,14 @@ impl EagerCraneliftArtifact {
     }
 }
 impl Executable for EagerCraneliftArtifact {
-    fn run(&self, session: &mut Session, budget: usize) -> Result<(), String> {
+    fn run(&self, session: &mut Session, budget: usize) -> Result<(), EngineError> {
         if !Arc::ptr_eq(&self.program, &session.program) {
             self.program.notice(
                 "invalidation",
                 0,
                 "stale Program artifact rejected before execution; no frame reconstruction",
             );
-            return Err("artifact belongs to a different program".into());
+            return Err(EngineError::ForeignProgram);
         }
         let start = session.instruction_count();
         session.bind_native_entries(if self.config.scope == CompilationScope::PerRoutine {
@@ -367,7 +367,7 @@ impl Executable for EagerCraneliftArtifact {
                     unit.run(session, (budget as u64 - (before - start)) as usize)?;
                 }
                 if before == session.instruction_count() {
-                    return Err("optimized routine made no progress".into());
+                    return Err(EngineError::NoProgress);
                 }
             }
             Ok(())
@@ -759,7 +759,7 @@ impl Lower<'_, '_> {
     fn guard(
         &mut self,
         error: cranelift::prelude::Value,
-        code: u64,
+        fault: NativeFault,
         pc: usize,
         fuel: cranelift::prelude::Value,
         pending: cranelift::prelude::Value,
@@ -769,7 +769,7 @@ impl Lower<'_, '_> {
         self.b.ins().brif(error, fail, &[], good, &[]);
         self.b.switch_to_block(fail);
         self.save(pc, pending);
-        let code = self.constant(code);
+        let code = self.constant(fault as u64);
         self.store(self.view, offset_of!(NativeView, error), code);
         let reason = self.constant(ExitReason::Error as u64);
         self.store(self.view, offset_of!(NativeView, exit_reason), reason);
@@ -922,7 +922,7 @@ impl Lower<'_, '_> {
                 };
                 let tag = self.load(ptr, offset_of!(NativeSlot, kind));
                 let missing = self.b.ins().icmp_imm_s(IntCC::Equal, tag, 0);
-                self.guard(missing, 2, pc, fuel, pending);
+                self.guard(missing, NativeFault::UninitializedRead, pc, fuel, pending);
                 let value = self.load(ptr, offset_of!(NativeSlot, bits));
                 self.write(*r, value, tag);
             }
@@ -972,7 +972,7 @@ impl Lower<'_, '_> {
                     Operator::Subtract if f.registers[*a] == Type::Integer => {
                         let zero = self.constant(0);
                         let (value, overflow) = self.b.ins().ssub_overflow(zero, value);
-                        self.guard(overflow, 1, pc, fuel, pending);
+                        self.guard(overflow, NativeFault::IntegerOverflow, pc, fuel, pending);
                         value
                     }
                     Operator::Subtract => self.b.ins().bxor_imm_s(value, i64::MIN),
@@ -1007,7 +1007,7 @@ impl Lower<'_, '_> {
                             Operator::Subtract => self.b.ins().ssub_overflow(a, c),
                             _ => self.b.ins().smul_overflow(a, c),
                         };
-                        self.guard(overflow, 1, pc, fuel, pending);
+                        self.guard(overflow, NativeFault::IntegerOverflow, pc, fuel, pending);
                         value
                     }
                     Operator::Add | Operator::Subtract | Operator::Multiply | Operator::Divide
@@ -1016,7 +1016,7 @@ impl Lower<'_, '_> {
                         if *op == Operator::Divide {
                             let zero = self.b.ins().f64const(0.0);
                             let zero = self.b.ins().fcmp(FloatCC::Equal, c, zero);
-                            self.guard(zero, 4, pc, fuel, pending);
+                            self.guard(zero, NativeFault::DivisionByZero, pc, fuel, pending);
                         }
                         let value = match *op {
                             Operator::Add => self.b.ins().fadd(a, c),
@@ -1028,12 +1028,12 @@ impl Lower<'_, '_> {
                     }
                     Operator::IntegerDivide | Operator::Remainder if !floating && numeric => {
                         let zero = self.b.ins().icmp_imm_s(IntCC::Equal, c, 0);
-                        self.guard(zero, 4, pc, fuel, pending);
+                        self.guard(zero, NativeFault::DivisionByZero, pc, fuel, pending);
                         let min = self.b.ins().icmp_imm_s(IntCC::Equal, a, i64::MIN);
                         let neg = self.b.ins().icmp_imm_s(IntCC::Equal, c, -1);
                         let overflow = self.b.ins().band(min, neg);
                         if *op == Operator::IntegerDivide {
-                            self.guard(overflow, 1, pc, fuel, pending);
+                            self.guard(overflow, NativeFault::IntegerOverflow, pc, fuel, pending);
                             self.b.ins().sdiv(a, c)
                         } else {
                             let one = self.constant(1);
@@ -1077,7 +1077,7 @@ impl Lower<'_, '_> {
             Op::CheckStep(r) => {
                 let value = self.reg(*r);
                 let zero = self.b.ins().icmp_imm_s(IntCC::Equal, value, 0);
-                self.guard(zero, 3, pc, fuel, pending);
+                self.guard(zero, NativeFault::ZeroStep, pc, fuel, pending);
             }
             Op::Jump(target) => {
                 self.next(fi, *target, fuel, pending);
@@ -1106,14 +1106,14 @@ pub(super) fn compile_unit(
     program: Arc<Program>,
     function: usize,
     speed: bool,
-) -> Result<CraneliftUnit, String> {
+) -> Result<CraneliftUnit, CompileError> {
     compile_configured(program, Some(function), CraneliftConfig::tiered(speed))
 }
 fn compile_configured(
     program: Arc<Program>,
     function: Option<usize>,
     config: CraneliftConfig,
-) -> Result<CraneliftUnit, String> {
+) -> Result<CraneliftUnit, CompileError> {
     let version = super::next_code_version();
     let mut artifact = compile_part(program.clone(), function, config, false, version)?;
     if config.resume == ResumeStrategy::LoopHeaders {
@@ -1129,18 +1129,16 @@ fn compile_part(
     config: CraneliftConfig,
     continuation: bool,
     version: u64,
-) -> Result<CraneliftUnit, String> {
+) -> Result<CraneliftUnit, CompileError> {
     if let Some(fi) = function
         && program.functions[fi].attributes.compilation == cyallo_ast::CompileHint::AlwaysLazy
     {
-        return Err("opt(always_lazy) forbids native compilation".into());
+        return Err(CompileError::AlwaysLazy);
     }
     if let Some(fi) = function {
-        program.functions[fi]
-            .checked()
-            .map_err(ToString::to_string)?;
+        program.functions[fi].checked()?;
     } else {
-        program.validate_all().map_err(|e| e.to_string())?;
+        program.validate_all()?;
     }
     let speed = config.resume == ResumeStrategy::LoopHeaders;
     let frame_bodies = if config.inlining {
@@ -1154,7 +1152,7 @@ fn compile_part(
     };
     let flags = config.flags();
     let mut jit =
-        JITBuilder::with_flags(&flags, default_libcall_names()).map_err(|e| e.to_string())?;
+        JITBuilder::with_flags(&flags, default_libcall_names())?;
     jit.symbol("caie_native_step", native_step as *const u8)
         .symbol("caie_native_flush", native_flush as *const u8)
         .symbol("caie_native_enter", native_enter as *const u8);
@@ -1162,7 +1160,7 @@ fn compile_part(
     let ptr = module.target_config().pointer_type();
     // This private ABI currently targets the 64-bit architectures supported here.
     if ptr != types::I64 {
-        return Err("native frame ABI requires 64-bit pointers".into());
+        return Err(CompileError::PointerWidth);
     }
     let step_id = import(&mut module, "caie_native_step", ptr)?;
     let flush_id = import(&mut module, "caie_native_flush", ptr)?;
@@ -1175,8 +1173,7 @@ fn compile_part(
     ];
     ctx.func.signature.returns = vec![AbiParam::new(types::I64)];
     let id = module
-        .declare_function("caie_entry", Linkage::Local, &ctx.func.signature)
-        .map_err(|e| e.to_string())?;
+        .declare_function("caie_entry", Linkage::Local, &ctx.func.signature)?;
     let step = module.declare_func_in_func(step_id, &mut ctx.func);
     let flush = module.declare_func_in_func(flush_id, &mut ctx.func);
     let enter = module.declare_func_in_func(enter_id, &mut ctx.func);
@@ -1595,8 +1592,7 @@ fn compile_part(
         );
     }
     module
-        .define_function(id, &mut ctx)
-        .map_err(|e| e.to_string())?;
+        .define_function(id, &mut ctx)?;
     if let Some(observer) = observer
         && observer.options.emit_clif
     {
@@ -1618,7 +1614,7 @@ fn compile_part(
         .expect("defined function")
         .code_buffer()
         .len();
-    module.finalize_definitions().map_err(|e| e.to_string())?;
+    module.finalize_definitions()?;
     let code = module.get_finalized_function(id);
     // SAFETY: the emitted signature and calling convention exactly match Entry.
     let entry = unsafe { std::mem::transmute::<*const u8, Entry>(code) };

@@ -3,7 +3,7 @@ use crate::backend::abi::{native_enter, native_flush, native_step};
 use crate::{
     Type,
     ir::{Op, Program},
-    runtime::native::{self, ExitReason, NativeView},
+    runtime::native::{self, ExitReason, NativeFault, NativeView},
 };
 use cyallo_ast::Literal;
 use cyallo_ast::Operator;
@@ -58,7 +58,7 @@ fn comparison(op: cyallo_ast::Operator) -> C {
 struct Emit {
     a: Assembler,
     targets: Vec<Label>,
-    errors: BTreeMap<(usize, u64), Label>,
+    errors: BTreeMap<(usize, NativeFault), Label>,
     // Write-through cache: all values remain canonical for errors/OSR. A
     // straight-line successor can reuse the last scalar in scratch register 7.
     cached: Option<usize>,
@@ -216,14 +216,11 @@ impl Emit {
         self.exit(pc, ExitReason::Hot, done);
         self.a.bind(end);
     }
-    fn error(&mut self, pc: usize, code: u64) -> Label {
-        if let Some(label) = self.errors.get(&(pc, code)) {
-            *label
-        } else {
-            let label = self.a.label();
-            self.errors.insert((pc, code), label);
-            label
-        }
+    fn error(&mut self, pc: usize, fault: NativeFault) -> Label {
+        *self
+            .errors
+            .entry((pc, fault))
+            .or_insert_with(|| self.a.label())
     }
     fn float(&mut self, r: usize, ty: &Type, dst: u8) {
         self.read(r, 7);
@@ -293,7 +290,7 @@ impl Emit {
                     self.cell(*a);
                 }
                 self.a.load(8, 6, 8);
-                let missing = self.error(pc, 2);
+                let missing = self.error(pc, NativeFault::UninitializedRead);
                 self.zero(8, C::Eq, missing);
                 self.a.load(7, 6, 0);
                 self.write(*r, 7, 8);
@@ -343,7 +340,7 @@ impl Emit {
                     Operator::Subtract if types[*a] == Type::Integer => {
                         self.a.mov(8, 7);
                         self.imm(7, 0);
-                        let overflow = self.error(pc, 1);
+                        let overflow = self.error(pc, NativeFault::IntegerOverflow);
                         self.a.checked(A::Sub, 7, 7, 8, overflow);
                     }
                     Operator::Subtract => {
@@ -374,7 +371,7 @@ impl Emit {
                             if *op == Operator::Divide {
                                 self.imm(7, 0);
                                 self.a.bits_to_float(2, 7);
-                                let zero = self.error(pc, 4);
+                                let zero = self.error(pc, NativeFault::DivisionByZero);
                                 self.a.float_branch(1, 2, C::Eq, zero);
                             }
                             self.a.float_binary(
@@ -403,7 +400,7 @@ impl Emit {
                     self.read(*b, 8);
                     match *op {
                         Operator::Add | Operator::Subtract | Operator::Multiply => {
-                            let overflow = self.error(pc, 1);
+                            let overflow = self.error(pc, NativeFault::IntegerOverflow);
                             self.a.checked(
                                 match *op {
                                     Operator::Add => A::Add,
@@ -418,7 +415,7 @@ impl Emit {
                             self.result(*r, 7, native::INTEGER);
                         }
                         Operator::IntegerDivide | Operator::Remainder => {
-                            let zero = self.error(pc, 4);
+                            let zero = self.error(pc, NativeFault::DivisionByZero);
                             self.zero(8, C::Eq, zero);
                             let divide = self.a.label();
                             let end = self.a.label();
@@ -429,7 +426,7 @@ impl Emit {
                             self.a.compare(8, 9);
                             self.a.branch(C::Ne, divide);
                             if *op == Operator::IntegerDivide {
-                                let overflow = self.error(pc, 1);
+                                let overflow = self.error(pc, NativeFault::IntegerOverflow);
                                 self.a.jump(overflow);
                             } else {
                                 self.imm(7, 0);
@@ -458,7 +455,7 @@ impl Emit {
             }
             Op::CheckStep(r) => {
                 self.read(*r, 7);
-                let zero = self.error(pc, 3);
+                let zero = self.error(pc, NativeFault::ZeroStep);
                 self.zero(7, C::Eq, zero);
             }
             Op::Jump(target) => {
@@ -477,7 +474,7 @@ impl Emit {
         true
     }
 }
-pub(super) fn compile(program: &Program, fi: usize, version: u64) -> Result<Vec<u8>, String> {
+pub(super) fn compile(program: &Program, fi: usize, version: u64) -> Vec<u8> {
     let mut a = Assembler::new();
     let done = a.label();
     let dispatch = a.label();
@@ -607,10 +604,10 @@ pub(super) fn compile(program: &Program, fi: usize, version: u64) -> Result<Vec<
         e.a.jump(e.targets[pc]);
     }
     let errors = std::mem::take(&mut e.errors);
-    for ((pc, code), label) in errors {
+    for ((pc, fault), label) in errors {
         e.a.bind(label);
         e.save(pc);
-        e.imm(4, code);
+        e.imm(4, fault as u64);
         e.a.store(4, V, offset_of!(NativeView, error) as u32);
         e.imm(4, ExitReason::Error as u64);
         e.a.store(4, V, offset_of!(NativeView, exit_reason) as u32);
@@ -618,5 +615,5 @@ pub(super) fn compile(program: &Program, fi: usize, version: u64) -> Result<Vec<
     }
     e.a.bind(done);
     e.a.epilogue();
-    Ok(e.a.finish())
+    e.a.finish()
 }

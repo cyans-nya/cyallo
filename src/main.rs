@@ -189,7 +189,7 @@ enum Compiled {
     Tiered(Box<TieredArtifact>),
 }
 impl Compiled {
-    fn run(&self, session: &mut Session, budget: usize) -> Result<(), String> {
+    fn run(&self, session: &mut Session, budget: usize) -> Result<(), cyallo::runtime::EngineError> {
         match self {
             Self::Direct(unit) => unit.run(session, budget),
             Self::Tiered(unit) => unit.run(session, budget),
@@ -504,11 +504,11 @@ fn run(
                 let bytes = io::stdin().read_line(&mut line)?;
                 timings.input_wait += waiting.elapsed();
                 if bytes == 0 {
-                    let d = Diagnostic::new(
-                        "R002",
-                        "INPUT reached end of input",
+                    let d = cyallo::runtime::RuntimeFailure::new(
+                        cyallo::runtime::InputError::EndOfInput.into(),
                         session.current_span().unwrap_or_default(),
-                    );
+                    )
+                    .diagnostic();
                     eprintln!(
                         "{}",
                         cyallo::diagnostics::render_program(
@@ -536,7 +536,7 @@ fn run(
                     cyallo::diagnostics::render_program(
                         source_name,
                         &program,
-                        d,
+                        &d.diagnostic(),
                         diagnostic_color,
                         dialect,
                     )
@@ -571,7 +571,11 @@ fn check_emission(program: &cyallo::ir::Program) -> color_eyre::Result<()> {
         if !errors.is_empty() {
             return Err(color_eyre::eyre::eyre!(
                 "failed to emit compiler inspection files: {}",
-                errors.join("; ")
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ));
         }
     }
@@ -779,7 +783,7 @@ fn draw(frame: &mut Frame, debugger: &Debugger, input: &str, cursor: usize) {
     let status = match debugger.session.status() {
         Status::WaitingForInput => "Waiting for input".into(),
         Status::Finished => "Finished".into(),
-        Status::Failed(d) => format!("{}: {}", d.code, d.message),
+        Status::Failed(failure) => format!("{}: {}", failure.error.code(), failure.error),
         Status::Paused => match debugger.mode {
             Mode::Paused => "Paused",
             Mode::Continue => "Running",
@@ -946,7 +950,7 @@ fn repl_cli(
                         cyallo::diagnostics::render_with_color_and_dialect(
                             "<repl>",
                             repl.source(),
-                            d,
+                            &d.diagnostic(),
                             diagnostic_color,
                             dialect,
                         )
@@ -963,11 +967,11 @@ fn repl_cli(
                     let bytes = input.read_line(&mut value)?;
                     timings.input_wait += waiting.elapsed();
                     if bytes == 0 {
-                        let d = Diagnostic::new(
-                            "R002",
-                            "INPUT reached end of input",
+                        let d = cyallo::runtime::RuntimeFailure::new(
+                            cyallo::runtime::InputError::EndOfInput.into(),
                             repl.session().current_span().unwrap_or_default(),
-                        );
+                        )
+                        .diagnostic();
                         eprintln!(
                             "{}",
                             cyallo::diagnostics::render_with_color_and_dialect(

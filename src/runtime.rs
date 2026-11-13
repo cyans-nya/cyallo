@@ -2,6 +2,7 @@
 use cyallo_ast::IdentifierEq as _;
 use cyallo_ast::Operator;
 pub mod gc;
+mod error;
 mod lookup;
 mod memory;
 mod generator;
@@ -12,6 +13,13 @@ use crate::ir::{LocalStorage, Op, Program, Reg};
 use crate::metrics::{ExecutionEngine, ExecutionReport, FrameMetrics};
 use cyallo_ast::{Diagnostic, Span, Type};
 pub use cyallo_values::Value;
+pub use error::{
+    AllocatorError, ArithmeticError, BoundsError, EngineError, GcError, GeneratorError,
+    IdentitySpace, InputError, Invariant, LookupError, OwnershipError, ResourceLimit,
+    RuntimeError, RuntimeFailure, ServiceError, TextError, UninitializedRead, UnwrapError,
+    ValueKind,
+};
+use error::expected;
 pub use lookup::LookupStats;
 use native::{NativeSlot, NativeStorage, NativeView};
 pub use services::ServiceStats;
@@ -46,7 +54,7 @@ pub enum Status {
     Paused,
     WaitingForInput,
     Finished,
-    Failed(Diagnostic),
+    Failed(RuntimeFailure),
 }
 #[derive(Debug)]
 struct Cell {
@@ -115,7 +123,7 @@ pub struct Session {
     gc_config: gc::GcConfig,
     gc_instruction: Option<(usize, usize)>,
 }
-type RunResult<T> = Result<T, String>;
+type RunResult<T> = Result<T, RuntimeError>;
 impl Session {
     pub fn new(program: Arc<Program>) -> Result<Self, Diagnostic> {
         Self::with_context(program, Context::default())
@@ -161,7 +169,7 @@ impl Session {
             gc_instruction: None,
         };
         s.push_frame(0, vec![], None)
-            .map_err(|e| Diagnostic::new("R001", e, Span::default()))?;
+            .map_err(|e| RuntimeFailure::new(e, Span::default()).diagnostic())?;
         s.globals = s.frames[0].locals.clone();
         s.register_globals();
         Ok(s)
@@ -414,7 +422,7 @@ impl Session {
                             self.cell_owners.truncate(heap_len);
                         }
                         self.release_cells(reused);
-                        return Err(Diagnostic::new("R001", message, local.span));
+                        return Err(RuntimeFailure::new(message, local.span).diagnostic());
                     }
                 }
             }
@@ -531,7 +539,7 @@ impl Session {
             })
             .collect()
     }
-    pub(crate) fn constant_value(&self, index: usize) -> Result<Value, String> {
+    pub(crate) fn constant_value(&self, index: usize) -> RunResult<Value> {
         self.read(self.globals[index])
     }
     pub(crate) fn limit_constant_memory(&mut self, bytes: usize) {
@@ -552,7 +560,7 @@ impl Session {
                 };
                 size(*a).checked_add(size(*b))
             }
-            .ok_or("const evaluation exceeded its allocation limit")?,
+            .ok_or(ResourceLimit::ConstantAllocation)?,
             Op::Builtin(_, name, args)
                 if matches!(
                     *name,
@@ -580,7 +588,7 @@ impl Session {
                 } else {
                     text.len().checked_mul(3)
                 }
-                .ok_or("const evaluation exceeded its allocation limit")?
+                .ok_or(ResourceLimit::ConstantAllocation)?
             }
             Op::ArrayLiteral(_, args) | Op::Aggregate(_, args) | Op::FunctionValue(_, _, args) => {
                 args.len().saturating_mul(size_of::<Value>())
@@ -590,7 +598,7 @@ impl Session {
         let remaining = self.constant_memory.as_mut().unwrap();
         *remaining = remaining
             .checked_sub(bytes)
-            .ok_or("const evaluation exceeded its allocation limit")?;
+            .ok_or(ResourceLimit::ConstantAllocation)?;
         Ok(())
     }
     pub fn restart(&mut self) -> Result<(), Diagnostic> {
@@ -639,8 +647,13 @@ impl Session {
             Status::Finished | Status::Failed(_) | Status::WaitingForInput
         )
     }
-    pub(crate) fn fail(&mut self, message: impl Into<String>, span: Span) {
-        self.status = Status::Failed(Diagnostic::new("R001", message, span));
+    pub(crate) fn fail(&mut self, error: impl Into<RuntimeError>, span: Span) {
+        self.status = Status::Failed(RuntimeFailure::new(error.into(), span));
+    }
+    /// A deferred body or mapper failed its semantic checks on first use.
+    pub(crate) fn fail_check(&mut self, diagnostic: Diagnostic) {
+        let span = diagnostic.span;
+        self.fail(RuntimeError::DeferredCheck(diagnostic), span);
     }
     fn alloc(&mut self, ty: &Type) -> RunResult<usize> {
         if let Type::RecordRef(identity) = ty {
@@ -649,7 +662,7 @@ impl Session {
                 .records
                 .get(identity.as_ref())
                 .cloned()
-                .ok_or("unknown record layout")?;
+                .ok_or(Invariant::UnknownRecordLayout)?;
             return self.alloc(&record);
         }
         self.maybe_collect()?;
@@ -657,7 +670,7 @@ impl Session {
         self.next_cell_identity = self
             .next_cell_identity
             .checked_add(1)
-            .ok_or("storage identity space exhausted")?;
+            .ok_or(IdentitySpace::StorageIdentity)?;
         let id = if !self.gc_config.enabled
             && let Some(id) = self.free_cells.pop()
         {
@@ -677,7 +690,7 @@ impl Session {
             id
         } else {
             if self.heap.len() >= self.context.max_cells || self.heap.len() >= u32::MAX as usize {
-                return Err("execution storage limit exceeded".into());
+                return Err(ResourceLimit::Storage.into());
             }
             if self.gc_config.enabled {
                 self.collector.reserve(self.heap.len() + 1);
@@ -717,11 +730,11 @@ impl Session {
                     .checked_sub(*low)
                     .and_then(|v| v.checked_add(1))
                     .and_then(|v| usize::try_from(v).ok())
-                    .ok_or("array size overflow")?;
-                count = count.checked_mul(width).ok_or("array size overflow")?;
+                    .ok_or(ResourceLimit::Storage)?;
+                count = count.checked_mul(width).ok_or(ResourceLimit::Storage)?;
             }
             if count >= self.context.max_cells {
-                return Err("array exceeds execution storage limit".into());
+                return Err(ResourceLimit::Storage.into());
             }
             self.heap[roots.cell_id(parent)].value = Value::Array(Vec::with_capacity(count));
             for _ in 0..count {
@@ -807,7 +820,7 @@ impl Session {
         return_to: Option<Reg>,
     ) -> RunResult<()> {
         if self.frames.len() >= self.context.max_frames {
-            return Err("call depth limit exceeded".into());
+            return Err(ResourceLimit::CallDepth.into());
         }
         let program = Arc::clone(&self.program);
         let fun = &program.functions[function];
@@ -850,7 +863,7 @@ impl Session {
                     }
                     let root = if fun.params.get(i) == Some(&true) {
                         let Value::Address(id) = roots.array_at(arguments, i) else {
-                            return Err("invalid reference argument".into());
+                            return Err(expected(ValueKind::Address));
                         };
                         roots.cell(id)
                     } else {
@@ -882,7 +895,7 @@ impl Session {
                     }
                     let id = if fun.params.get(i) == Some(&true) {
                         let Some(Value::Address(id)) = argument else {
-                            return Err("invalid reference argument".into());
+                            return Err(expected(ValueKind::Address));
                         };
                         id
                     } else {
@@ -955,13 +968,13 @@ impl Session {
         match self.register(r) {
             Value::Address(id) | Value::Managed(id) => Ok(id),
             value @ Value::Rc(_) => self.rc_address(&value),
-            _ => Err("invalid storage address".into()),
+            _ => Err(expected(ValueKind::Address)),
         }
     }
     fn read(&self, id: usize) -> RunResult<Value> {
         let v = &self.heap[id].value;
         if *v == Value::Uninitialized {
-            Err("read of uninitialized storage".into())
+            Err(UninitializedRead::Storage.into())
         } else {
             Ok(self.snapshot(v))
         }
@@ -1007,7 +1020,7 @@ impl Session {
             self.heap[id].version = self.heap[id]
                 .version
                 .checked_add(1)
-                .ok_or("storage version exhausted")?;
+                .ok_or(IdentitySpace::StorageVersion)?;
             match self.heap[id].parent {
                 Some((identity, parent))
                     if parent < self.heap.len() && self.heap[parent].identity == identity =>
@@ -1035,7 +1048,7 @@ impl Session {
             }
             let len = roots
                 .array_len(source)
-                .ok_or("collection assignment requires elements")?;
+                .ok_or(expected(ValueKind::Array))?;
             self.heap[roots.cell_id(target)].value = if kind == cyallo_ast::StorageKind::Vec {
                 Value::Array(Vec::new())
             } else {
@@ -1082,10 +1095,10 @@ impl Session {
         let ty = self.heap[roots.cell_id(target)].ty.clone();
         if let Some(len) = roots.array_len(source) {
             let Value::Array(dst) = &self.heap[roots.cell_id(target)].value else {
-                return Err("array shape mismatch".into());
+                return Err(Invariant::ArrayShapeMismatch.into());
             };
             if dst.len() != len {
-                return Err("array shape mismatch".into());
+                return Err(Invariant::ArrayShapeMismatch.into());
             }
             for i in 0..len {
                 let Value::Array(dst) = &self.heap[roots.cell_id(target)].value else {
@@ -1137,7 +1150,7 @@ impl Session {
             report.body_analysis_time += start.elapsed();
         }
         if let Err(error) = checked {
-            self.status = Status::Failed(error);
+            self.fail_check(error);
             return Ok(());
         }
         if routine.generator.is_some() { self.construct_generator(function, args, result) }
@@ -1185,21 +1198,21 @@ impl Session {
             Op::Field(r, base, index) => {
                 let id = self.address(base)?;
                 let Value::Array(ids) = &self.heap[id].value else {
-                    return Err("invalid composite storage".into());
+                    return Err(Invariant::InvalidStorage.into());
                 };
-                let id = *ids.get(index).ok_or("field index out of bounds")?;
+                let id = *ids.get(index).ok_or(BoundsError::Field(index))?;
                 self.set(r, Value::Address(id));
             }
             Op::Extract(r, base, index) => {
                 let Value::ArraySnapshot(values) = self.register(base) else {
-                    return Err("invalid composite value".into());
+                    return Err(expected(ValueKind::Composite));
                 };
                 let value = values
                     .get(index)
                     .cloned()
-                    .ok_or("field index out of bounds")?;
+                    .ok_or(BoundsError::Field(index))?;
                 if value == Value::Uninitialized {
-                    return Err("read of uninitialized storage".into());
+                    return Err(UninitializedRead::Storage.into());
                 }
                 self.set(r, value);
             }
@@ -1209,7 +1222,7 @@ impl Session {
             }
             Op::Invoke(r, callee, args) => {
                 let Value::Function(function, mut captures) = self.register(callee) else {
-                    return Err("value is not callable".into());
+                    return Err(expected(ValueKind::Callable));
                 };
                 if self.program.functions[function].generator.is_some() {
                     let roots = self.root_scope();
@@ -1249,8 +1262,8 @@ impl Session {
                     Value::SparseArray(_, length) => *length as i64,
                     Value::Array(ids) => ids.len() as i64,
                     Value::Deque(ids) => ids.len() as i64,
-                    Value::Uninitialized => return Err("read of uninitialized storage".into()),
-                    _ => return Err("length requires string or array".into()),
+                    Value::Uninitialized => return Err(UninitializedRead::Storage.into()),
+                    _ => return Err(expected(ValueKind::Array)),
                 };
                 self.set(r, Value::Integer(length));
             }
@@ -1277,7 +1290,7 @@ impl Session {
             Op::FrameLoad(r, slot) => {
                 let value = self.register(slot);
                 if value == Value::Uninitialized {
-                    return Err("read of uninitialized storage".into());
+                    return Err(UninitializedRead::Storage.into());
                 }
                 self.set(r, value);
             }
@@ -1295,29 +1308,34 @@ impl Session {
                     length,
                 } = self.register(a)
                 {
-                    let index = usize::try_from(integer(self.register(indices[0]))?)
-                        .map_err(|_| "negative slice index")?;
-                    if index >= length {
-                        return Err("slice index out of bounds".into());
-                    }
+                    let requested = integer(self.register(indices[0]))?;
+                    let index = usize::try_from(requested)
+                        .ok()
+                        .filter(|index| *index < length)
+                        .ok_or(BoundsError::Slice { index: requested, length })?;
                     let Value::Array(elements) = &self.heap[owner].value else {
-                        return Err("invalid slice storage".into());
+                        return Err(Invariant::InvalidSliceStorage.into());
                     };
-                    self.set(r, Value::Address(elements[offset + index]));
+                    // The owner is re-checked: a slice must never index past live storage.
+                    let element = offset
+                        .checked_add(index)
+                        .and_then(|position| elements.get(position))
+                        .ok_or(BoundsError::Slice { index: requested, length })?;
+                    self.set(r, Value::Address(*element));
                     return Ok(());
                 }
                 let id = self.address(a)?;
                 if let Type::SparseArray(element) = self.heap[id].ty.clone() {
-                    let index = integer(self.register(indices[0]))?;
-                    let index = u32::try_from(index)
+                    let requested = integer(self.register(indices[0]))?;
+                    let index = u32::try_from(requested)
                         .ok()
                         .filter(|i| *i < u32::MAX)
-                        .ok_or("sparse array index must be in 0..4294967295")?;
+                        .ok_or(BoundsError::SparseIndex(requested))?;
                     if self.heap[id].value == Value::Uninitialized && write {
                         self.heap[id].value = Value::SparseArray(BTreeMap::new(), 0);
                     }
                     let Value::SparseArray(entries, _) = &self.heap[id].value else {
-                        return Err("read of uninitialized array".into());
+                        return Err(UninitializedRead::Storage.into());
                     };
                     let cell = if let Some(cell) = entries.get(&index) {
                         *cell
@@ -1337,7 +1355,7 @@ impl Session {
                         self.bump_cell_version(parent)?;
                         cell
                     } else {
-                        return Err(format!("read of array hole at index {index}"));
+                        return Err(UninitializedRead::Hole(index).into());
                     };
                     self.set(r, Value::Address(cell));
                     return Ok(());
@@ -1350,31 +1368,43 @@ impl Session {
                         _
                     )
                 ) {
-                    let index = usize::try_from(integer(self.register(indices[0]))?)
-                        .map_err(|_| "negative collection index")?;
-                    let child = match &self.heap[id].value {
-                        Value::Array(cells) => cells.get(index),
-                        Value::Deque(cells) => cells.get(index),
-                        _ => return Err("uninitialized collection".into()),
-                    }
-                    .copied()
-                    .ok_or("collection index out of bounds")?;
+                    let requested = integer(self.register(indices[0]))?;
+                    let (length, child) = match &self.heap[id].value {
+                        Value::Array(cells) => (
+                            cells.len(),
+                            usize::try_from(requested).ok().and_then(|i| cells.get(i)),
+                        ),
+                        Value::Deque(cells) => (
+                            cells.len(),
+                            usize::try_from(requested).ok().and_then(|i| cells.get(i)),
+                        ),
+                        _ => return Err(UninitializedRead::Collection.into()),
+                    };
+                    let child = *child.ok_or(BoundsError::Collection {
+                        index: requested,
+                        length,
+                    })?;
                     self.set(r, Value::Address(child));
                     return Ok(());
                 }
                 let Type::Array(bounds, _) = &self.heap[id].ty else {
-                    return Err("index requires an array".into());
+                    return Err(expected(ValueKind::Array));
                 };
                 let mut offset = 0usize;
                 for ((l, h), r) in bounds.iter().zip(indices) {
                     let i = integer(self.register(r))?;
                     if i < *l || i > *h {
-                        return Err(format!("array index {i} outside {l}:{h}"));
+                        return Err(BoundsError::Array {
+                            index: i,
+                            lower: *l,
+                            upper: *h,
+                        }
+                        .into());
                     }
                     offset = offset * (*h - *l + 1) as usize + (i - *l) as usize;
                 }
                 let Value::Array(ids) = &self.heap[id].value else {
-                    return Err("uninitialized array".into());
+                    return Err(UninitializedRead::Storage.into());
                 };
                 self.set(r, Value::Address(ids[offset]));
             }
@@ -1417,7 +1447,7 @@ impl Session {
                 let mut value = r.map(|r| self.register(r));
                 if lookup_return.is_some() {
                     value =
-                        Some(self.finish_lookup(value.take().ok_or("mapper returned no plan")?)?);
+                        Some(self.finish_lookup(value.take().ok_or(LookupError::MapperReturnedNothing)?)?);
                 }
                 let returned = self.root_scope();
                 let returned_value = value.take().map(|value| returned.value(value));
@@ -1457,7 +1487,7 @@ impl Session {
                 } else if let Some(r) = return_to {
                     let mut value = returned_value
                         .map(|root| returned.value_copy(root))
-                        .ok_or("function returned without a value")?;
+                        .ok_or(Invariant::MissingReturnValue)?;
                     if lookup_return.is_none()
                         && result == Type::Real
                         && let Value::Integer(n) = value
@@ -1488,7 +1518,7 @@ impl Session {
                     && let Some(number) = value.as_number()
                     && number.kind != kind
                 {
-                    Value::from_number(number.cast(kind).map_err(|e| e.to_string())?)
+                    Value::from_number(number.cast(kind)?)
                 } else {
                     value
                 };
@@ -1517,7 +1547,7 @@ impl Session {
             }
             Op::CheckStep(r) => {
                 if integer(self.register(r))? == 0 {
-                    return Err("FOR STEP must not be zero".into());
+                    return Err(ArithmeticError::ZeroStep.into());
                 }
             }
         }
@@ -1547,7 +1577,7 @@ impl Session {
         let span = self.current_span().unwrap_or_default();
         self.record_work(1, self.execution_engine);
         if overflow {
-            self.fail("INTEGER overflow", span);
+            self.fail(ArithmeticError::IntegerOverflow, span);
             return;
         }
         let frame = self.frames.last().unwrap();
@@ -1616,43 +1646,43 @@ fn integer(v: Value) -> RunResult<i64> {
     let number = v
         .as_number()
         .filter(|n| !n.kind.float())
-        .ok_or("expected integer")?;
-    i64::try_from(number.int()).map_err(|_| "integer outside index range".into())
+        .ok_or(expected(ValueKind::Integer))?;
+    i64::try_from(number.int()).map_err(|_| cyallo_ast::NumberError::OutOfRange.into())
 }
 fn real(v: Value) -> RunResult<f64> {
     match v {
         Value::Integer(n) => Ok(n as f64),
         Value::Real(n) => Ok(n),
         Value::Number(n) => Ok(n.real()),
-        _ => Err("expected number".into()),
+        _ => Err(expected(ValueKind::Number)),
     }
 }
 fn boolean(v: Value) -> RunResult<bool> {
     if let Value::Boolean(b) = v {
         Ok(b)
     } else {
-        Err("expected BOOLEAN".into())
+        Err(expected(ValueKind::Boolean))
     }
 }
 fn unary(op: cyallo_ast::Operator, v: Value) -> RunResult<Value> {
     match (op, v) {
         (Operator::Subtract, Value::Number(n)) => {
-            n.negate().map(Value::from_number).map_err(|e| e.to_string())
+            n.negate().map(Value::from_number).map_err(RuntimeError::from)
         }
         (Operator::Not, Value::Boolean(b)) => Ok(Value::Boolean(!b)),
         (Operator::Subtract, Value::Integer(n)) => n
             .checked_neg()
             .map(Value::Integer)
-            .ok_or("INTEGER overflow".into()),
+            .ok_or(ArithmeticError::IntegerOverflow.into()),
         (Operator::Subtract, Value::Real(n)) => Ok(Value::Real(-n)),
         (Operator::Add, v) => Ok(v),
-        _ => Err("invalid unary operand".into()),
+        _ => Err(Invariant::UnsupportedOperation.into()),
     }
 }
 fn binary(op: cyallo_ast::Operator, a: Value, b: Value) -> RunResult<Value> {
     if matches!(a, Value::Number(_)) || matches!(b, Value::Number(_)) {
-        let x = a.as_number().ok_or("expected numeric operand")?;
-        let y = b.as_number().ok_or("expected numeric operand")?;
+        let x = a.as_number().ok_or(expected(ValueKind::Number))?;
+        let y = b.as_number().ok_or(expected(ValueKind::Number))?;
         return if matches!(
             op,
             Operator::Equal
@@ -1662,9 +1692,9 @@ fn binary(op: cyallo_ast::Operator, a: Value, b: Value) -> RunResult<Value> {
                 | Operator::LessEqual
                 | Operator::GreaterEqual
         ) {
-            x.compare(y, op).map(Value::Boolean).map_err(|e| e.to_string())
+            x.compare(y, op).map(Value::Boolean).map_err(RuntimeError::from)
         } else {
-            x.binary(y, op).map(Value::from_number).map_err(|e| e.to_string())
+            x.binary(y, op).map(Value::from_number).map_err(RuntimeError::from)
         };
     }
     if let (Value::Integer(x), Value::Integer(y)) = (&a, &b) {
@@ -1683,9 +1713,9 @@ fn binary(op: cyallo_ast::Operator, a: Value, b: Value) -> RunResult<Value> {
         if let Some(n) = n {
             return n.map(Value::Integer).ok_or_else(|| {
                 if *y == 0 && (op == Operator::IntegerDivide || op == Operator::Remainder) {
-                    "division by zero".into()
+                    ArithmeticError::DivisionByZero.into()
                 } else {
-                    "INTEGER overflow".into()
+                    ArithmeticError::IntegerOverflow.into()
                 }
             });
         }
@@ -1716,7 +1746,7 @@ fn binary(op: cyallo_ast::Operator, a: Value, b: Value) -> RunResult<Value> {
             Operator::Multiply => Value::Real(x * y),
             Operator::Divide => {
                 if y == 0.0 {
-                    return Err("division by zero".into());
+                    return Err(ArithmeticError::DivisionByZero.into());
                 }
                 Value::Real(x / y)
             }
@@ -1726,7 +1756,7 @@ fn binary(op: cyallo_ast::Operator, a: Value, b: Value) -> RunResult<Value> {
             Operator::Greater => Value::Boolean(x > y),
             Operator::LessEqual => Value::Boolean(x <= y),
             Operator::GreaterEqual => Value::Boolean(x >= y),
-            _ => return Err("invalid numeric operation".into()),
+            _ => return Err(Invariant::UnsupportedOperation.into()),
         });
     }
     let ordering = match (&a, &b) {
@@ -1741,14 +1771,14 @@ fn binary(op: cyallo_ast::Operator, a: Value, b: Value) -> RunResult<Value> {
         Operator::Greater => ordering.is_some_and(|o| o.is_gt()),
         Operator::LessEqual => ordering.is_some_and(|o| o.is_le()),
         Operator::GreaterEqual => ordering.is_some_and(|o| o.is_ge()),
-        _ => return Err("invalid comparison".into()),
+        _ => return Err(Invariant::UnsupportedOperation.into()),
     }))
 }
 fn text(v: &Value) -> RunResult<&str> {
     if let Value::String(s) = v {
         Ok(s)
     } else {
-        Err("expected STRING".into())
+        Err(expected(ValueKind::String))
     }
 }
 fn builtin(
@@ -1760,10 +1790,10 @@ fn builtin(
     if let Some(kind) = n.cast_kind() {
         return args[0]
             .as_number()
-            .ok_or("numeric cast requires a number")?
+            .ok_or(expected(ValueKind::Number))?
             .cast(kind)
             .map(Value::from_number)
-            .map_err(|e| e.to_string());
+            .map_err(RuntimeError::from);
     }
     Ok(match n {
         cyallo_ir::intrinsic::Intrinsic::Length
@@ -1781,30 +1811,30 @@ fn builtin(
             let (start, len) = if n == cyallo_ir::intrinsic::Intrinsic::Mid {
                 let start = integer(args[1].clone())?
                     .checked_sub(1)
-                    .ok_or("string index out of bounds")?;
+                    .ok_or(TextError::IndexOutOfBounds)?;
                 (
-                    usize::try_from(start).map_err(|_| "string index out of bounds")?,
+                    usize::try_from(start).map_err(|_| TextError::IndexOutOfBounds)?,
                     usize::try_from(integer(args[2].clone())?)
-                        .map_err(|_| "negative string length")?,
+                        .map_err(|_| TextError::NegativeLength)?,
                 )
             } else {
                 let len = usize::try_from(integer(args[1].clone())?)
-                    .map_err(|_| "negative string length")?;
+                    .map_err(|_| TextError::NegativeLength)?;
                 let start = if n == cyallo_ir::intrinsic::Intrinsic::Right {
                     chars
                         .len()
                         .checked_sub(len)
-                        .ok_or("string length out of bounds")?
+                        .ok_or(TextError::RangeOutOfBounds)?
                 } else {
                     0
                 };
                 (start, len)
             };
-            let end = start.checked_add(len).ok_or("string range overflow")?;
+            let end = start.checked_add(len).ok_or(TextError::RangeOutOfBounds)?;
             Value::String(
                 chars
                     .get(start..end)
-                    .ok_or("string range out of bounds")?
+                    .ok_or(TextError::RangeOutOfBounds)?
                     .iter()
                     .collect::<String>()
                     .into(),
@@ -1812,7 +1842,7 @@ fn builtin(
         }
         cyallo_ir::intrinsic::Intrinsic::LowerChar | cyallo_ir::intrinsic::Intrinsic::UpperChar => {
             let Value::Char(c) = args[0] else {
-                return Err("expected CHAR".into());
+                return Err(expected(ValueKind::Char));
             };
             let s = if n == cyallo_ir::intrinsic::Intrinsic::LowerChar {
                 c.to_lowercase().collect::<String>()
@@ -1822,13 +1852,13 @@ fn builtin(
             let mut cs = s.chars();
             let c = cs.next().unwrap();
             if cs.next().is_some() {
-                return Err("case conversion does not produce a single CHAR".into());
+                return Err(TextError::CaseConversionNotSingleChar.into());
             }
             Value::Char(c)
         }
         cyallo_ir::intrinsic::Intrinsic::CharCode => {
             let Value::Char(c) = args[0] else {
-                return Err("expected CHAR".into());
+                return Err(expected(ValueKind::Char));
             };
             Value::Integer(c as i64)
         }
@@ -1836,7 +1866,7 @@ fn builtin(
             u32::try_from(integer(args[0].clone())?)
                 .ok()
                 .and_then(char::from_u32)
-                .ok_or("invalid Unicode scalar")?,
+                .ok_or(TextError::InvalidScalar)?,
         ),
         cyallo_ir::intrinsic::Intrinsic::Truncate => {
             if let Value::Integer(n) = args[0] {
@@ -1844,7 +1874,7 @@ fn builtin(
             }
             let x = real(args[0].clone())?.trunc();
             if !x.is_finite() || x < i64::MIN as f64 || x >= -(i64::MIN as f64) {
-                return Err("INT result outside INTEGER range".into());
+                return Err(ArithmeticError::TruncationOutOfRange.into());
             }
             Value::Integer(x as i64)
         }
@@ -1854,7 +1884,7 @@ fn builtin(
                 .parse::<f64>()
                 .ok()
                 .filter(|x| x.is_finite())
-                .ok_or("invalid numeric string")?,
+                .ok_or(TextError::InvalidNumber)?,
         ),
         cyallo_ir::intrinsic::Intrinsic::IsNumeric => {
             Value::Boolean(text(&args[0])?.parse::<f64>().is_ok_and(|x| x.is_finite()))
@@ -1862,7 +1892,7 @@ fn builtin(
         cyallo_ir::intrinsic::Intrinsic::Random => {
             let x = real(args[0].clone())?;
             if !x.is_finite() || x <= 0.0 {
-                return Err("RAND requires a positive finite bound".into());
+                return Err(ArithmeticError::RandomBound.into());
             }
             *seed = seed
                 .wrapping_mul(6364136223846793005)
@@ -1881,15 +1911,15 @@ fn parse_input(s: &str, ty: &Type) -> RunResult<Value> {
     if let Type::Numeric(kind) = ty {
         return cyallo_ast::Number::parse(*kind, s.trim())
             .map(Value::from_number)
-            .map_err(|e| e.to_string());
+            .map_err(RuntimeError::from);
     }
     match ty {
         Type::String => Ok(Value::String(s.into())),
         Type::Char => {
             let mut cs = s.chars();
-            let c = cs.next().ok_or("empty CHAR input")?;
+            let c = cs.next().ok_or(InputError::EmptyChar)?;
             if cs.next().is_some() {
-                return Err("CHAR input requires one Unicode scalar".into());
+                return Err(InputError::MultipleChars.into());
             }
             Ok(Value::Char(c))
         }
@@ -1897,19 +1927,19 @@ fn parse_input(s: &str, ty: &Type) -> RunResult<Value> {
             .trim()
             .parse()
             .map(Value::Integer)
-            .map_err(|_| "invalid INTEGER input".into()),
+            .map_err(|_| InputError::Integer.into()),
         Type::Real => s
             .trim()
             .parse::<f64>()
             .ok()
             .filter(|n| n.is_finite())
             .map(Value::Real)
-            .ok_or("invalid REAL input".into()),
+            .ok_or(InputError::Real.into()),
         Type::Boolean => match s.trim().to_ascii_uppercase().as_str() {
             "TRUE" => Ok(Value::Boolean(true)),
             "FALSE" => Ok(Value::Boolean(false)),
-            _ => Err("invalid BOOLEAN input".into()),
+            _ => Err(InputError::Boolean.into()),
         },
-        _ => Err("unsupported INPUT type".into()),
+        _ => Err(InputError::UnsupportedType.into()),
     }
 }

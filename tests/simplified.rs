@@ -1,3 +1,4 @@
+use cyallo::runtime::{BoundsError, RuntimeError, UninitializedRead};
 use cyallo::{
     CompileOptions, Context, Dialect, Session, Status,
     backend::{CraneliftBackend, Executable, NativeBackend},
@@ -54,18 +55,33 @@ fn array_grows_without_allocating_holes() {
 }
 #[test]
 fn missing_reads_fail() {
-    for (source, message) in [
-        ("Arr[10] <- 123\nOUTPUT Arr[0]\n", "hole"),
-        ("OUTPUT Count\nCount <- 0\n", "uninitialized"),
-        ("Arr[10] <- 123\nOUTPUT Arr[11]\n", "hole"),
-        ("Arr[10] <- 123\nOUTPUT Arr[-1]\n", "index"),
-        ("Arr[4294967295] <- 1\n", "index"),
+    for (source, expected) in [
+        (
+            "Arr[10] <- 123\nOUTPUT Arr[0]\n",
+            RuntimeError::Uninitialized(UninitializedRead::Hole(0)),
+        ),
+        (
+            "OUTPUT Count\nCount <- 0\n",
+            RuntimeError::Uninitialized(UninitializedRead::Storage),
+        ),
+        (
+            "Arr[10] <- 123\nOUTPUT Arr[11]\n",
+            RuntimeError::Uninitialized(UninitializedRead::Hole(11)),
+        ),
+        (
+            "Arr[10] <- 123\nOUTPUT Arr[-1]\n",
+            RuntimeError::Bounds(BoundsError::SparseIndex(-1)),
+        ),
+        (
+            "Arr[4294967295] <- 1\n",
+            RuntimeError::Bounds(BoundsError::SparseIndex(4294967295)),
+        ),
     ] {
         let (_, status) = run(source);
-        let Status::Failed(d) = status else {
+        let Status::Failed(failure) = status else {
             panic!("expected failure: {source}")
         };
-        assert!(d.message.contains(message), "{d}");
+        assert_eq!(failure.error, expected, "{source}");
     }
 }
 #[test]

@@ -1,12 +1,12 @@
 //! Compilation runs on a bounded worker pool, with a shared first-call wait budget.
 use super::{
-    Executable, NativeBackend,
+    CompileError, Executable, NativeBackend,
     cranelift_backend::{CraneliftUnit, compile_unit},
     winch::WinchUnit,
 };
 use crate::{
     ir::{Program, RoutineShape},
-    runtime::{Session, Status},
+    runtime::{EngineError, Session, Status, native::ExitReason},
 };
 mod scheduler;
 use scheduler::{Mailbox, Request, Slots, service};
@@ -143,8 +143,8 @@ pub struct TierInfo {
     pub compiling: bool,
     pub compilation_time: Option<Duration>,
     pub compiler_thread: Option<ThreadId>,
-    pub fallback_reason: Option<String>,
-    pub error: Option<String>,
+    pub fallback_reason: Option<CompileError>,
+    pub error: Option<CompileError>,
 }
 #[derive(Debug, Clone)]
 pub enum TierEventKind {
@@ -160,7 +160,7 @@ pub enum TierEventKind {
     CompileFinished {
         tier: Tier,
         duration: Duration,
-        fallback: Option<String>,
+        fallback: Option<CompileError>,
     },
     Superseded {
         previous: Tier,
@@ -179,7 +179,7 @@ pub enum TierEventKind {
         tier: Tier,
     },
     Failed {
-        message: String,
+        error: CompileError,
     },
 }
 #[derive(Debug, Clone)]
@@ -237,10 +237,10 @@ enum WorkerMessage {
 struct Finished {
     function: usize,
     actual: Tier,
-    result: Result<Unit, String>,
+    result: Result<Unit, CompileError>,
     elapsed: Duration,
     thread: ThreadId,
-    fallback: Option<String>,
+    fallback: Option<CompileError>,
     completed: Instant,
 }
 impl State {
@@ -288,7 +288,7 @@ impl State {
                         tier: finished.actual,
                     },
                     Err(error) => TierEventKind::Failed {
-                        message: error.clone(),
+                        error: error.clone(),
                     },
                 },
             });
@@ -369,7 +369,7 @@ impl State {
 }
 impl NativeBackend for TieredBackend {
     type Artifact = TieredArtifact;
-    fn compile(&self, program: Arc<Program>) -> Result<Self::Artifact, String> {
+    fn compile(&self, program: Arc<Program>) -> Result<Self::Artifact, CompileError> {
         self.compile_observed(program, None)
     }
 }
@@ -379,20 +379,20 @@ impl TieredBackend {
         &self,
         program: Arc<Program>,
         origin: Instant,
-    ) -> Result<TieredArtifact, String> {
+    ) -> Result<TieredArtifact, CompileError> {
         self.compile_observed(program, Some(origin))
     }
     fn compile_observed(
         &self,
         program: Arc<Program>,
         origin: Option<Instant>,
-    ) -> Result<TieredArtifact, String> {
+    ) -> Result<TieredArtifact, CompileError> {
         if self.policy.execution_quantum == 0
             || self.policy.small_limit >= self.policy.heavy_limit
             || self.policy.eager.min_words >= self.policy.eager.max_words
             || self.policy.eager.forced_max_words == 0
         {
-            return Err("invalid tier policy".into());
+            return Err(CompileError::InvalidTierPolicy);
         }
         let mailbox = Mailbox::new();
         let alive = Arc::new(());
@@ -470,9 +470,9 @@ impl TieredBackend {
     }
 }
 impl TieredArtifact {
-    pub fn hint_call_soon(&self, function: usize) -> Result<super::EagerDecision, String> {
+    pub fn hint_call_soon(&self, function: usize) -> Result<super::EagerDecision, CompileError> {
         if function >= self.program.functions.len() {
-            return Err("unknown function".into());
+            return Err(CompileError::UnknownFunction(function));
         }
         self.schedule_eager(function, true, 128)
     }
@@ -504,7 +504,7 @@ impl TieredArtifact {
         function: usize,
         explicit: bool,
         repeats: u64,
-    ) -> Result<super::EagerDecision, String> {
+    ) -> Result<super::EagerDecision, CompileError> {
         use cyallo_ast::{CompileHint, HeatHint};
         let routine = &self.program.functions[function];
         let options = self.policy.eager;
@@ -597,35 +597,32 @@ impl TieredArtifact {
                 routine.estimated_words, options.min_words, options.max_words, explicit, cost
             ),
         );
-        self.request(function, tier, None)?;
+        self.request(function, tier, None);
         if priority {
             let request = self.state.borrow().requests[function].clone();
             service().prioritize(&request);
         }
         Ok(super::EagerDecision::Queued(tier))
     }
-    pub fn precompile(&self, function: usize, tier: Tier) -> Result<(), String> {
-        if self
+    pub fn precompile(&self, function: usize, tier: Tier) -> Result<(), CompileError> {
+        let routine = self
             .program
             .functions
             .get(function)
-            .is_some_and(|r| r.attributes.compilation == cyallo_ast::CompileHint::AlwaysLazy)
-        {
-            return Err("opt(always_lazy) forbids native compilation".into());
+            .ok_or(CompileError::UnknownFunction(function))?;
+        if routine.attributes.compilation == cyallo_ast::CompileHint::AlwaysLazy {
+            return Err(CompileError::AlwaysLazy);
         }
-        if let Some(request) = self.state.borrow().requests.get(function) {
-            request.eager_range(None);
-        }
-        self.request(function, tier, None)
+        self.state.borrow().requests[function].eager_range(None);
+        self.request(function, tier, None);
+        Ok(())
     }
-    fn request(&self, function: usize, tier: Tier, executed: Option<u64>) -> Result<(), String> {
-        if self
-            .program
-            .functions
-            .get(function)
-            .is_some_and(|r| r.attributes.compilation == cyallo_ast::CompileHint::AlwaysLazy)
+    /// Queues `function` (a valid routine index) for `tier`.
+    fn request(&self, function: usize, tier: Tier, executed: Option<u64>) {
+        if self.program.functions[function].attributes.compilation
+            == cyallo_ast::CompileHint::AlwaysLazy
         {
-            return Ok(());
+            return;
         }
         let mut state = self.state.borrow_mut();
         state.poll();
@@ -634,13 +631,9 @@ impl TieredArtifact {
             .get(function)
             .is_some_and(|info| info.tier.is_some_and(|installed| installed >= tier))
         {
-            return Ok(());
+            return;
         }
-        let request = state
-            .requests
-            .get(function)
-            .ok_or("unknown function")?
-            .clone();
+        let request = state.requests[function].clone();
         drop(state);
         service().request(
             &request,
@@ -648,7 +641,6 @@ impl TieredArtifact {
             executed,
             executed.is_some_and(|count| count >= self.policy.hot_instructions),
         );
-        Ok(())
     }
 
     pub fn tiers(&self) -> Vec<TierInfo> {
@@ -748,14 +740,14 @@ impl TieredArtifact {
     }
 }
 impl Executable for TieredArtifact {
-    fn run(&self, session: &mut Session, budget: usize) -> Result<(), String> {
+    fn run(&self, session: &mut Session, budget: usize) -> Result<(), EngineError> {
         if !Arc::ptr_eq(&self.program, &session.program) {
             self.program.notice(
                 "invalidation",
                 0,
                 "stale Program artifact rejected before execution; no frame reconstruction",
             );
-            return Err("artifact belongs to a different program".into());
+            return Err(EngineError::ForeignProgram);
         }
         let start = session.instruction_count();
         while session.instruction_count() - start < budget as u64 {
@@ -782,7 +774,7 @@ impl Executable for TieredArtifact {
                 .hinted(self.program.functions[function].attributes.heat)
                 .promote(shape, size, work, calls)
             {
-                self.request(function, desired, Some(work))?;
+                self.request(function, desired, Some(work));
             }
             self.admit_first_call(function, session);
             let remaining = (budget as u64 - (session.instruction_count() - start)) as usize;
@@ -845,9 +837,12 @@ impl Executable for TieredArtifact {
                 result?;
             }
             if session.instruction_count() == before
-                && !matches!(session.native_exit_reason(), 2..=4)
+                && !matches!(
+                    session.native_exit_reason(),
+                    Some(ExitReason::CodeReady | ExitReason::Osr | ExitReason::Hot)
+                )
             {
-                return Err("compiled routine made no progress".into());
+                return Err(EngineError::NoProgress);
             }
         }
         Ok(())

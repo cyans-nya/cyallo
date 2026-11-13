@@ -132,7 +132,7 @@ impl Session {
     }
     pub(super) fn allocate_backing(&mut self, size: usize, alignment: usize) -> RunResult<usize> {
         let layout = Layout::from_size_align(size.max(1), alignment)
-            .map_err(|_| "invalid allocation layout")?;
+            .map_err(|_| AllocatorError::InvalidLayout)?;
         let limit = self
             .context
             .max_cells
@@ -141,13 +141,13 @@ impl Session {
             .memory
             .allocated_bytes
             .checked_add(layout.size())
-            .ok_or("allocation size overflow")?;
+            .ok_or(AllocatorError::SizeOverflow)?;
         if total > limit {
-            return Err("allocation storage limit exceeded".into());
+            return Err(ResourceLimit::Allocation.into());
         }
         // SAFETY: Layout validates size/alignment. Null is a recoverable failure.
         let pointer =
-            NonNull::new(unsafe { alloc::alloc_zeroed(layout) }).ok_or("allocation failed")?;
+            NonNull::new(unsafe { alloc::alloc_zeroed(layout) }).ok_or(AllocatorError::AllocationFailed)?;
         self.memory.allocated_bytes = total;
         let id = self
             .memory
@@ -166,11 +166,11 @@ impl Session {
             .memory
             .allocations
             .get(allocation)
-            .ok_or("released allocation")?;
+            .ok_or(OwnershipError::ReleasedAllocation)?;
         if storage.layout.size() < std::mem::size_of::<usize>()
             || storage.layout.align() < std::mem::align_of::<usize>()
         {
-            return Err("allocator returned insufficient size or alignment".into());
+            return Err(AllocatorError::InsufficientBlock.into());
         }
         let pointer = storage.pointer.cast::<usize>();
         // SAFETY: the checked backing block holds this live descriptor until the
@@ -197,12 +197,12 @@ impl Session {
             fallible,
         } = request;
         let Value::Result(allocated) = allocated else {
-            return Err("allocator must return Result<Allocation, AllocError>".into());
+            return Err(AllocatorError::InvalidResultType.into());
         };
         let allocation = match allocated {
             Ok(value) => match *value {
                 Value::Allocation(id) => id,
-                _ => return Err("allocator returned a non-allocation".into()),
+                _ => return Err(AllocatorError::ResultNotAllocation.into()),
             },
             Err(error) => {
                 self.drop_value(value)?;
@@ -210,7 +210,7 @@ impl Session {
                 return if fallible {
                     Ok(Value::Result(Err(error)))
                 } else {
-                    Err(error.to_string())
+                    Err(AllocatorError::Rejected(error.to_string().into()).into())
                 };
             }
         };
@@ -224,7 +224,7 @@ impl Session {
             self.store(roots.cell_id(cell), roots.value_copy(value))?;
             let state = roots.cell(self.alloc(allocator_ty)?);
             self.store(roots.cell_id(state), roots.value_copy(allocator))?;
-            Ok::<_, String>((cell, state))
+            Ok::<_, RuntimeError>((cell, state))
         })();
         self.allocation_owner = previous;
         let (cell, state) = allocated_cells?;
@@ -274,7 +274,7 @@ impl Session {
         let state = self.memory.blocks[finalizer.block]
             .as_ref()
             .and_then(|control| control.allocator.as_ref())
-            .ok_or("missing allocator state")?;
+            .ok_or(AllocatorError::MissingState)?;
         let function = state.deallocate;
         let cell = state.roots.cell_id(state.cell);
         let receiver = if state.borrowed {
@@ -299,15 +299,15 @@ impl Session {
     pub(super) fn finish_memory_finalizer(&mut self, block: usize) -> RunResult<()> {
         self.memory.blocks[block]
             .as_mut()
-            .ok_or("missing allocator state")?
+            .ok_or(AllocatorError::MissingState)?
             .finalizing = false;
         self.retire_rc_block(block)
     }
 
     pub(super) fn clone_value(&mut self, value: Value) -> RunResult<Value> {
         Ok(match value {
-            Value::Allocation(_) => return Err("Allocation is move-only".into()),
-            Value::Generator(_) => return Err("generators are move-only".into()),
+            Value::Allocation(_) => return Err(OwnershipError::MoveOnlyAllocation.into()),
+            Value::Generator(_) => return Err(OwnershipError::MoveOnlyGenerator.into()),
             Value::GeneratorStep(step) => Value::GeneratorStep(match step {
                 cyallo_values::GeneratorStep::Yielded(value) => cyallo_values::GeneratorStep::Yielded(Box::new(self.clone_value(*value)?)),
                 cyallo_values::GeneratorStep::Complete(value) => cyallo_values::GeneratorStep::Complete(Box::new(self.clone_value(*value)?)),
@@ -396,12 +396,12 @@ impl Session {
     fn owner(&self, value: &Value) -> RunResult<&Handle> {
         let index = match value {
             Value::Rc(index) | Value::Weak(index) => *index,
-            _ => return Err("expected reference-counted owner".into()),
+            _ => return Err(expected(ValueKind::ReferenceCounted)),
         };
         self.memory
             .handles
             .get(index)
-            .ok_or_else(|| "use of a released owner".into())
+            .ok_or(OwnershipError::ReleasedOwner.into())
     }
     pub(super) fn owner_value(&self, value: &Value) -> RunResult<Value> {
         if let Value::Address(cell) = value {
@@ -413,12 +413,12 @@ impl Session {
     pub(super) fn rc_address(&self, value: &Value) -> RunResult<usize> {
         let handle = self.owner(value)?;
         if handle.weak {
-            return Err("weak owner must be upgraded before access".into());
+            return Err(OwnershipError::WeakNotUpgraded.into());
         }
         let payload = self.memory.blocks[handle.block]
             .as_ref()
             .and_then(|block| block.payload.as_ref())
-            .ok_or("released allocation")?;
+            .ok_or(OwnershipError::ReleasedAllocation)?;
         Ok(payload.roots.cell_id(payload.cell))
     }
     pub(super) fn rc_clone(
@@ -437,17 +437,17 @@ impl Session {
         };
         let control = self.memory.blocks[block]
             .as_mut()
-            .ok_or("released allocation")?;
+            .ok_or(OwnershipError::ReleasedAllocation)?;
         if upgrade && control.strong == 0 {
             return Ok(Value::Optional(None));
         }
         if weak {
-            control.weak = control.weak.checked_add(1).ok_or("weak count overflow")?;
+            control.weak = control.weak.checked_add(1).ok_or(OwnershipError::WeakCountOverflow)?;
         } else {
             control.strong = control
                 .strong
                 .checked_add(1)
-                .ok_or("strong count overflow")?;
+                .ok_or(OwnershipError::StrongCountOverflow)?;
         }
         let result = self.new_rc_handle(block, weak);
         Ok(if upgrade {
@@ -461,7 +461,7 @@ impl Session {
         let handle = self.owner(&value)?;
         let block = self.memory.blocks[handle.block]
             .as_ref()
-            .ok_or("released allocation")?;
+            .ok_or(OwnershipError::ReleasedAllocation)?;
         Ok(if weak { block.weak } else { block.strong })
     }
     fn release_rc(&mut self, index: usize) -> RunResult<()> {
@@ -470,7 +470,7 @@ impl Session {
         };
         let control = self.memory.blocks[handle.block]
             .as_mut()
-            .ok_or("released allocation")?;
+            .ok_or(OwnershipError::ReleasedAllocation)?;
         if handle.weak {
             control.weak -= 1;
         } else {
@@ -486,7 +486,7 @@ impl Session {
         }
         let control = self.memory.blocks[handle.block]
             .as_mut()
-            .ok_or("released allocation")?;
+            .ok_or(OwnershipError::ReleasedAllocation)?;
         if control.strong == 0
             && let Some(allocation) = control.storage.take()
         {

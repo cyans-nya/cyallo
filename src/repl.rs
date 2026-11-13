@@ -1,5 +1,6 @@
 //! Persistent submissions; old statements are never replayed.
 use crate::{CompileOptions, Diagnostic, Dialect, Session, Status, compiler::compile_source};
+use crate::runtime::ResourceLimit;
 use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Submission {
@@ -112,7 +113,7 @@ impl Repl {
     /// Abort the current computation while preserving prior writes, then permit another entry.
     pub fn interrupt(&mut self) {
         let span = self.session.current_span().unwrap_or_default();
-        self.session.fail("REPL instruction limit reached", span);
+        self.session.fail(ResourceLimit::Instructions, span);
     }
     pub fn discard_pending(&mut self) {
         self.source.truncate(self.committed);

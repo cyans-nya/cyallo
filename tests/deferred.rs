@@ -1,3 +1,4 @@
+use cyallo::runtime::RuntimeError;
 use cyallo::{
     CompileOptions, Session, Status,
     backend::{Executable, NativeBackend, TierPolicy, TieredBackend},
@@ -36,7 +37,11 @@ fn deferred_errors_keep_the_original_diagnostic_before_body_effects() {
         let jit = TieredBackend::default().compile(program.clone()).unwrap();
         let mut s = Session::new(program).unwrap();
         jit.run(&mut s, 1000).unwrap();
-        assert_eq!(s.status(), &Status::Failed(expected));
+        let Status::Failed(failure) = s.status() else {
+            panic!("expected a deferred check failure: {source}")
+        };
+        assert_eq!(failure.error, RuntimeError::DeferredCheck(expected.clone()));
+        assert_eq!(failure.diagnostic(), expected);
         assert!(s.context.output.is_empty());
     }
 }

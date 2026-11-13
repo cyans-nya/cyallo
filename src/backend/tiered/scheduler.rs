@@ -541,7 +541,7 @@ mod tests {
             Some(Finished {
                 function: 0,
                 actual: tier,
-                result: Err("test compilation failure".into()),
+                result: Err(CompileError::UnsupportedTarget),
                 elapsed: Duration::ZERO,
                 thread: thread::current().id(),
                 fallback: None,
@@ -555,10 +555,10 @@ mod tests {
         state.mailbox = request.mailbox.clone();
         state.requests[0] = request.clone();
         state.poll();
-        assert_eq!(
-            state.info[0].error.as_deref(),
-            Some("test compilation failure")
-        );
+        assert!(matches!(
+            state.info[0].error,
+            Some(CompileError::UnsupportedTarget)
+        ));
         assert!(!state.info[0].compiling);
         assert_eq!(state.transition_limits[0], u64::MAX);
         service.request(&request, Tier::CraneliftFast, Some(5001), false);

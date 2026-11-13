@@ -30,7 +30,23 @@ struct Records {
     events: Vec<Notice>,
     index: BTreeMap<(String, String, String), usize>,
     dropped: u64,
-    errors: Vec<String>,
+    errors: Vec<EmitError>,
+}
+/// An inspection file that could not be written.
+#[derive(Debug, Clone)]
+pub struct EmitError {
+    pub path: std::path::PathBuf,
+    pub error: Arc<std::io::Error>,
+}
+impl std::fmt::Display for EmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.error)
+    }
+}
+impl std::error::Error for EmitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
 }
 #[derive(Debug)]
 pub struct Inspection {
@@ -109,7 +125,7 @@ impl Inspection {
         }
         text
     }
-    pub fn errors(&self) -> Vec<String> {
+    pub fn errors(&self) -> Vec<EmitError> {
         self.records.lock().unwrap().errors.clone()
     }
     /// Start an independent reporting window without changing snapshot numbering.
@@ -134,7 +150,10 @@ impl Inspection {
         if let Err(error) = result {
             let mut records = self.records.lock().unwrap();
             if records.errors.len() < 16 {
-                records.errors.push(format!("{}: {error}", path.display()));
+                records.errors.push(EmitError {
+                    path,
+                    error: Arc::new(error),
+                });
             }
         }
     }

@@ -20,6 +20,56 @@ pub(crate) enum ExitReason {
     Continuation = 6,
 }
 
+/// Typed fault written by generated code into `NativeView::error`. The
+/// discriminant is the ABI encoding; Rust decodes it with [`NativeFault::decode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u64)]
+pub(crate) enum NativeFault {
+    IntegerOverflow = 1,
+    UninitializedRead = 2,
+    ZeroStep = 3,
+    DivisionByZero = 4,
+    StorageVersion = 6,
+}
+impl ExitReason {
+    pub(crate) fn decode(bits: u64) -> Option<Self> {
+        Some(match bits {
+            0 => Self::Return,
+            1 => Self::Budget,
+            2 => Self::CodeReady,
+            3 => Self::Osr,
+            4 => Self::Hot,
+            5 => Self::Error,
+            6 => Self::Continuation,
+            _ => return None,
+        })
+    }
+}
+impl NativeFault {
+    /// Zero means no fault.
+    fn decode(bits: u64) -> Option<Result<Self, u64>> {
+        Some(Ok(match bits {
+            0 => return None,
+            1 => Self::IntegerOverflow,
+            2 => Self::UninitializedRead,
+            3 => Self::ZeroStep,
+            4 => Self::DivisionByZero,
+            6 => Self::StorageVersion,
+            unknown => return Some(Err(unknown)),
+        }))
+    }
+    fn error(self) -> super::RuntimeError {
+        use super::error::{ArithmeticError, IdentitySpace, UninitializedRead};
+        match self {
+            Self::IntegerOverflow => ArithmeticError::IntegerOverflow.into(),
+            Self::UninitializedRead => UninitializedRead::Storage.into(),
+            Self::ZeroStep => ArithmeticError::ZeroStep.into(),
+            Self::DivisionByZero => ArithmeticError::DivisionByZero.into(),
+            Self::StorageVersion => IdentitySpace::StorageVersion.into(),
+        }
+    }
+}
+
 pub(crate) const DIRTY: u64 = 256;
 pub(crate) const INTEGER: u64 = 1;
 pub(crate) const REAL: u64 = 2;
@@ -311,22 +361,18 @@ impl Session {
             self.heap[id].value = slot.materialize();
             slot.kind &= !DIRTY;
             if self.bump_cell_version(id).is_err() {
-                self.native_view.error = 6;
+                self.native_view.error = NativeFault::StorageVersion as u64;
             }
         }
         let view = &mut self.native_view;
         view.dirty_count = 0;
         let error = std::mem::take(&mut view.error);
-        if error != 0 {
-            let message = match error {
-                1 => "INTEGER overflow",
-                2 => "read of uninitialized storage",
-                3 => "FOR STEP must not be zero",
-                4 => "division by zero",
-                6 => "storage version exhausted",
-                _ => "internal native execution failure",
-            };
-            self.fail(message, self.current_span().unwrap_or_default());
+        if let Some(fault) = NativeFault::decode(error) {
+            let error = fault.map_or_else(
+                |bits| super::error::Invariant::UnknownNativeFault(bits).into(),
+                NativeFault::error,
+            );
+            self.fail(error, self.current_span().unwrap_or_default());
         }
         if let (Some(start), Some(report)) = (start, &mut self.report) {
             report.native_materialize_time += start.elapsed();
@@ -400,8 +446,9 @@ impl Session {
         view.osr_targets = targets;
         view.poll_interval = interval.max(1);
     }
-    pub(crate) fn native_exit_reason(&self) -> u64 {
-        self.native_view.exit_reason
+    /// Why the last native run returned; `None` if generated code wrote an unknown code.
+    pub(crate) fn native_exit_reason(&self) -> Option<ExitReason> {
+        ExitReason::decode(self.native_view.exit_reason)
     }
     pub(crate) fn observe_native_exit(&mut self) {
         if let Some(report) = &mut self.report {
@@ -410,5 +457,50 @@ impl Session {
     }
     pub(crate) fn reset_native_exit(&mut self) {
         self.native_view.exit_reason = ExitReason::Return as u64;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::{ArithmeticError, IdentitySpace, RuntimeError};
+
+    #[test]
+    fn native_faults_round_trip_through_their_abi_encoding() {
+        for fault in [
+            NativeFault::IntegerOverflow,
+            NativeFault::UninitializedRead,
+            NativeFault::ZeroStep,
+            NativeFault::DivisionByZero,
+            NativeFault::StorageVersion,
+        ] {
+            assert_eq!(NativeFault::decode(fault as u64), Some(Ok(fault)));
+        }
+        assert_eq!(NativeFault::decode(0), None);
+        assert_eq!(NativeFault::decode(5), Some(Err(5)));
+        assert_eq!(
+            NativeFault::DivisionByZero.error(),
+            RuntimeError::Arithmetic(ArithmeticError::DivisionByZero)
+        );
+        assert_eq!(
+            NativeFault::StorageVersion.error(),
+            RuntimeError::Exhausted(IdentitySpace::StorageVersion)
+        );
+    }
+
+    #[test]
+    fn exit_reasons_decode_every_variant_and_reject_unknown_codes() {
+        for reason in [
+            ExitReason::Return,
+            ExitReason::Budget,
+            ExitReason::CodeReady,
+            ExitReason::Osr,
+            ExitReason::Hot,
+            ExitReason::Error,
+            ExitReason::Continuation,
+        ] {
+            assert_eq!(ExitReason::decode(reason as u64), Some(reason));
+        }
+        assert_eq!(ExitReason::decode(7), None);
     }
 }

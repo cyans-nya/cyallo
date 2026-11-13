@@ -492,15 +492,15 @@ fn evaluate_one(
     session.run(FUEL);
     match session.status() {
         Status::Finished => {}
-        Status::Failed(d) => {
-            return Err(error(format!("const evaluation: {}", d.message), d.span)
+        Status::Failed(failure) => {
+            return Err(error(format!("const evaluation: {}", failure.error), failure.span)
                 .with_related(expr.span, "constant initializer"));
         }
         _ => return Err(error("const evaluation exceeded its work limit", expr.span)),
     }
     let value = session
         .constant_value(result_index)
-        .map_err(|e| error(e, expr.span))?;
+        .map_err(|e| error(e.to_string(), expr.span))?;
     Ok((
         freeze(value, &result_type, &program, expr.span)?,
         result_type,

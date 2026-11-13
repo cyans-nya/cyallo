@@ -1,5 +1,6 @@
 //! Stackless lexical generators: saved activation fields, never a captured helper stack.
 use super::{Frame, RunResult, Session, Value, gc, native::NativeSlot};
+use super::error::{GeneratorError, IdentitySpace, Invariant, ResourceLimit, ValueKind, expected};
 use crate::{ir::{LocalStorage, Reg}, metrics::FrameMetrics};
 
 enum State { New, Suspended(Reg), Running, Complete, Closed }
@@ -47,14 +48,14 @@ impl Default for Generators {
 }
 impl Session {
     pub(super) fn construct_generator(&mut self, function: usize, args: Vec<Value>, result: Option<Reg>) -> RunResult<()> {
-        if self.generators.entries.len() >= self.context.max_cells { return Err("generator limit exceeded".into()); }
+        if self.generators.entries.len() >= self.context.max_cells { return Err(GeneratorError::LimitExceeded.into()); }
         let ty = self.program.functions[function].generator.as_ref().unwrap();
         let (_, input, _) = cyallo_ir::generator::parts(ty).unwrap();
         let unit_input = cyallo_ir::generator::unit(input);
         self.push_frame(function, args, None)?;
         let activation = Activation::save(self.frames.pop().unwrap());
         let id = self.generators.next;
-        self.generators.next = id.checked_add(1).ok_or("generator identity space exhausted")?;
+        self.generators.next = id.checked_add(1).ok_or(IdentitySpace::Generator)?;
         self.generators.entries.insert(id, Generator { state: State::New, activation: Some(activation), unit_input });
         self.publish_generator_roots();
         if let Some(result) = result { self.set(result, Value::Generator(id)); }
@@ -65,20 +66,20 @@ impl Session {
         match value {
             Value::Generator(id) => Ok(*id),
             Value::Address(cell) => self.generator_id(&self.heap[*cell].value),
-            _ => Err("expected a generator".into()),
+            _ => Err(expected(ValueKind::Generator)),
         }
     }
     pub(super) fn resume_generator(&mut self, id: usize, input: Option<Value>, result: Reg) -> RunResult<()> {
-        if self.frames.len() >= self.context.max_frames { return Err("call depth limit exceeded".into()); }
-        let generator = self.generators.entries.get_mut(&id).ok_or("cannot resume a completed or closed generator")?;
+        if self.frames.len() >= self.context.max_frames { return Err(ResourceLimit::CallDepth.into()); }
+        let generator = self.generators.entries.get_mut(&id).ok_or(GeneratorError::Finished)?;
         match generator.state {
-            State::New if input.is_some() => return Err("start a generator with resume(); arguments belong to its factory".into()),
-            State::Running => return Err("generator is already running".into()),
-            State::Complete | State::Closed => return Err("cannot resume a completed or closed generator".into()),
-            State::Suspended(_) if input.is_none() && !generator.unit_input => return Err("resume requires the value expected by yield".into()),
+            State::New if input.is_some() => return Err(GeneratorError::StartWithArgument.into()),
+            State::Running => return Err(GeneratorError::AlreadyRunning.into()),
+            State::Complete | State::Closed => return Err(GeneratorError::Finished.into()),
+            State::Suspended(_) if input.is_none() && !generator.unit_input => return Err(GeneratorError::MissingResumeValue.into()),
             _ => {}
         }
-        let mut activation = generator.activation.take().ok_or("generator has no continuation")?;
+        let mut activation = generator.activation.take().ok_or(Invariant::MissingContinuation)?;
         if let State::Suspended(destination) = generator.state {
             activation.registers[destination] = input.unwrap_or_else(|| Value::ArraySnapshot(vec![]));
         }
@@ -88,9 +89,9 @@ impl Session {
     }
     pub(super) fn yield_generator(&mut self, input: Reg, value: Reg) -> RunResult<()> {
         let yielded = self.register(value);
-        let frame = self.frames.pop().ok_or("yield without a frame")?;
-        let id = frame.generator.ok_or("yield outside its lexical generator")?;
-        let result = frame.return_to.ok_or("generator has no resumer")?;
+        let frame = self.frames.pop().ok_or(Invariant::YieldOutsideGenerator)?;
+        let id = frame.generator.ok_or(Invariant::YieldOutsideGenerator)?;
+        let result = frame.return_to.ok_or(Invariant::MissingResumer)?;
         let generator = self.generators.entries.get_mut(&id).unwrap();
         generator.activation = Some(Activation::save(frame));
         generator.state = State::Suspended(input);
@@ -104,7 +105,7 @@ impl Session {
         let returned = roots.value(returned);
         let frame = self.frames.pop().unwrap();
         let id = frame.generator.unwrap();
-        let result = frame.return_to.ok_or("generator has no resumer")?;
+        let result = frame.return_to.ok_or(Invariant::MissingResumer)?;
         let generator = self.generators.entries.get_mut(&id).unwrap();
         generator.activation = Some(Activation::save(frame));
         generator.state = State::Complete;
@@ -115,9 +116,9 @@ impl Session {
     }
     pub(super) fn close_generator(&mut self, id: usize) -> RunResult<()> {
         let Some(generator) = self.generators.entries.get_mut(&id) else {
-            return if id > 0 && id < self.generators.next { Ok(()) } else { Err("invalid generator".into()) };
+            return if id > 0 && id < self.generators.next { Ok(()) } else { Err(GeneratorError::Invalid.into()) };
         };
-        if matches!(generator.state, State::Running) { return Err("cannot close a running generator".into()); }
+        if matches!(generator.state, State::Running) { return Err(GeneratorError::CloseWhileRunning.into()); }
         generator.state = State::Closed;
         self.drop_generator_activation(id)?;
         self.generators.entries.remove(&id);

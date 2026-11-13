@@ -57,10 +57,13 @@ which are mandatory through the root AGENTS.md.
    Add language scheduling/channel/ownership examples and real CLI regressions
    as their integrations become executable. Do not add Rust example programs or
    external Rust integration work.
-9. Complete the in-progress error-model migration: replace provisional numeric
-   value tags with semantic enums; use typed resource/generator/host/task failures
-   and format them at diagnostic boundaries. Resolve primitive/member identities
-   before lowering and specialize using types rather than source spellings.
+9. Runtime and backend failures are typed: `Status::Failed` carries a
+   `RuntimeFailure` (`RuntimeError` plus span), native faults and exit reasons
+   are decoded enums, and backends return `CompileError`/`EngineError`. Remaining:
+   task/channel failures must reuse these types when language integration lands,
+   and compile-time diagnostics still carry free-form messages. Resolve
+   primitive/member identities before lowering and specialize using types
+   rather than source spellings.
 
 The agreed native model remains heap VM continuations with all-PC fallback;
 native machine-stack switching is deferred. Root return stops unfinished Cs;

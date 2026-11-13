@@ -19,13 +19,13 @@ pub(super) fn call(
         let values: Vec<_> = match &args[0] {
             Value::ArraySnapshot(values) => values.iter().collect(),
             Value::SparseSnapshot(values, _) => values.values().collect(),
-            _ => return Err("sum requires numeric array elements".into()),
+            _ => return Err(expected(ValueKind::Number)),
         };
         let kind = values
             .first()
             .and_then(|value| value.as_number())
             .map_or(NumberKind::I64, |number| number.kind);
-        let mut total = Value::from_number(Number::integer(kind, 0).map_err(|e| e.to_string())?);
+        let mut total = Value::from_number(Number::integer(kind, 0)?);
         for value in values {
             total = binary(Operator::Add, total, value.clone())?;
         }
@@ -36,14 +36,14 @@ pub(super) fn call(
         let first = *first;
         let result = match n {
             Intrinsic::Abs => Some(if first.kind.float() {
-                Number::floating(first.kind, first.real().abs()).map_err(|e| e.to_string())?
+                Number::floating(first.kind, first.real().abs())?
             } else {
-                Number::integer(first.kind, first.int().abs()).map_err(|e| e.to_string())?
+                Number::integer(first.kind, first.int().abs())?
             }),
             Intrinsic::Min | Intrinsic::Max | Intrinsic::Clamp => {
-                let second = args[1].as_number().ok_or("expected number")?;
+                let second = args[1].as_number().ok_or(expected(ValueKind::Number))?;
                 let choose = |a: Number, b: Number, smaller: bool| -> RunResult<Number> {
-                    let less = a.compare(b, Operator::Less).map_err(|e| e.to_string())?;
+                    let less = a.compare(b, Operator::Less)?;
                     Ok(if less == smaller { a } else { b })
                 };
                 Some(if n == Intrinsic::Min {
@@ -51,12 +51,12 @@ pub(super) fn call(
                 } else if n == Intrinsic::Max {
                     choose(first, second, false)?
                 } else {
-                    let third = args[2].as_number().ok_or("expected number")?;
+                    let third = args[2].as_number().ok_or(expected(ValueKind::Number))?;
                     if second
                         .compare(third, Operator::Greater)
-                        .map_err(|e| e.to_string())?
+?
                     {
-                        return Err("clamp lower bound exceeds upper bound".into());
+                        return Err(ArithmeticError::ClampBoundsReversed.into());
                     }
                     choose(choose(first, second, false)?, third, true)?
                 })
@@ -94,7 +94,7 @@ pub(super) fn call(
                         },
                         value,
                     )
-                    .map_err(|e| e.to_string())?,
+?,
                 )
             }
             _ => None,
@@ -126,7 +126,7 @@ pub(super) fn call(
                 .into(),
         ),
         cyallo_ir::intrinsic::Intrinsic::Abs => match &args[0] {
-            Value::Integer(n) => Value::Integer(n.checked_abs().ok_or("INTEGER overflow")?),
+            Value::Integer(n) => Value::Integer(n.checked_abs().ok_or(ArithmeticError::IntegerOverflow)?),
             v => Value::Real(real(v.clone())?.abs()),
         },
         cyallo_ir::intrinsic::Intrinsic::Min
@@ -144,7 +144,7 @@ pub(super) fn call(
                         unreachable!()
                     };
                     if *y > z {
-                        return Err("clamp lower bound exceeds upper bound".into());
+                        return Err(ArithmeticError::ClampBoundsReversed.into());
                     }
                     (*x).clamp(*y, z)
                 };
@@ -159,7 +159,7 @@ pub(super) fn call(
                 } else {
                     let z = real(args[2].clone())?;
                     if y.is_nan() || z.is_nan() || y > z {
-                        return Err("invalid clamp bounds".into());
+                        return Err(ArithmeticError::ClampBoundsReversed.into());
                     }
                     x.clamp(y, z)
                 };
@@ -180,7 +180,7 @@ pub(super) fn call(
                 _ => x.powf(real(args[1].clone())?),
             };
             if !value.is_finite() {
-                return Err(format!("{n} result is outside its finite numeric domain"));
+                return Err(ArithmeticError::NonFiniteResult(n).into());
             }
             Value::Real(value)
         }
@@ -189,7 +189,7 @@ pub(super) fn call(
         | cyallo_ir::intrinsic::Intrinsic::Count
         | cyallo_ir::intrinsic::Intrinsic::Sum => {
             let Value::SparseSnapshot(entries, _) = &args[0] else {
-                return Err("expected sparse array".into());
+                return Err(expected(ValueKind::SparseArray));
             };
             match n {
                 cyallo_ir::intrinsic::Intrinsic::Keys => {
@@ -201,7 +201,7 @@ pub(super) fn call(
                     let mut total = Value::Integer(0);
                     for value in entries.values() {
                         if *value == Value::Uninitialized {
-                            return Err("read of uninitialized array element".into());
+                            return Err(UninitializedRead::ArrayElement.into());
                         }
                         total = binary(Operator::Add, total, value.clone())?;
                     }
@@ -209,6 +209,6 @@ pub(super) fn call(
                 }
             }
         }
-        _ => return Err(format!("unsupported builtin {n}")),
+        _ => return Err(Invariant::UnsupportedIntrinsic(n).into()),
     })
 }

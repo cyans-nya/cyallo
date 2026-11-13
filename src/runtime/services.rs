@@ -1,5 +1,6 @@
 //! Session-owned resolution slots. Provider churn changes data, never bytecode.
 use super::{RunResult, Session, Value, gc};
+use super::error::{AllocatorError, Invariant, ResourceLimit, ServiceError, ValueKind, expected};
 use crate::{ir::Reg, services::Operation};
 use std::collections::HashMap;
 #[derive(Debug, Clone, Default)]
@@ -175,9 +176,9 @@ impl Services {
         }
     }
     fn selected(&self, view: usize, key: usize, cleanup: bool) -> RunResult<usize> {
-        let v = self.views.get(view).ok_or("invalid context")?;
+        let v = self.views.get(view).ok_or(expected(ValueKind::Context))?;
         if v.state == State::Inactive || (v.state == State::Retiring && !cleanup) {
-            return Err("service context is inactive".into());
+            return Err(ServiceError::InactiveContext.into());
         }
         let own = v.provided[key].filter(|b| {
             self.bindings[*b].state == State::Active
@@ -188,13 +189,13 @@ impl Services {
         } else {
             own.or(v.routes[key])
         }
-        .ok_or("service is unavailable or was not injected")?;
+        .ok_or(ServiceError::NotInjected)?;
         let binding = &self.bindings[b];
         if binding.state == State::Inactive
             || (binding.state == State::Retiring
                 && !(cleanup && (v.admitted[key] == Some(b) || v.provided[key] == Some(b))))
         {
-            return Err("service is unavailable".into());
+            return Err(ServiceError::Unavailable.into());
         }
         Ok(b)
     }
@@ -242,7 +243,7 @@ impl Session {
         if let Value::Context(v) = value {
             Ok(*v)
         } else {
-            Err("expected context".into())
+            Err(expected(ValueKind::Context))
         }
     }
     fn service_key(&self, value: &Value) -> RunResult<usize> {
@@ -251,7 +252,7 @@ impl Session {
         {
             return Ok(*k);
         }
-        Err("expected linked service key".into())
+        Err(expected(ValueKind::ServiceKey))
     }
     fn root_service_value(&self, value: Value) -> Rooted {
         let scope = self.root_scope();
@@ -271,7 +272,7 @@ impl Session {
         use Operation::*;
         if operation == Context {
             if self.services.views.len() >= self.context.max_cells {
-                return Err("context storage limit exceeded".into());
+                return Err(ResourceLimit::Context.into());
             }
             let v = self.services.view(None, self.program.services.keys.len());
             self.set(r, Value::Context(v));
@@ -281,7 +282,7 @@ impl Session {
             match values[0] {
                 Value::Registration(b) => self.retire_binding(b)?,
                 Value::Context(v) => self.retire_view(v)?,
-                _ => return Err("expected registration or context".into()),
+                _ => return Err(expected(ValueKind::Registration)),
             };
             return Ok(());
         }
@@ -301,12 +302,12 @@ impl Session {
             return Ok(());
         }
         if self.services.views[view].state != State::Active {
-            return Err("service context is inactive".into());
+            return Err(ServiceError::InactiveContext.into());
         }
         match operation {
             Extend | Isolate => {
                 if self.services.views.len() >= self.context.max_cells {
-                    return Err("context storage limit exceeded".into());
+                    return Err(ResourceLimit::Context.into());
                 }
                 let v = self
                     .services
@@ -328,10 +329,10 @@ impl Session {
                 let key = self.service_key(&values[1])?;
                 let realm = self.services.views[view].realms[key];
                 if self.services.active.contains_key(&(key, realm)) {
-                    return Err("service already has an active provider in this isolation".into());
+                    return Err(ServiceError::ProviderConflict.into());
                 }
                 if self.services.bindings.len() >= self.context.max_cells {
-                    return Err("registration storage limit exceeded".into());
+                    return Err(ResourceLimit::Registration.into());
                 }
                 let value = self.root_service_value(values[2].clone());
                 let binding = self.services.bindings.len();
@@ -373,7 +374,7 @@ impl Session {
                 self.services.views[child].admitted[key] = Some(binding);
                 self.services.refresh_key(key);
                 let Value::Function(function, mut args) = values[2].clone() else {
-                    return Err("inject requires a callback".into());
+                    return Err(ServiceError::InjectRequiresCallback.into());
                 };
                 args.push(Value::Context(child));
                 self.call(function, args, None)?;
@@ -445,7 +446,7 @@ impl Session {
         // Every cleanup remains rooted by its view until its frame completes.
         for (view, callback) in plan.into_iter().rev() {
             let Value::Function(function, args) = callback else {
-                return Err("invalid cleanup callback".into());
+                return Err(AllocatorError::InvalidCleanup.into());
             };
             self.call(function, args, None)?;
             self.frames.last_mut().unwrap().service_scope = Some(view);
@@ -522,17 +523,17 @@ impl Session {
                 let Value::TraitObject(r, i) = self.services.bindings[b]
                     .value
                     .as_ref()
-                    .ok_or("service was released")?
+                    .ok_or(ServiceError::Released)?
                     .value()
                 else {
-                    return Err("service must implement a trait".into());
+                    return Err(ServiceError::TraitRequired.into());
                 };
                 self.services.stats.slot_hits += 1;
                 self.services.bindings[b].leases += 1;
                 lease = Some(b);
                 (r, i)
             }
-            _ => return Err("trait call requires a trait object or service reference".into()),
+            _ => return Err(expected(ValueKind::TraitObject)),
         };
         self.observe_lookup_read(receiver);
         let function_id = self.frames.last().unwrap().function;
@@ -560,7 +561,7 @@ impl Session {
             let f = *self.program.services.implementations[implementation]
                 .methods
                 .get(method)
-                .ok_or("invalid trait method")?;
+                .ok_or(Invariant::InvalidTraitMethod)?;
             if cache.count < 4 {
                 cache.cases[cache.count as usize] = TargetCase {
                     implementation: implementation as u64 + 1,
@@ -574,10 +575,10 @@ impl Session {
         };
         let metadata = &self.program.services.implementations[implementation];
         if self.has_pending_lookup()
-            && let Err(diagnostic) =
+            && let Err(failure) =
                 self.check_lookup_mapper(target, &mut vec![false; self.program.functions.len()])
         {
-            self.status = super::Status::Failed(diagnostic);
+            self.status = super::Status::Failed(failure);
             if let Some(binding) = lease {
                 self.services.bindings[binding].leases -= 1;
                 self.release_retired();

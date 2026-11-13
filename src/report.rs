@@ -231,8 +231,8 @@ pub(crate) fn render(
                     previous.map_or("uncompiled", tier),
                     tier(to)
                 ),
-                TierEventKind::Failed { message } => {
-                    format!("{name}: compilation failed: {message}")
+                TierEventKind::Failed { error } => {
+                    format!("{name}: compilation failed: {error}")
                 }
                 TierEventKind::FirstCall { waited, compiled } => format!(
                     "{name}: first-call admission; wait={:.3} ms; compiled={compiled}",

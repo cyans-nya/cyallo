@@ -1,3 +1,4 @@
+use cyallo::runtime::{ArithmeticError, BoundsError, RuntimeError, TextError, UninitializedRead};
 use cyallo::{
     Context, Session, Status,
     backend::{
@@ -142,33 +143,43 @@ fn random_is_reproducible() {
 }
 #[test]
 fn failures_match() {
-    for (source, message) in [
-        ("OUTPUT 9223372036854775807 + 1\n", "overflow"),
-        ("OUTPUT 9223372036854775807 * 2\n", "overflow"),
-        ("OUTPUT (-9223372036854775807 - 1) - 1\n", "overflow"),
-        ("OUTPUT 1 DIV 0\n", "division by zero"),
-        ("OUTPUT 1 / 0\n", "division by zero"),
-        ("DECLARE x : INTEGER\nOUTPUT x\n", "uninitialized"),
+    let overflow = RuntimeError::Arithmetic(ArithmeticError::IntegerOverflow);
+    let division = RuntimeError::Arithmetic(ArithmeticError::DivisionByZero);
+    let uninitialized = RuntimeError::Uninitialized(UninitializedRead::Storage);
+    for (source, expected) in [
+        ("OUTPUT 9223372036854775807 + 1\n", overflow.clone()),
+        ("OUTPUT 9223372036854775807 * 2\n", overflow.clone()),
+        ("OUTPUT (-9223372036854775807 - 1) - 1\n", overflow),
+        ("OUTPUT 1 DIV 0\n", division.clone()),
+        ("OUTPUT 1 / 0\n", division),
+        ("DECLARE x : INTEGER\nOUTPUT x\n", uninitialized.clone()),
         (
             "FUNCTION F() RETURNS INTEGER\n DECLARE x : INTEGER\n RETURN x\nENDFUNCTION\nOUTPUT F()\n",
-            "uninitialized",
+            uninitialized,
         ),
         (
             "DECLARE a : ARRAY[1:2] OF INTEGER\nOUTPUT a[3]\n",
-            "outside",
+            RuntimeError::Bounds(BoundsError::Array {
+                index: 3,
+                lower: 1,
+                upper: 2,
+            }),
         ),
-        ("OUTPUT MID(\"abc\",0,1)\n", "bounds"),
+        (
+            "OUTPUT MID(\"abc\",0,1)\n",
+            RuntimeError::Text(TextError::IndexOutOfBounds),
+        ),
         (
             "DECLARE i : INTEGER\nFOR i <- 1 TO 2 STEP 0\nNEXT i\n",
-            "zero",
+            RuntimeError::Arithmetic(ArithmeticError::ZeroStep),
         ),
     ] {
         let (_, status) = execute(source, &[]);
-        let Status::Failed(d) = status else {
+        let Status::Failed(failure) = status else {
             panic!("expected failure: {source}")
         };
-        assert!(d.message.contains(message), "{}", d.message);
-        assert!(d.span.end > d.span.start);
+        assert_eq!(failure.error, expected, "{source}");
+        assert!(failure.span.end > failure.span.start);
     }
 }
 #[test]

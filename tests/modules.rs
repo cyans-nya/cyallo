@@ -230,7 +230,7 @@ fn runtime_diagnostics_name_the_imported_source() {
         panic!("expected division failure")
     };
     let report =
-        cyallo::diagnostics::render_program("main.ya", &p, error, false, Default::default());
+        cyallo::diagnostics::render_program("main.ya", &p, &error.diagnostic(), false, Default::default());
     assert!(report.contains("lib.ya"));
     assert!(report.contains("1 div 0"));
 }

@@ -1,3 +1,4 @@
+use cyallo::runtime::{GeneratorError, RuntimeError};
 use cyallo::{CompileOptions, Context, Session, Status, compile, compile_for_execution};
 use cyallo::backend::{CraneliftBackend, CraneliftSpeedBackend, Executable, NativeBackend, Tier, TieredBackend};
 use std::{sync::Arc, time::Duration};
@@ -59,7 +60,11 @@ fn resume_after_close_or_completion_is_rejected() {
         let program = Arc::new(compile(&source).unwrap());
         let mut session = Session::new(program).unwrap();
         session.run(10_000);
-        assert!(matches!(session.status(), Status::Failed(error) if error.message.contains("completed or closed")), "{:?}", session.status());
+        assert!(
+            matches!(session.status(), Status::Failed(failure) if failure.error == RuntimeError::Generator(GeneratorError::Finished)),
+            "{:?}",
+            session.status()
+        );
     }
 }
 
