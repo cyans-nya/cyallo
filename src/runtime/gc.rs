@@ -532,6 +532,10 @@ impl Collector {
                         | Value::Weak(_)
                         | Value::Allocation(_)
                         | Value::Generator(_) => pending.push(value.clone()),
+                        Value::TaskOutcome(cyallo_concurrent_values::TaskOutcome::Completed(
+                            value,
+                        )) => owners(value, pending),
+                        Value::SendError(error) => owners(&error.value, pending),
                         Value::ArraySnapshot(values) | Value::Function(_, values) => {
                             for value in values {
                                 owners(value, pending);
@@ -579,6 +583,9 @@ fn trace(
     visit: &mut impl FnMut(usize) -> Result<(), RuntimeError>,
 ) -> Result<(), RuntimeError> {
     match value {
+        // Task results and failed sends retain values that may hold heap cells.
+        Value::TaskOutcome(cyallo_concurrent_values::TaskOutcome::Completed(v)) => trace(v, visit)?,
+        Value::SendError(error) => trace(&error.value, visit)?,
         Value::Managed(id) | Value::Address(id) | Value::TraitObject(id, _) => visit(*id)?,
         Value::Slice { owner, .. } => visit(*owner)?,
         Value::GeneratorStep(
@@ -620,6 +627,10 @@ fn trace(
 }
 fn relocate(value: &mut Value, rewrite: &impl Fn(&mut usize)) {
     match value {
+        Value::TaskOutcome(cyallo_concurrent_values::TaskOutcome::Completed(v)) => {
+            relocate(v, rewrite)
+        }
+        Value::SendError(error) => relocate(&mut error.value, rewrite),
         Value::Managed(id) | Value::Address(id) | Value::TraitObject(id, _) => rewrite(id),
         Value::Slice { owner, .. } => rewrite(owner),
         Value::GeneratorStep(
@@ -830,6 +841,37 @@ mod tests {
         gc.collect(&mut heap, 1).unwrap();
         assert_eq!(heap.len(), 0);
         assert_eq!(heap.capacity(), 0);
+    }
+    #[test]
+    fn task_results_and_failed_sends_keep_their_cells_alive() {
+        let mut heap = Arena::default();
+        heap.push(cell(Value::Integer(0)));
+        heap.push(cell(Value::Integer(7)));
+        heap.push(cell(Value::Integer(8)));
+        let mut gc = Collector::default();
+        gc.reserve(heap.len());
+        let roots = gc.scope();
+        let completed = roots.value(Value::TaskOutcome(
+            cyallo_concurrent_values::TaskOutcome::Completed(Box::new(Value::Managed(1))),
+        ));
+        let unsent = roots.value(Value::SendError(cyallo_concurrent_values::SendError {
+            kind: cyallo_concurrent_values::SendFailure::Closed,
+            value: Box::new(Value::Managed(2)),
+        }));
+        gc.collect(&mut heap, 1).unwrap();
+        // Cell 0 is unreachable; the two referenced cells survive and are renumbered.
+        assert_eq!(heap.len(), 2);
+        assert_eq!(heap[0].value, Value::Integer(7));
+        assert_eq!(
+            roots.value_copy(completed),
+            Value::TaskOutcome(cyallo_concurrent_values::TaskOutcome::Completed(Box::new(
+                Value::Managed(0)
+            )))
+        );
+        let Value::SendError(error) = roots.value_copy(unsent) else {
+            panic!("expected a send error")
+        };
+        assert_eq!(*error.value, Value::Managed(1));
     }
     #[test]
     fn invalid_edge_fails_before_rewriting_roots_or_heap() {
