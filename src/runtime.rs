@@ -620,14 +620,14 @@ impl Session {
     }
     /// Execute one IR instruction. Waiting input does not advance the program counter.
     pub fn step(&mut self) -> bool {
-        if matches!(self.status, Status::Finished | Status::Failed(_)) {
-            return false;
+        match self.status {
+            Status::Finished | Status::Failed(_) => return false,
+            Status::WaitingForInput if self.context.input.is_empty() => return false,
+            Status::WaitingForInput => self.status = Status::Paused,
+            Status::Paused => {}
         }
-        if self.status == Status::WaitingForInput && self.context.input.is_empty() {
-            return false;
-        }
-        self.status = Status::Paused;
-        let span = self.current_span().unwrap_or_default();
+        // The failing instruction's span is only looked up if it fails.
+        let at = self.frames.last().map(|f| (f.function, f.pc));
         self.record_work(1, self.execution_engine);
         if self.gc_config.enabled {
             self.gc_instruction = self.frames.last().map(|f| (self.frames.len() - 1, f.pc));
@@ -638,6 +638,9 @@ impl Session {
         // must publish the successor's live values, including that new result.
         let result = result.and_then(|_| self.start_memory_finalizer());
         if let Err(e) = result {
+            let span = at
+                .and_then(|(function, pc)| self.program.functions[function].code.get(pc))
+                .map_or_else(Span::default, |instruction| instruction.span);
             self.fail(e, span);
             return false;
         }
@@ -828,7 +831,8 @@ impl Session {
         {
             *calls = calls.saturating_add(1);
         }
-        let mut registers = vec![Value::Uninitialized; fun.registers.len()];
+        let mut registers: gc::Slots<Value> =
+            gc::Slots::filled(fun.registers.len(), || Value::Uninitialized);
         let cell_count = fun
             .local_storage
             .iter()
@@ -936,7 +940,7 @@ impl Session {
             },
             owner_id,
             owned_cells,
-            registers: registers.into(),
+            registers,
             return_to,
             metrics: self.report.as_mut().map(|r| r.frame(function)),
         };
@@ -954,7 +958,10 @@ impl Session {
         Ok(())
     }
     fn register(&self, r: Reg) -> Value {
-        self.frames.last().unwrap().registers[r].clone()
+        self.register_ref(r).clone()
+    }
+    fn register_ref(&self, r: Reg) -> &Value {
+        &self.frames.last().unwrap().registers[r]
     }
     fn set(&mut self, r: Reg, value: Value) {
         let frame = self.frames.last_mut().unwrap();
@@ -1157,25 +1164,28 @@ impl Session {
         }
     }
     fn execute(&mut self) -> RunResult<()> {
+        // A Program handle lets the operation borrow its pooled operands while
+        // `self` is mutated; it never changes during execution.
+        let program = Arc::clone(&self.program);
         let f = self.frames.last().unwrap();
         let function = f.function;
-        let op = self.program.bytecode.functions[function].decode(f.pc);
+        let op = program.bytecode.functions[function].decode_ref(f.pc);
         self.check_constant_allocation(&op)?;
         self.frames.last_mut().unwrap().pc += 1;
-        match op {
-            Op::Yield(input, value) => self.yield_generator(input, value)?,
-            Op::Frozen(r, value) => self.set(r, Value::from(value.as_ref())),
-            Op::Lookup(r, operation, args) => self.execute_lookup(r, operation, args)?,
-            Op::ServiceKey(r, key) => self.set(r, Value::ServiceKey(key)),
-            Op::Service(r, operation, args) => self.execute_service(r, operation, args)?,
-            Op::TraitCall(result, target, method, args) => self.trait_call(
+        match &*op {
+            &Op::Yield(input, value) => self.yield_generator(input, value)?,
+            &Op::Frozen(r, ref value) => self.set(r, Value::from(value.as_ref())),
+            &Op::Lookup(r, operation, ref args) => self.execute_lookup(r, operation, args)?,
+            &Op::ServiceKey(r, key) => self.set(r, Value::ServiceKey(key)),
+            &Op::Service(r, operation, ref args) => self.execute_service(r, operation, args)?,
+            &Op::TraitCall(result, target, method, ref args) => self.trait_call(
                 result,
                 target,
                 method,
                 args,
                 self.frames.last().unwrap().pc - 1,
             )?,
-            Op::TraitBox(r, value, implementation) => {
+            &Op::TraitBox(r, value, implementation) => {
                 let roots = self.root_scope();
                 let source = roots.value(self.register(value));
                 let ty = self.program.services.implementations[implementation]
@@ -1190,12 +1200,12 @@ impl Session {
                 self.store(roots.cell_id(root), roots.value_copy(source))?;
                 self.set(r, Value::TraitObject(roots.cell_id(root), implementation));
             }
-            Op::Statement | Op::Nop => {}
-            Op::Aggregate(r, regs) => {
-                let values = regs.into_iter().map(|r| self.register(r)).collect();
+            &Op::Statement | &Op::Nop => {}
+            &Op::Aggregate(r, ref regs) => {
+                let values = regs.iter().map(|&r| self.register(r)).collect();
                 self.set(r, Value::ArraySnapshot(values));
             }
-            Op::Field(r, base, index) => {
+            &Op::Field(r, base, index) => {
                 let id = self.address(base)?;
                 let Value::Array(ids) = &self.heap[id].value else {
                     return Err(Invariant::InvalidStorage.into());
@@ -1203,7 +1213,7 @@ impl Session {
                 let id = *ids.get(index).ok_or(BoundsError::Field(index))?;
                 self.set(r, Value::Address(id));
             }
-            Op::Extract(r, base, index) => {
+            &Op::Extract(r, base, index) => {
                 let Value::ArraySnapshot(values) = self.register(base) else {
                     return Err(expected(ValueKind::Composite));
                 };
@@ -1216,11 +1226,11 @@ impl Session {
                 }
                 self.set(r, value);
             }
-            Op::FunctionValue(r, id, regs) => {
-                let captures = regs.into_iter().map(|r| self.register(r)).collect();
+            &Op::FunctionValue(r, id, ref regs) => {
+                let captures = regs.iter().map(|&r| self.register(r)).collect();
                 self.set(r, Value::Function(id, captures));
             }
-            Op::Invoke(r, callee, args) => {
+            &Op::Invoke(r, callee, ref args) => {
                 let Value::Function(function, mut captures) = self.register(callee) else {
                     return Err(expected(ValueKind::Callable));
                 };
@@ -1235,27 +1245,27 @@ impl Session {
                     }
                     captures = copies.into_iter().map(|id| roots.value_copy(id)).collect();
                 }
-                captures.extend(args.into_iter().map(|r| self.register(r)));
+                captures.extend(args.iter().map(|&r| self.register(r)));
                 self.call(function, captures, r)?;
             }
-            Op::ArrayLiteral(r, regs) => {
+            &Op::ArrayLiteral(r, ref regs) => {
                 if matches!(
                     self.program.functions[function].registers[r],
                     Type::Array(..)
                 ) {
-                    let values = regs.into_iter().map(|r| self.register(r)).collect();
+                    let values = regs.iter().map(|&r| self.register(r)).collect();
                     self.set(r, Value::ArraySnapshot(values));
                     return Ok(());
                 }
                 let length = regs.len() as u64;
                 let values = regs
-                    .into_iter()
+                    .iter()
                     .enumerate()
-                    .map(|(i, r)| (i as u32, self.register(r)))
+                    .map(|(i, &r)| (i as u32, self.register(r)))
                     .collect();
                 self.set(r, Value::SparseSnapshot(values, length));
             }
-            Op::Length(r, address) => {
+            &Op::Length(r, address) => {
                 let id = self.address(address)?;
                 let length = match &self.heap[id].value {
                     Value::String(text) => text.chars().count() as i64,
@@ -1267,9 +1277,9 @@ impl Session {
                 };
                 self.set(r, Value::Integer(length));
             }
-            Op::Literal(r, l) => self.set(r, l.into()),
-            Op::LiteralString(r, text) => self.set(r, Value::String(text)),
-            Op::Address(r, s) => {
+            &Op::Literal(r, ref l) => self.set(r, l.clone().into()),
+            &Op::LiteralString(r, ref text) => self.set(r, Value::String(text.clone())),
+            &Op::Address(r, s) => {
                 let id = if s.global {
                     self.globals[s.index]
                 } else {
@@ -1278,30 +1288,30 @@ impl Session {
                 };
                 self.set(r, Value::Address(id));
             }
-            Op::Load(r, a) => {
+            &Op::Load(r, a) => {
                 let v = self.read(self.address(a)?)?;
                 self.set(r, v);
             }
-            Op::Store(a, r) => {
+            &Op::Store(a, r) => {
                 let id = self.address(a)?;
                 let v = self.register(r);
                 self.store(id, v)?;
             }
-            Op::FrameLoad(r, slot) => {
+            &Op::FrameLoad(r, slot) => {
                 let value = self.register(slot);
                 if value == Value::Uninitialized {
                     return Err(UninitializedRead::Storage.into());
                 }
                 self.set(r, value);
             }
-            Op::FrameStore(slot, r) => {
+            &Op::FrameStore(slot, r) => {
                 let value = coerce_assignment(
                     &self.program.functions[function].registers[slot],
                     self.register(r),
                 );
                 self.set(slot, value);
             }
-            Op::Index(r, a, indices, write) => {
+            &Op::Index(r, a, ref indices, write) => {
                 if let Value::Slice {
                     owner,
                     offset,
@@ -1398,7 +1408,7 @@ impl Session {
                 };
                 let mut offset = 0usize;
                 for ((l, h), r) in bounds.iter().zip(indices) {
-                    let i = integer(self.register(r))?;
+                    let i = integer(self.register(*r))?;
                     if i < *l || i > *h {
                         return Err(BoundsError::Array {
                             index: i,
@@ -1414,37 +1424,37 @@ impl Session {
                 };
                 self.set(r, Value::Address(ids[offset]));
             }
-            Op::Take(r, address) => {
+            &Op::Take(r, address) => {
                 let value = self.take_cell(self.address(address)?)?;
                 self.set(r, value);
             }
-            Op::ManagedAddress(result, owner) => {
+            &Op::ManagedAddress(result, owner) => {
                 let address = self.address(owner)?;
                 self.set(result, Value::Address(address));
             }
-            Op::Drop(address) => self.drop_cell(self.address(address)?)?,
-            Op::Unary(r, op, a) => {
-                let v = unary(op, self.register(a))?;
+            &Op::Drop(address) => self.drop_cell(self.address(address)?)?,
+            &Op::Unary(r, op, a) => {
+                let v = unary(op, self.register_ref(a))?;
                 self.set(r, v);
             }
-            Op::Binary(r, op, a, b) => {
-                let v = binary(op, self.register(a), self.register(b))?;
+            &Op::Binary(r, op, a, b) => {
+                let v = binary(op, self.register_ref(a), self.register_ref(b))?;
                 self.set(r, v);
             }
-            Op::Move(r, a) => {
+            &Op::Move(r, a) => {
                 let v = self.register(a);
                 self.set(r, v);
             }
-            Op::Jump(pc) => self.frames.last_mut().unwrap().pc = pc,
-            Op::Branch(r, a, b) => {
+            &Op::Jump(pc) => self.frames.last_mut().unwrap().pc = pc,
+            &Op::Branch(r, a, b) => {
                 let v = boolean(self.register(r))?;
                 self.frames.last_mut().unwrap().pc = if v { a } else { b };
             }
-            Op::Call(r, function, args) => {
-                let args = args.into_iter().map(|r| self.register(r)).collect();
+            &Op::Call(r, function, ref args) => {
+                let args = args.iter().map(|&r| self.register(r)).collect();
                 self.call(function, args, r)?;
             }
-            Op::Return(r) => {
+            &Op::Return(r) => {
                 if self.frames.last().unwrap().generator.is_some() {
                     self.complete_generator(r)?;
                     return Ok(());
@@ -1513,8 +1523,8 @@ impl Session {
                     self.finish_memory_finalizer(block)?;
                 }
             }
-            Op::Builtin(r, n, args) => {
-                let args = args.into_iter().map(|r| self.register(r)).collect();
+            &Op::Builtin(r, n, ref args) => {
+                let args = args.iter().map(|&r| self.register(r)).collect();
                 let value = builtin(
                     n,
                     args,
@@ -1532,10 +1542,10 @@ impl Session {
                 };
                 self.set(r, value);
             }
-            Op::Output(rs, style) => {
+            &Op::Output(ref rs, style) => {
                 let text = rs
-                    .into_iter()
-                    .map(|r| match (style, self.register(r)) {
+                    .iter()
+                    .map(|&r| match (style, self.register(r)) {
                         (TextStyle::Caie, Value::Boolean(b)) => {
                             if b { "TRUE" } else { "FALSE" }.to_string()
                         }
@@ -1545,10 +1555,10 @@ impl Session {
                 self.context.output.push_str(&text);
                 self.context.output.push('\n');
             }
-            Op::Input(r, ref ty) | Op::FrameInput(r, ref ty) => {
+            &Op::Input(r, ref ty) | &Op::FrameInput(r, ref ty) => {
                 if let Some(line) = self.context.input.pop_front() {
                     let value = parse_input(&line, ty)?;
-                    if matches!(op, Op::FrameInput(..)) {
+                    if matches!(*op, Op::FrameInput(..)) {
                         self.set(r, value);
                     } else {
                         self.store(self.address(r)?, value)?;
@@ -1558,7 +1568,7 @@ impl Session {
                     self.status = Status::WaitingForInput;
                 }
             }
-            Op::CheckStep(r) => {
+            &Op::CheckStep(r) => {
                 if integer(self.register(r))? == 0 {
                     return Err(ArithmeticError::ZeroStep.into());
                 }
@@ -1669,7 +1679,10 @@ fn integer(v: Value) -> RunResult<i64> {
     i64::try_from(number.int()).map_err(|_| cyallo_ast::NumberError::OutOfRange.into())
 }
 fn real(v: Value) -> RunResult<f64> {
-    match v {
+    real_ref(&v)
+}
+fn real_ref(v: &Value) -> RunResult<f64> {
+    match *v {
         Value::Integer(n) => Ok(n as f64),
         Value::Real(n) => Ok(n),
         Value::Number(n) => Ok(n.real()),
@@ -1683,7 +1696,7 @@ fn boolean(v: Value) -> RunResult<bool> {
         Err(expected(ValueKind::Boolean))
     }
 }
-fn unary(op: cyallo_ast::Operator, v: Value) -> RunResult<Value> {
+fn unary(op: cyallo_ast::Operator, v: &Value) -> RunResult<Value> {
     match (op, v) {
         (Operator::Subtract, Value::Number(n)) => n
             .negate()
@@ -1695,11 +1708,11 @@ fn unary(op: cyallo_ast::Operator, v: Value) -> RunResult<Value> {
             .map(Value::Integer)
             .ok_or(ArithmeticError::IntegerOverflow.into()),
         (Operator::Subtract, Value::Real(n)) => Ok(Value::Real(-n)),
-        (Operator::Add, v) => Ok(v),
+        (Operator::Add, v) => Ok(v.clone()),
         _ => Err(Invariant::UnsupportedOperation.into()),
     }
 }
-fn binary(op: cyallo_ast::Operator, a: Value, b: Value) -> RunResult<Value> {
+fn binary(op: cyallo_ast::Operator, a: &Value, b: &Value) -> RunResult<Value> {
     if matches!(a, Value::Number(_)) || matches!(b, Value::Number(_)) {
         let x = a.as_number().ok_or(expected(ValueKind::Number))?;
         let y = b.as_number().ok_or(expected(ValueKind::Number))?;
@@ -1767,8 +1780,8 @@ fn binary(op: cyallo_ast::Operator, a: Value, b: Value) -> RunResult<Value> {
     if matches!(a, Value::Integer(_) | Value::Real(_))
         && matches!(b, Value::Integer(_) | Value::Real(_))
     {
-        let x = real(a)?;
-        let y = real(b)?;
+        let x = real_ref(a)?;
+        let y = real_ref(b)?;
         return Ok(match op {
             Operator::Add => Value::Real(x + y),
             Operator::Subtract => Value::Real(x - y),

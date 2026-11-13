@@ -282,6 +282,16 @@ impl Function {
             complex: complex.into_boxed_slice(),
         }
     }
+    /// Like [`decode`](Self::decode), but borrows pooled operations instead of
+    /// cloning them, so executing a call or builtin does not allocate.
+    pub fn decode_ref(&self, pc: usize) -> std::borrow::Cow<'_, Op> {
+        let w = self.instructions[pc];
+        if w.opcode == Opcode::Complex {
+            std::borrow::Cow::Borrowed(&self.complex[w.a as usize])
+        } else {
+            std::borrow::Cow::Owned(self.decode(pc))
+        }
+    }
     pub fn decode(&self, pc: usize) -> Op {
         use Opcode::*;
         let w = self.instructions[pc];

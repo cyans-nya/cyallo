@@ -386,7 +386,7 @@ impl Session {
         &mut self,
         destination: Reg,
         operation: Operation,
-        args: Vec<Reg>,
+        args: &[Reg],
     ) -> RunResult<()> {
         let values: Vec<_> = args.iter().map(|r| self.register(*r)).collect();
         let function = self.frames.last().unwrap().function;

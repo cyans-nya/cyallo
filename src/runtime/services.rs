@@ -270,9 +270,9 @@ impl Session {
         &mut self,
         r: Reg,
         operation: Operation,
-        regs: Vec<Reg>,
+        regs: &[Reg],
     ) -> RunResult<()> {
-        let values: Vec<_> = regs.into_iter().map(|r| self.register(r)).collect();
+        let values: Vec<_> = regs.iter().map(|&r| self.register(r)).collect();
         use Operation::*;
         if operation == Context {
             if self.services.views.len() >= self.context.max_cells {
@@ -512,7 +512,7 @@ impl Session {
         result: Option<Reg>,
         target: Reg,
         method: usize,
-        regs: Vec<Reg>,
+        regs: &[Reg],
         pc: usize,
     ) -> RunResult<()> {
         let hint = std::mem::take(&mut self.native_view.trait_hint_target);
@@ -597,7 +597,7 @@ impl Session {
         } else {
             self.read(receiver)?
         });
-        args.extend(regs.into_iter().map(|r| self.register(r)));
+        args.extend(regs.iter().map(|&r| self.register(r)));
         let depth = self.frames.len();
         let called = self.call(target, args, result);
         if called.is_ok() && self.frames.len() > depth {

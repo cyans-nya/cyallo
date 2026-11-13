@@ -35,7 +35,7 @@ pub(super) fn call(
             .map_or(NumberKind::I64, |number| number.kind);
         let mut total = Value::from_number(Number::integer(kind, 0)?);
         for value in values {
-            total = binary(Operator::Add, total, value.clone())?;
+            total = binary(Operator::Add, &total, value)?;
         }
         return Ok(total);
     }
@@ -217,7 +217,7 @@ pub(super) fn call(
                         if *value == Value::Uninitialized {
                             return Err(UninitializedRead::ArrayElement.into());
                         }
-                        total = binary(Operator::Add, total, value.clone())?;
+                        total = binary(Operator::Add, &total, value)?;
                     }
                     total
                 }

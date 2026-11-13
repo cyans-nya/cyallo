@@ -33,6 +33,10 @@ impl<T: Clone> Clone for Slots<T> {
     }
 }
 impl<T> Slots<T> {
+    /// `len` slots built in place, with a single allocation.
+    pub fn filled(len: usize, mut value: impl FnMut() -> T) -> Self {
+        Self((0..len).map(|_| UnsafeCell::new(value())).collect())
+    }
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.0.iter().map(|v| unsafe { &*v.get() })
     }
