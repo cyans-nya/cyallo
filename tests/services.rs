@@ -15,7 +15,7 @@ fn typed_services_smoke() {
     let mut s = Session::new(p).unwrap();
     s.run(10000);
     assert_eq!(s.status(), &Status::Finished);
-    assert_eq!(s.context.output, "app: ready\nFALSE\n");
+    assert_eq!(s.context.output, "app: ready\nfalse\n");
     assert_eq!(s.service_stats().released, 1);
 }
 #[test]
@@ -141,7 +141,7 @@ registration.dispose()
 std::io::print(ctx.available(LOGGER))
 "#
     );
-    parity(&source, "A1\nA1\nA1\nA1\nB2\nC3\nFALSE\n");
+    parity(&source, "A1\nA1\nA1\nA1\nB2\nC3\nfalse\n");
 }
 #[test]
 fn injection_isolation_and_cleanup_before_release() {
@@ -167,7 +167,7 @@ std::io::print(root.available(LOGGER))
     );
     parity(
         &source,
-        "root:setup\nroot:child\nFALSE\ninner:ready\nroot:cleanup\ninner:still\nFALSE\n",
+        "root:setup\nroot:child\nfalse\ninner:ready\nroot:cleanup\ninner:still\nfalse\n",
     );
 }
 #[test]
@@ -307,7 +307,7 @@ let registration = ctx.provide(KEY,R { n: 6 } as dyn T)
 ctx.service(KEY).run()
 std::io::print(ctx.available(KEY))
 "#,
-        "7\nFALSE\n",
+        "7\nfalse\n",
     );
 }
 #[test]

@@ -189,19 +189,45 @@ pub fn infer(
             local.constant = candidate.constant;
         }
     }
+    let unresolved: std::collections::HashSet<&str> = candidates
+        .iter()
+        .map(|c| c.name)
+        .filter(|name| !known.contains_key(&key(name)))
+        .collect();
     for c in candidates {
         let name = c.name;
         if !known.contains_key(&key(name)) {
+            // An initializer that does not wait on another uninferred binding
+            // failed on its own; report that error rather than hiding it.
+            if let Some(value) = c.value
+                && !mentions(value, &unresolved)
+                && let Err(error) = expression_type(value, &known, routines)
+            {
+                return Err(error);
+            }
             return Err(Diagnostic::new(
                 "E114",
                 format!(
-                    "cannot infer type of {name}; initialize it with a known value or declare its type"
+                    "cannot infer the type of `{}`; initialize it with a known value or declare its type",
+                    cyallo_ast::source_name(name)
                 ),
                 c.span,
             ));
         }
     }
     Ok(())
+}
+/// Whether `expression` names any of `names`.
+fn mentions(expression: &Expr, names: &std::collections::HashSet<&str>) -> bool {
+    let mut copy = expression.clone();
+    let mut found = false;
+    let _ = cyallo_ast::visit::visit_expr(&mut copy, &mut |e: &mut Expr| {
+        if let ExprKind::Name(name) = &e.kind {
+            found |= names.contains(name.as_ref());
+        }
+        Ok(())
+    });
+    found
 }
 pub fn expression_type(
     e: &Expr,
@@ -444,7 +470,7 @@ fn expression_type_inner(
             }
             Err(Diagnostic::new(
                 "E106",
-                format!("unresolved callable {n}"),
+                format!("unresolved callable `{}`", cyallo_ast::source_name(n)),
                 e.span,
             ))
         }

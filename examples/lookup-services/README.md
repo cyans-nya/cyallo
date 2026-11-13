@@ -8,7 +8,7 @@ cargo run -- run examples/lookup-services/main.ya --gc-stress --jobs 4
 first: ready
 second: replacement
 second: cached lookup
-FALSE
+false
 ```
 
 Start with [main.ya](main.ya). Importing `logger` enables `ctx.logger` in

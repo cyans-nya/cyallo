@@ -653,10 +653,12 @@ pub fn collect(body: &[Stmt], params: &[Param]) -> Result<Vec<ir::Local>> {
             | StmtKind::Binding(name, _, _, _, _) = &s.kind
                 && let Some(first) = seen.insert(key(name), s.span)
             {
-                return Err(
-                    Diagnostic::new("E101", format!("duplicate name {name}"), s.span)
-                        .with_related(first, "first declared here"),
-                );
+                return Err(Diagnostic::new(
+                    "E101",
+                    format!("duplicate name `{}`", cyallo_ast::source_name(name)),
+                    s.span,
+                )
+                .with_related(first, "first declared here"));
             }
             let decl = match &s.kind {
                 StmtKind::Declare(n, t) => Some((n, t.clone(), false)),
@@ -671,10 +673,12 @@ pub fn collect(body: &[Stmt], params: &[Param]) -> Result<Vec<ir::Local>> {
             };
             if let Some((n, t, c)) = decl {
                 if let Some(first) = locals.iter().find(|l| l.name.eq_identifier(n)) {
-                    return Err(
-                        Diagnostic::new("E101", format!("duplicate name {n}"), s.span)
-                            .with_related(first.span, "first declared here"),
-                    );
+                    return Err(Diagnostic::new(
+                        "E101",
+                        format!("duplicate name `{}`", cyallo_ast::source_name(n)),
+                        s.span,
+                    )
+                    .with_related(first.span, "first declared here"));
                 }
                 locals.push(ir::Local {
                     display_name: Some(n.clone()),
@@ -887,6 +891,23 @@ fn assignable(e: &Expr) -> bool {
     }
 }
 /// The operation a typed binary operator performs: `+` producing a string is concatenation.
+/// Types with structural equality: scalars, strings, and tuples, records and
+/// fixed arrays built from them. Identity-bearing values are excluded.
+fn comparable(ty: &Type) -> bool {
+    match ty {
+        Type::Integer
+        | Type::Real
+        | Type::Numeric(_)
+        | Type::Boolean
+        | Type::Char
+        | Type::String
+        | Type::Symbol => true,
+        Type::Tuple(items) => items.iter().all(comparable),
+        Type::Record(_, fields) => fields.iter().all(|(_, ty)| comparable(ty)),
+        Type::Array(_, element) => comparable(element),
+        _ => false,
+    }
+}
 /// Integer `/` is the checked, truncating integer division.
 fn specialized_operator(op: Operator, result: &Type) -> Operator {
     match (op, result) {
@@ -957,20 +978,7 @@ pub fn binary_type(op: cyallo_ast::Operator, a: &Type, b: &Type, span: Span) -> 
                 Type::Integer
             })
         }
-        Operator::Equal | Operator::NotEqual
-            if a == b
-                && matches!(
-                    a,
-                    Type::Integer
-                        | Type::Real
-                        | Type::Boolean
-                        | Type::Char
-                        | Type::String
-                        | Type::Symbol
-                ) =>
-        {
-            Some(Type::Boolean)
-        }
+        Operator::Equal | Operator::NotEqual if a == b && comparable(a) => Some(Type::Boolean),
         Operator::Less | Operator::Greater | Operator::LessEqual | Operator::GreaterEqual
             if (numeric(a) && numeric(b)) || (a == b && matches!(a, Type::Char | Type::String)) =>
         {
@@ -982,7 +990,7 @@ pub fn binary_type(op: cyallo_ast::Operator, a: &Type, b: &Type, span: Span) -> 
     t.ok_or_else(|| {
         Diagnostic::new(
             "E105",
-            format!("operator {op} does not accept {a:?} and {b:?}"),
+            format!("operator `{op}` cannot be applied to `{a}` and `{b}`"),
             span,
         )
     })
@@ -1353,7 +1361,10 @@ impl Lower<'_> {
                     crate::services::intrinsic(&ty, name, &ts).ok_or_else(|| {
                         Diagnostic::new(
                             "E131",
-                            format!("invalid service operation {name} or argument types"),
+                            format!(
+                                "invalid service operation `{}` or argument types",
+                                cyallo_ast::source_name(name)
+                            ),
                             span,
                         )
                     })?;
@@ -1477,6 +1488,14 @@ impl Lower<'_> {
             _ => Err(not_a_range(iterable.span)),
         }
     }
+    /// Statement-level output keeps the source dialect's spelling.
+    fn output_style(&self) -> ir::TextStyle {
+        if self.options.dialect == Dialect::Modern {
+            ir::TextStyle::Plain
+        } else {
+            ir::TextStyle::Caie
+        }
+    }
     fn close_loop(&mut self, end: usize, next: usize) {
         let scope = self.loops.pop().unwrap();
         for at in scope.breaks {
@@ -1537,7 +1556,7 @@ impl Lower<'_> {
         }
         Err(Diagnostic::new(
             "E106",
-            format!("undeclared identifier {n}"),
+            format!("undeclared identifier `{}`", cyallo_ast::source_name(n)),
             self.span,
         ))
     }
@@ -1802,9 +1821,16 @@ impl Lower<'_> {
         {
             Ok(())
         } else {
+            let hint = if want.number_kind().is_some_and(|kind| kind.float())
+                && got.number_kind().is_some_and(|kind| !kind.float())
+            {
+                "; integers never convert to floats implicitly: write a float literal such as `2.0` or cast with `as`"
+            } else {
+                ""
+            };
             Err(Diagnostic::new(
                 "E109",
-                format!("expected {want:?}, got {got:?}"),
+                format!("mismatched types: expected `{want}`, found `{got}`{hint}"),
                 span,
             ))
         }
@@ -2069,7 +2095,7 @@ impl Lower<'_> {
                             e.span,
                         ),
                         Lowering::Print => {
-                            self.emit(Op::Output(registers));
+                            self.emit(Op::Output(registers, ir::TextStyle::Plain));
                             Ok((self.reg(Type::Void), Type::Void))
                         }
                         Lowering::Input => {
@@ -2246,7 +2272,11 @@ impl Lower<'_> {
                             .iter()
                             .position(|(n, _)| n.eq_identifier(name))
                             .ok_or_else(|| {
-                                Diagnostic::new("E116", format!("unknown field {name}"), value.span)
+                                Diagnostic::new(
+                                    "E116",
+                                    format!("unknown field `{}`", cyallo_ast::source_name(name)),
+                                    value.span,
+                                )
                             })?;
                         if rs[index].is_some() {
                             return Err(Diagnostic::new(
@@ -2513,7 +2543,7 @@ impl Lower<'_> {
                     } else {
                         Err(Diagnostic::new(
                             "E106",
-                            format!("unresolved callable {n}"),
+                            format!("unresolved callable `{}`", cyallo_ast::source_name(n)),
                             e.span,
                         ))
                     }
@@ -2732,7 +2762,7 @@ impl Lower<'_> {
                                     s.span,
                                 ));
                             }
-                            self.emit(Op::Output(vec![r]));
+                            self.emit(Op::Output(vec![r], self.output_style()));
                         }
                         return Ok(());
                     }
@@ -2746,7 +2776,7 @@ impl Lower<'_> {
                         };
                         let (r, t) = self.invoke(&callee, args, es[0].span, true)?;
                         if t != Type::Void {
-                            self.emit(Op::Output(vec![r]));
+                            self.emit(Op::Output(vec![r], self.output_style()));
                         }
                         return Ok(());
                     }
@@ -2783,7 +2813,7 @@ impl Lower<'_> {
                     }
                     rs.push(r);
                 }
-                self.emit(Op::Output(rs));
+                self.emit(Op::Output(rs, self.output_style()));
             }
             StmtKind::Input(e) => {
                 let (a, t) = self.address(e, true)?;
@@ -2806,7 +2836,11 @@ impl Lower<'_> {
             }
             StmtKind::Call(n, args) => {
                 let sig = self.signatures.get(&key(n)).cloned().ok_or_else(|| {
-                    Diagnostic::new("E110", format!("unknown procedure {n}"), s.span)
+                    Diagnostic::new(
+                        "E110",
+                        format!("unknown procedure `{}`", cyallo_ast::source_name(n)),
+                        s.span,
+                    )
                 })?;
                 if sig.kind != RoutineKind::Procedure {
                     return Err(Diagnostic::new("E110", "CALL requires a procedure", s.span));
@@ -3072,7 +3106,14 @@ pub fn builtin_type(n: Intrinsic, types: &[Type], span: Span) -> Result<Type> {
     crate::builtins::result_type(n, types).ok_or_else(|| {
         Diagnostic::new(
             "E112",
-            format!("unknown function or invalid arguments: {n}{types:?}"),
+            format!(
+                "`{n}` does not accept ({})",
+                types
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             span,
         )
     })

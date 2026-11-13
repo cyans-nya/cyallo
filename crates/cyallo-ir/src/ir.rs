@@ -21,6 +21,13 @@ pub enum LocalStorage {
     Cell(usize),
     Register(Reg),
 }
+/// How an output operation spells values. Modern `print` uses Rust-like text;
+/// CAIE `OUTPUT` keeps the exam spelling of booleans (`TRUE`, `FALSE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextStyle {
+    Plain,
+    Caie,
+}
 #[derive(Debug, Clone)]
 pub enum Op {
     Yield(Reg, Reg),
@@ -57,7 +64,7 @@ pub enum Op {
     Branch(Reg, usize, usize),
     Call(Option<Reg>, usize, Vec<Reg>),
     Builtin(Reg, crate::intrinsic::Intrinsic, Vec<Reg>),
-    Output(Vec<Reg>),
+    Output(Vec<Reg>, TextStyle),
     Input(Reg, Type),
     FrameInput(Reg, Type),
     Return(Option<Reg>),

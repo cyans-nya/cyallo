@@ -126,9 +126,13 @@ pub fn resolve(ast: &mut Ast) -> Result<HashMap<String, Type>> {
             }
             Type::Named(name) => {
                 let identity = key(name);
-                let record = defs
-                    .get(&identity)
-                    .ok_or_else(|| Diagnostic::new("E116", format!("unknown type {name}"), span))?;
+                let record = defs.get(&identity).ok_or_else(|| {
+                    Diagnostic::new(
+                        "E116",
+                        format!("unknown type `{}`", cyallo_ast::source_name(name)),
+                        span,
+                    )
+                })?;
                 if let Some(start) = active.get(&identity) {
                     if depth > *start {
                         *t = Type::RecordRef(identity.into());
@@ -376,7 +380,10 @@ pub fn lift(
                     {
                         return Err(Diagnostic::new(
                             "E117",
-                            format!("invalid or unused reference capture {name}"),
+                            format!(
+                                "invalid or unused reference capture `{}`",
+                                cyallo_ast::source_name(name)
+                            ),
                             e.span,
                         ));
                     }

@@ -81,14 +81,14 @@ fn gc_sharing_example() {
 fn rc_ownership_example() {
     parity(
         include_str!("../examples/rc-ownership.ya"),
-        "strong: 2\nsurvivor: 42\nupgraded: 42:2\nexpired: TRUE\n",
+        "strong: 2\nsurvivor: 42\nupgraded: 42:2\nexpired: true\n",
     );
 }
 #[test]
 fn combined_gc_rc_example() {
     parity(
         include_str!("../examples/gc-rc.ya"),
-        "first: 7\nsecond: 7\nfirst expired: TRUE\nsecond survives: 9\ngc survives: 11\n",
+        "first: 7\nsecond: 7\nfirst expired: true\nsecond survives: 9\ngc survives: 11\n",
     );
 }
 #[test]
@@ -130,7 +130,7 @@ std::io::print(first_weak.upgrade().is_none(), ":", second_weak.upgrade().is_non
 std::mem::drop(first_weak)
 std::mem::drop(second_weak)
 "#,
-        "TRUE:TRUE\n",
+        "true:true\n",
     );
 }
 #[test]
@@ -151,7 +151,7 @@ std::io::print(**released, ":", weak.upgrade().is_some())
 std::mem::drop(weak)
 "#
         ),
-        "owned:1\n1:FALSE\n",
+        "owned:1\n1:false\n",
     );
 }
 #[test]
@@ -177,7 +177,7 @@ std::mem::drop(success)
 std::io::print(**allocated, ":", **released)
 "#
         ),
-        "TRUE:1\n7\n2:2\n",
+        "true:1\n7\n2:2\n",
     );
 }
 #[test]
@@ -206,7 +206,7 @@ std::mem::drop(weak)
 std::io::print(**allocator.allocated)
 "#
         ),
-        "TRUE:1\n1\n",
+        "true:1\n1\n",
     );
 }
 
@@ -279,7 +279,7 @@ std::mem::drop(handle)
 std::io::print(**allocator.allocated)
 "#
         ),
-        "TRUE:1\n1\n",
+        "true:1\n1\n",
     );
     let source = format!(
         r#"{ALLOCATOR}

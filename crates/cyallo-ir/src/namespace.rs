@@ -185,7 +185,7 @@ impl Resolver {
                 let entries = node.names.entry(name.to_string()).or_default();
                 if entries.iter().any(|s| s.kind == kind) {
                     return Err(error(
-                        format!("duplicate declaration {name}"),
+                        format!("duplicate declaration `{}`", cyallo_ast::source_name(&name)),
                         Span::default(),
                     ));
                 }
@@ -211,7 +211,7 @@ impl Resolver {
                     && entries.iter().any(|symbol| symbol.kind == Kind::Value)
                 {
                     return Err(error(
-                        format!("duplicate declaration {name}"),
+                        format!("duplicate declaration `{}`", cyallo_ast::source_name(name)),
                         statement.span,
                     ));
                 }
@@ -407,7 +407,10 @@ impl Resolver {
                                 && (previous.is_empty()
                                     || previous.iter().any(|previous| !imports[*previous].1.glob)))
                         {
-                            return Err(error(format!("ambiguous import {name}"), import.span));
+                            return Err(error(
+                                format!("ambiguous import `{}`", cyallo_ast::source_name(&name)),
+                                import.span,
+                            ));
                         }
                         if import.public && !existing.public {
                             existing.public = true;
@@ -436,7 +439,12 @@ impl Resolver {
     fn symbol(&self, module: usize, name: &str, kind: Kind, span: Span) -> Result<Box<str>> {
         self.path(module, name, Some(kind))
             .map(|s| s.target)
-            .ok_or_else(|| error(format!("unresolved name {name}"), span))
+            .ok_or_else(|| {
+                error(
+                    format!("unresolved name `{}`", cyallo_ast::source_name(name)),
+                    span,
+                )
+            })
     }
     fn ty(&self, module: usize, ty: &mut Type, params: &[Box<str>], span: Span) -> Result<()> {
         match ty {
@@ -654,7 +662,7 @@ impl Resolver {
                     } else {
                         e.kind = ExprKind::Invalid(Diagnostic::new(
                             "E106",
-                            format!("undeclared identifier {n}"),
+                            format!("undeclared identifier `{}`", cyallo_ast::source_name(n)),
                             e.span,
                         ));
                         return Ok(());
@@ -697,7 +705,10 @@ impl Resolver {
                             } else {
                                 e.kind = ExprKind::Invalid(Diagnostic::new(
                                     "E106",
-                                    format!("undeclared function {name}"),
+                                    format!(
+                                        "undeclared function `{}`",
+                                        cyallo_ast::source_name(name)
+                                    ),
                                     e.span,
                                 ));
                                 return Ok(());

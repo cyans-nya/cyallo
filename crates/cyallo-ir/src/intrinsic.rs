@@ -226,8 +226,14 @@ pub fn resolve(
             lowering: Lowering::Storage(operation),
         });
     }
-    let invalid =
-        || cyallo_ast::Diagnostic::new("E112", format!("invalid argument types for {id}"), span);
+    let invalid = || {
+        let found = arguments
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        cyallo_ast::Diagnostic::new("E112", format!("`{id}` does not accept ({found})"), span)
+    };
     if id == Intrinsic::Print
         && type_args.is_empty()
         && arguments.iter().all(|ty| {

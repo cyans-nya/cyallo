@@ -121,7 +121,7 @@ fn ordinary_service_library_keeps_paths_during_replacement() {
         assert_eq!(s.status(), &Status::Finished);
         assert_eq!(
             s.context.output,
-            "first: ready\nsecond: replacement\nsecond: cached lookup\nFALSE\n"
+            "first: ready\nsecond: replacement\nsecond: cached lookup\nfalse\n"
         );
         assert_eq!(s.lookup_stats().mapper_calls, 1);
         assert_eq!(s.lookup_stats().hits, 2);
@@ -168,7 +168,7 @@ std::io::print(optional(two))
 std::io::print(optional(one))
 "#
     );
-    let p = parity(&source, "FALSE\nFALSE\nTRUE\nTRUE\n");
+    let p = parity(&source, "false\nfalse\ntrue\ntrue\n");
     let mut s = Session::new(p).unwrap();
     s.run(100000);
     assert_eq!(s.lookup_stats().mapper_calls, 3);

@@ -135,7 +135,7 @@ impl std::fmt::Display for Value {
             Self::Number(n) => write!(f, "{n}"),
             Self::Integer(v) => write!(f, "{v}"),
             Self::Real(v) => write!(f, "{v}"),
-            Self::Boolean(v) => write!(f, "{}", if *v { "TRUE" } else { "FALSE" }),
+            Self::Boolean(v) => write!(f, "{v}"),
             Self::Char(v) => write!(f, "{v}"),
             Self::String(v) => write!(f, "{v}"),
             Self::Array(v) => write!(f, "<array: {} elements>", v.len()),

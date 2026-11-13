@@ -265,7 +265,7 @@ fn analyze_selected(
                     effect.may_fail = true;
                     violation = Some("pure fn cannot read input".into());
                 }
-                Op::Output(_) => {
+                Op::Output(..) => {
                     effect.io = true;
                     violation = Some("pure fn cannot produce output".into());
                 }
@@ -283,7 +283,7 @@ fn analyze_selected(
                     );
                     if !crate::builtins::pure(*name) {
                         effect.nondeterministic = true;
-                        violation = Some(format!("pure fn cannot call effectful builtin {name}"));
+                        violation = Some(format!("pure fn cannot call effectful builtin `{name}`"));
                     }
                 }
                 Op::Call(_, to, _) => {

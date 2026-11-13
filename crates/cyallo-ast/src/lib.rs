@@ -1,6 +1,8 @@
 //! Source-preserving syntax and diagnostics for the 9618 executable dialect.
 pub use oxc_span::{GetSpan, GetSpanMut, SPAN, Span};
 pub mod diagnostic;
+mod display;
+pub use display::source_name;
 mod number;
 pub use number::{Number, NumberError, NumberKind};
 mod operator;

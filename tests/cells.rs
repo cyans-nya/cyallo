@@ -99,7 +99,7 @@ std::mem::drop(cell)
 std::mem::drop(first_weak)
 std::mem::drop(second_weak)
 "#,
-        "1:1\nTRUE\nTRUE\n4:5\n",
+        "1:1\ntrue\ntrue\n4:5\n",
     );
 }
 

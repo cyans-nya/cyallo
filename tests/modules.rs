@@ -195,7 +195,7 @@ fn service_modules_run_from_cli() {
         );
         assert_eq!(
             String::from_utf8_lossy(&result.stdout),
-            "first: ready\nfirst: cleanup\nsecond: ready\nFALSE\n"
+            "first: ready\nfirst: cleanup\nsecond: ready\nfalse\n"
         );
     }
 }
@@ -271,5 +271,5 @@ std::io::print(r.n, exists)
     let mut s = Session::new(p).unwrap();
     s.run(1000);
     assert_eq!(s.status(), &Status::Finished);
-    assert_eq!(s.context.output, "2FALSE\n");
+    assert_eq!(s.context.output, "2false\n");
 }

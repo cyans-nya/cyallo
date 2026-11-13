@@ -236,7 +236,7 @@ fn native_sparse_allocation_and_complex_helpers_observe_scalar_writes() {
     native.run(&mut b, 100_000).unwrap();
     parity(&a, &b);
     assert_eq!(b.status(), &Status::Finished);
-    assert_eq!(b.context.output, "180901:1:999\n03.5TRUETRUE\n");
+    assert_eq!(b.context.output, "180901:1:999\n03.5truetrue\n");
 }
 
 #[test]

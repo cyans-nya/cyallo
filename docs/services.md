@@ -8,7 +8,7 @@ cargo run -- run examples/services/main.ya --gc-stress --jit-report
 cargo run -- check examples/services/main.ya
 ```
 
-It prints `first: ready`, `first: cleanup`, `second: ready`, then `FALSE`.
+It prints `first: ready`, `first: cleanup`, `second: ready`, then `false`.
 
 ## Declarations and imports
 

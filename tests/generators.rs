@@ -160,7 +160,7 @@ values.close()
 let expired = weak.upgrade()
 std::io::print(expired.is_none())
 "#,
-        "42\nTRUE\n",
+        "42\ntrue\n",
     );
 }
 

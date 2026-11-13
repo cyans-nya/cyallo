@@ -9,7 +9,7 @@ mod memory;
 pub(crate) mod native;
 pub(crate) mod services;
 mod utilities;
-use crate::ir::{LocalStorage, Op, Program, Reg};
+use crate::ir::{LocalStorage, Op, Program, Reg, TextStyle};
 use crate::metrics::{ExecutionEngine, ExecutionReport, FrameMetrics};
 use cyallo_ast::{Diagnostic, Span, Type};
 pub use cyallo_values::Value;
@@ -1532,10 +1532,15 @@ impl Session {
                 };
                 self.set(r, value);
             }
-            Op::Output(rs) => {
+            Op::Output(rs, style) => {
                 let text = rs
                     .into_iter()
-                    .map(|r| self.register(r).to_string())
+                    .map(|r| match (style, self.register(r)) {
+                        (TextStyle::Caie, Value::Boolean(b)) => {
+                            if b { "TRUE" } else { "FALSE" }.to_string()
+                        }
+                        (_, value) => value.to_string(),
+                    })
                     .collect::<String>();
                 self.context.output.push_str(&text);
                 self.context.output.push('\n');

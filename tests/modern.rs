@@ -61,7 +61,7 @@ fn typed_arrays_ref_and_expression_constants() {
 fn loops_else_if_and_boolean_operators() {
     output(
         "let mut n = 0; let mut total = 0\nwhile n < 6 {\n n += 1\n if n == 2 { continue } else if n == 5 { break } else { total += n }\n}\nstd::io::print(total, true && !false, 7 % 3, 1 != 2)\n",
-        "8TRUE1TRUE\n",
+        "8true1true\n",
     );
 }
 #[test]
@@ -84,7 +84,7 @@ fn collection_push_evaluates_its_argument_before_growth() {
 fn utilities() {
     output(
         "std::io::print(std::string::trim(\" 水 \"), std::string::upper(\"straße\"), std::string::lower(\"ABC\"), std::string::contains(\"water\",\"at\"), std::string::starts_with(\"water\",\"wa\"), std::string::ends_with(\"water\",\"er\"), std::string::replace(\"a-b-a\",\"a\",\"x\"))\nstd::io::print(std::num::abs(-3), std::num::min(2,5), std::num::max(2.5,5.0), std::num::clamp(20,0,10), std::num::clamp(5.0,0.0,3.5), std::num::round(1.6), std::num::floor(-1.2), std::num::ceil(1.2), std::num::sqrt(9.0), std::num::pow(2.0,3.0))\nlet a = Vec[5,3,1]\nstd::io::print(std::array::sum(a),std::array::len(a),a.len())\nlet mut values = Vec[10]\nvalues.push(30)\nstd::io::print(values.len(),values[1],std::array::sum(values))\n",
-        "水STRASSEabcTRUETRUETRUEx-b-x\n325103.52-2238\n933\n23040\n",
+        "水STRASSEabctruetruetruex-b-x\n325103.52-2238\n933\n23040\n",
     );
 }
 #[test]
@@ -271,7 +271,7 @@ fn numbers_follow_rust_like_rules() {
     );
     output(
         "let zero = 0.0\nstd::io::print(1.0 / zero, \":\", -1.0 / zero, \":\", std::num::sqrt(-1.0), \":\", 0.0 / zero == 0.0 / zero)\n",
-        "inf:-inf:NaN:FALSE\n",
+        "inf:-inf:NaN:false\n",
     );
     output(
         "let x: f32 = 2.0\nlet y: u8 = 200\nstd::io::print(std::num::pow(x, 3.0), \":\", y / 3u8, \":\", std::num::max(y, 7u8))\n",
@@ -299,4 +299,39 @@ fn numbers_follow_rust_like_rules() {
         a.run(1000);
         assert!(matches!(a.status(), Status::Failed(_)), "{source}");
     }
+}
+#[test]
+fn tuples_records_and_arrays_compare_structurally() {
+    output(
+        "record P { x: i64, y: string }\nlet p = P { x: 1, y: \"a\" }\nlet q = P { x: 1, y: \"a\" }\nlet r = P { x: 2, y: \"a\" }\nlet n1 = ((1, 2.5), [P { x: 1, y: \"a\" }])\nlet n2 = ((1, 2.5), [P { x: 1, y: \"b\" }])\nstd::io::print((1, \"x\") == (1, \"x\"), p == q, p == r, p != r, [1, 2] == [1, 2], n1 == n2)\n",
+        "truetruefalsetruetruefalse\n",
+    );
+    for source in [
+        "let a = @gc 1\nlet b = @gc 1\nlet same = a == b\n",
+        "let a = (1, 2)\nlet b = (1, 2.0)\nlet same = a == b\n",
+        "let a = (1, 2)\nlet less = a < (2, 3)\n",
+    ] {
+        assert!(compile(source).is_err(), "accepted {source}");
+    }
+}
+#[test]
+fn diagnostics_use_source_names_and_types() {
+    let message = |source: &str| compile(source).unwrap_err().message;
+    assert_eq!(
+        message("let a = (1, 2)\nlet b = a < a\n"),
+        "operator `<` cannot be applied to `(i64, i64)` and `(i64, i64)`"
+    );
+    let mismatch = message("let a: f64 = 1\n");
+    assert!(
+        mismatch
+            .starts_with("mismatched types: expected `f64`, found `i64`; integers never convert"),
+        "{mismatch}"
+    );
+    let unknown = message("let s = missing + 1\n");
+    assert!(!unknown.contains('$'), "{unknown}");
+    assert!(unknown.contains("`missing`"), "{unknown}");
+    assert_eq!(
+        message("let a = std::num::sqrt(4)\n"),
+        "`std::num::sqrt` does not accept (i64)"
+    );
 }

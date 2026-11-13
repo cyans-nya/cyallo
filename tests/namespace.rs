@@ -147,7 +147,7 @@ let malformed = num::parse<i32>("no")
 let floating = num::parse<f32>("1.25")
 io::print(value.is_ok(), ":", value.unwrap(), ":", overflow.is_err(), ":", malformed.is_err(), ":", floating.unwrap())
 "#,
-        "TRUE:255:TRUE:TRUE:1.25\n",
+        "true:255:true:true:1.25\n",
     );
     assert!(compile("let value = num::parse<bool>(\"true\")\n").is_err());
 }
@@ -239,10 +239,10 @@ io::print(rc::strong_count(&owner))
 mem::drop(owner)
 io::print(weak.upgrade().is_none(), ":", expired().upgrade().is_none())
 "#;
-    output(source, "7:5\n2:9\n1\nTRUE:TRUE\n");
+    output(source, "7:5\n2:9\n1\ntrue:true\n");
     output_context(
         source,
-        "7:5\n2:9\n1\nTRUE:TRUE\n",
+        "7:5\n2:9\n1\ntrue:true\n",
         cyallo::Context {
             gc: cyallo::runtime::gc::GcConfig::stress(),
             ..Default::default()
@@ -352,7 +352,7 @@ for i in 0..=3 {
 }
 std::io::print(owner.strong_count())
 "#,
-        "TRUE:1\n1\n2\n2\n1\n",
+        "true:1\n1\n2\n2\n1\n",
         cyallo::Context {
             gc: cyallo::runtime::gc::GcConfig::stress(),
             ..Default::default()

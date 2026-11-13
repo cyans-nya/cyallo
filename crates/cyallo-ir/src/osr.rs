@@ -165,7 +165,7 @@ pub fn uses_defs(op: &Op) -> (Vec<Reg>, Option<Reg>) {
         Op::Branch(r, _, _) => (vec![*r], None),
         Op::Call(r, _, rs) => (rs.clone(), *r),
         Op::Return(r) => (r.iter().copied().collect(), None),
-        Op::Output(rs) => (rs.clone(), None),
+        Op::Output(rs, _) => (rs.clone(), None),
     }
 }
 fn live_inputs(function: &Function) -> Vec<LiveBlock> {

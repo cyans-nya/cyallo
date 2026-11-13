@@ -217,7 +217,7 @@ pub fn prepare(ast: &mut cyallo_ast::Ast) -> Result<Metadata, cyallo_ast::Diagno
             Type::TraitObject(name) if metadata.trait_id(name).is_none() => {
                 return Err(Diagnostic::new(
                     "E130",
-                    format!("unknown trait {name}"),
+                    format!("unknown trait `{}`", cyallo_ast::source_name(name)),
                     span,
                 ));
             }

@@ -149,7 +149,7 @@ after all strong owners are dropped, upgrading fails:
 strong: 2
 survivor: 42
 upgraded: 42:2
-expired: TRUE
+expired: true
 ```
 
 [gc-rc.ya](gc-rc.ya) gives two independent RC allocations references to the same
@@ -159,7 +159,7 @@ reference retains the cell after both RC owners expire:
 ```text
 first: 7
 second: 7
-first expired: TRUE
+first expired: true
 second survives: 9
 gc survives: 11
 ```
@@ -192,7 +192,7 @@ Its output is:
 first: ready
 second: replacement
 second: cached lookup
-FALSE
+false
 ```
 
 The [Context lifecycle example](services/main.ya) uses the existing runtime
@@ -202,7 +202,7 @@ service API. It demonstrates injection and cleanup hooks, printing:
 first: ready
 first: cleanup
 second: ready
-FALSE
+false
 ```
 
 Imports expose declarations. The entry calls `install` to activate a provider.
