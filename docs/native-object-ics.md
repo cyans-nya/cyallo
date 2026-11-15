@@ -42,7 +42,8 @@ failures. It compares output, typed failures and exact instruction counts for:
 - GC stress and one-instruction/137-instruction handoffs.
 
 There are 384 native runs against 64 interpreter baselines. Enabled runs must
-record actual native read/write hits and guard misses; disabled runs require
+record actual native read/write hits, guard misses and misses beyond four
+shapes; disabled runs require
 zero hits. Failures print the seed and complete generated Cyallo source.
 
 Additional cases cover scalar tags, saved generator roots, independent Sessions
@@ -59,7 +60,8 @@ numeric-cast arm masking checked conversions from `dynamic`.
 
 The internal benchmark runs [native-ic.ya](../examples/objects/native-ic.ya):
 200,000 writes and 200,000 reads of one typed field. Samples use fresh Sessions
-and the same compiled artifact. Compilation is outside the timer. Reproduce the
+and the same compiled artifact. Initial artifact compilation is outside the timer; tiered promotion work may
+occur during execution. Reproduce the
 debug-runtime measurements with:
 
 ```sh
@@ -70,9 +72,9 @@ Local aarch64 results, five-sample medians, seconds:
 
 | Engine | ICs disabled | ICs enabled |
 | --- | ---: | ---: |
-| Tiered | 0.903604 | 0.164750 |
-| Cranelift fast | 0.904294 | 0.161659 |
-| Cranelift speed | 0.910715 | 0.163582 |
+| Tiered | 0.873572 | 0.162472 |
+| Cranelift fast | 0.894496 | 0.160196 |
+| Cranelift speed | 0.877618 | 0.162070 |
 
 Enabled samples recorded 199,999 read hits, 199,999 write commits and two misses.
 Disabled samples recorded zero hits and 400,000 misses. This measures a scalar,

@@ -164,6 +164,7 @@ fn seeded_objects_match_interpreter_with_native_ics_enabled_and_disabled() {
                             assert!(stats.native_reads > 0, "{stats:?}");
                             assert!(stats.native_writes > 0, "{stats:?}");
                             assert!(stats.native_misses > 0, "{stats:?}");
+                            assert!(stats.megamorphic_misses > 0, "{stats:?}");
                         }
                         ObjectIcMode::Disabled => {
                             assert_eq!(stats.native_reads, 0);
