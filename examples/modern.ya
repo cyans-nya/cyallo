@@ -1,5 +1,5 @@
 // A larger arithmetic workload for observing calls and tiering. Start with tour.ya for a short introduction.
-// Run: cargo run -- run examples/modern.ya --jit-report
+// Run: cargo run -- run examples/modern.ya --jit-trace=summary
 const limit = 163840
 let mut total = 0
 let names = ["  Ada  ", "Grace", "Linus"]
@@ -13,7 +13,7 @@ fn cube(n: i64) -> i64 {
 }
 
 proc announce(message: &string) {
-    std::io::print(std::string::upper(std::string::trim(*message)))
+    std::io::print(std::string::upper(std::string::trim(message.*)))
 }
 
 for i in 0..=limit {

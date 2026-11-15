@@ -2,6 +2,9 @@ use cyallo_ast::Span;
 pub use cyallo_ir::ir::*;
 #[derive(Debug, Clone)]
 pub struct Program {
+    pub(crate) dynamic_plan: Option<std::sync::Arc<crate::dynamic_modules::CompilePlan>>,
+    pub(crate) module_loader: Option<cyallo_modules::ModuleLoader>,
+    pub(crate) parent: Option<std::sync::Arc<Program>>,
     pub(crate) records: std::sync::Arc<std::collections::HashMap<String, cyallo_ast::Type>>,
     pub(crate) requires_tracing: bool,
     pub(crate) jobs: crate::Jobs,
@@ -17,6 +20,27 @@ pub struct Program {
     pub(crate) code_versions: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 impl Program {
+    pub fn with_module_loader(mut self, loader: cyallo_modules::ModuleLoader) -> Self {
+        self.module_loader = Some(loader);
+        self
+    }
+    pub(crate) fn static_global_count(&self) -> usize {
+        let mut base = self;
+        while let Some(parent) = &base.parent {
+            base = parent;
+        }
+        base.functions[0].locals.len()
+    }
+    pub(crate) fn extends(&self, ancestor: &std::sync::Arc<Program>) -> bool {
+        let mut current = self.parent.as_ref();
+        while let Some(parent) = current {
+            if std::sync::Arc::ptr_eq(parent, ancestor) {
+                return true;
+            }
+            current = parent.parent.as_ref();
+        }
+        false
+    }
     /// A fresh native code version; zero is reserved for "no native frame".
     pub(crate) fn next_code_version(&self) -> u64 {
         self.code_versions
@@ -36,6 +60,11 @@ impl Program {
     pub fn emit_inspection(&self) {
         if let Some(observer) = &self.inspection {
             observer.emit_program(self);
+        }
+    }
+    pub(crate) fn inline_site(&self, site: crate::inspection::InlineSite) {
+        if let Some(observer) = &self.inspection {
+            observer.inline_site(site);
         }
     }
     pub(crate) fn notice(

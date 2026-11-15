@@ -231,7 +231,7 @@ fn main() {
         5,
     ));
     cases.push(Case::new("tiny-leaves", "fn square(n: i64) -> i64 { return n * n }\nfn cube(n: i64) -> i64 { return square(n) * n }\nlet mut total = 0\nfor i in 0..=32767 { total += cube(i) }\nstd::io::print(total)\n", 15, 5));
-    cases.push(Case::new("procedure-calls", "proc bump(n: &mut i64) { *n += 1 }\nlet mut total = 0\nfor i in 0..=32767 { bump(&mut total) }\nstd::io::print(total)\n", 15, 5));
+    cases.push(Case::new("procedure-calls", "proc bump(n: &mut i64) { n.* += 1 }\nlet mut total = 0\nfor i in 0..=32767 { bump(&mut total) }\nstd::io::print(total)\n", 15, 5));
     for count in [100, 500] {
         let source = (0..count)
             .map(|i| format!("fn cold{i}(n: i64) -> i64 {{ return n + {i} }}\n"))

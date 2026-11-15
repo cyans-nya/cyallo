@@ -24,6 +24,8 @@ pub use cyallo_scheduler as concurrency;
 mod constants;
 pub mod debugger;
 pub mod diagnostics;
+mod dynamic_modules;
+pub mod module_loader;
 use cyallo_ir::effects;
 pub use cyallo_ir::gc_metadata;
 pub mod highlight;
@@ -34,9 +36,13 @@ pub mod metrics;
 pub use cyallo_ir::osr;
 pub mod repl;
 pub mod runtime;
-pub use compiler::{CompileOptions, Dialect, compile, compile_for_execution, compile_with_options};
+pub use compiler::{
+    CompileOptions, Dialect, compile, compile_for_execution, compile_with_core_package,
+    compile_with_import_policy, compile_with_options,
+};
 pub use cyallo_ast::{Diagnostic, SourceFile, Span, Type};
 pub use cyallo_compile_jobs::Jobs;
+pub use cyallo_ir::{core_package, import_policy};
 pub use runtime::{Context, Session, Status, Value};
 pub mod modules;
 pub use cyallo_ir::services;

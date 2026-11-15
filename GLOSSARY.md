@@ -10,6 +10,12 @@ that persist across pauses and resumptions.
 
 ## Managed lifetime
 
+**Storage and locality**:
+`gc` and `rc` select managed lifetime strategy. `@local` and `@shared` describe
+coroutine confinement independently; local is the default and does not imply
+unique ownership. Shared managed execution remains pending; the compiler rejects
+`@shared` until its graph and runtime requirements are implemented.
+
 **Session heap**:
 The managed language data belonging to one Session. Managed objects are not
 shared between Sessions.
@@ -48,7 +54,7 @@ language-visible procedure effect.
 ## Language storage
 
 **Cell<T>**: Owned interior-mutable storage. Sharing a cell requires an explicit
-managed owner, for example `@gc std::cell::Cell<T>`.
+managed owner, for example `gc std::cell::Cell<T>`.
 
 **Location<T>**: A strong retained reference to a statically checked field.
 It remains valid after the source binding leaves scope.

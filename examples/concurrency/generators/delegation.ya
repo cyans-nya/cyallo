@@ -13,7 +13,7 @@ let parent = gen proc(start: i64) -> Generator<i64, i64, i64> {
 }
 
 let mut values = parent(7)
-let first = values.resume()
+let first = values.start()
 print("yielded: ", first.yielded())
 let last = values.resume(20)
 print("complete: ", last.completed())

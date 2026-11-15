@@ -70,16 +70,16 @@ fn inline_modules_and_reexports() {
 #[test]
 fn explicit_readonly_and_writable_references() {
     output(
-        "fn read(n: &i64) -> i64 { return *n + 1 }\nproc bump(n: &mut i64) { *n += 1 }\nlet mut n = 4\nbump(&mut n)\nio::print(read(&n),n)\n",
+        "fn read(n: &i64) -> i64 { return n.* + 1 }\nproc bump(n: &mut i64) { n.* += 1 }\nlet mut n = 4\nbump(&mut n)\nio::print(read(&n),n)\n",
         "65\n",
     );
-    assert!(compile("proc bad(n: &i64) { *n = 2 }\n").is_err());
-    assert!(compile("fn bad(n: &mut i64) -> i64 { *n = 2; return *n }\n").is_err());
+    assert!(compile("proc bad(n: &i64) { n.* = 2 }\n").is_err());
+    assert!(compile("fn bad(n: &mut i64) -> i64 { n.* = 2; return n.* }\n").is_err());
 }
 #[test]
 fn native_reference_store_uses_pointee_tag() {
     output(
-        "proc bump(n: &mut i64) { *n += 1 }\nlet mut n = 4\nbump(&mut n)\nio::print(n)\n",
+        "proc bump(n: &mut i64) { n.* += 1 }\nlet mut n = 4\nbump(&mut n)\nio::print(n)\n",
         "5\n",
     );
 }
@@ -178,8 +178,8 @@ let mut fixed = [1u8, 2u8, 3u8]
 let readonly: &[]u8 = &fixed
 io::print(count(readonly), ":", readonly[2])
 bump(&mut fixed)
-let mut dynamic = Vec<u8>[4, 5]
-let borrowed = dynamic.as_mut_slice()
+let mut buffer = Vec<u8>[4, 5]
+let borrowed = buffer.as_mut_slice()
 borrowed[0] += 1
 io::print(fixed[1], ":", borrowed[0], ":", borrowed.len())
 "#,
@@ -192,7 +192,7 @@ io::print(fixed[1], ":", borrowed[0], ":", borrowed.len())
 fn ownership_and_boundary_loans_are_checked() {
     for source in [
         "fn bad() -> &i64 { let value = 1; return &value }\n",
-        "proc edit(a: &mut i64, b: &i64) { *a += *b }\nlet mut value = 1\nedit(&mut value, &value)\n",
+        "proc edit(a: &mut i64, b: &i64) { a.* += b.* }\nlet mut value = 1\nedit(&mut value, &value)\n",
         "let mut values = Vec[1,2]\nlet view = values.as_slice()\nvalues.push(3)\nio::print(view[0])\n",
         "let values = Vec[1]\nlet moved = values\nio::print(values.len())\n",
     ] {
@@ -200,14 +200,14 @@ fn ownership_and_boundary_loans_are_checked() {
     }
     output(
         r#"
-proc edit(a: &mut i64, b: &i64) { *a += *b }
+proc edit(a: &mut i64, b: &i64) { a.* += b.* }
 let mut pair = (1, 2)
 edit(&mut pair.0, &pair.1)
 let mut value = 4
 let a = &mut value
 let b = &mut value
-*a += 1
-*b += 1
+a.* += 1
+b.* += 1
 io::print(pair.0, ":", value)
 let mut values = Vec[1,2]
 let view = values.as_slice()
@@ -223,14 +223,14 @@ io::print(values.len())
 fn dedicated_managed_syntax_and_reference_counting() {
     let source = r#"
 record Pair { value: i64 }
-fn make() -> @gc Pair { return @gc Pair { value: 7 } }
-fn read(value: &@rc i64) -> i64 { return **value }
-proc expired() -> std::rc::Weak<i64> { let owner = @rc 8; return owner.downgrade() }
+fn make() -> gc Pair { return gc Pair { value: 7 } }
+fn read(value: &rc i64) -> i64 { return value.*.* }
+proc expired() -> std::rc::Weak<i64> { let owner = rc 8; return owner.downgrade() }
 let managed = make()
-let cell = @gc Cell::new(2)
-**cell = 5
-io::print(managed.value, ":", **cell)
-let owner = @rc 9
+let cell = gc Cell::new(2)
+cell.*.* = 5
+io::print(managed.value, ":", cell.*.*)
+let owner = rc 9
 let cloned = rc::clone(&owner)
 let weak = rc::downgrade(&owner)
 io::print(rc::strong_count(&owner), ":", read(&cloned))
@@ -248,8 +248,8 @@ io::print(weak.upgrade().is_none(), ":", expired().upgrade().is_none())
             ..Default::default()
         },
     );
-    assert!(compile("fn bad(value: @rc i64) -> i64 { return *value }\n").is_err());
-    assert!(compile("fn bad() -> (@rc i64,i64) { return (@rc 1,2) }\n").is_err());
+    assert!(compile("fn bad(value: rc i64) -> i64 { return value.* }\n").is_err());
+    assert!(compile("fn bad() -> (rc i64,i64) { return (rc 1,2) }\n").is_err());
 }
 
 #[test]
@@ -339,7 +339,7 @@ std::io::print(value)
 fn rc_temporaries_and_loop_exits_release_owners() {
     output_context(
         r#"
-let owner = @rc 9
+let owner = rc 9
 let weak = owner.downgrade()
 std::io::print(weak.upgrade().is_some(), ":", owner.strong_count())
 owner.clone()

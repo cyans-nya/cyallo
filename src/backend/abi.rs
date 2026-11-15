@@ -10,8 +10,10 @@ pub(super) unsafe extern "C" fn state(session: *mut Session) -> i64 {
     if let Some(report) = s.execution_report_mut() {
         report.boundaries.state += 1;
     }
-    if matches!(s.status(), Status::Finished | Status::Failed(_))
-        || (*s.status() == Status::WaitingForInput && s.context.input.is_empty())
+    if matches!(
+        s.status(),
+        Status::Finished | Status::Failed(_) | Status::Waiting
+    ) || (*s.status() == Status::WaitingForInput && s.context.input.is_empty())
     {
         -1
     } else {
@@ -63,4 +65,42 @@ pub(super) unsafe extern "C" fn native_flush(session: *mut Session) {
 pub(super) unsafe extern "C" fn native_enter(session: *mut Session) {
     let s = unsafe { &mut *session };
     s.enter_native_reporting();
+}
+pub(super) unsafe extern "C" fn native_property_write(session: *mut Session) {
+    let s = unsafe { &mut *session };
+    s.finish_native();
+    if !matches!(s.status(), crate::runtime::Status::Paused) {
+        s.prepare_native();
+        return;
+    }
+    let span = s.current_span().unwrap_or_default();
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.native_property_step())).is_err()
+    {
+        s.fail(EngineError::Panic, span);
+    }
+    s.prepare_native();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn failed_materialization_cannot_commit_a_later_property_write() {
+        let mut session = Session::new(std::sync::Arc::new(crate::compile("").unwrap())).unwrap();
+        let view = session.prepare_native();
+        // SAFETY: establish the same validated engine tag as a native entry.
+        unsafe {
+            (*view).engine = crate::metrics::ExecutionEngine::Winch as u64;
+        }
+        session.fail(
+            crate::runtime::ArithmeticError::IntegerOverflow,
+            crate::Span::default(),
+        );
+        let failed = session.status().clone();
+        // SAFETY: the callback borrows this live Session exclusively. A failed
+        // safepoint must exit before reading any property-handler operands.
+        unsafe { native_property_write(&mut session) };
+        assert_eq!(session.status(), &failed);
+        assert_eq!(session.instruction_count(), 0);
+    }
 }

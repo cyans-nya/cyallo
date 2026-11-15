@@ -53,12 +53,23 @@ and user-defined members. Standard declarations may carry stable intrinsic or
 builtin-type identities. Instantiate their contracts using the resolved operand,
 receiver, and type-argument information before lowering.
 
+Dereference is the postfix operator `value.*`, composable as `value.*.*`,
+`value.*.field`, or `value.*[i]`. Keep multiplication as `a * b`. Reject prefix
+`*value` with its migration diagnostic. Dereference and multiplication retain
+distinct typed operation identities; execution never recognizes source text.
+
 Never hardcode builtin primitive behavior by string-matching source names in
 lowering, optimization, code generation, or execution. A name such as `spawn`,
 `share`, `Cell`, or `resume` does not, by itself, identify an operation. Source
 strings belong in lexical/declaration lookup, display, and diagnostics. A
-declaration catalog may map a public spelling to a declaration identity; that is
-name resolution, and subsequent stages consume the resolved identity.
+public namespace comes from real `.ya` declarations and ordinary `mod`/`use`.
+Do not keep a parallel Rust list of standard paths, exports, member names,
+prelude names, or signatures. Trusted declarations bind private semantic ABI
+keys through `#[cyallo_internal("...")]`; the compiler validates those bindings
+and specializes their instantiated contracts. Renaming or moving a standard
+declaration requires only source edits. See
+[standard declarations and imports](standard-declarations.md) for the boundaries
+and verification requirements.
 
 For example, an alias of a standard primitive retains that primitive's identity.
 A user declaration with the same spelling retains the user's behavior. A user
@@ -106,6 +117,12 @@ state to discover the current runtime or processor. Carry coroutine identity,
 processor preference, fuel, and wake capabilities explicitly.
 
 Keep GC/RC storage choices separate from local/shared/unique qualification.
+Spell storage as `gc`/`rc`, with optional `@local` or `@shared` before it. Local
+is the default. Preserve locality in AST and resolved types, including through
+generic substitution and type comparison. Reject the old `@gc`/`@rc` syntax.
+Until shared graph support exists, reject `@shared` with a typed diagnostic;
+never erase it or execute it with local semantics. The current syntax and limits
+are documented in [managed memory](managed-memory.md).
 Default-local managed graphs stay with their coroutine. Sharing requires the
 appropriate checked conversion; an accepting function cannot silently promote a
 local value and send it to another coroutine. Validate captures, saved state,

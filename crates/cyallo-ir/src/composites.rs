@@ -23,7 +23,7 @@ pub fn borrowed(t: &Type) -> bool {
     match t {
         Type::Borrowed(_) => true,
         Type::Tuple(ts) => ts.iter().any(borrowed),
-        Type::Record(_, fs) => fs.iter().any(|(_, t)| borrowed(t)),
+        Type::Record(_, fs) | Type::Object(fs) => fs.iter().any(|(_, t)| borrowed(t)),
         Type::Array(_, t) | Type::SparseArray(t) | Type::Storage(_, t) => borrowed(t),
         _ => false,
     }
@@ -74,10 +74,12 @@ pub fn type_view(ty: &Type, definitions: &HashMap<String, Type>) -> Type {
             .expect("resolved record identity"),
         Type::Managed {
             kind,
+            locality,
             lifetime,
             pointee,
         } => Type::Managed {
             kind: *kind,
+            locality: *locality,
             lifetime: lifetime.clone(),
             pointee: Box::new(type_view(pointee, definitions)),
         },
@@ -314,13 +316,13 @@ pub use cyallo_ast::visit::{visit_block, visit_expr};
 pub fn lift(
     ast: &mut Ast,
     globals: &[Local],
-    types: &HashMap<String, Type>,
+    types: &crate::declarations::TypeEnvironment,
     options: CompileOptions,
 ) -> Result<()> {
     fn block(
         body: &mut [Stmt],
         known: &[Local],
-        types: &HashMap<String, Type>,
+        types: &crate::declarations::TypeEnvironment,
         options: CompileOptions,
         generated: &mut Vec<Function>,
         owner: &str,
@@ -437,6 +439,8 @@ pub fn lift(
                     is_borrowed |= reference.is_some() || borrowed(&local.ty);
                     captures.push(value);
                     params.push(Param {
+                        arity: ParameterArity::One,
+                        passing: ParameterPassing::Value,
                         receiver: false,
                         name: local.name.clone(),
                         ty,

@@ -1,0 +1,18 @@
+use std::result::Result;
+#[cyallo_internal("object_view_trait")]
+pub trait ObjectView {}
+#[cyallo_internal("object_like_trait")]
+pub trait ObjectLike {}
+#[cyallo_internal("type_descriptor_struct")]
+pub record TypeDescriptor {}
+#[cyallo_internal("view_error_struct")]
+pub record ViewError {}
+
+#[cyallo_internal("object_view")]
+pub proc view<T: ObjectView>(read value: dynamic) -> Result<T, ViewError>;
+#[cyallo_internal("object_freeze")]
+pub proc freeze<T: ObjectLike>(read value: T) -> T;
+impl ViewError {
+    #[cyallo_internal("view_error_message")]
+    pub fn message(self: &Self) -> string;
+}

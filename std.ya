@@ -1,0 +1,26 @@
+// The standard package uses the same file modules and imports as user packages.
+pub mod any;
+pub mod array;
+pub mod cell;
+pub mod channel;
+pub mod char;
+pub mod collections;
+pub mod gc;
+pub mod generator;
+pub mod io;
+pub mod lookup;
+pub mod mem;
+pub mod num;
+pub mod module;
+pub mod option;
+pub mod object;
+#[cyallo_internal("prelude")]
+pub mod prelude;
+pub mod random;
+pub mod rc;
+pub mod result;
+pub mod runtime;
+pub mod service;
+pub mod string;
+pub mod task;
+pub mod time;

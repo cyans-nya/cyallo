@@ -1,0 +1,31 @@
+#[cyallo_internal("generator_struct")]
+pub record Generator<Yield, Resume, Return> {}
+#[cyallo_internal("generator_step_struct")]
+pub record Step<Yield, Return> {}
+
+impl<Y, R, C> Generator<Y, R, C> {
+    #[cyallo_internal("generator_start")]
+    pub proc start(self: &mut Self) -> Step<Y, C>;
+    #[cyallo_internal("generator_resume")]
+    pub proc resume(self: &mut Self, value: R) -> Step<Y, C>;
+    #[cyallo_internal("generator_close")]
+    pub proc close(self: &mut Self);
+}
+
+impl<Y, C> Generator<Y, (), C> {
+    #[cyallo_internal("generator_resume")]
+    pub proc resume(self: &mut Self) -> Step<Y, C>;
+    #[cyallo_internal("generator_next")]
+    pub proc next(self: &mut Self) -> Step<Y, C>;
+}
+
+impl<Y, C> Step<Y, C> {
+    #[cyallo_internal("generator_is_yielded")]
+    pub fn is_yielded(self: &Self) -> bool;
+    #[cyallo_internal("generator_is_complete")]
+    pub fn is_complete(self: &Self) -> bool;
+    #[cyallo_internal("generator_yielded")]
+    pub fn yielded(self) -> Y;
+    #[cyallo_internal("generator_completed")]
+    pub fn completed(self) -> C;
+}

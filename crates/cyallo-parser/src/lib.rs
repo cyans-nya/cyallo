@@ -173,17 +173,31 @@ impl<'src> Parser<'src> {
                 return Ok(ast);
             }
             let attribute_start = self.token().span.start;
-            let attributes = self.routine_attributes()?;
+            let (attributes, annotations) = self.declaration_attributes()?;
+            let module_count = ast.modules.len();
+            let trait_count = ast.traits.len();
             if self.module_declaration(&mut ast)? {
                 if !attributes.is_empty() {
                     return Err(
                         self.error("routine attributes require a function or procedure body")
                     );
                 }
+                if !annotations.is_empty() {
+                    if ast.modules.len() > module_count {
+                        ast.modules.last_mut().unwrap().annotations = annotations;
+                    } else if ast.traits.len() > trait_count {
+                        ast.traits.last_mut().unwrap().annotations = annotations;
+                    } else {
+                        return Err(self.error(
+                            "annotation requires a module, type, trait or callable declaration",
+                        ));
+                    }
+                }
                 continue;
             }
             if self.at("fn") || self.at("proc") {
                 let mut function = self.modern_function()?;
+                function.annotations.extend(annotations);
                 if !attributes.is_empty() {
                     function.attributes = attributes;
                     function.span.start = attribute_start;
@@ -195,9 +209,11 @@ impl<'src> Parser<'src> {
                         self.error("routine attributes require a function or procedure body")
                     );
                 }
-                ast.records.push(self.record()?);
+                let mut record = self.record()?;
+                record.annotations = annotations;
+                ast.records.push(record);
             } else {
-                if !attributes.is_empty() {
+                if !attributes.is_empty() || !annotations.is_empty() {
                     return Err(
                         self.error("routine attributes require a function or procedure body")
                     );
@@ -238,8 +254,7 @@ impl<'src> Parser<'src> {
             self.pos += 1;
             return Ok(Type::Lifetime(lifetime));
         }
-        if self.take("@") {
-            let kind = self.memory_kind()?;
+        if let Some(modern::ManagedPrefix { kind, locality }) = self.managed_prefix()? {
             let lifetime = if self.take("<") {
                 if self.token().kind != TokenKind::Lifetime {
                     return Err(self.error("expected allocator lifetime"));
@@ -253,6 +268,7 @@ impl<'src> Parser<'src> {
             };
             return Ok(Type::Managed {
                 kind,
+                locality,
                 lifetime,
                 pointee: Box::new(self.ty()?),
             });
@@ -286,6 +302,32 @@ impl<'src> Parser<'src> {
         self.base_ty()
     }
     fn base_ty(&mut self) -> Result<Type, Diagnostic> {
+        if self.take("dynamic") {
+            return Ok(Type::Dynamic);
+        }
+        if self.take("object") {
+            self.expect("{")?;
+            self.newlines();
+            let mut fields = vec![];
+            while !self.take("}") {
+                if self.take("..") {
+                    self.newlines();
+                    self.expect("}")?;
+                    break;
+                }
+                let name = self.name()?;
+                self.expect(":")?;
+                fields.push((name, self.ty()?));
+                if self.take("}") {
+                    break;
+                }
+                if !self.take(",") && self.token().kind != TokenKind::Newline {
+                    return Err(self.error("expected comma or newline"));
+                }
+                self.newlines();
+            }
+            return Ok(Type::Object(fields));
+        }
         if self.word("dyn") {
             return Ok(Type::TraitObject(self.qualified_name()?));
         }
@@ -332,7 +374,14 @@ impl<'src> Parser<'src> {
             }
             return Ok(Type::Tuple(fields));
         }
-        if self.token().kind == TokenKind::Identifier {
+        if matches!(
+            self.token().kind,
+            TokenKind::Identifier
+                | TokenKind::Gc
+                | TokenKind::Rc
+                | TokenKind::Object
+                | TokenKind::Dynamic
+        ) {
             if let Some(kind) = NumberKind::parse(self.token_text()) {
                 self.pos += 1;
                 return Ok(Type::numeric(kind));
@@ -406,6 +455,7 @@ impl<'src> Parser<'src> {
                         | ExprKind::GenericCall(..)
                         | ExprKind::Invoke(..)
                         | ExprKind::Yield(..)
+                        | ExprKind::DeleteProperty(..)
                 ) {
                     StmtKind::Evaluate(value)
                 } else {
@@ -425,8 +475,9 @@ impl<'src> Parser<'src> {
             self.newlines();
         }
         let span = self.token().span;
-        let mut lhs = if self.take("@") {
-            let kind = self.memory_kind()?;
+        let mut lhs = if let Some(modern::ManagedPrefix { kind, locality }) =
+            self.managed_prefix()?
+        {
             let (allocator, value) = if kind == MemoryKind::Rc && self.take("(") {
                 let inner = self.expr(0)?;
                 self.expect(")")?;
@@ -444,9 +495,10 @@ impl<'src> Parser<'src> {
                         | TokenKind::At
                         | TokenKind::Fn
                         | TokenKind::Proc
+                        | TokenKind::Gc
+                        | TokenKind::Rc
                         | TokenKind::Ampersand
                         | TokenKind::Bang
-                        | TokenKind::Star
                         | TokenKind::Minus
                         | TokenKind::Plus
                 ) {
@@ -458,7 +510,46 @@ impl<'src> Parser<'src> {
                 (None, Box::new(self.expr(UNARY_OPERAND)?))
             };
             Expr {
-                kind: ExprKind::ManagedNew(kind, allocator, value),
+                kind: ExprKind::ManagedNew(kind, locality, allocator, value),
+                span: self.finish_span(span),
+            }
+        } else if (self.at("object") || self.at("dynamic"))
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .is_some_and(|token| token.kind == TokenKind::LeftBrace)
+        {
+            let kind = if self.take("object") {
+                ObjectKind::Typed
+            } else {
+                self.expect("dynamic")?;
+                ObjectKind::Dynamic
+            };
+            self.expect("{")?;
+            self.nesting += 1;
+            self.newlines();
+            let mut fields = vec![];
+            while !self.take("}") {
+                let name = self.name()?;
+                self.expect(":")?;
+                fields.push((name, self.expr(0)?));
+                if self.take("}") {
+                    break;
+                }
+                if !self.take(",") && self.token().kind != TokenKind::Newline {
+                    return Err(self.error("expected comma or newline"));
+                }
+                self.newlines();
+            }
+            self.nesting -= 1;
+            Expr {
+                kind: ExprKind::ObjectLiteral(kind, fields),
+                span: self.finish_span(span),
+            }
+        } else if self.take("delete") {
+            let target = self.expr(UNARY_OPERAND)?;
+            Expr {
+                kind: ExprKind::DeleteProperty(Box::new(target)),
                 span: self.finish_span(span),
             }
         } else if self.take("gen") {
@@ -491,11 +582,8 @@ impl<'src> Parser<'src> {
                 kind: ExprKind::Unary(op, Box::new(self.expr(UNARY_OPERAND)?)),
                 span: self.finish_span(span),
             }
-        } else if self.take("*") {
-            Expr {
-                kind: ExprKind::Unary(Operator::Dereference, Box::new(self.expr(UNARY_OPERAND)?)),
-                span: self.finish_span(span),
-            }
+        } else if self.at("*") {
+            return Err(cyallo_ast::diagnostic::prefix_dereference_removed(span));
         } else if self.take("-") {
             if matches!(self.token().kind, TokenKind::Integer | TokenKind::Real) {
                 let literal = self.number_literal(true)?;
@@ -585,7 +673,11 @@ impl<'src> Parser<'src> {
                 TokenKind::True | TokenKind::False => {
                     ExprKind::Literal(Literal::Boolean(self.token().kind == TokenKind::True))
                 }
-                TokenKind::Identifier => {
+                TokenKind::Identifier
+                | TokenKind::Gc
+                | TokenKind::Rc
+                | TokenKind::Object
+                | TokenKind::Dynamic => {
                     let mut name = self.token_text().to_string();
                     while self
                         .tokens
@@ -682,7 +774,9 @@ impl<'src> Parser<'src> {
                 continue;
             }
             if self.take(".") {
-                let kind = if self.token().kind == TokenKind::Integer {
+                let kind = if self.take("*") {
+                    ExprKind::Unary(Operator::Dereference, Box::new(lhs))
+                } else if self.token().kind == TokenKind::Integer {
                     let index = usize::try_from(self.magnitude()?)
                         .map_err(|_| self.error("tuple index is too large"))?;
                     self.pos += 1;

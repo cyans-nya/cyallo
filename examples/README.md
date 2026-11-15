@@ -16,15 +16,18 @@ front-end compilation workers. `--gc-stress` is useful on the short examples;
 ## Concurrency runtime sets
 
 The [dedicated concurrency examples](concurrency/README.md) are Cyallo `.ya`
-programs. The generator set covers factories, captures, resume input, completion,
-and delegation, with run commands and expected output:
+programs. The sets cover generators, task scheduling, timers, cancellation,
+and MPMC channels, with run commands and expected output:
 
 ```sh
 cargo run -- run examples/concurrency/generators/sequence.ya
 cargo test --test generators
+cargo run -- run examples/concurrency/channels/mpmc.ya --gc-stress
+cargo test --test concurrency
 ```
 
-Task, channel, and managed transport integration is still in progress.
+Shared managed graphs, source groups, and selection remain in progress; see the
+[integration tracker](../docs/concurrency-language-progress.md).
 
 ## Start here
 
@@ -35,11 +38,12 @@ its run command and comments explaining the behavior.
 | --- | --- |
 | [tour.ya](tour.ya) | Small functions, procedures, arrays, range loops, break/continue, and string utilities |
 | [composites.ya](composites.ya) | Records, tuples, callbacks, returning owned closures, and explicit `&mut` captures |
+| [postfix-dereference.ya](postfix-dereference.ya) | `value.*`, chained dereferences, mutation through references, tuple fields, and multiplication; prints `21`, `12`, `7` |
 | [generics.ya](generics.ya) | Generic records, inferred/explicit type arguments, an array transform, and specialized closures |
 | [traits.ya](traits.ya) | Concrete method calls, `dyn` dispatch, owned conversion, and aliases to an erased object |
-| [gc-sharing.ya](gc-sharing.ya) | `@gc` aliases, owned `Cell` fields, snapshots, and references retained across vector growth |
+| [gc-sharing.ya](gc-sharing.ya) | `gc` aliases, owned `Cell` fields, snapshots, and references retained across vector growth |
 | [gc-cycles.ya](gc-cycles.ya) | Recursive records, strong circular GC references, and reclamation of unreachable cycles |
-| [rc-ownership.ya](rc-ownership.ya) | `@rc` moves, explicit cloning, pure borrowed reads, weak upgrades, and last-owner destruction |
+| [rc-ownership.ya](rc-ownership.ya) | `rc` moves, explicit cloning, pure borrowed reads, weak upgrades, and last-owner destruction |
 | [gc-rc.ya](gc-rc.ya) | Independent RC owners sharing one traced GC cell |
 | [managed.ya](managed.ya) | Explicit RC ownership, weak references, and a custom allocator |
 | [locations.ya](locations.ya) | Value snapshots, explicit GC sharing, and stable typed locations |
@@ -105,7 +109,7 @@ cargo run -- run examples/rc-ownership.ya
 cargo run -- run examples/gc-rc.ya --gc-stress
 ```
 
-`@gc` and `@rc` enable their required tracing automatically, including without
+`gc` and `rc` enable their required tracing automatically, including without
 `--gc`. Add `--gc-stress` to exercise collection during allocations. The older
 [gc-cells.ya](gc-cells.ya) is an allocation workload; these examples demonstrate
 the explicit ownership syntax.
@@ -120,17 +124,17 @@ shared: 11:11
 retained: 21
 ```
 
-Cell reads require Copy contents. `*counter.value = *counter.value + 1` replaces
+Cell reads require Copy contents. `counter.value.* = counter.value.* + 1` replaces
 the integer without exposing a mutable reference. For owned, non-Copy contents,
 use `.replace(value)` to transfer the previous value out. A managed Cell adds a
-dereference layer: `**state` accesses an `@gc Cell<i64>`.
+dereference layer: `state.*.*` accesses an `gc Cell<i64>`.
 
 [gc-cycles.ya](gc-cycles.ya) links two nodes with strong references in both
 directions. Its cells hold Copy handles to GC-owned edge vectors. Once an
 invocation returns, its unreachable cycle can be collected:
 
 ```sh
-cargo run -- run examples/gc-cycles.ya --gc-stress --jit-report
+cargo run -- run examples/gc-cycles.ya --gc-stress --jit-trace=summary
 ```
 
 ```text
@@ -245,8 +249,8 @@ printf '%s\n' hello 2.5 20 70 42 | cargo run -- run examples/secret-number.ya
 
 ```text
 Guess a whole number from 1 to 100.
-Please enter a number.
-Enter a whole number from 1 to 100.
+Please enter a whole number.
+Please enter a whole number.
 Try higher.
 Try lower.
 Correct!
@@ -272,3 +276,14 @@ cargo run -- run examples/arrays.psc
 printf '42\n' | cargo run -- run examples/input.psc
 cargo run -- run examples/simplified.psc --dialect simplified
 ```
+
+## Runtime source loading
+
+[modules/dynamic/main.ya](modules/dynamic/main.ya) loads its plugin at runtime,
+uses a readonly dynamic namespace and an optional structural view, calls a procedure with local managed state,
+and handles a missing file as an ordinary Result. Run with `--gc-stress`; expected
+output is `runtime`, `42`, `42`, `true` on separate lines.
+See [runtime imports](../docs/dynamic-import.md) for the contract and read grants.
+
+The [object examples](objects/README.md) exercise open typed fields, configurable
+properties, structural views, shared local identity and dynamic callable values.

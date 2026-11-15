@@ -1,0 +1,20 @@
+use std::io::Printable;
+
+#[cyallo_internal("string_length")]
+pub fn len(read value: string) -> i64;
+#[cyallo_internal("string_trim")]
+pub fn trim(read value: string) -> string;
+#[cyallo_internal("string_upper")]
+pub fn upper(read value: string) -> string;
+#[cyallo_internal("string_lower")]
+pub fn lower(read value: string) -> string;
+#[cyallo_internal("string_contains")]
+pub fn contains(read value: string, read pattern: string) -> bool;
+#[cyallo_internal("string_starts_with")]
+pub fn starts_with(read value: string, read pattern: string) -> bool;
+#[cyallo_internal("string_ends_with")]
+pub fn ends_with(read value: string, read pattern: string) -> bool;
+#[cyallo_internal("string_replace")]
+pub fn replace(read value: string, read pattern: string, read replacement: string) -> string;
+#[cyallo_internal("string_from")]
+pub fn from<T: Printable>(read value: T) -> string;

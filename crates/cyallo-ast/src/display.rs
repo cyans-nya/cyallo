@@ -1,6 +1,33 @@
 //! Source-syntax rendering of types and resolved names, for diagnostics.
-use crate::{MemoryKind, NumberKind, RoutineKind, StorageKind, Type};
+use crate::{Locality, MemoryKind, NumberKind, ParameterPassing, RoutineKind, StorageKind, Type};
 use std::fmt::{self, Display, Formatter};
+
+impl Display for MemoryKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Gc => "gc",
+            Self::Rc => "rc",
+        })
+    }
+}
+
+impl Display for RoutineKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Function => "fn",
+            Self::Procedure => "proc",
+        })
+    }
+}
+
+impl Display for ParameterPassing {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Value => "by-value",
+            Self::Read => "read",
+        })
+    }
+}
 
 /// The name a programmer wrote for a resolved declaration. Name resolution
 /// gives declarations internal identities (`$module0$Value$total`,
@@ -58,6 +85,13 @@ fn list(f: &mut Formatter<'_>, items: &[Type]) -> fmt::Result {
 impl Display for Type {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ValueParameter(index) => write!(f, "value parameter {index}"),
+            Self::NativeCallable(_) => f.write_str("native callable"),
+            Self::Dependent(id, arguments) => {
+                write!(f, "type family {}<", id.0)?;
+                list(f, arguments)?;
+                f.write_str(">")
+            }
             Self::Lifetime(name) => write!(f, "'{name}"),
             Self::SelfType => f.write_str("Self"),
             Self::Numeric(kind) => kind.fmt(f),
@@ -87,6 +121,14 @@ impl Display for Type {
                 write!(f, "{}<", source_name(name))?;
                 list(f, arguments)?;
                 f.write_str(">")
+            }
+            Self::Dynamic => f.write_str("dynamic"),
+            Self::Object(fields) => {
+                f.write_str("object { ")?;
+                for (name, ty) in fields {
+                    write!(f, "{name}: {ty}, ")?;
+                }
+                f.write_str(".. }")
             }
             Self::Tuple(items) => {
                 f.write_str("(")?;
@@ -133,13 +175,14 @@ impl Display for Type {
             }
             Self::Managed {
                 kind,
+                locality,
                 lifetime,
                 pointee,
             } => {
-                f.write_str(match kind {
-                    MemoryKind::Gc => "@gc",
-                    MemoryKind::Rc => "@rc",
-                })?;
+                if *locality == Locality::Shared {
+                    f.write_str("@shared ")?;
+                }
+                kind.fmt(f)?;
                 if let Some(lifetime) = lifetime {
                     write!(f, "<'{lifetime}>")?;
                 }
@@ -170,6 +213,16 @@ impl Display for Type {
                     StorageKind::Generator => "Generator",
                     StorageKind::PureGenerator => "Generator",
                     StorageKind::GeneratorStep => "GeneratorStep",
+                    StorageKind::Sender => "Sender",
+                    StorageKind::Receiver => "Receiver",
+                    StorageKind::SendError => "SendError",
+                    StorageKind::ReceiveError => return f.write_str("ReceiveError"),
+                    StorageKind::Clock => return f.write_str("Clock"),
+                    StorageKind::Task => "Task",
+                    StorageKind::TaskOutcome => "TaskOutcome",
+                    StorageKind::TypeDescriptor => return f.write_str("TypeDescriptor"),
+                    StorageKind::ViewError => return f.write_str("ViewError"),
+                    StorageKind::LoadError => return f.write_str("LoadError"),
                 };
                 write!(f, "{name}<")?;
                 // Multi-parameter constructors store their arguments as a tuple.
@@ -238,10 +291,11 @@ mod tests {
             (
                 Type::Managed {
                     kind: MemoryKind::Gc,
+                    locality: Locality::Local,
                     lifetime: None,
                     pointee: Box::new(point),
                 },
-                "@gc Point",
+                "gc Point",
             ),
         ];
         for (ty, text) in cases {

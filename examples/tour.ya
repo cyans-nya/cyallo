@@ -8,7 +8,7 @@ fn square(n: i64) -> i64 {
 }
 
 proc announce(message: &string) {
-    std::io::print(std::string::upper(std::string::trim(*message)))
+    std::io::print(std::string::upper(std::string::trim(message.*)))
 }
 
 // `0..=limit` includes both bounds; `0..limit` would stop before `limit`.

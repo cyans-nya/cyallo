@@ -36,6 +36,8 @@ fn owned(ty: &Type) -> bool {
             | Type::Function(..)
             | Type::Borrowed(..)
             | Type::Storage(..)
+            | Type::Dynamic
+            | Type::Object(_)
             | Type::Any
             | Type::TraitObject(_)
     )
@@ -84,7 +86,8 @@ impl GcMetadata {
             .map(|inst| {
                 let may_collect = match &inst.op {
                     Op::Service(_, crate::services::Operation::Reference, _) => false,
-                    Op::Lookup(..)
+                    Op::Dynamic(..)
+                    | Op::Lookup(..)
                     | Op::Call(..)
                     | Op::TraitCall(..)
                     | Op::TraitBox(..)
@@ -103,7 +106,10 @@ impl GcMetadata {
                     Op::Store(_, value)
                     | Op::Load(value, _)
                     | Op::Unary(value, ..)
-                    | Op::Binary(value, ..) => owned(&function.registers[*value]),
+                    | Op::Binary(value, ..) => {
+                        owned(&function.registers[*value])
+                            && !matches!(function.registers[*value], Type::Object(_))
+                    }
                     _ => false,
                 };
                 SafepointEffects {

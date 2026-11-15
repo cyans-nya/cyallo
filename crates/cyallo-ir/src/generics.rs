@@ -25,7 +25,7 @@ fn walk_type(t: &mut Type, f: &mut impl FnMut(&mut Type)) {
                 walk_type(t, f)
             }
         }
-        Type::Record(_, fs) => {
+        Type::Record(_, fs) | Type::Object(fs) => {
             for (_, t) in fs {
                 walk_type(t, f)
             }
@@ -185,7 +185,7 @@ impl Specializer {
                     self.ty(t, span)?
                 }
             }
-            Type::Record(_, fs) => {
+            Type::Record(_, fs) | Type::Object(fs) => {
                 for (_, t) in fs {
                     self.ty(t, span)?
                 }
@@ -261,6 +261,25 @@ impl Specializer {
             };
         }
         match (pattern, actual) {
+            (
+                Type::Managed {
+                    kind: p_kind,
+                    locality: p_locality,
+                    lifetime: p_lifetime,
+                    pointee: p,
+                },
+                Type::Managed {
+                    kind: a_kind,
+                    locality: a_locality,
+                    lifetime: a_lifetime,
+                    pointee: a,
+                },
+            ) if p_kind == a_kind
+                && p_locality == a_locality
+                && p_lifetime.is_some() == a_lifetime.is_some() =>
+            {
+                self.unify(p, a, params, bindings)
+            }
             (Type::Applied(n, ps), Type::Record(an, _))
             | (Type::Applied(n, ps), Type::Named(an)) => self
                 .record_arguments
@@ -302,7 +321,9 @@ impl Specializer {
             | (Type::ServiceKey(p), Type::ServiceKey(a))
             | (Type::ServiceRef(p), Type::ServiceRef(a)) => self.unify(p, a, params, bindings),
             (Type::Function(pk, ps, pr), Type::Function(ak, ts, ar))
-                if pk == ak && ps.len() == ts.len() =>
+                if (pk == ak
+                    || (*pk == RoutineKind::Procedure && *ak == RoutineKind::Function))
+                    && ps.len() == ts.len() =>
             {
                 ps.iter().zip(ts).all(|((p, pref), (a, aref))| {
                     pref == aref && self.unify(p, a, params, bindings)
@@ -312,14 +333,14 @@ impl Specializer {
                 .iter()
                 .zip(ts)
                 .all(|(p, a)| self.unify(p, a, params, bindings)),
-            _ => canonical(pattern) == canonical(actual),
+            _ => crate::declarations::equivalent_types(&canonical(pattern), &canonical(actual)),
         }
     }
     fn infer_body(
         &mut self,
         body: &mut [Stmt],
         known: &HashMap<String, Type>,
-        routines: &HashMap<String, Type>,
+        routines: &crate::declarations::TypeEnvironment,
     ) -> Result<bool> {
         let mut changed = false;
         crate::composites::visit_block(
@@ -342,9 +363,43 @@ impl Specializer {
                         .collect::<Result<Vec<_>>>();
                     if let Ok(actual) = actual {
                         let mut bindings = HashMap::new();
-                        let matches = template.params.iter().zip(&actual).all(|(p, a)| {
-                            self.unify(&p.ty, a, &template.type_params, &mut bindings)
-                        });
+                        let mut matches = true;
+                        // Resolve ordinary operands first so callback inputs
+                        // can use the generic types they establish.
+                        for (parameter, actual) in template.params.iter().zip(&actual) {
+                            if matches!(
+                                (&parameter.ty, actual),
+                                (Type::Function(..), Type::NativeCallable(_))
+                            ) {
+                                continue;
+                            }
+                            matches &= self.unify(
+                                &parameter.ty,
+                                actual,
+                                &template.type_params,
+                                &mut bindings,
+                            );
+                        }
+                        for (parameter, actual) in template.params.iter().zip(&actual) {
+                            if let (Type::Function(..), Type::NativeCallable(declaration)) =
+                                (&parameter.ty, actual)
+                            {
+                                let mut expected = parameter.ty.clone();
+                                substitute(&mut expected, &bindings);
+                                let callback = crate::native_contract::as_callable(
+                                    routines,
+                                    *declaration,
+                                    &expected,
+                                    e.span,
+                                )?;
+                                matches &= self.unify(
+                                    &parameter.ty,
+                                    &callback.callable_type,
+                                    &template.type_params,
+                                    &mut bindings,
+                                );
+                            }
+                        }
                         if !matches {
                             return Err(error(e.span, "generic arguments do not agree"));
                         }
@@ -432,7 +487,10 @@ pub fn specialize(ast: &mut Ast, options: crate::CompileOptions) -> Result<()> {
             ast.functions.extend(fs);
         }
         ast.records.append(&mut s.generated_records);
-        let mut routines = crate::composites::resolve(ast)?;
+        let mut routines = crate::declarations::TypeEnvironment::new(
+            crate::composites::resolve(ast)?,
+            ast.native.clone(),
+        );
         routines.extend(
             ast.functions
                 .iter()

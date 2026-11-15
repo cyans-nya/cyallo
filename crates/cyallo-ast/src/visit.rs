@@ -3,7 +3,7 @@ type Result<T> = std::result::Result<T, Diagnostic>;
 pub fn visit_expr(e: &mut Expr, f: &mut impl FnMut(&mut Expr) -> Result<()>) -> Result<()> {
     crate::with_stack(|| {
         match &mut e.kind {
-            ExprKind::ManagedNew(_, allocator, value) => {
+            ExprKind::ManagedNew(_, _, allocator, value) => {
                 if let Some(allocator) = allocator {
                     visit_expr(allocator, f)?;
                 }
@@ -19,19 +19,22 @@ pub fn visit_expr(e: &mut Expr, f: &mut impl FnMut(&mut Expr) -> Result<()>) -> 
                     visit_expr(e, f)?;
                 }
             }
-            ExprKind::Record(_, fs) | ExprKind::GenericRecord(_, _, fs) => {
+            ExprKind::Record(_, fs)
+            | ExprKind::GenericRecord(_, _, fs)
+            | ExprKind::ObjectLiteral(_, fs) => {
                 for (_, e) in fs {
                     visit_expr(e, f)?;
                 }
             }
-            ExprKind::Yield(a, _)
+            ExprKind::DeleteProperty(a)
+            | ExprKind::Yield(a, _)
             | ExprKind::Parenthesized(a)
             | ExprKind::Unary(_, a)
             | ExprKind::Field(a, _)
             | ExprKind::ExtensionField(a, _, _)
             | ExprKind::Cast(a, _)
             | ExprKind::TupleField(a, _) => visit_expr(a, f)?,
-            ExprKind::Binary(_, a, b) => {
+            ExprKind::Binary(_, a, b) | ExprKind::NativeCoerce(a, b) => {
                 visit_expr(a, f)?;
                 visit_expr(b, f)?;
             }
@@ -111,4 +114,42 @@ pub fn visit_block(
         }
         Ok(())
     })
+}
+
+/// Postorder traversal of a type contract, shared by declaration instantiation
+/// and native-family resolution. No interpretation of source names occurs here.
+pub fn visit_type(ty: &mut Type, f: &mut impl FnMut(&mut Type)) {
+    crate::with_stack(|| {
+        match ty {
+            Type::Applied(_, arguments)
+            | Type::Dependent(_, arguments)
+            | Type::Tuple(arguments) => {
+                for argument in arguments {
+                    visit_type(argument, f);
+                }
+            }
+            Type::Array(_, t)
+            | Type::SparseArray(t)
+            | Type::Borrowed(t)
+            | Type::Slice(t)
+            | Type::Storage(_, t)
+            | Type::ServiceKey(t)
+            | Type::ServiceRef(t)
+            | Type::Reference { pointee: t, .. }
+            | Type::Managed { pointee: t, .. } => visit_type(t, f),
+            Type::Record(_, fields) | Type::Object(fields) => {
+                for (_, ty) in fields {
+                    visit_type(ty, f);
+                }
+            }
+            Type::Function(_, parameters, result) => {
+                for (ty, _) in parameters {
+                    visit_type(ty, f);
+                }
+                visit_type(result, f);
+            }
+            _ => {}
+        }
+        f(ty);
+    });
 }

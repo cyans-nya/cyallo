@@ -83,7 +83,7 @@ fn pure_factory_and_owned_delegation_forward_input_and_return() {
 #[test]
 fn construction_is_lazy_and_closed_generators_do_not_run() {
     parity(
-        "let create = gen proc() -> Generator<i64, (), ()> { std::io::print(\"started\"); yield 1 }\nlet mut first = create()\nfirst.close()\nlet mut second = create()\nlet item = second.resume()\nstd::io::print(item.yielded())\nsecond.close()\n",
+        "let create = gen proc() -> Generator<i64, (), ()> { std::io::print(\"started\"); yield 1 }\nlet mut first = create()\nfirst.close()\nlet mut second = create()\nlet item = second.start()\nstd::io::print(item.yielded())\nsecond.close()\n",
         "started\n1\n",
     );
 }
@@ -106,7 +106,7 @@ fn generator_syntax_and_types_reject_invalid_programs() {
 fn resume_after_close_or_completion_is_rejected() {
     for body in [
         "g.close(); g.resume()",
-        "let first = g.resume(); let last = g.resume(); g.resume()",
+        "let first = g.start(); let last = g.resume(); g.resume()",
     ] {
         let source = format!(
             "let create = gen proc() -> Generator<i64, (), ()> {{ yield 1 }}\nlet mut g = create()\n{body}\n"
@@ -127,15 +127,15 @@ fn saved_managed_values_survive_compaction_between_resumes() {
     parity(
         r#"
 record Item { number: i64 }
-let make = gen proc() -> Generator<@gc Item, (), i64> {
-    let saved = @gc Item { number: 42 }
+let make = gen proc() -> Generator<gc Item, (), i64> {
+    let saved = gc Item { number: 42 }
     yield saved
     return saved.number
 }
 let mut values = make()
-let item = values.resume()
+let item = values.start()
 let saved = item.yielded()
-for i in 0..=30 { let garbage = @gc Item { number: i } }
+for i in 0..=30 { let garbage = gc Item { number: i } }
 std::io::print(saved.number)
 let finished = values.resume()
 std::io::print(finished.completed())
@@ -149,12 +149,12 @@ fn close_releases_rc_parameters_and_owned_delegates() {
     parity(
         r#"
 record Item { number: i64 }
-let child = gen proc(owner: @rc Item) -> Generator<i64, (), ()> { yield owner.number }
-let outer = gen proc(owner: @rc Item) -> Generator<i64, (), ()> { yield from child(owner) }
-let owner = @rc Item { number: 42 }
+let child = gen proc(owner: rc Item) -> Generator<i64, (), ()> { yield owner.number }
+let outer = gen proc(owner: rc Item) -> Generator<i64, (), ()> { yield from child(owner) }
+let owner = rc Item { number: 42 }
 let weak = owner.downgrade()
 let mut values = outer(owner)
-let item = values.resume()
+let item = values.start()
 std::io::print(item.yielded())
 values.close()
 let expired = weak.upgrade()
@@ -198,5 +198,31 @@ fn a_session_can_migrate_with_parked_generator_and_host_roots() {
     assert_eq!(
         session.gc_scope().no_gc().get(&root).unwrap(),
         &cyallo::Value::Integer(99)
+    );
+}
+
+#[test]
+fn start_and_resume_enforce_the_generator_lifecycle() {
+    for (body, expected) in [
+        ("g.resume(1)", GeneratorError::NotStarted),
+        (
+            "let first = g.start(); g.start()",
+            GeneratorError::AlreadyStarted,
+        ),
+    ] {
+        let source = format!(
+            "let make = gen proc() -> Generator<i64, i64, ()> {{ yield 1 }}\nlet mut g = make()\n{body}\n"
+        );
+        let mut session = Session::new(Arc::new(compile(&source).unwrap())).unwrap();
+        session.run(10_000);
+        assert!(
+            matches!(session.status(), Status::Failed(failure) if failure.error == RuntimeError::Generator(expected))
+        );
+    }
+    let source = "let make = gen proc() -> Generator<i64, i64, ()> { yield 1 }; let mut g = make(); let first = g.start(); g.resume()";
+    assert!(compile(source).is_err());
+    parity(
+        "let make = gen proc() -> Generator<i64, (), i64> { yield 1; return 2 }; let mut g = make(); std::io::print(g.next().yielded()); std::io::print(g.next().completed())",
+        "1\n2\n",
     );
 }

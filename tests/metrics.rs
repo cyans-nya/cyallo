@@ -94,9 +94,15 @@ fn osr_report_tracks_same_invocation_and_executed_tiers() {
 fn native_callees_are_charged_to_their_own_tier_and_caller_is_restored() {
     let program = Arc::new(compile("fn inner(n: i64) -> i64 { return n * 2 }\nfn outer(n: i64) -> i64 { return inner(n) + 1 }\nstd::io::print(outer(7))\n").unwrap());
     let origin = Instant::now();
-    let artifact = backend()
-        .compile_with_reporting(program.clone(), origin)
-        .unwrap();
+    // Observation keeps frameless inlining, which would fold `inner` into
+    // `outer` and leave it no frame of its own. This test is about real
+    // callee frames, so inlining is disabled explicitly.
+    let artifact = TieredBackend::new(TierPolicy {
+        inlining: false,
+        ..backend().policy
+    })
+    .compile_with_reporting(program.clone(), origin)
+    .unwrap();
     assert!(artifact.wait_for_compilation(Duration::from_secs(30)));
     for (fi, tier) in [
         (0, Tier::CraneliftFast),

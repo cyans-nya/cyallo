@@ -1,22 +1,104 @@
 use super::*;
+#[derive(Default)]
+struct GenericParameters {
+    names: Vec<Box<str>>,
+    constraints: Vec<GenericConstraint>,
+    packs: Vec<Box<str>>,
+}
+pub(super) struct ManagedPrefix {
+    pub kind: MemoryKind,
+    pub locality: Locality,
+}
 impl Parser<'_> {
-    pub(super) fn memory_kind(&mut self) -> Result<MemoryKind, Diagnostic> {
-        let kind = match self.token_text() {
-            "gc" => MemoryKind::Gc,
-            "rc" => MemoryKind::Rc,
-            "arena" => return Err(self.error("arena allocation syntax is reserved")),
-            _ => return Err(self.error("expected gc or rc")),
+    /// Parses storage syntax independently of its optional locality modifier.
+    pub(super) fn managed_prefix(&mut self) -> Result<Option<ManagedPrefix>, Diagnostic> {
+        use cyallo_ast::diagnostic::{ManagedSyntaxError as E, invalid_managed_syntax};
+        let start = self.token().span;
+        let mut locality = Locality::Local;
+        let qualified = self.take("@");
+        if qualified {
+            locality = match self.token_text() {
+                "local" => Locality::Local,
+                "shared" => Locality::Shared,
+                "gc" => {
+                    return Err(invalid_managed_syntax(
+                        E::LegacySigil(MemoryKind::Gc),
+                        Span::new(start.start, self.token().span.end),
+                    ));
+                }
+                "rc" => {
+                    return Err(invalid_managed_syntax(
+                        E::LegacySigil(MemoryKind::Rc),
+                        Span::new(start.start, self.token().span.end),
+                    ));
+                }
+                name => {
+                    return Err(invalid_managed_syntax(
+                        E::UnknownLocality(name.into()),
+                        Span::new(start.start, self.token().span.end),
+                    ));
+                }
+            };
+            self.pos += 1;
+            if self.at("@") {
+                return Err(invalid_managed_syntax(
+                    E::RepeatedLocality,
+                    Span::new(start.start, self.token().span.end),
+                ));
+            }
+        }
+        // A storage keyword can also name an ordinary module in a path.
+        if !qualified
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .is_some_and(|token| token.kind == TokenKind::Colon)
+        {
+            return Ok(None);
+        }
+        let kind = match self.token().kind {
+            TokenKind::Gc => MemoryKind::Gc,
+            TokenKind::Rc => MemoryKind::Rc,
+            _ if qualified => {
+                return Err(invalid_managed_syntax(
+                    E::ExpectedStorage,
+                    Span::new(start.start, self.token().span.end),
+                ));
+            }
+            _ => return Ok(None),
         };
         self.pos += 1;
-        Ok(kind)
+        Ok(Some(ManagedPrefix { kind, locality }))
     }
-    pub(super) fn routine_attributes(&mut self) -> Result<RoutineAttributes, Diagnostic> {
+    pub(super) fn declaration_attributes(
+        &mut self,
+    ) -> Result<(RoutineAttributes, Vec<DeclarationAnnotation>), Diagnostic> {
         let mut attributes = RoutineAttributes::default();
+        let mut annotations = vec![];
         while self.token().kind == TokenKind::Hash {
             let start = self.token().span;
             self.pos += 1;
             self.expect("[")?;
             let name = self.name()?.to_string();
+            if name == "cyallo_internal" {
+                self.expect("(")?;
+                if self.token().kind != TokenKind::Text {
+                    return Err(self.error("cyallo_internal requires a string literal ABI key"));
+                }
+                let value = self
+                    .literal_text(self.token_text(), self.token().span)?
+                    .into_boxed_str();
+                self.pos += 1;
+                self.expect(")")?;
+                self.expect("]")?;
+                annotations.push(DeclarationAnnotation {
+                    name: name.into(),
+                    value,
+                    span: self.finish_span(start),
+                });
+                self.newlines();
+                continue;
+            }
             let value = if self.take("(") {
                 let value = self.name()?.to_string();
                 self.expect(")")?;
@@ -98,7 +180,7 @@ impl Parser<'_> {
                 "native compilation forbidden here",
             ));
         }
-        Ok(attributes)
+        Ok((attributes, annotations))
     }
     fn condition_expr(&mut self) -> Result<Expr, Diagnostic> {
         let old = self.condition;
@@ -108,14 +190,48 @@ impl Parser<'_> {
         result
     }
     pub(super) fn type_params(&mut self) -> Result<Vec<Box<str>>, Diagnostic> {
+        let GenericParameters {
+            names,
+            constraints,
+            packs,
+        } = self.generic_parameters()?;
+        if !constraints.is_empty() || !packs.is_empty() {
+            return Err(self.error("bounds and packs require a callable declaration"));
+        }
+        Ok(names)
+    }
+    fn pack_marker(&mut self) -> Result<bool, Diagnostic> {
+        if !self.take("..") {
+            return Ok(false);
+        }
+        self.expect(".")?;
+        Ok(true)
+    }
+    fn generic_parameters(&mut self) -> Result<GenericParameters, Diagnostic> {
         if !self.take("<") {
-            return Ok(vec![]);
+            return Ok(GenericParameters::default());
         }
         let mut params: Vec<Box<str>> = vec![];
+        let mut constraints = vec![];
+        let mut packs = vec![];
         loop {
+            let pack = self.pack_marker()?;
             let name = self.name()?;
             if params.iter().any(|p| p == &name) {
                 return Err(self.error("duplicate type parameter"));
+            }
+            if pack {
+                packs.push(name.clone());
+            }
+            if self.take(":") {
+                let mut bounds = vec![self.ty()?];
+                while self.take("+") {
+                    bounds.push(self.ty()?);
+                }
+                constraints.push(GenericConstraint {
+                    parameter: name.clone(),
+                    bounds,
+                });
             }
             params.push(name);
             if self.take(">") {
@@ -123,7 +239,11 @@ impl Parser<'_> {
             }
             self.expect(",")?;
         }
-        Ok(params)
+        Ok(GenericParameters {
+            names: params,
+            constraints,
+            packs,
+        })
     }
     pub(super) fn type_arguments(&mut self) -> Result<Vec<Type>, Diagnostic> {
         let mut ts = vec![];
@@ -160,6 +280,7 @@ impl Parser<'_> {
         let span = self.finish_span(start);
         self.eol()?;
         Ok(Record {
+            annotations: vec![],
             type_params,
             name,
             fields,
@@ -202,6 +323,8 @@ impl Parser<'_> {
             self.expect(":")?;
             let ty = self.ty()?;
             params.push(Param {
+                arity: ParameterArity::One,
+                passing: ParameterPassing::Value,
                 receiver: false,
                 name,
                 ty,
@@ -225,6 +348,10 @@ impl Parser<'_> {
         let body = self.braces()?;
         Ok((
             Function {
+                annotations: vec![],
+                body_kind: FunctionBodyKind::Source,
+                constraints: vec![],
+                type_packs: vec![],
                 generator: false,
                 origin: RoutineOrigin::Source,
                 attributes: Default::default(),
@@ -310,7 +437,7 @@ impl Parser<'_> {
     }
     pub(super) fn modern_routine(&mut self, declaration: bool) -> Result<Function, Diagnostic> {
         let span = self.token().span;
-        let attributes = self.routine_attributes()?;
+        let (attributes, annotations) = self.declaration_attributes()?;
         if declaration && !attributes.is_empty() {
             return Err(self.error("put routine attributes on the implementation body"));
         }
@@ -319,12 +446,32 @@ impl Parser<'_> {
             self.expect("proc")?;
         }
         let name = self.name()?;
-        let type_params = self.type_params()?;
+        let GenericParameters {
+            names: type_params,
+            constraints,
+            packs: type_packs,
+        } = self.generic_parameters()?;
         self.expect("(")?;
         let mut params = vec![];
         self.newlines();
         while !self.take(")") {
             let start = self.token().span;
+            let arity = if self.pack_marker()? {
+                ParameterArity::Variadic
+            } else {
+                ParameterArity::One
+            };
+            let passing = if self.token_text() == "read"
+                && self
+                    .tokens
+                    .get(self.pos + 1)
+                    .is_some_and(|token| token.kind == TokenKind::Identifier)
+            {
+                self.pos += 1;
+                ParameterPassing::Read
+            } else {
+                ParameterPassing::Value
+            };
             let by_ref = false;
             let name = self.name()?;
             let ty = if name.as_ref() == "self" && !self.at(":") {
@@ -334,6 +481,8 @@ impl Parser<'_> {
                 self.ty()?
             };
             params.push(Param {
+                arity,
+                passing,
                 receiver: name.as_ref() == "self",
                 name,
                 ty,
@@ -355,10 +504,23 @@ impl Parser<'_> {
         } else {
             Type::Void
         };
-        let body = if declaration { vec![] } else { self.braces()? };
+        let body_kind = if declaration || self.at(";") {
+            FunctionBodyKind::Declaration
+        } else {
+            FunctionBodyKind::Source
+        };
+        let body = if body_kind == FunctionBodyKind::Declaration {
+            vec![]
+        } else {
+            self.braces()?
+        };
         let span = self.finish_span(span);
         self.eol()?;
         Ok(Function {
+            annotations,
+            body_kind,
+            constraints,
+            type_packs,
             generator: false,
             origin: RoutineOrigin::Source,
             attributes,

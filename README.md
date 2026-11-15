@@ -16,7 +16,7 @@ still in progress.
 
 ```sh
 cargo run -- run examples/tour.ya
-cargo run -- run examples/osr-loop.ya --jit-report
+cargo run -- run examples/osr-loop.ya --jit-trace=summary
 cargo run -- repl
 cargo run -- pretty examples/modern.ya --color always
 cargo run -- debug examples/modern.ya
@@ -127,21 +127,32 @@ pub use crate::detail::*;
 
 Modules support inline declarations, external files, grouped imports, aliases,
 globs, and reexports. `crate`, `self`, and `super` anchor relative paths. `pub`
-exports declarations. Only declared modules are loaded; module loading does not
-activate service providers. See [modules and services](docs/services.md).
+exports declarations. Static loading follows declared module edges and does not
+activate service providers. [`std::module::load(path)`](docs/dynamic-import.md)
+loads a new `.ya` file at runtime, returning a readonly dynamic namespace
+and suspending the caller during loading. See [modules and services](docs/services.md).
 
 ## Managed values and storage
 
-`@gc T` and `@rc T` are dedicated types. `@gc expression` allocates a traced shared
-value; `@rc expression` creates a session-local reference-counted owner. Explicit
-managed syntax enables the necessary collector integration without `--gc`.
+Dereference uses the postfix operator `value.*`. It composes with field access,
+indexing, and calls: `view.*.field`, `view.*[i]`, and `get().*`. Repeated layers
+use `value.*.*`. Assignment through a reference uses `view.* = value`.
+Multiplication remains `a * b`; prefix `*value` reports a migration diagnostic.
+
+`gc T` and `rc T` select traced and reference-counted storage. Their objects are
+local to the current coroutine by default. `@local gc T` and `@local rc T` spell
+that default explicitly; construction uses `gc expression`, `rc expression`, or
+an explicit `@local` prefix. Managed syntax enables collector integration
+without `--gc`. Locality is separate from storage: `@shared gc T` and
+`@shared rc T` parse as shared types, but currently produce an unsupported-feature
+diagnostic because shared managed graphs are not implemented.
 `std::rc::clone(&owner)` increments the strong count; `downgrade`, `upgrade`,
 `strong_count`, and `weak_count` use resolved RC declarations. Strong cycles are
 not collected by reference counting.
 
-`Cell<T>` owns its contents. `@gc Cell<T>` expresses shared interior-mutable
-storage explicitly. `Vec<@gc Cell<T>>` composes growable storage with shared cells.
-`*cell` copies the contents and requires Copy; `*cell = value` replaces them.
+`Cell<T>` owns its contents. `gc Cell<T>` permits aliased access within one
+coroutine. `Vec<gc Cell<T>>` composes growable storage with these local cells.
+`cell.*` copies the contents and requires Copy; `cell.* = value` replaces them.
 `cell.replace(value)` returns the previous owned value. Cell contents expose no
 references and do not support compound assignment. Recursive records may use
 managed or collection indirection; unreachable GC cycles are collected.
@@ -177,7 +188,7 @@ fn inc(n: i64) -> i64 { return n + 1 }
 
 `opt(lazy)` suppresses predictive JIT jobs while allowing normal observed-work tiering and inlining. `opt(always_lazy)` forbids all native compilation and inlining, including explicit eager engines. `always_eager` bypasses the automatic size window, retaining hard limits. `inline(always)` can retain real frames for supported branching functions and procedures; it never bypasses correctness limits. Unfulfilled requests are silent unless `--warn-unfulfilled-attributes` is set. See [policy, limits and measurements](docs/jit-inspection-and-admission.md).
 
-`--emit ir,bytecode,clif --emit-dir ./compiler-output` writes typed IR, register bytecode, and generated Cranelift IR before/after optimization. A manifest identifies deferred routines. `--jit-notices` prints bounded inline, optimization, eager-admission, fallback and invalidation notices at execution safepoints. These options preserve ordinary inlining; `--jit-trace` remains the intrusive tracing mode.
+`--emit ir,bytecode,clif --emit-dir ./compiler-output` writes typed IR, register bytecode, and generated Cranelift IR before/after optimization. A manifest identifies deferred routines. `--jit-notices` prints bounded inline, optimization, eager-admission, fallback and invalidation notices at execution safepoints. These options preserve ordinary inlining; `--jit-trace` observes execution without turning inlining off.
 
 Independent parsing, checking, bytecode lowering and dump formatting use bounded jobs with ordered publication. Eager native compilation uses up to three workers; background compilation also honors the artifact's worker allowance. `--jobs 1` selects serial compilation within an artifact. Execution and code installation preserve source order on the Session thread.
 
@@ -207,16 +218,31 @@ worker completion. Readiness polling uses a separate configurable interval.
 
 Tiering is monotonic. A hot loop can promote **during the same function invocation**. Interpreter, Winch, and Cranelift fast resume at every bytecode PC; automatic speed units enter at function starts and loop headers. A speed invocation paused elsewhere resumes through a speed-compiled continuation until its next optimized entry. Native loops poll readiness and promotion thresholds without returning on every execution quantum; instruction budgets remain exact. Locals, virtual registers, BYREF aliases, return destinations, and prior side effects remain in the shared VM frames. This is VM-frame OSR, not reconstruction/deoptimization of a native machine stack. The OSR tests verify both a single long invocation and aliased caller storage.
 
-`--jit-report` prints a compact summary while preserving normal optimization and inlining. It shows logical instructions/calls (including inlined routines), inline counts, GC/service counters and a bounded compiler timeline. It does not enable per-call clocks or create physical frames for inlined bodies. Its VM execution time includes deferred checks, compiler admission waits and GC; run wall excludes frontend, process startup and report rendering.
+JIT reports are selected with `--jit-trace`:
 
-`--jit-trace` enables the detailed invocation/tier timeline, per-function timing, runtime boundary counters and VM-frame OSR observations. This intrusive mode disables inlining and adds observer overhead. Use it to inspect execution transitions; use the normal run or summary mode to measure optimized performance.
+- `--jit-trace` traces execution: per-invocation and tier events, per-routine timing, runtime boundary counters and VM-frame OSR observations. Observation keeps routine inlining on; inlined bodies have no frame, so they appear in the logical counters rather than as individual events. While the program runs on a terminal, a live block on stderr shows elapsed time, instructions, each routine's current tier (or the tier it is compiling toward) and the busiest routines. The block is erased before any program output and replaced by the final report. Piped stderr gets only the final report.
+- `--jit-trace=summary` prints counters and the compiler timeline once at exit. It does not enable observation and preserves optimized execution, so use it to measure performance.
+- `--jit-no-inline` turns off routine inlining in every engine, for comparison.
+- `--jit-trace-format=json` writes the final report as one JSON object on stderr. Program stdout is unchanged.
+- `--jit-trace-style=plain|color|boxed` picks the human layout: ASCII, colored, or colored with frames. By default color follows the terminal, `--color`, and `NO_COLOR`.
 
 ```sh
 cargo build --release
-./target/release/cyallo run examples/osr-loop.ya --engine jit --jit-report
-./target/release/cyallo run examples/hot-loop.ya --engine cranelift_speed --jit-report
+./target/release/cyallo run examples/osr-loop.ya --engine jit --jit-trace=summary
+./target/release/cyallo run examples/hot-loop.ya --engine cranelift_speed --jit-trace=summary
 ./target/release/cyallo run examples/osr-loop.ya --engine jit --jit-trace
 ```
+
+Trace files drive an interactive timeline viewer:
+
+```sh
+./target/release/cyallo run examples/mergesort.ya --jit-trace --jit-trace-format=json --jit-trace-out trace.json
+./target/release/cyallo trace trace.json
+```
+
+`cyallo trace` shows one lane per routine. Each lane's upper lines show the tier installed over time: `·` interpreter, `▒` Winch, `█` Cranelift or speed. Markers sit on top: `▲` install, `◆` OSR entry, `◇` inlined call sites (at the routine's first native run), `✖` failure. The bottom line is compile work: `━` while a worker compiles, `┄` while the request waits for one. A panel lists the events nearest the cursor. Keys: `← →` move the cursor, `[ ]` pan, `+ -` zoom, `0` fit, `↑ ↓` select a routine, `n p` jump between events, `f` cycles the event filter, `?` lists the keys, `q` quits. The viewer needs an interactive terminal. The full guide, with the screen layout, keys, recipes and the JSON reference, is in [the JIT trace viewer guide](docs/jit-trace-viewer.md).
+
+The JSON `trace` member is versioned (`"version": 1`). It holds the typed event list (`kind`, `routine`, `at_ms`, tier and engine names, compile durations, OSR readiness), per-routine engine counts, and the compile-time inline decisions (`frameless`, `embedded`, or `call`). Program output is unchanged; the JSON goes to stderr.
 
 The full trace separates frontend/read, deferred body checks, backend/session setup, VM execution, first-call compiler wait, input wait, GC pauses, and run wall time. Its VM execution headline excludes separately reported body checks, compiler wait and GC pauses; observed per-function phases can include helper-driven analysis and collection. Per-tier instruction totals/shares include runtime helpers in their calling tier. Trace function summaries show invocations, instructions, OSR counts and execution time; peak frame/cell counts describe physical VM storage. Compiler work overlaps execution and must not be added to VM time. Trace events are capped at 4,096; summary compiler events are capped at 64. Omitted-event counts and complete logical counters remain available.
 
@@ -224,7 +250,7 @@ Tiny programs can finish before compilation completes; the report shows pending 
 
 Cranelift inlines bounded direct scalar calls by default: small integer/boolean functions and procedures can run without VM frames. Small effectful procedures can share embedded code while retaining real frames and helper/GC boundaries; this path is opt-in through `CraneliftConfig.procedure_inlining`. Logical instructions and calls still count toward fuel and promotion thresholds. Full execution reporting disables both paths. Dynamic calls remain out of line, and native artifacts reject a replacement Program. Set `CraneliftConfig.inlining = false` to disable all inlining; see [routine optimization results](docs/routine-optimization-results.md).
 
-`--engine interpreter` disables native compilation. Both explicit Cranelift engines synchronously compile every routine with all-PC resume entries and link their native entry slots: `--engine cranelift` defaults to `opt_level=none` with backtracking (`Ion`) allocation; `--engine cranelift_speed` uses `opt_level=speed` with the same allocator. They share dispatch and resume structure, and neither builds selective-entry continuations or a large combined compiler graph. Speed optimization can increase compilation latency; it does not promise lower total latency on every short run. Effective configurations appear in `--jit-report`. Library embedders can use `CraneliftConfig` to vary optimization, combined/per-routine scope, resume strategy, and allocator independently. The default `--engine jit` retains automatic tiering with replaceable per-routine units. The public `TierPolicy` controls warm/hot thresholds, the speed body-size cap, and baseline admission.
+`--engine interpreter` disables native compilation. Both explicit Cranelift engines synchronously compile every routine with all-PC resume entries and link their native entry slots: `--engine cranelift` defaults to `opt_level=none` with backtracking (`Ion`) allocation; `--engine cranelift_speed` uses `opt_level=speed` with the same allocator. They share dispatch and resume structure, and neither builds selective-entry continuations or a large combined compiler graph. Speed optimization can increase compilation latency; it does not promise lower total latency on every short run. Effective configurations appear in `--jit-trace=summary`. Library embedders can use `CraneliftConfig` to vary optimization, combined/per-routine scope, resume strategy, and allocator independently. The default `--engine jit` retains automatic tiering with replaceable per-routine units. The public `TierPolicy` controls warm/hot thresholds, the speed body-size cap, and baseline admission.
 
 ```sh
 cyallo run program.ya --engine cranelift
@@ -252,6 +278,8 @@ The persistent line-oriented REPL accepts statements, bare expressions, and mult
 
 `pretty <file>` uses the same lexer and preserves the original source. `--color auto|always|never` controls syntax colors and Oxc diagnostics. Auto detects stdout for pretty/prompts and stderr for diagnostics. `NO_COLOR` and `TERM=dumb` disable auto color; `always` overrides them.
 
+Highlighting includes contextual syntax such as `use`, `pub`, `mut`, and `yield from`. Keywords are magenta, types bold blue, namespaces blue, functions cyan, strings green, numbers and booleans yellow, and operators bright red. Comments and punctuation use subdued gray; annotations and lifetimes use bright magenta. The same palette applies to diagnostic source excerpts, and each dialect keeps its own keyword rules.
+
 The Ratatui debugger uses the interpreter. Keys: `c` continue, `p` pause, `s` into, `n` over, `o` out, arrows select a line, `b` toggle breakpoint, `r` restart, `q`/Esc quit. It shows source, stack, variables, sparse entries, and program I/O. During INPUT, type a value and press Enter; Esc exits.
 
 ## Runtime contract and verification
@@ -272,7 +300,7 @@ current limits count cells rather than all bytes. See [GC progress](docs/gc-plan
 and [measurements](docs/gc-benchmarks.md).
 
 ```sh
-cyallo run examples/gc-cells.ya --gc --jit-report
+cyallo run examples/gc-cells.ya --gc --jit-trace=summary
 cyallo repl --gc-stress
 cargo bench --bench gc
 ```

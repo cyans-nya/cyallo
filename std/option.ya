@@ -1,0 +1,18 @@
+#[cyallo_internal("option_struct")]
+pub record Option<T> {}
+
+#[cyallo_internal("option_some")]
+pub fn some<T>(value: T) -> Option<T>;
+#[cyallo_internal("option_none")]
+pub fn none<T>() -> Option<T>;
+
+impl<T> Option<T> {
+    #[cyallo_internal("option_is_some")]
+    pub fn is_some(self: &Self) -> bool;
+    #[cyallo_internal("option_is_none")]
+    pub fn is_none(self: &Self) -> bool;
+    #[cyallo_internal("option_unwrap")]
+    pub fn unwrap(self) -> T;
+    #[cyallo_internal("option_or_fail")]
+    pub fn or_fail(self, read message: string) -> T;
+}

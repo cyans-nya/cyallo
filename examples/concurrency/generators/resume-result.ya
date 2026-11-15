@@ -15,13 +15,13 @@ let request = gen proc() -> Generator<string, Result<i64, string>, i64> {
 }
 
 let mut success = request()
-let waiting = success.resume()
+let waiting = success.start()
 print(waiting.yielded())
 let finished = success.resume(ok<i64, string>(42))
 print("complete: ", finished.completed())
 
 let mut failure = request()
-let waiting = failure.resume()
+let waiting = failure.start()
 print(waiting.yielded())
 let finished = failure.resume(err<i64, string>("unavailable"))
 print("complete: ", finished.completed())

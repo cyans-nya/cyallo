@@ -48,6 +48,9 @@ pub struct TierPolicy {
     pub execution_quantum: usize,
     /// Total wait budget shared by all first-call admissions in this artifact.
     pub first_call_wait: Duration,
+    /// Frameless routine inlining in native code. Observation no longer turns
+    /// it off; disabling it is an explicit codegen choice (`--jit-no-inline`).
+    pub inlining: bool,
 }
 impl Default for TierPolicy {
     fn default() -> Self {
@@ -65,6 +68,7 @@ impl Default for TierPolicy {
             use_winch: true,
             execution_quantum: 1024,
             first_call_wait: Duration::from_millis(1),
+            inlining: true,
         }
     }
 }
@@ -415,6 +419,7 @@ impl TieredBackend {
                     mailbox.clone(),
                     Arc::downgrade(&alive),
                     origin.is_some(),
+                    self.policy.inlining,
                     slots.clone(),
                 )
             })
@@ -756,6 +761,11 @@ impl TieredArtifact {
 impl Executable for TieredArtifact {
     fn run(&self, session: &mut Session, budget: usize) -> Result<(), EngineError> {
         if !Arc::ptr_eq(&self.program, &session.program) {
+            if session.program.extends(&self.program) {
+                session.run(budget);
+                return Ok(());
+            }
+
             self.program.notice(
                 "invalidation",
                 0,
@@ -765,6 +775,9 @@ impl Executable for TieredArtifact {
         }
         let start = session.instruction_count();
         while session.instruction_count() - start < budget as u64 {
+            if !session.resume_pending() {
+                break;
+            }
             if matches!(session.status(), Status::Finished | Status::Failed(_))
                 || (*session.status() == Status::WaitingForInput
                     && session.context.input.is_empty())

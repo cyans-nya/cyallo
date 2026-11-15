@@ -1,0 +1,11 @@
+// Loaded at runtime by main.ya. Effects belong in explicit procedures.
+pub const label = "runtime"
+
+pub fn twice(value: i64) -> i64 { return value * 2 }
+
+pub proc update(value: gc Cell<i64>) -> i64 {
+    let clock = std::time::clock()
+    clock.sleep(1)
+    value.*.* = value.*.* + 2
+    return value.*.*
+}

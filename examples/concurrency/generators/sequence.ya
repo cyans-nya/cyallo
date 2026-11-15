@@ -14,7 +14,7 @@ let sequence = gen proc(count: i64) -> Generator<i64, (), i64> {
 }
 
 let mut values = sequence(3)
-let first = values.resume()
+let first = values.start()
 print(first.yielded())
 let second = values.resume()
 print(second.yielded())

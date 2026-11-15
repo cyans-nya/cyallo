@@ -51,10 +51,10 @@ measured runtime, while copied bodies increase compilation work and code size.
 | `CraneliftConfig.inlining` | `true` | Master switch; bounded scalar function and procedure inlining |
 | `CraneliftConfig.procedure_inlining` | `false` | Also embed effectful procedures while retaining frames |
 
-`--jit-report` uses existing logical counters and preserves both optimization
-paths. Intrusive `--jit-trace` / `Session::enable_reporting` disables both inline
-paths and says so in its output. The original CLI used full tracing for
-`--jit-report`; it was split after that observer changed measured execution.
+`--jit-trace=summary` uses existing logical counters and preserves both optimization
+paths. `--jit-trace` / `Session::enable_reporting` observes physical invocations but
+keeps frameless inlining; `--jit-no-inline` turns inlining off for comparison. The
+embedded-procedure path still retains real frames and is not inlined while observed.
 `Session::inlined_call_count()` and `body_inlined_call_count()` provide lightweight
 evidence without enabling that observer.
 
@@ -157,23 +157,25 @@ cargo bench --offline --bench engines -- procedure-calls
 
 ## Reporting observer correction
 
-The original `--jit-report` selected full Session tracing, disabled inlining and
+The original `--jit-trace=summary` selected full Session tracing, disabled inlining and
 recorded every physical invocation. A user run consequently measured tens of
 milliseconds of observed execution and printed over 4,000 lines. A failing CLI
 regression reproduced the optimization change before the fix.
 
-`--jit-report` now captures existing logical counters without enabling Session
+`--jit-trace=summary` captures existing logical counters without enabling Session
 tracing. It preserves inlining, includes logical work from virtual callees and
-prints a bounded compiler timeline. `--jit-trace` explicitly selects the former
-intrusive mode. The summary includes deferred checks, admission waits and GC in
-its execution time; it does not invent per-tier/per-call phase timings.
+prints a bounded compiler timeline. `--jit-trace` selects full observation. Since the
+trace mode stopped disabling inlining, observed runs keep the same optimized bodies;
+only their per-invocation events are missing for frameless inlined calls. The summary
+includes deferred checks, admission waits and GC in its execution time; it does not
+invent per-tier/per-call phase timings.
 
 For 21 rotated cold CLI samples on the same machine and release binary:
 
 | Mode | Median process | p95 process | Median reported VM | Output lines |
 | --- | ---: | ---: | ---: | ---: |
 | Normal | 7.52 ms | 7.78 ms | — | 0 |
-| `--jit-report` | 7.34 ms | 7.87 ms | 3.57 ms | 43 |
+| `--jit-trace=summary` | 7.34 ms | 7.87 ms | 3.57 ms | 43 |
 | `--jit-trace` | 31.80 ms | 32.62 ms | 27.07 ms | 4,153 |
 
 Normal and summary times are comparable within measurement noise. Program

@@ -212,7 +212,7 @@ fn rewrite(expr: &mut Expr, env: &Environment, require_constant: bool) -> Result
     cyallo_ast::with_stack(|| {
         match &mut expr.kind {
             ExprKind::Yield(value, _) => rewrite(value, env, require_constant)?,
-            ExprKind::ManagedNew(_, allocator, value) => {
+            ExprKind::ManagedNew(_, _, allocator, value) => {
                 if let Some(allocator) = allocator {
                     rewrite(allocator, env, require_constant)?;
                 }
@@ -231,7 +231,7 @@ fn rewrite(expr: &mut Expr, env: &Environment, require_constant: bool) -> Result
                     *expr = value.clone();
                     // A service key is a declaration identity, not a fresh key at
                     // each use. Its source identity survives constant substitution.
-                    if !matches!(&expr.kind, ExprKind::IntrinsicCall(id, _, _) if *id == cyallo_ir::intrinsic::Intrinsic::ServiceKeyNew.id())
+                    if !matches!(&expr.kind, ExprKind::IntrinsicCall(id, _, _) if cyallo_ir::intrinsic::Intrinsic::from_id(*id) == Some(cyallo_ir::intrinsic::Intrinsic::ServiceKeyNew))
                     {
                         expr.span = span;
                     }
@@ -261,13 +261,14 @@ fn rewrite(expr: &mut Expr, env: &Environment, require_constant: bool) -> Result
                     _ => {}
                 }
             }
-            ExprKind::Unary(_, e)
+            ExprKind::DeleteProperty(e)
+            | ExprKind::Unary(_, e)
             | ExprKind::Parenthesized(e)
             | ExprKind::Cast(e, _)
             | ExprKind::Field(e, _)
             | ExprKind::TupleField(e, _)
             | ExprKind::ExtensionField(e, _, _) => rewrite(e, env, require_constant)?,
-            ExprKind::Binary(_, a, b) => {
+            ExprKind::Binary(_, a, b) | ExprKind::NativeCoerce(a, b) => {
                 rewrite(a, env, require_constant)?;
                 rewrite(b, env, require_constant)?;
             }
@@ -285,7 +286,9 @@ fn rewrite(expr: &mut Expr, env: &Environment, require_constant: bool) -> Result
                     rewrite(arg, env, require_constant)?;
                 }
             }
-            ExprKind::Record(_, fields) | ExprKind::GenericRecord(_, _, fields) => {
+            ExprKind::Record(_, fields)
+            | ExprKind::GenericRecord(_, _, fields)
+            | ExprKind::ObjectLiteral(_, fields) => {
                 for (_, value) in fields {
                     rewrite(value, env, require_constant)?;
                 }
@@ -312,7 +315,11 @@ fn rewrite(expr: &mut Expr, env: &Environment, require_constant: bool) -> Result
                     rewrite(value, env, require_constant)?;
                 }
             }
-            ExprKind::Literal(_) | ExprKind::Frozen(..) | ExprKind::Invalid(_) => {}
+            ExprKind::TypeDescriptor(_)
+            | ExprKind::DeferredCallable(_)
+            | ExprKind::Literal(_)
+            | ExprKind::Frozen(..)
+            | ExprKind::Invalid(_) => {}
         }
         Ok(())
     })
@@ -476,7 +483,11 @@ fn evaluate_one(
                             | crate::lookup::Operation::Mapped
                     )
             }
-            Op::Service(..) | Op::TraitCall(..) | Op::Input(..) | Op::Output(..) => false,
+            Op::Dynamic(..)
+            | Op::Service(..)
+            | Op::TraitCall(..)
+            | Op::Input(..)
+            | Op::Output(..) => false,
             _ => true,
         };
         if !valid {

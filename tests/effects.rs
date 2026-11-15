@@ -4,7 +4,7 @@ use cyallo::{
 use std::sync::Arc;
 #[test]
 fn returning_procedures_and_private_mutation() {
-    let source = "let mut counter = 0\nproc advance(n: &mut i64) -> i64 { *n += 1; return *n }\nfn work(n: i64) -> i64 { let mut copy = [n,2]; copy[0] += 3; let mut x = 0; for i in 1..=3 { x += i }; return copy[0] + x }\nstd::io::print(advance(&mut counter), work(1), counter)\nadvance(&mut counter)\nadvance(&mut counter)\nstd::io::print(counter)\n";
+    let source = "let mut counter = 0\nproc advance(n: &mut i64) -> i64 { n.* += 1; return n.* }\nfn work(n: i64) -> i64 { let mut copy = [n,2]; copy[0] += 3; let mut x = 0; for i in 1..=3 { x += i }; return copy[0] + x }\nstd::io::print(advance(&mut counter), work(1), counter)\nadvance(&mut counter)\nadvance(&mut counter)\nstd::io::print(counter)\n";
     let program = Arc::new(compile(source).unwrap());
     assert_eq!(program.functions()[1].kind, RoutineKind::Procedure);
     assert!(program.functions()[1].effects.writes_references);
@@ -26,7 +26,7 @@ fn rejects_effects_including_transitive_calls() {
         "fn f() -> f64 { return RAND(1) }\n",
         "proc effect() -> i64 { return 1 }\nfn f() -> i64 { return effect() }\n",
         "fn outer() -> i64 { return inner() }\nfn inner() -> i64 { std::io::print(1); return 1 }\n",
-        "fn f(n: &mut i64) -> i64 { *n += 1; return *n }\n",
+        "fn f(n: &mut i64) -> i64 { n.* += 1; return n.* }\n",
         "proc f() -> i64 { if true { return 1 } }\n",
         "proc f() -> i64 { return }\n",
     ] {

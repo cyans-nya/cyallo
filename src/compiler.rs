@@ -27,6 +27,45 @@ fn compile_source_inner(
     repl: bool,
     deferred: bool,
 ) -> Result<ir::Program> {
+    compile_source_configured(
+        source,
+        options,
+        repl,
+        deferred,
+        &cyallo_ir::import_policy::ImportPolicy::default(),
+        &cyallo_ir::core_package::CorePackage::embedded(),
+    )
+}
+pub fn compile_with_import_policy(
+    source: &str,
+    options: CompileOptions,
+    policy: &cyallo_ir::import_policy::ImportPolicy,
+) -> Result<ir::Program> {
+    compile_source_configured(
+        source,
+        options,
+        false,
+        false,
+        policy,
+        &cyallo_ir::core_package::CorePackage::embedded(),
+    )
+}
+pub fn compile_with_core_package(
+    source: &str,
+    options: CompileOptions,
+    policy: &cyallo_ir::import_policy::ImportPolicy,
+    core: &cyallo_ir::core_package::CorePackage<'_>,
+) -> Result<ir::Program> {
+    compile_source_configured(source, options, false, false, policy, core)
+}
+fn compile_source_configured(
+    source: &str,
+    options: CompileOptions,
+    repl: bool,
+    deferred: bool,
+    policy: &cyallo_ir::import_policy::ImportPolicy,
+    core: &cyallo_ir::core_package::CorePackage<'_>,
+) -> Result<ir::Program> {
     let ast = if options.dialect == Dialect::Modern {
         cyallo_parser::parse_modern_with_jobs(
             source,
@@ -38,12 +77,55 @@ fn compile_source_inner(
     } else {
         caie_int_parser::parse(source)?
     };
-    let ast = if options.dialect == Dialect::Modern {
-        crate::namespace::single(ast)?
+    if options.dialect == Dialect::Modern {
+        let mut archive = source.to_owned();
+        let core_archive = core
+            .append_to(&mut archive)
+            .map_err(cyallo_ir::core_package::invalid_core_source)?;
+        let raw = ast.clone();
+        let ast = crate::namespace::link_with_core(
+            vec![ast],
+            &["main.ya".into()],
+            0,
+            policy,
+            core,
+            core_archive.base,
+        )?;
+        let authorization = ast.native.import_policy.clone();
+        let mut program = compile_ast(&archive, ast, options, deferred)?;
+        let mut ranges = vec![crate::modules::SourceRange {
+            path: None,
+            span: Span::new(0, source.len() as u32),
+        }];
+        ranges.extend(
+            core_archive
+                .ranges
+                .into_iter()
+                .map(|range| crate::modules::SourceRange {
+                    path: Some(range.path),
+                    span: range.span,
+                }),
+        );
+        let mut plan = crate::dynamic_modules::CompilePlan::new(
+            crate::dynamic_modules::CompileSources {
+                asts: vec![raw],
+                paths: vec!["main.ya".into()],
+                entry: 0,
+                archive,
+                ranges: ranges.clone(),
+                core_base: core_archive.base,
+            },
+            options,
+            policy,
+            core,
+        );
+        plan.authorization = authorization;
+        program.dynamic_plan = Some(std::sync::Arc::new(plan));
+        program.source_modules = ranges.into_boxed_slice();
+        Ok(program)
     } else {
-        ast
-    };
-    compile_ast(source, ast, options, deferred)
+        compile_ast(source, ast, options, deferred)
+    }
 }
 pub(crate) fn compile_ast(
     source: &str,
@@ -69,6 +151,9 @@ pub(crate) fn compile_ast_unfolded(
     let bytecode =
         crate::bytecode::Module::lower(&checked.functions, cyallo_compile_jobs::Jobs(options.jobs));
     Ok(ir::Program {
+        dynamic_plan: None,
+        module_loader: None,
+        parent: None,
         records: checked.records,
         requires_tracing: checked.requires_tracing,
         jobs: crate::Jobs(options.jobs),

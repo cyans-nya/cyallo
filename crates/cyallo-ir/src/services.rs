@@ -8,19 +8,19 @@ pub struct Metadata {
     pub implementations: Vec<Implementation>,
     pub keys: Vec<Key>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extension {
     pub name: Box<str>,
     pub receiver: Type,
     pub result: Type,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trait {
     pub origin: cyallo_ast::TraitOrigin,
     pub name: Box<str>,
     pub methods: Vec<Method>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Method {
     pub name: Box<str>,
     pub kind: RoutineKind,
@@ -41,13 +41,13 @@ fn receiver(ty: &Type) -> Receiver {
         _ => Receiver::Value,
     }
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Implementation {
     pub trait_id: usize,
     pub receiver: Type,
     pub methods: Vec<usize>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Key {
     pub span: u32,
     pub label: Box<str>,
@@ -279,7 +279,8 @@ pub fn prepare(ast: &mut cyallo_ast::Ast) -> Result<Metadata, cyallo_ast::Diagno
                     scan(&mut f.body, out)?;
                 }
                 if let ExprKind::IntrinsicCall(id, types, args) = &e.kind
-                    && *id == crate::intrinsic::Intrinsic::ServiceKeyNew.id()
+                    && crate::intrinsic::Intrinsic::from_id(*id)
+                        == Some(crate::intrinsic::Intrinsic::ServiceKeyNew)
                 {
                     let [ty @ Type::TraitObject(_)] = types.as_slice() else {
                         return Err(Diagnostic::new(
@@ -317,37 +318,4 @@ pub fn prepare(ast: &mut cyallo_ast::Ast) -> Result<Metadata, cyallo_ast::Diagno
         scan(&mut f.body, &mut out)?;
     }
     Ok(out)
-}
-
-pub fn intrinsic(receiver: &Type, name: &str, args: &[Type]) -> Option<(Operation, Type)> {
-    use Operation::*;
-    let n = name;
-    match (receiver.pointee_or_self(), n, args) {
-        (Type::Context, "extend", []) => Some((Extend, Type::Context)),
-        (Type::Context, "isolate", [Type::ServiceKey(_)]) => Some((Isolate, Type::Context)),
-        (Type::Context, "service", [Type::ServiceKey(t)]) => {
-            Some((Reference, Type::ServiceRef(t.clone())))
-        }
-        (Type::Context, "provide", [Type::ServiceKey(t), value]) if t.as_ref() == value => {
-            Some((Provide, Type::Registration))
-        }
-        (Type::Context, "available", [Type::ServiceKey(_)]) => Some((Available, Type::Boolean)),
-        (Type::Context | Type::Registration, "dispose", []) => Some((Dispose, Type::Void)),
-        (
-            Type::Context,
-            "inject",
-            [
-                Type::ServiceKey(_),
-                Type::Function(RoutineKind::Procedure, p, r),
-            ],
-        ) if p == &[(Type::Context, false)] && r.as_ref() == &Type::Void => {
-            Some((Inject, Type::Void))
-        }
-        (Type::Context, "on_dispose", [Type::Function(RoutineKind::Procedure, p, r)])
-            if p.is_empty() && r.as_ref() == &Type::Void =>
-        {
-            Some((OnDispose, Type::Void))
-        }
-        _ => None,
-    }
 }

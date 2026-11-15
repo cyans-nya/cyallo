@@ -134,3 +134,60 @@ fn interrupted_entry_allows_recovery() {
     entry(&mut repl, "42", true);
     assert_eq!(repl.session().context.output, "42\n");
 }
+
+#[test]
+fn a_clock_capability_survives_repl_entry_completion() {
+    use std::time::{Duration, Instant};
+    for jit in [false, true] {
+        let mut repl = Repl::new(CompileOptions::default()).unwrap();
+        for source in [
+            "let clock = std::time::clock()",
+            "clock.sleep(1 as u64)",
+            "clock.sleep(1 as u64); std::io::print(42)",
+        ] {
+            assert_eq!(repl.push_line(source).unwrap(), Submission::Ready);
+            let program = repl.session().program().clone();
+            let engine = jit.then(|| CraneliftBackend.compile(program).unwrap());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(engine) = &engine {
+                    engine.run(repl.session_mut(), 10).unwrap();
+                } else {
+                    repl.run(10);
+                }
+                match repl.session().status() {
+                    Status::Paused => {}
+                    Status::Waiting => repl.session().wait_for_wakeup(Duration::from_millis(5)),
+                    _ => break,
+                }
+                assert!(Instant::now() < deadline);
+            }
+            assert_eq!(repl.session().status(), &Status::Finished);
+        }
+        assert_eq!(repl.session().context.output, "42\n");
+    }
+}
+
+#[test]
+fn native_aliases_keep_their_declarations_when_repl_definitions_are_added() {
+    for jit in [false, true] {
+        let mut repl = Repl::new(CompileOptions::default()).unwrap();
+        entry(
+            &mut repl,
+            "let magnitude = std::num::abs; let emit = std::io::print",
+            jit,
+        );
+        entry(
+            &mut repl,
+            "proc unrelated() -> i64 { return 99 }; let another = 10",
+            jit,
+        );
+        entry(&mut repl, "emit(magnitude(-42))", jit);
+        entry(
+            &mut repl,
+            "mod unrelated_module { pub fn value() -> i64 { return 7 } }; emit(magnitude(-7))",
+            jit,
+        );
+        assert_eq!(repl.session().context.output, "42\n7\n");
+    }
+}

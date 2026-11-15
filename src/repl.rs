@@ -26,6 +26,7 @@ impl Repl {
     ) -> Result<Self, Diagnostic> {
         let program = Arc::new(compile_source("", options, true)?);
         let mut session = Session::with_context(program, context.clone())?;
+        session.keep_runtime_between_entries();
         session.run(1);
         Ok(Self {
             inspection: None,
@@ -69,7 +70,7 @@ impl Repl {
     pub fn push_line(&mut self, line: &str) -> Result<Submission, Diagnostic> {
         if matches!(
             self.session.status(),
-            Status::Paused | Status::WaitingForInput
+            Status::Paused | Status::WaitingForInput | Status::Waiting
         ) {
             return Err(Diagnostic::new(
                 "E202",

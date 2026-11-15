@@ -72,7 +72,7 @@ impl std::fmt::Display for Operator {
             Self::Or => "||",
             Self::Not => "!",
             Self::BorrowMut => "&mut",
-            Self::Dereference => "*",
+            Self::Dereference => ".*",
             Self::Range => "..",
             Self::RangeInclusive => "..=",
         })

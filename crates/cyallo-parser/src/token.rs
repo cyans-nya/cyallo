@@ -47,8 +47,14 @@ pub enum TokenKind {
     Range,
     RangeInclusive,
     Lifetime,
+    Object,
+    Dynamic,
+    Delete,
+    TypeAlias,
     Let,
     Gen,
+    Gc,
+    Rc,
     Yield,
     Const,
     Fn,
@@ -80,12 +86,18 @@ impl GetSpan for Token {
 }
 impl TokenKind {
     pub fn is_keyword(self) -> bool {
-        self as u8 >= Self::Let as u8
+        self as u8 >= Self::Object as u8
     }
     pub fn from_word(word: &str) -> Self {
         match word {
+            "object" => Self::Object,
+            "dynamic" => Self::Dynamic,
+            "delete" => Self::Delete,
+            "type" => Self::TypeAlias,
             "let" => Self::Let,
             "gen" => Self::Gen,
+            "gc" => Self::Gc,
+            "rc" => Self::Rc,
             "yield" => Self::Yield,
             "const" => Self::Const,
             "fn" => Self::Fn,

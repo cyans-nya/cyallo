@@ -23,7 +23,7 @@ rendered in a terminal. Compilation, execution, and process startup are included
 | jit | 16.8 ms | 19.8 ms |
 | cranelift | 18.3 ms | 22.0 ms |
 | cranelift_speed | 24.3 ms | 27.9 ms |
-| jit with `--jit-report` | 33.5 ms | 36.7 ms |
+| jit with `--jit-trace=summary` | 33.5 ms | 36.7 ms |
 
 Compare engines within a column. The original comparison included reporting
 only for JIT; reporting approximately doubles its latency here. Without
@@ -37,7 +37,7 @@ hyperfine --warmup 5 --runs 40 \
   './target/release/cyallo run examples/modern.ya --engine jit' \
   './target/release/cyallo run examples/modern.ya --engine cranelift' \
   './target/release/cyallo run examples/modern.ya --engine cranelift_speed' \
-  './target/release/cyallo run examples/modern.ya --engine jit --jit-report'
+  './target/release/cyallo run examples/modern.ya --engine jit --jit-trace=summary'
 ```
 
 **Confirmed bug: native execution can miss the fast-tier threshold.**

@@ -854,6 +854,14 @@ pub struct Spawner {
     preferred: Option<usize>,
 }
 impl Spawner {
+    /// Admits owned host work without retaining an execution permit.
+    pub fn blocking<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<super::Operation<Result<T, cyallo_host::HostError>>, cyallo_host::HostError> {
+        let core = self.core.upgrade().ok_or(cyallo_host::HostError::Stopped)?;
+        Ok(core.blocking.submit(work))
+    }
     pub fn spawn<C: Coroutine>(&self, c: C) -> Result<Task<C::Output>, SpawnError> {
         let core = self.core.upgrade().ok_or(SpawnError::Stopped)?;
         let c = core.spawn(

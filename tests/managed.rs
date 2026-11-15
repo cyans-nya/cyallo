@@ -5,14 +5,14 @@ use cyallo::{CompileOptions, Context, Session, Status, compile, compile_for_exec
 use std::{sync::Arc, time::Duration};
 const ALLOCATOR: &str = r#"
 use std::mem::{Allocator, Layout, Allocation, AllocError}
-record Counting { allocated: @gc Cell<i64>, released: @gc Cell<i64> }
+record Counting { allocated: gc Cell<i64>, released: gc Cell<i64> }
 impl Allocator for Counting {
     proc allocate(self: &mut Self, layout: Layout) -> Result<Allocation, AllocError> {
-        **self.allocated = **self.allocated + 1
+        self.allocated.*.* = self.allocated.*.* + 1
         return std::mem::allocate(layout)
     }
     proc deallocate(self: &mut Self, allocation: Allocation) {
-        **self.released = **self.released + 1
+        self.released.*.* = self.released.*.* + 1
         std::mem::deallocate(allocation)
     }
 }
@@ -77,6 +77,27 @@ fn gc_sharing_example() {
         "snapshot: 10\nshared: 11:11\nretained: 21\n",
     );
 }
+
+#[test]
+fn explicit_local_rc_supports_custom_allocator_state_and_lifetimes() {
+    parity(
+        &format!(
+            r#"{ALLOCATOR}
+        proc make(allocator: &'a mut Counting) -> @local rc<'a> i64 {{
+            return @local rc(allocator) 42
+        }}
+        let allocated = @local gc Cell::new(0)
+        let released = gc Cell::new(0)
+        let mut allocator = Counting {{ allocated: allocated, released: released }}
+        let owner = make(&mut allocator)
+        std::io::print(owner.*)
+        std::mem::drop(owner)
+        std::io::print(allocated.*.*, ":", released.*.*)
+    "#
+        ),
+        "42\n1:1\n",
+    );
+}
 #[test]
 fn rc_ownership_example() {
     parity(
@@ -95,18 +116,18 @@ fn combined_gc_rc_example() {
 fn recursive_generic_and_mutual_records_use_resolved_layouts() {
     parity(
         r#"
-record Node<T> { value: T, edges: Cell<@gc Vec<@gc Node<T>>> }
-record Left { value: i64, right: Cell<@gc Vec<@gc Right>> }
-record Right { left: @gc Left }
-let first = @gc Node<i64> { value: 1, edges: Cell::new(@gc Vec<@gc Node<i64>>[]) }
-let second = @gc Node<i64> { value: 2, edges: Cell::new(@gc Vec[first]) }
-*first.edges = @gc Vec[second]
-let next = (*first.edges)[0]
-std::io::print(next.value, ":", (*next.edges)[0].value)
-let left = @gc Left { value: 3, right: Cell::new(@gc Vec<@gc Right>[]) }
-let right = @gc Right { left: left }
-*left.right = @gc Vec[right]
-std::io::print((*left.right)[0].left.value)
+record Node<T> { value: T, edges: Cell<gc Vec<gc Node<T>>> }
+record Left { value: i64, right: Cell<gc Vec<gc Right>> }
+record Right { left: gc Left }
+let first = gc Node<i64> { value: 1, edges: Cell::new(gc Vec<gc Node<i64>>[]) }
+let second = gc Node<i64> { value: 2, edges: Cell::new(gc Vec[first]) }
+first.edges.* = gc Vec[second]
+let next = (first.edges.*)[0]
+std::io::print(next.value, ":", (next.edges.*)[0].value)
+let left = gc Left { value: 3, right: Cell::new(gc Vec<gc Right>[]) }
+let right = gc Right { left: left }
+left.right.* = gc Vec[right]
+std::io::print((left.right.*)[0].left.value)
 record Tree { value: i64, children: Vec<Tree> }
 let root = Tree { value: 4, children: Vec[Tree { value: 5, children: Vec<Tree>[] }] }
 std::io::print(root.value, ":", root.children[0].value)
@@ -118,10 +139,10 @@ std::io::print(root.value, ":", root.children[0].value)
 fn recursive_rc_nodes_release_when_backedges_are_weak() {
     parity(
         r#"
-record Node { next: Cell<Option<@rc Node>>, previous: Cell<Option<std::rc::Weak<Node>>> }
-let first = @rc Node { next: Cell::new(std::option::none<@rc Node>()), previous: Cell::new(std::option::none<std::rc::Weak<Node>>()) }
-let second = @rc Node { next: Cell::new(std::option::none<@rc Node>()), previous: Cell::new(std::option::some(first.downgrade())) }
-*first.next = std::option::some(std::rc::clone(&second))
+record Node { next: Cell<Option<rc Node>>, previous: Cell<Option<std::rc::Weak<Node>>> }
+let first = rc Node { next: Cell::new(std::option::none<rc Node>()), previous: Cell::new(std::option::none<std::rc::Weak<Node>>()) }
+let second = rc Node { next: Cell::new(std::option::none<rc Node>()), previous: Cell::new(std::option::some(first.downgrade())) }
+first.next.* = std::option::some(std::rc::clone(&second))
 let first_weak = first.downgrade()
 let second_weak = second.downgrade()
 std::mem::drop(second)
@@ -138,16 +159,16 @@ fn owned_allocator_survives_return_and_deallocates_through_trait() {
     parity(
         &format!(
             r#"{ALLOCATOR}
-proc make(allocated: @gc Cell<i64>, released: @gc Cell<i64>) -> @rc string {{
-    return @rc(Counting {{ allocated: allocated, released: released }}) "owned"
+proc make(allocated: gc Cell<i64>, released: gc Cell<i64>) -> rc string {{
+    return rc(Counting {{ allocated: allocated, released: released }}) "owned"
 }}
-let allocated = @gc Cell::new(0)
-let released = @gc Cell::new(0)
+let allocated = gc Cell::new(0)
+let released = gc Cell::new(0)
 let owner = make(allocated, released)
 let weak = owner.downgrade()
-std::io::print(*owner, ":", **allocated)
+std::io::print(owner.*, ":", allocated.*.*)
 std::mem::drop(owner)
-std::io::print(**released, ":", weak.upgrade().is_some())
+std::io::print(released.*.*, ":", weak.upgrade().is_some())
 std::mem::drop(weak)
 "#
         ),
@@ -166,15 +187,15 @@ impl Allocator for Denied {{
     }}
     proc deallocate(self: &mut Self, allocation: Allocation) {{ std::mem::deallocate(allocation) }}
 }}
-let allocated = @gc Cell::new(0)
-let released = @gc Cell::new(0)
-let payload = @rc(Counting {{ allocated: allocated, released: released }}) 3
+let allocated = gc Cell::new(0)
+let released = gc Cell::new(0)
+let payload = rc(Counting {{ allocated: allocated, released: released }}) 3
 let result = std::rc::try_new_in(payload, Denied {{}})
-std::io::print(result.is_err(), ":", **released)
+std::io::print(result.is_err(), ":", released.*.*)
 let success = std::rc::try_new_in(7, Counting {{ allocated: allocated, released: released }}).unwrap()
-std::io::print(*success)
+std::io::print(success.*)
 std::mem::drop(success)
-std::io::print(**allocated, ":", **released)
+std::io::print(allocated.*.*, ":", released.*.*)
 "#
         ),
         "true:1\n7\n2:2\n",
@@ -184,9 +205,9 @@ std::io::print(**allocated, ":", **released)
 fn allocation_tokens_are_move_only_and_allocator_borrows_cannot_escape() {
     for source in [
         format!("{ALLOCATOR}\nlet layout = Layout::new(8,8).unwrap()\nlet allocation = std::mem::allocate(layout).unwrap()\nlet second = std::mem::clone(&allocation)\n"),
-        format!("{ALLOCATOR}\nproc bad() -> @rc i64 {{ let mut allocator = Counting {{ allocated: @gc Cell::new(0), released: @gc Cell::new(0) }}; return @rc(&mut allocator) 1 }}\n"),
-        format!("{ALLOCATOR}\nlet allocator = Counting {{ allocated: @gc Cell::new(0), released: @gc Cell::new(0) }}\nlet owner = @rc(&allocator) 1\n"),
-        "let owner = @rc(1) 2\n".into(),
+        format!("{ALLOCATOR}\nproc bad() -> rc i64 {{ let mut allocator = Counting {{ allocated: gc Cell::new(0), released: gc Cell::new(0) }}; return rc(&mut allocator) 1 }}\n"),
+        format!("{ALLOCATOR}\nlet allocator = Counting {{ allocated: gc Cell::new(0), released: gc Cell::new(0) }}\nlet owner = rc(&allocator) 1\n"),
+        "let owner = rc(1) 2\n".into(),
         "fn bad() { let layout = std::mem::Layout::new(8,8).unwrap(); std::mem::allocate(layout) }\n".into(),
     ] { assert!(compile(&source).is_err(), "accepted {source}"); }
 }
@@ -195,15 +216,15 @@ fn borrowed_allocator_is_kept_until_weak_handles_are_released() {
     parity(
         &format!(
             r#"{ALLOCATOR}
-let allocated = @gc Cell::new(0)
-let released = @gc Cell::new(0)
+let allocated = gc Cell::new(0)
+let released = gc Cell::new(0)
 let mut allocator = Counting {{ allocated: allocated, released: released }}
-let owner = @rc(&mut allocator) 12
+let owner = rc(&mut allocator) 12
 let weak = owner.downgrade()
 std::mem::drop(owner)
-std::io::print(weak.upgrade().is_none(), ":", **released)
+std::io::print(weak.upgrade().is_none(), ":", released.*.*)
 std::mem::drop(weak)
-std::io::print(**allocator.allocated)
+std::io::print(allocator.allocated.*.*)
 "#
         ),
         "true:1\n1\n",
@@ -215,24 +236,24 @@ fn allocator_can_reuse_owned_backing_storage_after_payload_destruction() {
     parity(
         r#"
 use std::mem::{Allocator, Layout, Allocation, AllocError}
-record Pool { free: Vec<Allocation>, system: @gc Cell<i64> }
+record Pool { free: Vec<Allocation>, system: gc Cell<i64> }
 impl Allocator for Pool {
     proc allocate(self: &mut Self, layout: Layout) -> Result<Allocation, AllocError> {
         if self.free.len() > 0 {
             return std::result::ok<Allocation, AllocError>(self.free.pop().unwrap())
         }
-        **self.system = **self.system + 1
+        self.system.*.* = self.system.*.* + 1
         return std::mem::allocate(layout)
     }
     proc deallocate(self: &mut Self, allocation: Allocation) { self.free.push(allocation) }
 }
-let system = @gc Cell::new(0)
+let system = gc Cell::new(0)
 let mut pool = Pool { free: Vec<Allocation>[], system: system }
 for i in 0..=9 {
-    let owner = @rc(&mut pool) i
-    std::io::print(*owner)
+    let owner = rc(&mut pool) i
+    std::io::print(owner.*)
 }
-std::io::print(**system, ":", pool.free.len())
+std::io::print(system.*.*, ":", pool.free.len())
 std::mem::drop(pool)
 "#,
         "0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n1:1\n",
@@ -243,9 +264,9 @@ fn repl_relinks_allocator_deallocation_methods() {
     let mut repl = cyallo::repl::Repl::new(Default::default()).unwrap();
     for source in [
         ALLOCATOR,
-        "let allocated = @gc Cell::new(0); let released = @gc Cell::new(0); let owner = @rc(Counting { allocated: allocated, released: released }) 3",
+        "let allocated = gc Cell::new(0); let released = gc Cell::new(0); let owner = rc(Counting { allocated: allocated, released: released }) 3",
         "fn added() -> i64 { return 42 }",
-        "std::mem::drop(owner); std::io::print(**released, added())",
+        "std::mem::drop(owner); std::io::print(released.*.*, added())",
     ] {
         repl.push_line(source).unwrap();
         repl.run(10000);
@@ -256,7 +277,7 @@ fn repl_relinks_allocator_deallocation_methods() {
 #[test]
 fn parenthesized_rc_payload_is_distinct_from_an_allocator_argument() {
     parity(
-        "let owner = @rc(2 + 3)\nstd::io::print(*owner)\nstd::mem::drop(owner)\n",
+        "let owner = rc(2 + 3)\nstd::io::print(owner.*)\nstd::mem::drop(owner)\n",
         "5\n",
     );
 }
@@ -267,16 +288,16 @@ fn weak_results_preserve_borrowed_allocator_lifetimes() {
         &format!(
             r#"{ALLOCATOR}
 proc weak(allocator: &'a mut Counting) -> std::rc::Weak<'a, i64> {{
-    let owner = @rc(allocator) 3
+    let owner = rc(allocator) 3
     return owner.downgrade()
 }}
-let allocated = @gc Cell::new(0)
-let released = @gc Cell::new(0)
+let allocated = gc Cell::new(0)
+let released = gc Cell::new(0)
 let mut allocator = Counting {{ allocated: allocated, released: released }}
 let handle = weak(&mut allocator)
-std::io::print(handle.upgrade().is_none(), ":", **released)
+std::io::print(handle.upgrade().is_none(), ":", released.*.*)
 std::mem::drop(handle)
-std::io::print(**allocator.allocated)
+std::io::print(allocator.allocated.*.*)
 "#
         ),
         "true:1\n1\n",
@@ -284,8 +305,8 @@ std::io::print(**allocator.allocated)
     let source = format!(
         r#"{ALLOCATOR}
 proc bad() -> std::rc::Weak<i64> {{
-    let mut allocator = Counting {{ allocated: @gc Cell::new(0), released: @gc Cell::new(0) }}
-    let owner = @rc(&mut allocator) 1
+    let mut allocator = Counting {{ allocated: gc Cell::new(0), released: gc Cell::new(0) }}
+    let owner = rc(&mut allocator) 1
     return owner.downgrade()
 }}
 "#

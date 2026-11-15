@@ -63,7 +63,7 @@ impl Debugger {
             }
             self.started = true;
             if !self.session.step() {
-                if !matches!(self.session.status(), Status::Paused) {
+                if !matches!(self.session.status(), Status::Paused | Status::Waiting) {
                     self.mode = Mode::Paused;
                 }
                 return;

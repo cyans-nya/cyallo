@@ -1,0 +1,15 @@
+// Run: cargo run -- run examples/concurrency/channels/buffered.ya --engine interpreter
+// Expected: true, 42, true, 99 (one result per line).
+use std::channel::bounded
+use std::io::print
+
+let endpoints = bounded<i64>(1 as usize)
+let sender = endpoints.0.clone()
+let receiver = endpoints.1.clone()
+sender.send(42).unwrap()
+let full = sender.try_send(99).unwrap_err()
+print(full.is_full())
+print(receiver.recv().unwrap())
+sender.close()
+print(receiver.recv().unwrap_err().is_closed())
+print(full.into_value())

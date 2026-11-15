@@ -306,6 +306,31 @@ impl Session {
 
     pub(super) fn clone_value(&mut self, value: Value) -> RunResult<Value> {
         Ok(match value {
+            Value::Concurrent(handle) => Value::Concurrent(
+                handle
+                    .duplicate()
+                    .map_err(super::concurrent::ConcurrencyError::Resource)?,
+            ),
+            Value::TaskOutcome(outcome) => Value::TaskOutcome(match outcome {
+                cyallo_concurrent_values::TaskOutcome::Completed(value) => {
+                    cyallo_concurrent_values::TaskOutcome::Completed(Box::new(
+                        self.clone_value(*value)?,
+                    ))
+                }
+                cyallo_concurrent_values::TaskOutcome::Failed(error) => {
+                    cyallo_concurrent_values::TaskOutcome::Failed(error)
+                }
+                cyallo_concurrent_values::TaskOutcome::Cancelled => {
+                    cyallo_concurrent_values::TaskOutcome::Cancelled
+                }
+                cyallo_concurrent_values::TaskOutcome::Stopped => {
+                    cyallo_concurrent_values::TaskOutcome::Stopped
+                }
+            }),
+            Value::SendError(error) => Value::SendError(cyallo_concurrent_values::SendError {
+                kind: error.kind,
+                value: Box::new(self.clone_value(*error.value)?),
+            }),
             Value::Allocation(_) => return Err(OwnershipError::MoveOnlyAllocation.into()),
             Value::Generator(_) => return Err(OwnershipError::MoveOnlyGenerator.into()),
             Value::GeneratorStep(step) => Value::GeneratorStep(match step {
@@ -318,19 +343,12 @@ impl Session {
             }),
             value @ (Value::Rc(_) | Value::Weak(_)) => self.rc_clone(&value, false, false)?,
             Value::Cell(value) => Value::Cell(Box::new(self.clone_value(*value)?)),
-            Value::ArraySnapshot(values) => Value::ArraySnapshot(
-                values
-                    .into_iter()
-                    .map(|value| self.clone_value(value))
-                    .collect::<RunResult<Vec<_>>>()?,
-            ),
-            Value::SparseSnapshot(values, length) => Value::SparseSnapshot(
-                values
-                    .into_iter()
-                    .map(|(index, value)| Ok((index, self.clone_value(value)?)))
-                    .collect::<RunResult<_>>()?,
-                length,
-            ),
+            Value::ArraySnapshot(values) => Value::ArraySnapshot(self.clone_values(values)?),
+            Value::SparseSnapshot(values, length) => {
+                let (indices, values): (Vec<_>, Vec<_>) = values.into_iter().unzip();
+                let values = self.clone_values(values)?;
+                Value::SparseSnapshot(indices.into_iter().zip(values).collect(), length)
+            }
             Value::Optional(value) => Value::Optional(
                 value
                     .map(|value| self.clone_value(*value).map(Box::new))
@@ -340,16 +358,30 @@ impl Session {
                 Ok(value) => Ok(Box::new(self.clone_value(*value)?)),
                 Err(value) => Err(Box::new(self.clone_value(*value)?)),
             }),
-            Value::Function(function, captures) => Value::Function(
-                function,
-                captures
-                    .into_iter()
-                    .map(|value| self.clone_value(value))
-                    .collect::<RunResult<Vec<_>>>()?,
-            ),
+            Value::Function(function, captures) => {
+                Value::Function(function, self.clone_values(captures)?)
+            }
+            Value::Dynamic(ty, value) => Value::Dynamic(ty, Box::new(self.clone_value(*value)?)),
             Value::Erased(ty, value) => Value::Erased(ty, Box::new(self.clone_value(*value)?)),
             value => value,
         })
+    }
+    /// Cloning erased aggregates can discover move-only contents at runtime.
+    /// Release owners already cloned before propagating that failure.
+    fn clone_values(&mut self, values: impl IntoIterator<Item = Value>) -> RunResult<Vec<Value>> {
+        let mut cloned = Vec::new();
+        for value in values {
+            match self.clone_value(value) {
+                Ok(value) => cloned.push(value),
+                Err(error) => {
+                    for value in cloned {
+                        self.drop_value(value)?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(cloned)
     }
     pub(super) fn managed_new(
         &mut self,
@@ -424,6 +456,14 @@ impl Session {
             .and_then(|block| block.payload.as_ref())
             .ok_or(OwnershipError::ReleasedAllocation)?;
         Ok(payload.roots.cell_id(payload.cell))
+    }
+    /// Inspect a live payload without upgrading a weak owner or changing counts.
+    pub(super) fn rc_payload_cell(&self, value: &Value) -> RunResult<Option<usize>> {
+        let handle = self.owner(value)?;
+        Ok(self.memory.blocks[handle.block]
+            .as_ref()
+            .and_then(|block| block.payload.as_ref())
+            .map(|payload| payload.roots.cell_id(payload.cell)))
     }
     pub(super) fn rc_clone(
         &mut self,
@@ -552,6 +592,7 @@ impl Session {
             | Value::Cell(value)
             | Value::Optional(Some(value))
             | Value::Result(Ok(value) | Err(value))
+            | Value::Dynamic(_, value)
             | Value::Erased(_, value)
             | Value::StoragePath(value, _) => self.drop_value(*value)?,
             _ => {}
@@ -606,8 +647,42 @@ impl Session {
 mod tests {
     use super::*;
     #[test]
+    fn failed_erased_aggregate_clone_releases_partial_resource_owners() {
+        use cyallo_concurrent_values::{Handle, Payload, Resource};
+        let mut session = Session::new(Arc::new(crate::compile("").unwrap())).unwrap();
+        for aggregate in 0..3 {
+            let factory = cyallo_channel::Factory::new(8);
+            let (sender, receiver) = factory.bounded::<Payload>(1);
+            let handle = Handle::new(Resource::Sender(sender));
+            let values = vec![
+                Value::Concurrent(handle.clone()),
+                Value::Allocation(usize::MAX),
+            ];
+            let value = match aggregate {
+                0 => Value::ArraySnapshot(values),
+                1 => Value::Function(0, values),
+                _ => Value::SparseSnapshot(
+                    values
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, value)| (index as u32, value))
+                        .collect(),
+                    2,
+                ),
+            };
+            let erased = Value::Erased(Type::Any, Box::new(value));
+            assert_eq!(
+                session.clone_value(erased).unwrap_err(),
+                OwnershipError::MoveOnlyAllocation.into()
+            );
+            assert!(!receiver.is_closed());
+            handle.release();
+            assert!(receiver.is_closed(), "a partial clone retained the sender");
+        }
+    }
+    #[test]
     fn repeated_ownership_cycles_reuse_metadata_without_reusing_identity() {
-        let program = Arc::new(crate::compile("for i in 0..=999 { let owner = @rc i; let weak = owner.downgrade(); std::mem::drop(owner); let missing = weak.upgrade().is_none() }\n").unwrap());
+        let program = Arc::new(crate::compile("for i in 0..=999 { let owner = rc i; let weak = owner.downgrade(); std::mem::drop(owner); let missing = weak.upgrade().is_none() }\n").unwrap());
         let mut session = Session::new(program).unwrap();
         session.run(100_000);
         assert_eq!(session.status(), &Status::Finished);

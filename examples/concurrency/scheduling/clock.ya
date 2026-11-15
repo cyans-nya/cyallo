@@ -1,0 +1,7 @@
+// Run: cargo run -- run examples/concurrency/scheduling/clock.ya --engine interpreter
+// Expected: before, after (one line each).
+use std::io::print
+let clock = std::time::clock()
+print("before")
+clock.sleep(1 as u64)
+print("after")

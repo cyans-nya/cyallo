@@ -112,7 +112,7 @@ fn clif_emits_before_and_after_optimization_without_disabling_inlining() {
         source.to_str().unwrap(),
         "--engine",
         "cranelift_speed",
-        "--jit-report",
+        "--jit-trace=summary",
         "--emit",
         "ir,bytecode,clif",
         "--emit-dir",
@@ -125,7 +125,11 @@ fn clif_emits_before_and_after_optimization_without_disabling_inlining() {
     );
     assert_eq!(output.stdout, b"42\n");
     let report = String::from_utf8_lossy(&output.stderr);
-    assert!(report.contains("frameless calls: 1"));
+    assert!(
+        report
+            .lines()
+            .any(|line| line.trim_start().starts_with("frameless calls") && line.ends_with(" 1"))
+    );
     assert!(report.contains("[inline]"));
     assert!(report.contains("[opt]"));
     let files = std::fs::read_dir(&dump)

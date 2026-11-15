@@ -1,5 +1,4 @@
 //! Fixed-type inference for the explicit simplified dialect.
-use crate::intrinsic::Intrinsic;
 use crate::{
     analysis::{CompileOptions, binary_type, literal_type},
     ir::Local,
@@ -22,7 +21,7 @@ pub fn infer(
     body: &[Stmt],
     locals: &mut Vec<Local>,
     globals: &[Local],
-    routines: &HashMap<String, Type>,
+    routines: &crate::declarations::TypeEnvironment,
     _options: CompileOptions,
 ) -> Result<(), Diagnostic> {
     fn root(e: &Expr) -> Option<(&str, usize)> {
@@ -232,7 +231,7 @@ fn mentions(expression: &Expr, names: &std::collections::HashSet<&str>) -> bool 
 pub fn expression_type(
     e: &Expr,
     known: &HashMap<String, Type>,
-    routines: &HashMap<String, Type>,
+    routines: &crate::declarations::TypeEnvironment,
 ) -> Result<Type, Diagnostic> {
     let ty = expression_type_inner(e, known, routines)?;
     Ok(crate::composites::type_view(&ty, routines))
@@ -240,9 +239,33 @@ pub fn expression_type(
 fn expression_type_inner(
     e: &Expr,
     known: &HashMap<String, Type>,
-    routines: &HashMap<String, Type>,
+    routines: &crate::declarations::TypeEnvironment,
 ) -> Result<Type, Diagnostic> {
     cyallo_ast::with_stack(|| match &e.kind {
+        ExprKind::TypeDescriptor(_) => Ok(Type::Storage(
+            StorageKind::TypeDescriptor,
+            Box::new(Type::Void),
+        )),
+        ExprKind::DeferredCallable(_) => Ok(Type::Dynamic),
+        ExprKind::DeleteProperty(_) => Ok(Type::Boolean),
+        ExprKind::ObjectLiteral(kind, fields) => {
+            if *kind == ObjectKind::Dynamic {
+                Ok(Type::Dynamic)
+            } else {
+                Ok(Type::Object(
+                    fields
+                        .iter()
+                        .map(|(name, value)| {
+                            Ok((name.clone(), expression_type(value, known, routines)?))
+                        })
+                        .collect::<Result<_, Diagnostic>>()?,
+                ))
+            }
+        }
+        ExprKind::NativeCoerce(value, thunk) => {
+            expression_type(value, known, routines)?;
+            expression_type(thunk, known, routines)
+        }
         ExprKind::Yield(value, delegate) => {
             if *delegate {
                 return crate::generator::parts(&expression_type(value, known, routines)?)
@@ -255,8 +278,9 @@ fn expression_type_inner(
                 .ok_or_else(|| cyallo_ast::diagnostic::yield_outside_generator(e.span))
         }
         ExprKind::Invalid(diagnostic) => Err(diagnostic.clone()),
-        ExprKind::ManagedNew(kind, allocator, value) => Ok(crate::memory::managed_type(
+        ExprKind::ManagedNew(kind, locality, allocator, value) => Ok(crate::memory::managed_type(
             *kind,
+            *locality,
             allocator
                 .as_ref()
                 .map(|allocator| expression_type(allocator, known, routines))
@@ -272,15 +296,28 @@ fn expression_type_inner(
             e.span,
         )),
         ExprKind::IntrinsicCall(id, type_args, args) => {
-            let id = Intrinsic::from_id(*id)
-                .ok_or_else(|| Diagnostic::new("E112", "invalid intrinsic identity", e.span))?;
             let arguments =
-                crate::analysis::intrinsic_arguments(id, type_args, args, known, routines)?;
+                crate::analysis::intrinsic_arguments(*id, type_args, args, known, routines)?;
             let types = arguments
                 .iter()
                 .map(|argument| expression_type(argument, known, routines))
                 .collect::<Result<Vec<_>, Diagnostic>>()?;
-            Ok(crate::intrinsic::resolve_at_call(id, type_args, args, &types, e.span)?.result)
+            if let Some(declaration) = id.1 {
+                routines.check_native_access(declaration, e.span)?;
+                return Ok(crate::native_contract::function(
+                    routines,
+                    declaration,
+                    type_args,
+                    &arguments,
+                    &types,
+                    e.span,
+                )?
+                .result);
+            }
+            Ok(crate::intrinsic::resolve_declared(
+                *id, routines, type_args, &arguments, &types, e.span,
+            )?
+            .result)
         }
         ExprKind::TypedCollection(..) => Err(Diagnostic::new(
             "E151",
@@ -322,6 +359,11 @@ fn expression_type_inner(
             .pointee_or_self()
             .clone()
         {
+            Type::Dynamic => Ok(Type::Dynamic),
+            Type::Object(fields) => Ok(fields
+                .into_iter()
+                .find(|(name, _)| name == n)
+                .map_or(Type::Dynamic, |(_, ty)| ty)),
             Type::Record(_, fs) => fs
                 .into_iter()
                 .find(|(name, _)| name.eq_identifier(n))
@@ -348,9 +390,24 @@ fn expression_type_inner(
             )),
         },
         ExprKind::Invoke(a, args) => {
+            if expression_type(a, known, routines).is_ok_and(|ty| ty == Type::Dynamic) {
+                return Ok(Type::Dynamic);
+            }
+            if let Ok(Type::NativeCallable(declaration)) = expression_type(a, known, routines) {
+                let reference = routines.function_reference(declaration, e.span)?;
+                return expression_type(
+                    &Expr {
+                        kind: ExprKind::IntrinsicCall(reference, vec![], args.clone()),
+                        span: e.span,
+                    },
+                    known,
+                    routines,
+                );
+            }
             if let ExprKind::Field(base, name) | ExprKind::ExtensionField(base, name, _) = &a.kind {
                 let receiver = expression_type(base, known, routines)?;
-                let parameters = crate::lookup::parameter_types(&receiver, name);
+                let parameters =
+                    crate::native_contract::parameter_types(routines, &receiver, name, e.span);
                 let ts = args
                     .iter()
                     .enumerate()
@@ -372,12 +429,10 @@ fn expression_type_inner(
                 {
                     return Ok(t.2.clone());
                 }
-                let field = args.first().and_then(cyallo_ast::constant_text);
-                if let Some(method) = crate::lookup::method(&receiver, name, &ts, field) {
+                if let Some(method) =
+                    crate::member::resolve(routines, &receiver, name, args, &ts, e.span)?
+                {
                     return Ok(method.result);
-                }
-                if let Some((_, result)) = crate::services::intrinsic(&receiver, name, &ts) {
-                    return Ok(result);
                 }
                 let trait_type = match receiver.pointee_or_self() {
                     Type::ServiceRef(t) => t.as_ref(),
@@ -434,6 +489,11 @@ fn expression_type_inner(
                 e.span,
             )),
         },
+        ExprKind::Unary(Operator::Not, a)
+            if expression_type(a, known, routines)? == Type::Dynamic =>
+        {
+            Ok(Type::Boolean)
+        }
         ExprKind::Unary(_, a) => expression_type(a, known, routines),
         ExprKind::Binary(op, a, b) => {
             let ta = expression_type(a, known, routines)?;
@@ -456,14 +516,29 @@ fn expression_type_inner(
             .pointee_or_self()
             .clone()
         {
+            Type::Dynamic | Type::Object(_) => Ok(Type::Dynamic),
             Type::Array(_, element)
             | Type::SparseArray(element)
             | Type::Slice(element)
             | Type::Storage(StorageKind::Vec | StorageKind::VecDeque, element) => Ok(*element),
             _ => Err(Diagnostic::new("E114", "not an array", e.span)),
         },
-        ExprKind::Call(n, _args) => {
+        ExprKind::Call(n, args) => {
             if let Some(t) = known.get(&key(n)).or_else(|| routines.get(&key(n))) {
+                if *t == Type::Dynamic {
+                    return Ok(Type::Dynamic);
+                }
+                if let Type::NativeCallable(declaration) = t {
+                    let reference = routines.function_reference(*declaration, e.span)?;
+                    return expression_type(
+                        &Expr {
+                            kind: ExprKind::IntrinsicCall(reference, vec![], args.clone()),
+                            span: e.span,
+                        },
+                        known,
+                        routines,
+                    );
+                }
                 return crate::composites::callable(t)
                     .map(|(_, _, r)| r.clone())
                     .ok_or_else(|| Diagnostic::new("E110", "value is not callable", e.span));

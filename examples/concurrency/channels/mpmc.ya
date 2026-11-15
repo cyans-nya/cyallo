@@ -1,0 +1,29 @@
+// Run: cargo run -- run examples/concurrency/channels/mpmc.ya --engine cranelift
+// Expected: 21. Two producers and two consumers share one bounded channel.
+use std::task::spawn
+use std::io::print
+
+let endpoints = std::channel::bounded<i64>(1 as usize)
+let first_sender = endpoints.0.clone()
+let second_sender = endpoints.0.clone()
+let first_receiver = endpoints.1.clone()
+let second_receiver = endpoints.1.clone()
+let first = spawn(proc() {
+    for i in 1..=3 { first_sender.send(i).unwrap() }
+})
+let second = spawn(proc() {
+    for i in 4..=6 { second_sender.send(i).unwrap() }
+})
+let left = spawn(proc() -> i64 {
+    let mut total = 0
+    for i in 0..3 { total += first_receiver.recv().unwrap() }
+    return total
+})
+let right = spawn(proc() -> i64 {
+    let mut total = 0
+    for i in 0..3 { total += second_receiver.recv().unwrap() }
+    return total
+})
+first.join().completed()
+second.join().completed()
+print(left.join().completed() + right.join().completed())

@@ -1,5 +1,5 @@
 // A long scalar loop for observing promotion within one invocation.
-// Run: cargo run -- run examples/osr-loop.ya --jit-report
+// Run: cargo run -- run examples/osr-loop.ya --jit-trace=summary
 let mut entries = 0
 proc sum_to(limit: i64) -> i64 {
     entries += 1

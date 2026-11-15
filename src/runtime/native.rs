@@ -81,6 +81,24 @@ pub(crate) const SERVICE_KEY: u64 = 8;
 pub(crate) const SERVICE_REF: u64 = 9;
 pub(crate) const REGISTRATION: u64 = 10;
 pub(crate) const TRAIT_OBJECT: u64 = 11;
+pub(crate) const OBJECT: u64 = 12;
+pub(crate) const DYNAMIC_OBJECT: u64 = 13;
+pub(crate) const STRING_KEY: u64 = 14;
+pub(crate) const DYNAMIC_STRING_KEY: u64 = 15;
+pub(crate) const DYNAMIC_INTEGER: u64 = 16;
+pub(crate) const DYNAMIC_REAL: u64 = 17;
+pub(crate) const DYNAMIC_BOOLEAN: u64 = 18;
+pub(crate) const DYNAMIC_CHAR: u64 = 19;
+pub(crate) fn property_scalar_candidate(ty: &cyallo_ast::Type) -> bool {
+    matches!(
+        ty,
+        cyallo_ast::Type::Integer
+            | cyallo_ast::Type::Real
+            | cyallo_ast::Type::Boolean
+            | cyallo_ast::Type::Char
+            | cyallo_ast::Type::Dynamic
+    )
+}
 const HANDLE: u64 = 6;
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -92,6 +110,21 @@ pub(crate) struct NativeSlot {
 impl NativeSlot {
     pub(super) fn from_value(value: &Value) -> Self {
         let (kind, bits) = match value {
+            Value::Object(id) => (OBJECT, *id as u64),
+            Value::String(value) => (STRING_KEY, value.as_ptr() as u64),
+            Value::Dynamic(ty, value) => {
+                let slot = Self::from_value(value);
+                let kind = match (ty, slot.kind) {
+                    (cyallo_ast::Type::Object(_), OBJECT) => DYNAMIC_OBJECT,
+                    (cyallo_ast::Type::String, STRING_KEY) => DYNAMIC_STRING_KEY,
+                    (cyallo_ast::Type::Integer, INTEGER) => DYNAMIC_INTEGER,
+                    (cyallo_ast::Type::Real, REAL) => DYNAMIC_REAL,
+                    (cyallo_ast::Type::Boolean, BOOLEAN) => DYNAMIC_BOOLEAN,
+                    (cyallo_ast::Type::Char, CHAR) => DYNAMIC_CHAR,
+                    _ => HANDLE,
+                };
+                (kind, slot.bits)
+            }
             Value::Integer(n) => (INTEGER, *n as u64),
             Value::Real(n) => (REAL, n.to_bits()),
             Value::Boolean(b) => (BOOLEAN, u64::from(*b)),
@@ -110,8 +143,27 @@ impl NativeSlot {
         };
         Self { bits, kind }
     }
-    fn materialize(self) -> Value {
+    pub(super) fn materialize(self) -> Value {
         match self.kind & 255 {
+            OBJECT => Value::Object(self.bits as usize),
+            DYNAMIC_INTEGER => Value::Dynamic(
+                cyallo_ast::Type::Integer,
+                Box::new(Value::Integer(self.bits as i64)),
+            ),
+            DYNAMIC_REAL => Value::Dynamic(
+                cyallo_ast::Type::Real,
+                Box::new(Value::Real(f64::from_bits(self.bits))),
+            ),
+            DYNAMIC_BOOLEAN => Value::Dynamic(
+                cyallo_ast::Type::Boolean,
+                Box::new(Value::Boolean(self.bits != 0)),
+            ),
+            DYNAMIC_CHAR => Value::Dynamic(
+                cyallo_ast::Type::Char,
+                Box::new(Value::Char(
+                    char::from_u32(self.bits as u32).expect("validated character"),
+                )),
+            ),
             INTEGER => Value::Integer(self.bits as i64),
             REAL => Value::Real(f64::from_bits(self.bits)),
             BOOLEAN => Value::Boolean(self.bits != 0),
@@ -210,8 +262,8 @@ pub(crate) struct NativeView {
     pub next_poll: u64,
     pub exit_reason: u64,
     pub code_version: u64,
-    // Keep the baseline fields within Winch's compact addressing range. These
-    // trailing extensions are accessed only by Cranelift's general loads.
+    // Keep common fields within Winch's compact addressing range. Winch
+    // computes an address for trailing extensions; Cranelift uses general loads.
     pub inlined_pending: u64,
     pub inlined_calls: u64,
     pub function_work: *mut u64,
@@ -222,6 +274,14 @@ pub(crate) struct NativeView {
     pub inline_exit_function: u64,
     pub inline_exit_pc: u64,
     pub inline_exit_target: u64,
+    pub object_count: u64,
+    pub objects: *const *const super::dynamic::NativeObject,
+    pub property_caches: *mut super::dynamic::NativeCache,
+    pub object_stats: *mut super::dynamic::ObjectStats,
+    pub property_object: u64,
+    pub property_slot: u64,
+    pub property_input: u64,
+    pub property_destination: u64,
 }
 // SAFETY: these are borrowed pointers refreshed before entry, never dereferenced
 // by Rust outside the exclusive Session invocation. The boxed view has one owner.
@@ -233,6 +293,7 @@ impl Session {
         self.enter_reporting();
     }
     pub(crate) fn prepare_native(&mut self) -> *mut NativeView {
+        self.prepare_object_native();
         self.prepare_service_native();
         let start = self.report.as_ref().map(|_| std::time::Instant::now());
         if !self.native_enabled {
@@ -265,8 +326,10 @@ impl Session {
             .and_then(|f| self.services.caches.get_mut(f.function))
             .map_or(std::ptr::null_mut(), |c| c.as_mut_ptr());
         view.halted = u64::from(
-            matches!(self.status, Status::Finished | Status::Failed(_))
-                || (self.status == Status::WaitingForInput && self.context.input.is_empty()),
+            matches!(
+                self.status,
+                Status::Finished | Status::Failed(_) | Status::Waiting
+            ) || (self.status == Status::WaitingForInput && self.context.input.is_empty()),
         );
         if view.halted == 0 {
             self.status = Status::Paused;
@@ -322,7 +385,7 @@ impl Session {
             let pc = self.native_view.inline_exit_pc;
             let cause = match reason {
                 1 => "budget",
-                2 => "full tracing",
+                2 => "reserved",
                 3 => "logical depth",
                 4 => "argument tag",
                 5 => "callee promotion",
@@ -406,6 +469,7 @@ impl Session {
         self.prepare_native();
     }
     pub(super) fn rebuild_native_after_gc(&mut self) {
+        self.rebuild_object_native();
         self.services.refresh_native();
         debug_assert_eq!(self.native_view.pending, 0);
         debug_assert_eq!(self.native_view.inlined_pending, 0);

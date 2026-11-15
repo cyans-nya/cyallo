@@ -25,7 +25,7 @@ implements the concrete provider and exposes an explicit installation procedure.
 
 - `layout` holds a Copy handle to an immutable GC snapshot inside an owned `Cell`. The
   readonly mapper scans it on a cache miss and returns a relative slot recipe.
-- `entries` holds an immutable `@gc Vec<@gc Cell<@gc Binding>>` snapshot.
+- `entries` holds an immutable `gc Vec<gc Cell<gc Binding>>` snapshot.
   A handle retains a managed cell owner. Each acquisition copies the current
   binding snapshot's GC handle and checks the provider's erased type.
 - A lease records the binding generation it installed. Disposal only clears a

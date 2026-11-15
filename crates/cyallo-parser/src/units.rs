@@ -50,6 +50,7 @@ impl<'src> IndexedSource<'src> {
             let mut ast = ast?;
             out.body.append(&mut ast.body);
             out.functions.append(&mut ast.functions);
+            out.type_aliases.append(&mut ast.type_aliases);
             out.records.append(&mut ast.records);
             out.imports.append(&mut ast.imports);
             out.exports.append(&mut ast.exports);
@@ -57,6 +58,8 @@ impl<'src> IndexedSource<'src> {
             out.implementations.append(&mut ast.implementations);
             out.properties.append(&mut ast.properties);
             out.modules.append(&mut ast.modules);
+            out.inherent_implementations
+                .append(&mut ast.inherent_implementations);
         }
         Ok(out)
     }

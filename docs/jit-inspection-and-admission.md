@@ -84,7 +84,7 @@ on the Session thread, preserving effect order.
 ## Inspection
 
 ```sh
-cargo run --release -- run examples/modern.ya --jit-report
+cargo run --release -- run examples/modern.ya --jit-trace=summary
 cargo run --release -- run examples/modern.ya --jit-notices
 cargo run --release -- run examples/modern.ya --engine cranelift_speed \
   --emit ir,bytecode,clif --emit-dir /tmp/caie-ir
@@ -106,7 +106,7 @@ inline guard fallback and semantic snapshot invalidation. A buffer coalesces
 repeated notices and caps unique entries at 256; summary reports include overflow counts.
 Workers never print; live notices drain at CLI execution safepoints. Each REPL
 entry uses a separate reporting window and distinct snapshot filenames.
-`--jit-report` and notices preserve inlining. Full `--jit-trace` remains intrusive.
+`--jit-trace=summary`, notices and full `--jit-trace` all preserve frameless inlining; `--jit-no-inline` disables it.
 
 An overflow/guard miss uses the original call before committing inline effects.
 A stale artifact is rejected before execution. Neither notice claims general
@@ -158,7 +158,7 @@ prediction on/off while retaining the same compiler service, and includes the
 frontend, backend, Session and execution interval.
 
 
-On the same cold modern workload, `--jit-report` measures **7.587 / 8.164 ms**,
+On the same cold modern workload, `--jit-trace=summary` measures **7.587 / 8.164 ms**,
 while intrusive `--jit-trace` measures **40.390 / 42.272 ms**. The summary retains
 65,534 frameless calls; trace mode deliberately uses ordinary calls and per-call
 observation.

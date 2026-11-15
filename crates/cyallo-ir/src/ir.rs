@@ -30,6 +30,7 @@ pub enum TextStyle {
 }
 #[derive(Debug, Clone)]
 pub enum Op {
+    Dynamic(Reg, crate::dynamic::Operation, Vec<Reg>),
     Yield(Reg, Reg),
     Frozen(Reg, std::sync::Arc<cyallo_ast::ConstantValue>),
     Statement,
@@ -143,6 +144,7 @@ impl Routine {
                     i.op,
                     Op::Call(..)
                         | Op::Invoke(..)
+                        | Op::Dynamic(_, crate::dynamic::Operation::Invoke, _)
                         | Op::TraitCall(..)
                         | Op::Service(..)
                         | Op::Builtin(..)

@@ -8,9 +8,12 @@ pub fn render_program(
     color: bool,
     dialect: Dialect,
 ) -> String {
-    if let Some((path, source, local)) =
-        crate::modules::diagnostic_context(program.source(), program.source_modules(), diagnostic)
-    {
+    if let Some((path, source, local)) = crate::modules::diagnostic_context_with_name(
+        name,
+        program.source(),
+        program.source_modules(),
+        diagnostic,
+    ) {
         render_with_color_and_dialect(path, source, &local, color, dialect)
     } else {
         render_with_color_and_dialect(name, program.source(), diagnostic, color, dialect)

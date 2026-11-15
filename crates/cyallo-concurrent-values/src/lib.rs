@@ -1,6 +1,7 @@
 //! Heap-independent payloads and logical capability ownership for guest Cs.
 //! A payload never contains a Session-relative cell index or borrowed VM pointer.
 mod error;
+pub use cyallo_channel::ReceiveError;
 use cyallo_channel::{Factory, Offer, Receiver, Sender};
 pub use cyallo_channel::{SendError, SendFailure};
 pub use cyallo_scheduler::Outcome as TaskOutcome;

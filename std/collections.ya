@@ -1,0 +1,50 @@
+use std::array::Range;
+use std::option::Option;
+
+#[cyallo_internal("collection_trait")]
+pub trait Collection<T> {}
+#[cyallo_internal("numeric_collection_trait")]
+pub trait NumericCollection<T> {}
+
+#[cyallo_internal("vec_struct")]
+pub record Vec<T> {}
+#[cyallo_internal("vec_deque_struct")]
+pub record VecDeque<T> {}
+
+impl<T> Vec<T> {
+    #[cyallo_internal("vec_from")]
+    pub fn from(read values: Range<T>) -> Vec<T>;
+    #[cyallo_internal("collection_push_back")]
+    pub proc push(self: &mut Self, value: T);
+    #[cyallo_internal("collection_push_back")]
+    pub proc push_back(self: &mut Self, value: T);
+    #[cyallo_internal("collection_pop_back")]
+    pub proc pop(self: &mut Self) -> Option<T>;
+    #[cyallo_internal("collection_pop_back")]
+    pub proc pop_back(self: &mut Self) -> Option<T>;
+    #[cyallo_internal("collection_length")]
+    pub fn len(self: &Self) -> usize;
+    #[cyallo_internal("slice")]
+    pub fn as_slice(self: &Self) -> &[]T;
+    #[cyallo_internal("mutable_slice")]
+    pub fn as_mut_slice(self: &mut Self) -> &mut []T;
+}
+
+impl<T> VecDeque<T> {
+    #[cyallo_internal("vec_deque_from")]
+    pub fn from(read values: Range<T>) -> VecDeque<T>;
+    #[cyallo_internal("collection_push_back")]
+    pub proc push(self: &mut Self, value: T);
+    #[cyallo_internal("collection_push_back")]
+    pub proc push_back(self: &mut Self, value: T);
+    #[cyallo_internal("collection_push_front")]
+    pub proc push_front(self: &mut Self, value: T);
+    #[cyallo_internal("collection_pop_back")]
+    pub proc pop(self: &mut Self) -> Option<T>;
+    #[cyallo_internal("collection_pop_back")]
+    pub proc pop_back(self: &mut Self) -> Option<T>;
+    #[cyallo_internal("collection_pop_front")]
+    pub proc pop_front(self: &mut Self) -> Option<T>;
+    #[cyallo_internal("collection_length")]
+    pub fn len(self: &Self) -> usize;
+}

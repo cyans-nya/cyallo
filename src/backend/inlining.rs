@@ -201,6 +201,14 @@ pub(super) fn plans(
                             target.name, plan.cost, plan.depth
                         ),
                     );
+                    program.inline_site(crate::inspection::InlineSite {
+                        routine: fi,
+                        pc,
+                        callee: *to,
+                        decision: crate::inspection::InlineDecision::Frameless,
+                        cost: plan.cost as usize,
+                        depth: plan.depth as usize,
+                    });
                     growth += plan.cost;
                     plans.insert((fi, pc), plan);
                 } else if target.attributes.inlining == cyallo_ast::InlineHint::Always
@@ -209,6 +217,14 @@ pub(super) fn plans(
                     program.notice("unfulfilled",*to,format!("inline(always) at caller {} pc {pc}: unsupported body, recursion or hard growth limit",f.name));
                 } else {
                     program.notice("inline",fi,format!("pc {pc}: {} remains a call (policy, deferred body or unsupported frameless operations)",target.name));
+                    program.inline_site(crate::inspection::InlineSite {
+                        routine: fi,
+                        pc,
+                        callee: *to,
+                        decision: crate::inspection::InlineDecision::RemainsCall,
+                        cost: 0,
+                        depth: 0,
+                    });
                 }
             }
         }
@@ -279,6 +295,14 @@ pub(super) fn frame_bodies(
                         body.code.len()
                     ),
                 );
+                program.inline_site(crate::inspection::InlineSite {
+                    routine: root,
+                    pc: 0,
+                    callee: to,
+                    decision: crate::inspection::InlineDecision::Embedded,
+                    cost: body.code.len(),
+                    depth: depth + 1,
+                });
                 pending.push((to, depth + 1));
             }
         }

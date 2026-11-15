@@ -8,8 +8,9 @@ implementation modules. The language interface is resolved and type-checked by
 the compiler before VM execution.
 
 The [Cyallo language examples](../examples/concurrency/README.md) exercise the
-generator compiler/VM integration. Task, channel, and managed transport integration
-is still in progress; see the [implementation tracker](concurrency-language-progress.md).
+generator, task, channel, timer, and owned payload integration. Shared managed
+graphs and several source capabilities remain pending; see the
+[implementation tracker](concurrency-language-progress.md).
 
 | Crate | Owns | Dependencies |
 | --- | --- | --- |
@@ -18,6 +19,7 @@ is still in progress; see the [implementation tracker](concurrency-language-prog
 | `cyallo-io` | Single-commit operations, completion and cancellation | Standard library |
 | `cyallo-clock` | Timer registration and an explicit clock capability | Standard library |
 | `cyallo-host` | Bounded host work queue and OS workers without a P | `cyallo-io` |
+| `cyallo-modules` | Source read grants, declared file loading and typed import/publication errors | `cyallo-ast`, `cyallo-parser`, `cyallo-host` |
 | `cyallo-concurrent-values` | Heap-independent payloads and logical capability ownership | `cyallo-ast`, `cyallo-channel`, `cyallo-scheduler` |
 
 There are no process-wide runtime registries, counters, default factories, timer
@@ -120,9 +122,9 @@ commit protocol; this implementation makes no lock-free or throughput claim.
 Source generators now lower to stackless VM state machines and preserve moving
 GC roots across suspension. Session ownership can migrate between execution
 threads, with synchronized root registries and private stable slot storage;
-Sessions remain exclusively accessed. Source task/channel operations and shared
-managed transport remain in progress. Heap-relative Values must not be sent
-between Sessions.
+Sessions remain exclusively accessed. Source task/channel operations transport
+detached owned payloads. Shared managed transport remains in progress.
+Heap-relative Values must not be sent between Sessions.
 
 The remaining integration has these required boundaries:
 

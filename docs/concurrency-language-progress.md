@@ -1,71 +1,86 @@
 # Language integration progress
 
-This file tracks implementation work. It does not declare the full concurrency
-design complete. The runtime foundations are described in [concurrency.md](concurrency.md).
-Implementation requirements live in [compiler and runtime rules](compiler-and-runtime-rules.md),
-which are mandatory through the root AGENTS.md.
+This tracker records verified language behavior. The runtime contract lives in
+[concurrency.md](concurrency.md); required implementation practices live in
+[compiler and runtime rules](compiler-and-runtime-rules.md).
 
-## Implemented in the current working tree
+## Implemented and exercised in Cyallo
 
-- `gen proc` and `gen fn` closure syntax, with an explicit factory result
-  `Generator<Yield, Resume, Return>` and ordinary construction arguments.
-- Pure `gen fn` rejects captures. `gen proc` captures using closure conversion.
-- Lexical `yield`, resume input as an ordinary typed value (including Result),
-  Yielded/Complete steps, exclusive resume, idempotent close, owned `yield from`.
-- Stackless VM activation fields, explicit GC roots while suspended, owned
-  delegate and RC cleanup, and factory laziness.
-- `.ya` examples in `examples/concurrency/generators/` and `tests/generators.rs`
-  exercise eager/deferred checking, all native engines, moving GC stress, and
-  single-instruction engine/interpreter handoffs.
-- Root registries are becoming instance-owned Arc/Mutex registries so external
-  host roots may be retained/dropped safely as their exclusive Session migrates.
-  Session is not Sync. Narrow Send implementations cover stable private slot
-  backing, raw registered root descriptors, owned backing allocations, and native
-  service table pointer storage; no blanket unsafe Send implementation for Session.
+- Stackless `gen proc` and capture-free `gen fn`, lazy factories, lexical `yield`,
+  owned `yield from`, typed resume values (including Result), completion, close,
+  suspended GC roots, and RC cleanup. `start()` begins a generator; subsequent
+  `resume(value)` supplies its input. Unit-input `next()` starts or continues.
+  Startup/order misuse has typed runtime failures.
+- Task spawn, consuming join, cancellation, completion/failure/cancelled/stopped
+  outcomes, and detached task handles. Returned `Result::Err` is ordinary data.
+  Worker runtime failures preserve typed failure causes.
+- Bounded and unbounded MPMC channels, zero-capacity rendezvous, competing
+  receivers, endpoint clone/close, send/receive and nonblocking variants. Typed
+  send errors retain unsent values; receive errors distinguish empty and closed.
+- Explicit clock capabilities and millisecond sleeps from ordinary procedures.
+  Source procedures require no `async`/`await` coloring.
+- Independent worker Sessions with detached owned payload transport. Primitive,
+  array, record, option/result, and supported capability values cross Sessions
+  without transmitting heap cell indices. Logical endpoint ownership is distinct
+  from cloned internal Value storage.
+- Local managed objects and borrows are rejected as channel elements, task
+  captures, and task results. An accepting function cannot turn an unproven
+  callable parameter into spawn authority. Worker global access is guarded by a
+  typed runtime failure; static transitive global analysis remains pending.
+- Storage uses `gc`/`rc` with independent locality. `@local` explicitly spells
+  the default in types and constructions, including custom allocator/lifetime
+  forms. `@shared` is retained in AST/types but rejected during compilation
+  while shared managed graph support is pending. Legacy storage sigils are
+  rejected with a migration diagnostic. `tests/managed_syntax.rs` covers these
+  boundaries and preserves locality through generic checking.
+- Shared C/T/P scheduling budget for root and worker execution, including native
+  root entry. Waiting releases the P. Pending operations retain their destination
+  and successor PC and resume without replaying effects or charging busy waits.
+- Waiting/wake integration in VM, native drivers, CLI, debugger, and REPL. Root
+  completion stops unfinished tasks; REPL entry completion preserves its runtime
+  and capabilities for later entries.
+- Cancellation withdraws pending operations and unwinds owned resources and
+  generators; user finalizers may park during cleanup. Abrupt stop releases
+  logical resources without executing guest cleanup.
+- Instance-owned runtime state and synchronized root registries. Sessions remain
+  exclusively accessed and are movable between threads; there is no scheduler
+  TLS, global runtime service, or process-wide identity counter.
+- Runtime `.ya` loads through `std::module::load(path)` suspend through the
+  bounded host pool, inherit scoped standard-module permissions, and publish
+  append-only code at a VM safe point. Readonly namespaces use general object
+  properties/calls and retain identity through optional structural views.
+  Imported procedures use the caller's local heap. Independent one-P coroutine
+  loads and suspended generators are covered in `tests/dynamic_import.rs`;
+  examples are in `examples/concurrency/modules/`. Native drivers fall back to
+  the interpreter after publication; see [runtime loading](dynamic-import.md).
+- Real standard `.ya` declarations, private annotated ABI bindings, ordinary
+  module/import resolution, source-driven generic/member contracts, and scoped
+  import permissions. See [standard declarations](standard-declarations.md).
 
-## Required next work
+The executable examples are in [examples/concurrency](../examples/concurrency/README.md).
+`tests/concurrency.rs` and `tests/generators.rs` cover eager/deferred checking,
+interpreter/Winch/Cranelift engines, moving GC stress, single-instruction handoffs,
+and one-P progress. CLI tests execute the language examples; REPL tests cover
+capability and native-alias persistence. Runtime crate tests additionally verify
+the scheduler, channel commit/withdrawal protocol, timers, and blocking bridge.
 
-1. Finish migration regression tests and check the existing GC/native suites.
-   Generator identity allocation must bound live instances instead of cumulative
-   creations. Resource-owning factory captures and implicit close need coverage.
-2. Language values need a separate transport/resource module: detached owned
-   payloads, explicit logical resource handles, task joins, sender/receiver
-   ownership, clocks, and groups. Raw Session cell indices must never cross Cs.
-   Cloned Rust Value storage must not duplicate logical endpoint ownership.
-3. Connect source standard declarations and typed lookup operations to the C/T/P
-   scheduler: spawn, joins, cancellation/groups, MPMC channels, selection, clocks.
-   Ordinary procs park without async/await coloring. Store pending operation,
-   successor PC, and result destination before beginning its side effect.
-4. Worker Cs own independent movable Sessions. Root host execution must lease a
-   P from the same runtime, including native entries. Add explicit scheduler
-   execution permits with instance-owned T IDs, and hand off Ps to waiting host
-   execution between worker quanta; use no scheduler TLS or global counters.
-   Worker Context already owns its P and supplies its waker/fuel explicitly.
-5. Add Waiting-for-runtime status and wake handling in Session, native drivers,
-   CLI/debugger/REPL. A pending operation must not replay its bytecode or charge
-   busy-wait instructions. A host root waits outside its P; worker Cs return
-   Pending to the scheduler. Share output through runtime-owned storage.
-6. Enforce transport recursively over arguments, captures, results, saved state,
-   erased values, and transitive global dependencies. Default-local managed
-   graphs and references must not cross Cs. No implicit local-to-shared promotion.
-7. Implement explicit shared/unique qualification separately from GC/RC storage,
-   whole-graph uniqueness including weak/outside aliases and borrows, ordinary
-   user-defined `share` conversion, guarded shared mutation, synchronized shared
-   RC, and coordinated tracing of shared roots. Preserve module/capability limits.
-8. `examples/concurrency` contains the working Cyallo generator set. The
-   mistakenly added Rust example programs and their package have been removed.
-   Add language scheduling/channel/ownership examples and real CLI regressions
-   as their integrations become executable. Do not add Rust example programs or
-   external Rust integration work.
-9. Runtime and backend failures are typed: `Status::Failed` carries a
-   `RuntimeFailure` (`RuntimeError` plus span), native faults and exit reasons
-   are decoded enums, and backends return `CompileError`/`EngineError`. Remaining:
-   task/channel failures must reuse these types when language integration lands,
-   and compile-time diagnostics still carry free-form messages. Resolve
-   primitive/member identities before lowering and specialize using types
-   rather than source spellings.
+## Remaining work
 
-The agreed native model remains heap VM continuations with all-PC fallback;
-native machine-stack switching is deferred. Root return stops unfinished Cs;
-explicit groups/wait/cancel-and-join provide graceful cleanup. Result::Err is a
-normal returned value; runtime failures cancel group siblings and retain diagnostics.
+1. Source interfaces for groups, select/offers, and coroutine input capabilities.
+   Runtime foundation APIs alone do not establish source-language support.
+2. Execution of `@shared` managed storage and unique-to-shared conversion,
+   whole-graph uniqueness including weak/outside aliases and borrows, guarded
+   shared mutation, synchronized shared RC, and coordinated shared tracing.
+3. Static transitive global/capture proofs, including erased values and saved
+   state. Retain the worker global-access runtime guard until proven unnecessary.
+4. Native execution of child coroutine continuations. Child procedures currently
+   run in the interpreter; the root may run in any supported native engine.
+5. Relinking suspended generators across REPL program snapshots. Ordinary
+   function/native aliases and clock capabilities have regression coverage;
+   suspended generator persistence is not claimed.
+6. Broader ownership/finalizer rejection and shutdown coverage as those remaining
+   source capabilities are introduced. Keep examples in Cyallo and distinguish
+   runtime-only support from verified language behavior.
+
+The agreed native model remains heap VM continuations with all-PC fallback.
+Native machine-stack switching is deferred.

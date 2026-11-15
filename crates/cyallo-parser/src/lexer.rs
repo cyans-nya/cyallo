@@ -133,6 +133,7 @@ pub fn lex(source: &str) -> Result<Lexed<'_>, Diagnostic> {
                 }
                 let mut kind = if bytes.get(pos) == Some(&b'.')
                     && bytes.get(pos + 1) != Some(&b'.')
+                    && bytes.get(pos + 1) != Some(&b'*')
                     && !(tokens
                         .last()
                         .is_some_and(|t: &Token| t.kind == TokenKind::Dot))

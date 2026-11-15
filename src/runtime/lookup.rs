@@ -1,4 +1,5 @@
 //! Bounded per-site plan caches. Entries contain no strong heap references.
+use super::generator::Advance;
 use super::*;
 use crate::lookup::Operation;
 use std::collections::HashMap;
@@ -218,6 +219,15 @@ impl Session {
             Value::Concurrent(_)
             | Value::TaskOutcome(_)
             | Value::SendError(_)
+            | Value::NativeCallable(_)
+            | Value::TypeDescriptor(_)
+            | Value::DeferredCallable(_)
+            | Value::Object(_)
+            | Value::ObjectStorage { .. }
+            | Value::Dynamic(..)
+            | Value::ViewError(_)
+            | Value::LoadError(_)
+            | Value::ReceiveError(_)
             | Value::Address(_)
             | Value::Array(_)
             | Value::SparseArray(..)
@@ -392,13 +402,60 @@ impl Session {
         let function = self.frames.last().unwrap().function;
         let ty = self.program.functions[function].registers[destination].clone();
         let value = match operation {
-            Operation::GeneratorResume(with_input) => {
-                let id = self.generator_id(&values[0])?;
-                return self.resume_generator(
-                    id,
-                    with_input.then(|| values[1].clone()),
+            Operation::ObjectView => {
+                return self.execute_dynamic(
                     destination,
+                    &cyallo_ir::dynamic::Operation::View,
+                    args,
                 );
+            }
+            Operation::ObjectFreeze => {
+                return self.execute_dynamic(
+                    destination,
+                    &cyallo_ir::dynamic::Operation::Freeze,
+                    args,
+                );
+            }
+            Operation::ViewErrorMessage => {
+                let Value::ViewError(error) = &values[0] else {
+                    return Err(expected(ValueKind::ViewError));
+                };
+                Value::String(error.to_string().into())
+            }
+            Operation::ModuleLoad => return self.begin_load(destination, &values[0], &ty),
+            Operation::LoadErrorNotFound
+            | Operation::LoadErrorDenied
+            | Operation::LoadErrorCheck
+            | Operation::LoadErrorMessage => {
+                let Value::LoadError(error) = &values[0] else {
+                    return Err(expected(ValueKind::LoadError));
+                };
+                match operation {
+                    Operation::LoadErrorNotFound => Value::Boolean(error.is_not_found()),
+                    Operation::LoadErrorDenied => Value::Boolean(error.is_denied()),
+                    Operation::LoadErrorCheck => Value::Boolean(error.is_check_error()),
+                    _ => Value::String(error.to_string().into()),
+                }
+            }
+            Operation::NativeCallable(declaration) => Value::NativeCallable(declaration),
+            Operation::Concurrent(operation) => {
+                return self.execute_concurrent(destination, operation, values);
+            }
+            Operation::GeneratorStart => {
+                let id = self.generator_id(&values[0])?;
+                return self.advance_generator(id, Advance::Start, destination);
+            }
+            Operation::GeneratorResume(input) => {
+                let id = self.generator_id(&values[0])?;
+                let input = match input {
+                    cyallo_ir::lookup::ResumeInput::Unit => Value::ArraySnapshot(vec![]),
+                    cyallo_ir::lookup::ResumeInput::Value => values[1].clone(),
+                };
+                return self.advance_generator(id, Advance::Resume(input), destination);
+            }
+            Operation::GeneratorNext => {
+                let id = self.generator_id(&values[0])?;
+                return self.advance_generator(id, Advance::Next, destination);
             }
             Operation::GeneratorClose => {
                 let id = self.generator_id(&values[0])?;
@@ -716,13 +773,16 @@ impl Session {
                 Box::new(values[0].clone()),
             ),
             Operation::Checked => {
-                let Value::Erased(actual, v) = &values[0] else {
+                // The checked declaration consumes Any: transfer the erased
+                // owner into the result instead of creating another owner.
+                let Value::Erased(actual, v) = values[0].clone() else {
                     return Err(expected(ValueKind::Any));
                 };
-                if !cyallo_ir::memory::same_regions(actual, &ty) {
+                if !cyallo_ir::memory::same_regions(&actual, &ty) {
+                    self.drop_value(*v)?;
                     return Err(RuntimeError::CheckedTypeMismatch);
                 }
-                *v.clone()
+                *v
             }
             Operation::IsSome | Operation::IsNone => {
                 let Value::Optional(v) = &values[0] else {

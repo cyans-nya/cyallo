@@ -43,6 +43,9 @@ struct Loan {
 #[derive(Clone, Debug, Default)]
 struct ValueInfo {
     plain_callable: bool,
+    // None on parameters and unknown call results: accepting a local callable
+    // does not grant authority to send its captures to a new C.
+    callable_captures: Option<Vec<Type>>,
     loans: Vec<Loan>,
 }
 impl ValueInfo {
@@ -68,7 +71,7 @@ type Result<T> = std::result::Result<T, Diagnostic>;
 struct Checker<'a> {
     moves: HashSet<(u32, u32)>,
     types: HashMap<String, Type>,
-    routines: &'a HashMap<String, Type>,
+    routines: &'a crate::declarations::TypeEnvironment,
     bindings: HashMap<String, Binding>,
     globals: &'a [crate::ir::Local],
     last_use: HashMap<String, u32>,
@@ -84,6 +87,8 @@ pub fn copy(ty: &Type) -> bool {
             | Type::Reference { .. }
             | Type::Symbol
             | Type::Void
+            | Type::Object(_)
+            | Type::NativeCallable(_)
             | Type::Storage(StorageKind::Layout, _)
             | Type::Managed {
                 kind: MemoryKind::Gc,
@@ -93,7 +98,11 @@ pub fn copy(ty: &Type) -> bool {
 }
 fn carries_borrows(ty: &Type) -> bool {
     match ty {
-        Type::Reference { .. } | Type::Borrowed(_) | Type::Any | Type::TraitObject(_) => true,
+        Type::Reference { .. }
+        | Type::Borrowed(_)
+        | Type::Any
+        | Type::TraitObject(_)
+        | Type::Function(..) => true,
         Type::Managed {
             lifetime, pointee, ..
         } => lifetime.is_some() || carries_borrows(pointee),
@@ -118,10 +127,19 @@ pub fn effectful_lifecycle(ty: &Type) -> bool {
             StorageKind::Weak
             | StorageKind::ArenaCell
             | StorageKind::Allocation
-            | StorageKind::Generator,
+            | StorageKind::Generator
+            | StorageKind::Sender
+            | StorageKind::Receiver
+            | StorageKind::Clock
+            | StorageKind::Task,
             _,
         ) => true,
-        Type::Context | Type::Registration | Type::ServiceRef(_) | Type::TraitObject(_) => true,
+        Type::Dynamic
+        | Type::Any
+        | Type::Context
+        | Type::Registration
+        | Type::ServiceRef(_)
+        | Type::TraitObject(_) => true,
         Type::Array(_, inner)
         | Type::SparseArray(inner)
         | Type::Slice(inner)
@@ -151,7 +169,7 @@ pub fn check(
     body: &[Stmt],
     locals: &[crate::ir::Local],
     globals: &[crate::ir::Local],
-    routines: &HashMap<String, Type>,
+    routines: &crate::declarations::TypeEnvironment,
     params: &[Param],
     pure: bool,
     result: &Type,
@@ -208,6 +226,7 @@ pub fn check(
                 Binding {
                     value: ValueInfo {
                         plain_callable: false,
+                        callable_captures: None,
                         loans: vec![Loan {
                             place: Place {
                                 root: param.name.to_string(),
@@ -356,7 +375,15 @@ impl Checker<'_> {
             let read = params
                 .get(index)
                 .is_some_and(|(ty, by_ref)| *by_ref || matches!(ty, Type::Reference { .. }));
-            values.push(self.expression(argument, if read { Use::Read } else { Use::Move })?);
+            let value = self.expression(argument, if read { Use::Read } else { Use::Move })?;
+            if params
+                .get(index)
+                .is_some_and(|(ty, _)| crate::dynamic::object(ty))
+                && !value.loans.is_empty()
+            {
+                return Err(cyallo_ast::diagnostic::dynamic_borrow_escape(argument.span));
+            }
+            values.push(value);
         }
         self.boundary(&values, span)?;
         let mut result = ValueInfo::default();
@@ -370,6 +397,11 @@ impl Checker<'_> {
             let mut moved_projection = None;
             if matches!(usage, Use::Move) && self.ty(expression).is_ok_and(|ty| !copy(&ty)) {
                 let base = match &expression.kind {
+                    ExprKind::Field(base, _) | ExprKind::Index(base, _)
+                        if crate::dynamic::object(self.ty(base)?.pointee_or_self()) =>
+                    {
+                        None
+                    }
                     ExprKind::Field(base, _)
                     | ExprKind::TupleField(base, _)
                     | ExprKind::Index(base, _)
@@ -394,11 +426,16 @@ impl Checker<'_> {
             }
             let mut result = ValueInfo::default();
             match &expression.kind {
+                ExprKind::NativeCoerce(value, thunk) => {
+                    self.expression(value, Use::Read)?;
+                    result = self.expression(thunk, usage)?;
+                }
                 ExprKind::Yield(value, _) => {
                     result.extend(self.expression(value, Use::Move)?);
                 }
+                ExprKind::TypeDescriptor(_) | ExprKind::DeferredCallable(_) => {}
                 ExprKind::Invalid(diagnostic) => return Err(diagnostic.clone()),
-                ExprKind::ManagedNew(_, allocator, value) => {
+                ExprKind::ManagedNew(_, _, allocator, value) => {
                     if let Some(allocator) = allocator {
                         result.extend(self.expression(allocator, Use::Move)?);
                     }
@@ -413,6 +450,11 @@ impl Checker<'_> {
                         .unwrap_or_default();
                     result.plain_callable |= !self.types.contains_key(name.as_ref())
                         && self.routines.contains_key(name.as_ref());
+                    if !self.types.contains_key(name.as_ref())
+                        && self.routines.contains_key(name.as_ref())
+                    {
+                        result.callable_captures = Some(vec![]);
+                    }
                     if matches!(usage, Use::Move)
                         && let Some(ty) = self.types.get(name.as_ref())
                         && !copy(ty)
@@ -457,8 +499,20 @@ impl Checker<'_> {
                 ExprKind::Unary(Operator::Dereference, inner) => {
                     result = self.expression(inner, Use::Read)?;
                 }
+                ExprKind::DeleteProperty(inner) => {
+                    self.expression(inner, Use::Read)?;
+                }
                 ExprKind::Unary(_, inner) | ExprKind::Cast(inner, _) => {
                     result = self.expression(inner, usage)?;
+                    if matches!(
+                        &expression.kind,
+                        ExprKind::Cast(_, Type::Dynamic | Type::Object(_))
+                    ) && !result.loans.is_empty()
+                    {
+                        return Err(cyallo_ast::diagnostic::dynamic_borrow_escape(
+                            expression.span,
+                        ));
+                    }
                 }
                 ExprKind::Binary(_, a, b) => {
                     self.expression(a, Use::Read)?;
@@ -480,14 +534,46 @@ impl Checker<'_> {
                         result.extend(self.expression(value, Use::Move)?);
                     }
                 }
-                ExprKind::Record(_, fields) | ExprKind::GenericRecord(_, _, fields) => {
+                ExprKind::Record(_, fields)
+                | ExprKind::GenericRecord(_, _, fields)
+                | ExprKind::ObjectLiteral(_, fields) => {
                     for (_, value) in fields {
                         result.extend(self.expression(value, Use::Move)?);
                     }
+                    if matches!(expression.kind, ExprKind::ObjectLiteral(..))
+                        && !result.loans.is_empty()
+                    {
+                        return Err(cyallo_ast::diagnostic::dynamic_borrow_escape(
+                            expression.span,
+                        ));
+                    }
                 }
-                ExprKind::IntrinsicCall(id, _, arguments) => {
+                ExprKind::IntrinsicCall(id, type_args, arguments) => {
                     let intrinsic = Intrinsic::from_id(*id)
                         .ok_or_else(|| error("unresolved intrinsic", expression.span))?;
+                    let source_contract = if let Some(declaration) = id.1 {
+                        let contextual = crate::analysis::intrinsic_arguments(
+                            *id,
+                            type_args,
+                            arguments,
+                            &self.types,
+                            self.routines,
+                        )?;
+                        let types = contextual
+                            .iter()
+                            .map(|argument| self.ty(argument))
+                            .collect::<Result<Vec<_>>>()?;
+                        Some(crate::native_contract::function(
+                            self.routines,
+                            declaration,
+                            type_args,
+                            &contextual,
+                            &types,
+                            expression.span,
+                        )?)
+                    } else {
+                        None
+                    };
                     if matches!(
                         intrinsic,
                         Intrinsic::RcClone
@@ -510,18 +596,57 @@ impl Checker<'_> {
                             .unwrap_or_default());
                     }
                     for (index, argument) in arguments.iter().enumerate() {
-                        result.extend(self.expression(
+                        let info = self.expression(
                             argument,
-                            if intrinsic.consumes_argument(index) {
+                            if source_contract
+                                .as_ref()
+                                .and_then(|contract| {
+                                    crate::native_contract::source_consumes_argument(
+                                        contract, index,
+                                    )
+                                })
+                                .unwrap_or_else(|| intrinsic.consumes_argument(index))
+                            {
                                 Use::Move
                             } else {
                                 Use::Read
                             },
-                        )?);
+                        )?;
+                        if intrinsic == Intrinsic::TaskSpawn && index == 0 {
+                            let captures = info.callable_captures.as_ref().ok_or_else(|| {
+                                cyallo_ast::diagnostic::local_callable_cannot_spawn(argument.span)
+                            })?;
+                            if let Some(ty) = captures
+                                .iter()
+                                .find(|ty| !crate::concurrent::transferable(ty))
+                            {
+                                return Err(cyallo_ast::diagnostic::local_capture_cannot_spawn(
+                                    ty.clone(),
+                                    argument.span,
+                                ));
+                            }
+                        }
+                        result.extend(info);
                     }
                 }
                 ExprKind::Call(name, arguments) => {
                     self.available(name, expression.span)?;
+                    if let Some(Type::NativeCallable(declaration)) = self
+                        .types
+                        .get(name.as_ref())
+                        .or_else(|| self.routines.get(name.as_ref()))
+                    {
+                        let reference = self
+                            .routines
+                            .function_reference(*declaration, expression.span)?;
+                        return self.expression(
+                            &Expr {
+                                kind: ExprKind::IntrinsicCall(reference, vec![], arguments.clone()),
+                                span: expression.span,
+                            },
+                            usage,
+                        );
+                    }
                     let params = self
                         .routines
                         .get(name.as_ref())
@@ -535,7 +660,12 @@ impl Checker<'_> {
                         &callee.kind
                     {
                         let receiver = self.ty(base)?;
-                        let parameters = lookup::parameter_types(&receiver, name);
+                        let parameters = crate::native_contract::parameter_types(
+                            self.routines,
+                            &receiver,
+                            name,
+                            expression.span,
+                        );
                         let types = arguments
                             .iter()
                             .enumerate()
@@ -549,12 +679,14 @@ impl Checker<'_> {
                                 self.ty(&argument)
                             })
                             .collect::<Result<Vec<_>>>()?;
-                        if let Some(method) = lookup::method(
+                        if let Some(method) = crate::member::resolve(
+                            self.routines,
                             &receiver,
                             name,
+                            arguments,
                             &types,
-                            arguments.first().and_then(cyallo_ast::constant_text),
-                        ) {
+                            expression.span,
+                        )? {
                             let mut values = vec![self.expression(
                                 base,
                                 if method.receiver == lookup::ReceiverMode::Move {
@@ -563,19 +695,30 @@ impl Checker<'_> {
                                     Use::Read
                                 },
                             )?];
-                            for argument in arguments {
-                                values.push(self.expression(argument, Use::Move)?);
+                            for (index, argument) in arguments.iter().enumerate() {
+                                let consumes = method.params.get(index).is_some_and(|param| {
+                                    param.passing == ParameterPassing::Value
+                                        && !matches!(param.ty, Type::Reference { .. })
+                                });
+                                values.push(self.expression(
+                                    argument,
+                                    if consumes { Use::Move } else { Use::Read },
+                                )?);
                             }
                             if matches!(
-                                method.operation,
-                                lookup::Operation::CollectionPush(_)
-                                    | lookup::Operation::CollectionPop(_)
+                                method.body,
+                                crate::member::Body::Storage(
+                                    lookup::Operation::CollectionPush(_)
+                                        | lookup::Operation::CollectionPop(_)
+                                )
                             ) {
                                 let place = self.place(base)?;
                                 self.resize(&place, expression.span)?;
                             }
                             self.boundary(&values, expression.span)?;
-                            if let lookup::Operation::Slice(mutable) = method.operation {
+                            if let crate::member::Body::Storage(lookup::Operation::Slice(mutable)) =
+                                method.body
+                            {
                                 result.loans.push(Loan {
                                     place: self.place(base)?,
                                     mutable,
@@ -609,6 +752,12 @@ impl Checker<'_> {
                 }
                 ExprKind::ClosureValue(_, captures, _) => {
                     result.plain_callable = captures.is_empty();
+                    result.callable_captures = Some(
+                        captures
+                            .iter()
+                            .map(|capture| self.ty(capture))
+                            .collect::<Result<_>>()?,
+                    );
                     for capture in captures {
                         result.extend(self.expression(capture, Use::Move)?);
                     }
@@ -639,7 +788,15 @@ impl Checker<'_> {
             for statement in body {
                 match &statement.kind {
                     StmtKind::Binding(name, _, _, _, value) | StmtKind::Constant(name, value) => {
+                        let span = value.span;
                         let mut value = self.expression(value, Use::Move)?;
+                        if matches!(
+                            self.types.get(name.as_ref()),
+                            Some(Type::Dynamic | Type::Object(_))
+                        ) && !value.loans.is_empty()
+                        {
+                            return Err(cyallo_ast::diagnostic::dynamic_borrow_escape(span));
+                        }
                         if matches!(self.types.get(name.as_ref()), Some(Type::Reference { pointee, .. }) if matches!(pointee.as_ref(), Type::Slice(_)))
                         {
                             for loan in &mut value.loans {
@@ -651,16 +808,40 @@ impl Checker<'_> {
                         declared.push(name.to_string());
                     }
                     StmtKind::Assign(target, value) => {
+                        let span = value.span;
                         let value = self.expression(value, Use::Move)?;
+                        if crate::dynamic::object(&self.ty(target)?) && !value.loans.is_empty() {
+                            return Err(cyallo_ast::diagnostic::dynamic_borrow_escape(span));
+                        }
                         if let ExprKind::Name(name) = &target.kind {
                             self.bindings
                                 .insert(name.to_string(), Binding { value, moved: None });
                         } else {
-                            self.place(target)?;
+                            let dynamic = match &target.kind {
+                                ExprKind::Field(base, _) | ExprKind::Index(base, _) => {
+                                    crate::dynamic::object(self.ty(base)?.pointee_or_self())
+                                }
+                                _ => false,
+                            };
+                            if dynamic {
+                                self.expression(target, Use::Read)?;
+                            } else {
+                                self.place(target)?;
+                            }
                         }
                     }
                     StmtKind::Compound(target, _, value) => {
-                        self.place(target)?;
+                        let dynamic = match &target.kind {
+                            ExprKind::Field(base, _) | ExprKind::Index(base, _) => {
+                                crate::dynamic::object(self.ty(base)?.pointee_or_self())
+                            }
+                            _ => false,
+                        };
+                        if dynamic {
+                            self.expression(target, Use::Read)?;
+                        } else {
+                            self.place(target)?;
+                        }
                         self.expression(value, Use::Read)?;
                     }
                     StmtKind::Evaluate(value) => {

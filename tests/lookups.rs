@@ -5,13 +5,13 @@ use cyallo::runtime::{LookupError, RuntimeError};
 use cyallo::{Context, Session, Status, compile, runtime::gc::GcConfig};
 use std::sync::Arc;
 const BAG: &str = r#"
-record Bag { route: Cell<i64>, values: Cell<Vec<@gc Cell<i64>>> }
-proc locate(bag: @gc Bag, key: i64) -> std::lookup::StoragePath<@gc Cell<i64>> {
-    let index = *bag.route
-    if key != 7 || index < 0 { return std::lookup::missing<@gc Cell<i64>>() }
+record Bag { route: Cell<i64>, values: Cell<Vec<gc Cell<i64>>> }
+proc locate(bag: gc Bag, key: i64) -> std::lookup::StoragePath<gc Cell<i64>> {
+    let index = bag.route.*
+    if key != 7 || index < 0 { return std::lookup::missing<gc Cell<i64>>() }
     return std::lookup::path(bag).target().field("values").target().element(index)
 }
-proc fetch(bag: @gc Bag) -> i64 { return **std::lookup::mapped(bag, 7, locate).unwrap() }
+proc fetch(bag: gc Bag) -> i64 { return std::lookup::mapped(bag, 7, locate).unwrap().*.* }
 "#;
 fn engines(p: &Arc<cyallo::ir::Program>) -> Vec<Box<dyn Executable>> {
     let baseline = TieredBackend::default().compile(p.clone()).unwrap();
@@ -133,14 +133,14 @@ fn ordinary_service_library_keeps_paths_during_replacement() {
 fn relative_paths_aliases_and_payload_updates() {
     let source = format!(
         r#"{BAG}
-let first = @gc Cell::new(12)
-let second = @gc Cell::new(34)
-let bag = @gc Bag {{ route: Cell::new(0), values: Cell::new(Vec[first, second]) }}
+let first = gc Cell::new(12)
+let second = gc Cell::new(34)
+let bag = gc Bag {{ route: Cell::new(0), values: Cell::new(Vec[first, second]) }}
 std::io::print(fetch(bag))
 std::io::print(fetch(bag))
-*bag.route = 1
+bag.route.* = 1
 std::io::print(fetch(bag))
-**second = 99
+second.*.* = 99
 std::io::print(fetch(bag))
 "#
     );
@@ -157,14 +157,14 @@ std::io::print(fetch(bag))
 fn negative_paths_and_receiver_identity() {
     let source = format!(
         r#"{BAG}
-proc optional(bag: @gc Bag) -> bool {{ return std::lookup::mapped(bag, 7, locate).is_some() }}
-let values = Vec[@gc Cell::new(12)]
-let one = @gc Bag {{ route: Cell::new(-1), values: Cell::new(std::mem::clone(&values)) }}
-let two = @gc Bag {{ route: Cell::new(0), values: Cell::new(values) }}
+proc optional(bag: gc Bag) -> bool {{ return std::lookup::mapped(bag, 7, locate).is_some() }}
+let values = Vec[gc Cell::new(12)]
+let one = gc Bag {{ route: Cell::new(-1), values: Cell::new(std::mem::clone(&values)) }}
+let two = gc Bag {{ route: Cell::new(0), values: Cell::new(values) }}
 std::io::print(optional(one))
 std::io::print(optional(one))
 std::io::print(optional(two))
-*one.route = 0
+one.route.* = 0
 std::io::print(optional(one))
 "#
     );
@@ -179,22 +179,22 @@ fn arbitrary_mappers_captures_and_nested_dependencies() {
     parity(
         r#"
 record State { left: Cell<i64>, right: Cell<i64> }
-fn select(state: @gc State, left: bool) -> std::lookup::StoragePath<i64> {
+fn select(state: gc State, left: bool) -> std::lookup::StoragePath<i64> {
     if left { return std::lookup::path(state).target().field("left").target() }
     return std::lookup::path(state).target().field("right").target()
 }
-proc outer(state: @gc State, key: bool) -> std::lookup::StoragePath<i64> {
+proc outer(state: gc State, key: bool) -> std::lookup::StoragePath<i64> {
     let selected = std::lookup::mapped(state, key, select).unwrap()
     return select(state, selected > 0)
 }
-proc query(state: @gc State) -> i64 { return std::lookup::mapped(state, true, outer).unwrap() }
-let state = @gc State { left: Cell::new(1), right: Cell::new(20) }
+proc query(state: gc State) -> i64 { return std::lookup::mapped(state, true, outer).unwrap() }
+let state = gc State { left: Cell::new(1), right: Cell::new(20) }
 std::io::print(query(state))
 std::io::print(query(state))
-*state.left = -1
+state.left.* = -1
 std::io::print(query(state))
 let offset = false
-let mapper = proc(s: @gc State, key: bool) -> std::lookup::StoragePath<i64> { return select(s, offset) }
+let mapper = proc(s: gc State, key: bool) -> std::lookup::StoragePath<i64> { return select(s, offset) }
 std::io::print(std::lookup::mapped(state, true, mapper).unwrap())
 "#,
         "1\n1\n20\n20\n",
@@ -203,11 +203,11 @@ std::io::print(std::lookup::mapped(state, true, mapper).unwrap())
 #[test]
 fn paths_cannot_cross_receivers_and_erased_casts_are_checked() {
     let source = r#"
-fn wrong(state: @gc Cell<i64>, key: @gc Cell<i64>) -> std::lookup::StoragePath<i64> {
+fn wrong(state: gc Cell<i64>, key: gc Cell<i64>) -> std::lookup::StoragePath<i64> {
     return std::lookup::path(key).target().target()
 }
-let a = @gc Cell::new(1)
-let b = @gc Cell::new(2)
+let a = gc Cell::new(1)
+let b = gc Cell::new(2)
 std::io::print(std::lookup::mapped(a, b, wrong).unwrap())
 "#;
     let mut s = Session::new(Arc::new(compile(source).unwrap())).unwrap();
@@ -229,7 +229,7 @@ std::io::print(std::lookup::mapped(a, b, wrong).unwrap())
 #[test]
 fn mapper_effects_and_escaping_borrows_are_rejected() {
     for source in [
-        "fn bad(s: @gc Cell<i64>, key: i64) -> std::lookup::StoragePath<i64> { **s = key; return std::lookup::path(s).target().target() }\n",
+        "fn bad(s: gc Cell<i64>, key: i64) -> std::lookup::StoragePath<i64> { s.*.* = key; return std::lookup::path(s).target().target() }\n",
         "proc bad() -> proc() { let mut count = 0; return proc[&mut count]() { count += 1 } }\n",
         "fn bad(s: &mut Vec<i64>, key: i64) { s.push(key) }\n",
     ] {
@@ -238,11 +238,11 @@ fn mapper_effects_and_escaping_borrows_are_rejected() {
     for body in [
         "std::io::print(key)",
         "std::runtime::caie::input(&mut key)",
-        "**s = key",
+        "s.*.* = key",
         "let n = std::random::uniform(1)",
     ] {
         let source = format!(
-            "proc bad(s: @gc Cell<i64>, key: i64) -> std::lookup::StoragePath<i64> {{ {body}; return std::lookup::path(s).target().target() }}\nlet x = std::lookup::mapped(@gc Cell::new(1), 0, bad)\n"
+            "proc bad(s: gc Cell<i64>, key: i64) -> std::lookup::StoragePath<i64> {{ {body}; return std::lookup::path(s).target().target() }}\nlet x = std::lookup::mapped(gc Cell::new(1), 0, bad)\n"
         );
         let mut s = Session::new(Arc::new(compile(&source).unwrap())).unwrap();
         s.run(10000);
@@ -260,7 +260,7 @@ fn mapper_effects_and_escaping_borrows_are_rejected() {
 }
 #[test]
 fn deferred_mapper_errors_keep_the_original_diagnostic() {
-    let source = "fn bad(s: @gc Cell<i64>, key: i64) -> std::lookup::StoragePath<i64> { std::io::print(key); return std::lookup::path(s).target().target() }\nlet result = std::lookup::mapped(@gc Cell::new(1), 0, bad)\n";
+    let source = "fn bad(s: gc Cell<i64>, key: i64) -> std::lookup::StoragePath<i64> { std::io::print(key); return std::lookup::path(s).target().target() }\nlet result = std::lookup::mapped(gc Cell::new(1), 0, bad)\n";
     let expected = compile(source).unwrap_err();
     let p = Arc::new(cyallo::compile_for_execution(source, Default::default()).unwrap());
     let mut s = Session::new(p).unwrap();
@@ -292,18 +292,18 @@ fn snapshots_guard_aliased_child_cells() {
     parity(
         r#"
 record Entry { n: Cell<i64> }
-record Table { values: Vec<@gc Entry> }
-proc route(table: @gc Table, key: i64) -> std::lookup::StoragePath<i64> {
-    let index = *table.values[0].n
+record Table { values: Vec<gc Entry> }
+proc route(table: gc Table, key: i64) -> std::lookup::StoragePath<i64> {
+    let index = table.values[0].n.*
     return std::lookup::path(table).target().field("values").element(index).target().field("n").target()
 }
-proc query(table: @gc Table) -> i64 { return std::lookup::mapped(table, 0, route).unwrap() }
-let first = @gc Entry { n: Cell::new(0) }
-let second = @gc Entry { n: Cell::new(9) }
-let table = @gc Table { values: Vec[first, second] }
+proc query(table: gc Table) -> i64 { return std::lookup::mapped(table, 0, route).unwrap() }
+let first = gc Entry { n: Cell::new(0) }
+let second = gc Entry { n: Cell::new(9) }
+let table = gc Table { values: Vec[first, second] }
 std::io::print(query(table))
 std::io::print(query(table))
-*first.n = 1
+first.n.* = 1
 std::io::print(query(table))
 "#,
         "0\n0\n9\n",
@@ -314,18 +314,18 @@ fn erased_readonly_methods_guard_shared_cell_writes() {
     parity(
         r#"
 trait Selector { proc index(self: &Self) -> i64; proc advance(self: &Self) }
-record Counter { n: @gc Cell<i64> }
+record Counter { n: gc Cell<i64> }
 impl Selector for Counter {
-    proc index(self: &Self) -> i64 { return **self.n }
-    proc advance(self: &Self) { **self.n = **self.n + 1 }
+    proc index(self: &Self) -> i64 { return self.n.*.* }
+    proc advance(self: &Self) { self.n.*.* = self.n.*.* + 1 }
 }
 record State { selector: dyn Selector, values: Vec<i64> }
-proc route(state: @gc State, key: i64) -> std::lookup::StoragePath<i64> {
+proc route(state: gc State, key: i64) -> std::lookup::StoragePath<i64> {
     return std::lookup::path(state).target().field("values").element(state.selector.index())
 }
-proc query(state: @gc State) -> i64 { return std::lookup::mapped(state, 0, route).unwrap() }
-let selector = Counter { n: @gc Cell::new(0) } as dyn Selector
-let state = @gc State { selector: std::mem::clone(&selector), values: Vec[10,20] }
+proc query(state: gc State) -> i64 { return std::lookup::mapped(state, 0, route).unwrap() }
+let selector = Counter { n: gc Cell::new(0) } as dyn Selector
+let state = gc State { selector: std::mem::clone(&selector), values: Vec[10,20] }
 std::io::print(query(state))
 std::io::print(query(state))
 selector.advance()
@@ -337,9 +337,9 @@ std::io::print(query(state))
 #[test]
 fn bounded_cases_do_not_grow_for_megamorphic_sites() {
     let source = r#"
-proc route(values: @gc Cell<Vec<i64>>, key: i64) -> std::lookup::StoragePath<i64> { return std::lookup::path(values).target().target().element(key) }
-proc query(values: @gc Cell<Vec<i64>>, key: i64) -> i64 { return std::lookup::mapped(values, key, route).unwrap() }
-let values = @gc Cell::new(Vec::from(0..6))
+proc route(values: gc Cell<Vec<i64>>, key: i64) -> std::lookup::StoragePath<i64> { return std::lookup::path(values).target().target().element(key) }
+proc query(values: gc Cell<Vec<i64>>, key: i64) -> i64 { return std::lookup::mapped(values, key, route).unwrap() }
+let values = gc Cell::new(Vec::from(0..6))
 for i in 0..=5 { std::io::print(query(values, i)) }
 for i in 0..=5 { std::io::print(query(values, i)) }
 "#;
@@ -354,8 +354,8 @@ for i in 0..=5 { std::io::print(query(values, i)) }
 fn repl_abandons_failed_mappers_and_relinks_erased_closures() {
     let mut repl = cyallo::repl::Repl::new(Default::default()).unwrap();
     for source in [
-        "fn broken(s: @gc Cell<i64>, key: i64) -> std::lookup::StoragePath<i64> { let n = 1 / key; return std::lookup::path(s).target().target() }",
-        "let value = @gc Cell::new(10)",
+        "fn broken(s: gc Cell<i64>, key: i64) -> std::lookup::StoragePath<i64> { let n = 1 / key; return std::lookup::path(s).target().target() }",
+        "let value = gc Cell::new(10)",
         "let f = std::option::some(std::any::erase(fn() -> i64 { return 42 }))",
         "let result = std::lookup::mapped(value, 0, broken)",
     ] {
@@ -363,7 +363,7 @@ fn repl_abandons_failed_mappers_and_relinks_erased_closures() {
         repl.run(10000);
     }
     assert!(matches!(repl.session().status(), Status::Failed(_)));
-    repl.push_line("fn okay(s: @gc Cell<i64>, key: i64) -> std::lookup::StoragePath<i64> { return std::lookup::path(s).target().target() }").unwrap();
+    repl.push_line("fn okay(s: gc Cell<i64>, key: i64) -> std::lookup::StoragePath<i64> { return std::lookup::path(s).target().target() }").unwrap();
     repl.run(10000);
     repl.push_line("std::io::print(std::lookup::mapped(value, 0, okay).unwrap())")
         .unwrap();
@@ -379,14 +379,14 @@ fn repl_abandons_failed_mappers_and_relinks_erased_closures() {
 #[test]
 fn directory_snapshots_need_one_warm_version_guard() {
     let source = r#"
-record State { directory: Cell<@gc Vec<i64>>, values: Vec<i64> }
-proc route(state: @gc State, key: i64) -> std::lookup::StoragePath<i64> {
-    let directory = *state.directory
+record State { directory: Cell<gc Vec<i64>>, values: Vec<i64> }
+proc route(state: gc State, key: i64) -> std::lookup::StoragePath<i64> {
+    let directory = state.directory.*
     if directory[key] != key { return std::lookup::missing<i64>() }
     return std::lookup::path(state).target().field("values").element(0)
 }
-proc query(state: @gc State) -> i64 { return std::lookup::mapped(state, 200, route).unwrap() }
-let state = @gc State { directory: Cell::new(@gc Vec::from(0..256)), values: Vec[42] }
+proc query(state: gc State) -> i64 { return std::lookup::mapped(state, 200, route).unwrap() }
+let state = gc State { directory: Cell::new(gc Vec::from(0..256)), values: Vec[42] }
 std::io::print(query(state))
 std::io::print(query(state))
 "#;
@@ -406,11 +406,11 @@ fn retained_field_location_outlives_its_parent_binding() {
         r#"
 record Item { n: i64 }
 proc make() -> std::lookup::Location<i64> {
-    let root = @gc Item { n: 1 }
+    let root = gc Item { n: 1 }
     return std::lookup::field(&root, "n")
 }
 let location = make()
-let allocations = @gc Cell::new(10)
+let allocations = gc Cell::new(10)
 location.store(2)
 std::io::print(location.load())
 "#,

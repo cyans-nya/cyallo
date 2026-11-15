@@ -64,12 +64,23 @@ impl WinchUnit {
     }
     pub(super) fn run(&self, session: &mut Session, budget: usize) -> Result<(), EngineError> {
         if !Arc::ptr_eq(&self.program, &session.program) {
+            if session.program.extends(&self.program) {
+                session.run(budget);
+                return Ok(());
+            }
+
             return Err(EngineError::ForeignProgram);
         }
         if budget == 0 {
             return Ok(());
         }
         let previous = session.select_execution_engine(ExecutionEngine::Winch);
+        session.enter_execution();
+        if !session.poll_concurrent() {
+            session.select_execution_engine(previous);
+            session.leave_execution();
+            return Ok(());
+        }
         session.reset_native_exit();
         let view = session.prepare_native();
         // SAFETY: code and view are pinned by exclusive execution/artifact borrows.
@@ -80,6 +91,7 @@ impl WinchUnit {
         session.observe_native_exit();
         session.pause_reporting();
         session.select_execution_engine(previous);
+        session.leave_execution();
         Ok(())
     }
 }

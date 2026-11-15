@@ -39,9 +39,21 @@ pub struct RangeValue {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
+    TypeDescriptor(cyallo_ast::ExportedType),
+    DeferredCallable(Box<str>),
+    Dynamic(cyallo_ast::Type, Box<Value>),
+    Object(usize),
+    ObjectStorage {
+        shape: cyallo_shapes::ShapeId,
+        slots: Vec<Value>,
+    },
+    ViewError(std::sync::Arc<cyallo_shapes::DynamicError>),
+    NativeCallable(cyallo_ast::DeclarationId),
     Concurrent(cyallo_concurrent_values::Handle),
     TaskOutcome(cyallo_concurrent_values::TaskOutcome<Box<Value>>),
     SendError(cyallo_concurrent_values::SendError<Box<Value>>),
+    LoadError(std::sync::Arc<cyallo_modules::LoadError>),
+    ReceiveError(cyallo_concurrent_values::ReceiveError),
     Generator(usize),
     GeneratorStep(GeneratorStep<Box<Value>>),
     Layout {
@@ -115,7 +127,14 @@ impl Value {
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::NativeCallable(_) => f.write_str("<native callable>"),
             Self::Concurrent(handle) => write!(f, "{handle:?}"),
+            Self::TypeDescriptor(descriptor) => write!(f, "type {}", descriptor.name),
+            Self::DeferredCallable(_) => f.write_str("generic callable"),
+            Self::Dynamic(_, value) => value.fmt(f),
+            Self::Object(_) => f.write_str("object"),
+            Self::ObjectStorage { .. } => f.write_str("object storage"),
+            Self::ViewError(error) => error.fmt(f),
             Self::TaskOutcome(outcome) => match outcome {
                 cyallo_concurrent_values::TaskOutcome::Completed(value) => {
                     write!(f, "Completed({value})")
@@ -127,6 +146,8 @@ impl std::fmt::Display for Value {
                 cyallo_concurrent_values::TaskOutcome::Stopped => f.write_str("Stopped"),
             },
             Self::SendError(error) => write!(f, "SendError({}, {})", error.kind, error.value),
+            Self::LoadError(error) => error.fmt(f),
+            Self::ReceiveError(error) => error.fmt(f),
             Self::Generator(id) => write!(f, "<generator {id}>"),
             Self::GeneratorStep(step) => write!(f, "{step}"),
             Self::Layout { size, align } => write!(f, "Layout({size}, {align})"),

@@ -86,9 +86,30 @@ fn analyze_selected(
         for (pc, inst) in f.code.iter().enumerate() {
             let mut violation = None;
             match &inst.op {
+                Op::Dynamic(_, op, _) => {
+                    effect.may_allocate = true;
+                    effect.may_fail = true;
+                    if !matches!(
+                        op,
+                        crate::dynamic::Operation::Erase | crate::dynamic::Operation::Object(..)
+                    ) {
+                        effect.writes_references = true;
+                        violation =
+                            Some("pure fn cannot perform unchecked dynamic operations".into());
+                    }
+                }
                 Op::Lookup(destination, op, arguments) => {
                     effect.may_allocate = true;
                     effect.may_fail = true;
+                    if matches!(
+                        op,
+                        crate::lookup::Operation::Concurrent(_)
+                            | crate::lookup::Operation::ModuleLoad
+                    ) {
+                        effect.nondeterministic = true;
+                        effect.writes_references = true;
+                        violation = Some("pure fn cannot perform concurrent operations".into());
+                    }
                     if matches!(op, crate::lookup::Operation::CloneValue)
                         && crate::ownership::effectful_lifecycle(&f.registers[*destination])
                     {

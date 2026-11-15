@@ -93,10 +93,18 @@ impl super::NativeBackend for WasmBackend {
 impl super::Executable for WasmArtifact {
     fn run(&self, session: &mut Session, budget: usize) -> Result<(), EngineError> {
         if !Arc::ptr_eq(&self.program, &session.program) {
+            if session.program.extends(&self.program) {
+                session.run(budget);
+                return Ok(());
+            }
+
             return Err(EngineError::ForeignProgram);
         }
         let start = session.instruction_count();
         while session.instruction_count() - start < budget as u64 {
+            if !session.resume_pending() {
+                break;
+            }
             if matches!(
                 session.status(),
                 crate::Status::Finished | crate::Status::Failed(_)

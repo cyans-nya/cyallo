@@ -53,7 +53,7 @@ fn multiline_literals_and_escapes() {
 #[test]
 fn typed_arrays_ref_and_expression_constants() {
     output(
-        "const factor = 2 + 3\nfn make(n: i64) -> std::collections::Vec<i64> { return Vec[n, n * factor] }\nproc add(n: &mut i64) { *n += 1; return }\nlet mut a = make(2)\nadd(&mut a[0])\nstd::io::print(a[0], \":\", a[1])\n",
+        "const factor = 2 + 3\nfn make(n: i64) -> std::collections::Vec<i64> { return Vec[n, n * factor] }\nproc add(n: &mut i64) { n.* += 1; return }\nlet mut a = make(2)\nadd(&mut a[0])\nstd::io::print(a[0], \":\", a[1])\n",
         "3:10\n",
     );
 }
@@ -307,7 +307,7 @@ fn tuples_records_and_arrays_compare_structurally() {
         "truetruefalsetruetruefalse\n",
     );
     for source in [
-        "let a = @gc 1\nlet b = @gc 1\nlet same = a == b\n",
+        "let a = gc 1\nlet b = gc 1\nlet same = a == b\n",
         "let a = (1, 2)\nlet b = (1, 2.0)\nlet same = a == b\n",
         "let a = (1, 2)\nlet less = a < (2, 3)\n",
     ] {
@@ -332,6 +332,6 @@ fn diagnostics_use_source_names_and_types() {
     assert!(unknown.contains("`missing`"), "{unknown}");
     assert_eq!(
         message("let a = std::num::sqrt(4)\n"),
-        "`std::num::sqrt` does not accept (i64)"
+        "`i64` does not satisfy declared bound `Floating`"
     );
 }

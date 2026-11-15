@@ -1,0 +1,11 @@
+#[cyallo_internal("any_struct")]
+pub record Any {}
+#[cyallo_internal("symbol_struct")]
+pub record Symbol {}
+
+#[cyallo_internal("any_erase")]
+pub proc erase<T>(value: T) -> Any;
+#[cyallo_internal("any_checked")]
+pub proc checked<T>(value: Any) -> T;
+#[cyallo_internal("symbol_new")]
+pub proc fresh_symbol(read label: string) -> Symbol;

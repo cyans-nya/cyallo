@@ -1,0 +1,2 @@
+#[cyallo_internal("arena_cell_struct")]
+pub record ArenaCell<T> {}

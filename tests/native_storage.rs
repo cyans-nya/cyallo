@@ -29,7 +29,7 @@ fn parity(a: &Session, b: &Session) {
 
 #[test]
 fn configured_cranelift_layouts_preserve_each_budget_and_resume() {
-    let source = "let mut n = 0\nproc add(a: &mut i64) { let b = a; *a += 3; *b += *a }\nfn fact(n: i64) -> i64 { if n <= 1 { return 1 }; return n * fact(n-1) }\nfor i in 1..=4 { add(&mut n) }\nstd::io::print(n, \":\", fact(6))\n";
+    let source = "let mut n = 0\nproc add(a: &mut i64) { let b = a; a.* += 3; b.* += a.* }\nfn fact(n: i64) -> i64 { if n <= 1 { return 1 }; return n * fact(n-1) }\nfor i in 1..=4 { add(&mut n) }\nstd::io::print(n, \":\", fact(6))\n";
     let program = Arc::new(compile(source).unwrap());
     for scope in [CompilationScope::Combined, CompilationScope::PerRoutine] {
         for resume in [ResumeStrategy::AllPcs, ResumeStrategy::LoopHeaders] {
@@ -84,9 +84,13 @@ fn clean_native_call_returns_skip_materialization_but_dirty_yields_do_not() {
         ],
         [Tier::Winch, Tier::CraneliftSpeed, Tier::CraneliftFast],
     ] {
+        // Observation keeps frameless inlining, which would remove these calls
+        // and their returns; this test measures return synchronization, so the
+        // callees stay real calls.
         let artifact = TieredBackend::new(TierPolicy {
             warm_instructions: u64::MAX,
             hot_instructions: u64::MAX,
+            inlining: false,
             ..Default::default()
         })
         .compile(program.clone())
@@ -124,7 +128,7 @@ fn clean_native_call_returns_skip_materialization_but_dirty_yields_do_not() {
 
 #[test]
 fn every_instruction_can_handoff_between_native_and_interpreter() {
-    let source = "let mut x: f64 = 2.0\nlet mut n = 0\nproc add(a: &mut i64) { let b = a; *a += 3; *b += *a }\nfor i in 1..=8 { add(&mut n); x = x * 1.5; if n > 100 { n -= 7 } }\nlet mut a = [n, 2, 3]\nstd::io::print(a[0], x, '🐈' > 'a', !false)\n";
+    let source = "let mut x: f64 = 2.0\nlet mut n = 0\nproc add(a: &mut i64) { let b = a; a.* += 3; b.* += a.* }\nfor i in 1..=8 { add(&mut n); x = x * 1.5; if n > 100 { n -= 7 } }\nlet mut a = [n, 2, 3]\nstd::io::print(a[0], x, '🐈' > 'a', !false)\n";
     let program = Arc::new(compile(source).unwrap());
     let baseline = TieredBackend::new(TierPolicy {
         hot_instructions: u64::MAX,
@@ -163,7 +167,7 @@ fn every_instruction_can_handoff_between_native_and_interpreter() {
 
 #[test]
 fn native_calls_preserve_recursive_frames_aliases_and_budgets() {
-    let source = "let mut total = 0\nproc work(a: &mut i64, depth: i64) { let b = a; *a += 1; if depth > 0 { work(a, depth-1) }; *b += 2 }\nfn fact(n: i64) -> i64 { if n <= 1 { return 1 }; return n * fact(n-1) }\nwork(&mut total, 300)\nstd::io::print(total, \":\", fact(10))\n";
+    let source = "let mut total = 0\nproc work(a: &mut i64, depth: i64) { let b = a; a.* += 1; if depth > 0 { work(a, depth-1) }; b.* += 2 }\nfn fact(n: i64) -> i64 { if n <= 1 { return 1 }; return n * fact(n-1) }\nwork(&mut total, 300)\nstd::io::print(total, \":\", fact(10))\n";
     let program = Arc::new(compile(source).unwrap());
     let native = TieredBackend::default().compile(program.clone()).unwrap();
     for fi in 0..program.functions().len() {

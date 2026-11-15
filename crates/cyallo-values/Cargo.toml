@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 cyallo-ast = { path = "../cyallo-ast" }
 cyallo-concurrent-values = { path = "../cyallo-concurrent-values" }
+cyallo-modules = { path = "../cyallo-modules" }
+cyallo-shapes = { path = "../cyallo-shapes" }

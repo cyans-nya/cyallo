@@ -121,17 +121,22 @@ fn reports_use_real_frames_and_dynamic_targets_remain_dynamic() {
     }
     let p = Arc::new(compile(CHAIN).unwrap());
     let artifact = CraneliftConfig::speed().compile(p.clone()).unwrap();
+    let mut plain = Session::new(p.clone()).unwrap();
+    artifact.run(&mut plain, 100_000).unwrap();
     let mut s = Session::new(p).unwrap();
     s.enable_reporting(std::time::Instant::now());
     artifact.run(&mut s, 100_000).unwrap();
-    assert_eq!(s.inlined_call_count(), 0);
+    // Observation keeps frameless inlining: the same bodies are inlined and the
+    // logical call count still includes them.
+    assert!(s.inlined_call_count() > 0);
+    assert_eq!(s.inlined_call_count(), plain.inlined_call_count());
     assert_eq!(s.function_call_count(1), 20);
 }
 #[test]
 fn reported_procedures_keep_caller_accounting_with_embedded_code_available() {
     let p = Arc::new(
         compile(
-            "proc bump(n: &mut i64) { *n += 1 }\nlet mut n = 0\nfor i in 1..=3 { bump(&mut n) }\nstd::io::print(n)\n",
+            "proc bump(n: &mut i64) { n.* += 1 }\nlet mut n = 0\nfor i in 1..=3 { bump(&mut n) }\nstd::io::print(n)\n",
         )
         .unwrap(),
     );
@@ -158,7 +163,7 @@ fn reported_procedures_keep_caller_accounting_with_embedded_code_available() {
 
 #[test]
 fn effectful_procedure_bodies_keep_frames_aliases_gc_and_exact_once_effects() {
-    let source = "proc bump(n: &mut i64) { *n += 1; std::io::print(*n) }\nproc edit(a: &mut std::collections::Vec<i64>) { let copy = [10,20]; a[0] += copy[1]; bump(&mut a[0]) }\nlet mut a = std::collections::Vec[1]\nedit(&mut a)\nstd::io::print(a[0])\n";
+    let source = "proc bump(n: &mut i64) { n.* += 1; std::io::print(n.*) }\nproc edit(a: &mut std::collections::Vec<i64>) { let copy = [10,20]; a[0] += copy[1]; bump(&mut a[0]) }\nlet mut a = std::collections::Vec[1]\nedit(&mut a)\nstd::io::print(a[0])\n";
     let p = Arc::new(compile(source).unwrap());
     for scope in [CompilationScope::Combined, CompilationScope::PerRoutine] {
         for resume in [ResumeStrategy::AllPcs, ResumeStrategy::LoopHeaders] {
@@ -205,7 +210,7 @@ fn effectful_procedure_bodies_keep_frames_aliases_gc_and_exact_once_effects() {
 
 #[test]
 fn procedure_input_suspends_at_current_pc_without_replaying_output() {
-    let p = Arc::new(compile("proc take_input(n: &mut i64) { std::io::print(1); std::runtime::caie::input(&mut *n); std::io::print(*n) }\nlet mut n = 0\ntake_input(&mut n)\n").unwrap());
+    let p = Arc::new(compile("proc take_input(n: &mut i64) { std::io::print(1); std::runtime::caie::input(&mut n.*); std::io::print(n.*) }\nlet mut n = 0\ntake_input(&mut n)\n").unwrap());
     let artifact = CraneliftConfig {
         procedure_inlining: true,
         ..CraneliftConfig::speed()
@@ -249,8 +254,8 @@ fn semantic_replacement_requires_a_new_artifact_including_folded_dependencies() 
 #[test]
 fn procedure_errors_preserve_prior_effects_and_loop_continuations() {
     for source in [
-        "proc work(n: &mut i64) { *n += 1; std::io::print(*n); let bad = 9223372036854775807 + *n }\nlet mut n = 0\nwork(&mut n)\n",
-        "proc work(n: &mut i64) { while *n < 3 { *n += 1; std::io::print(*n) } }\nlet mut n = 0\nwork(&mut n)\n",
+        "proc work(n: &mut i64) { n.* += 1; std::io::print(n.*); let bad = 9223372036854775807 + n.* }\nlet mut n = 0\nwork(&mut n)\n",
+        "proc work(n: &mut i64) { while n.* < 3 { n.* += 1; std::io::print(n.*) } }\nlet mut n = 0\nwork(&mut n)\n",
     ] {
         let p = Arc::new(compile(source).unwrap());
         let artifact = CraneliftConfig {

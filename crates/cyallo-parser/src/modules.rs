@@ -9,7 +9,16 @@ impl Parser<'_> {
         }
     }
     pub(super) fn qualified_name(&mut self) -> Result<Box<str>, Diagnostic> {
-        let mut name = self.name()?.to_string();
+        let mut name = if matches!(
+            self.token().kind,
+            TokenKind::Gc | TokenKind::Rc | TokenKind::Object | TokenKind::Dynamic
+        ) {
+            let name = self.token_text().to_owned();
+            self.pos += 1;
+            name
+        } else {
+            self.name()?.to_string()
+        };
         while self.take(":") {
             self.expect(":")?;
             name.push_str("::");
@@ -80,19 +89,40 @@ impl Parser<'_> {
             }
             self.expect(")")?;
         }
+        if self.word("type") {
+            let name = self.name()?;
+            self.expect("=")?;
+            let ty = self.ty()?;
+            if public {
+                ast.exports.push(format!("$type${name}").into());
+            }
+            ast.type_aliases.push(TypeAlias {
+                name,
+                ty,
+                span: self.finish_span(start),
+            });
+            self.eol()?;
+            return Ok(true);
+        }
         if self.word("use") {
             self.use_tree("", public, ast, start)?;
             self.eol()?;
             return Ok(true);
         }
         if self.word("mod") {
-            let name = self.name()?;
+            if self.token().kind != TokenKind::Identifier && !self.token().kind.is_keyword() {
+                return Err(self.error("expected module name"));
+            }
+            let name: Box<str> = self.token_text().into();
+            self.pos += 1;
             let body = if self.take("{") {
                 Some(Box::new(self.declarations(true)?))
             } else {
                 None
             };
             ast.modules.push(ModuleDeclaration {
+                boundary: Default::default(),
+                annotations: vec![],
                 name,
                 public,
                 body,
@@ -117,6 +147,7 @@ impl Parser<'_> {
         }
         if self.word("trait") {
             let name = self.name()?;
+            let type_params = self.type_params()?;
             self.expect("{")?;
             self.newlines();
             let mut methods = vec![];
@@ -124,6 +155,8 @@ impl Parser<'_> {
                 methods.push(self.modern_routine(true)?);
             }
             ast.traits.push(Trait {
+                type_params,
+                annotations: vec![],
                 origin: TraitOrigin::Source,
                 name,
                 methods,
@@ -133,7 +166,35 @@ impl Parser<'_> {
             return Ok(true);
         }
         if self.word("impl") {
-            let trait_name = self.qualified_name()?;
+            let type_params = self.type_params()?;
+            let first = self.ty()?;
+            if self.at("{") {
+                self.expect("{")?;
+                self.newlines();
+                let mut methods = vec![];
+                while !self.take("}") {
+                    let (attributes, annotations) = self.declaration_attributes()?;
+                    let public = self.word("pub");
+                    let mut function = self.modern_function()?;
+                    function.attributes = attributes;
+                    function.annotations.extend(annotations);
+                    methods.push(InherentMethod { public, function });
+                }
+                ast.inherent_implementations.push(InherentImplementation {
+                    type_params,
+                    receiver: first,
+                    methods,
+                    span: self.finish_span(start),
+                });
+                self.eol()?;
+                return Ok(true);
+            }
+            if !type_params.is_empty() {
+                return Err(self.error("generic trait implementations are not yet supported"));
+            }
+            let Type::Named(trait_name) = first else {
+                return Err(self.error("expected trait name"));
+            };
             self.expect("for")?;
             let receiver = self.ty()?;
             self.expect("{")?;
@@ -174,6 +235,8 @@ impl Parser<'_> {
             getter.result = result;
             getter.name = format!("$get${name}").into();
             getter.params.push(Param {
+                arity: ParameterArity::One,
+                passing: ParameterPassing::Value,
                 receiver: true,
                 name: "self".into(),
                 ty: receiver.clone(),

@@ -9,7 +9,14 @@ mod operator;
 pub use operator::Operator;
 /// Opaque declaration identity attached by semantic resolution, never the parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct IntrinsicId(pub u16);
+pub struct IntrinsicId(pub u16, pub Option<DeclarationId>);
+impl IntrinsicId {
+    pub fn declared(self, declaration: DeclarationId) -> Self {
+        Self(self.0, Some(declaration))
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeclarationId(pub u32);
 /// Canonical builtin type constructors, assigned by type resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StorageKind {
@@ -30,11 +37,28 @@ pub enum StorageKind {
     Generator,
     PureGenerator,
     GeneratorStep,
+    Sender,
+    Receiver,
+    SendError,
+    ReceiveError,
+    Clock,
+    Task,
+    TaskOutcome,
+    LoadError,
+    ViewError,
+    TypeDescriptor,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MemoryKind {
     Gc,
     Rc,
+}
+/// Coroutine confinement is independent of the allocation's lifetime strategy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Locality {
+    #[default]
+    Local,
+    Shared,
 }
 /// Semantic identifiers are exact. Compatibility syntax folds names while parsing.
 pub trait IdentifierEq {
@@ -78,6 +102,12 @@ impl std::fmt::Display for Diagnostic {
 impl std::error::Error for Diagnostic {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
+    /// An unresolved generic native function value, retaining declaration identity.
+    NativeCallable(DeclarationId),
+    /// A value operand named by a native declaration's result contract.
+    ValueParameter(usize),
+    /// Application of an annotated native type-family declaration.
+    Dependent(DeclarationId, Vec<Type>),
     Lifetime(Box<str>),
     SelfType,
     Numeric(NumberKind),
@@ -103,6 +133,7 @@ pub enum Type {
     },
     Managed {
         kind: MemoryKind,
+        locality: Locality,
         lifetime: Option<Box<str>>,
         pointee: Box<Type>,
     },
@@ -116,6 +147,8 @@ pub enum Type {
     Storage(StorageKind, Box<Type>),
     Symbol,
     Any,
+    Dynamic,
+    Object(Vec<(Box<str>, Type)>),
     Void,
 }
 impl Type {
@@ -194,15 +227,27 @@ impl ConstantValue {
         128usize.saturating_add(extra)
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    Typed,
+    Dynamic,
+}
 #[derive(Debug, Clone)]
 pub enum ExprKind {
+    /// Evaluate a native function value, then materialize its checked ordinary
+    /// callable adapter. The first expression's effects must be preserved.
+    NativeCoerce(Box<Expr>, Box<Expr>),
     Yield(Box<Expr>, bool),
     Invalid(Diagnostic),
-    ManagedNew(MemoryKind, Option<Box<Expr>>, Box<Expr>),
+    ManagedNew(MemoryKind, Locality, Option<Box<Expr>>, Box<Expr>),
     IntrinsicCall(IntrinsicId, Vec<Type>, Vec<Expr>),
     Frozen(std::sync::Arc<ConstantValue>, Type),
     Literal(Literal),
     Name(Box<str>),
+    TypeDescriptor(ExportedType),
+    DeferredCallable(Box<str>),
+    ObjectLiteral(ObjectKind, Vec<(Box<str>, Expr)>),
+    DeleteProperty(Box<Expr>),
     ArrayLiteral(Vec<Expr>),
     Tuple(Vec<Expr>),
     Record(Box<str>, Vec<(Box<str>, Expr)>),
@@ -254,6 +299,8 @@ pub enum StmtKind {
 }
 #[derive(Debug, Clone)]
 pub struct Param {
+    pub arity: ParameterArity,
+    pub passing: ParameterPassing,
     pub receiver: bool,
     pub name: Box<str>,
     pub ty: Type,
@@ -267,6 +314,10 @@ pub struct ReferenceCapture {
 }
 #[derive(Debug, Clone)]
 pub struct Function {
+    pub annotations: Vec<DeclarationAnnotation>,
+    pub body_kind: FunctionBodyKind,
+    pub constraints: Vec<GenericConstraint>,
+    pub type_packs: Vec<Box<str>>,
     pub generator: bool,
     pub source_name: Box<str>,
     pub origin: RoutineOrigin,
@@ -278,6 +329,35 @@ pub struct Function {
     pub result: Type,
     pub body: Vec<Stmt>,
     pub span: Span,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionBodyKind {
+    Source,
+    Declaration,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclarationAnnotation {
+    pub name: Box<str>,
+    pub value: Box<str>,
+    pub span: Span,
+}
+#[derive(Debug, Clone)]
+pub struct GenericConstraint {
+    pub parameter: Box<str>,
+    pub bounds: Vec<Type>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParameterArity {
+    #[default]
+    One,
+    Variadic,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParameterPassing {
+    #[default]
+    Value,
+    /// A native call reads a VM descriptor without taking its language owner.
+    Read,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RoutineOrigin {
@@ -331,6 +411,9 @@ impl RoutineAttributes {
 }
 #[derive(Debug, Clone, Default)]
 pub struct Ast {
+    pub type_aliases: Vec<TypeAlias>,
+    pub resolved_modules: Vec<ResolvedModuleExports>,
+    pub native: NativeDeclarations,
     pub source_names: std::collections::HashMap<Box<str>, Box<str>>,
     pub body: Vec<Stmt>,
     pub functions: Vec<Function>,
@@ -341,9 +424,48 @@ pub struct Ast {
     pub implementations: Vec<Implementation>,
     pub properties: Vec<Property>,
     pub modules: Vec<ModuleDeclaration>,
+    pub inherent_implementations: Vec<InherentImplementation>,
+}
+#[derive(Debug, Clone)]
+pub struct TypeAlias {
+    pub name: Box<str>,
+    pub ty: Type,
+    pub span: Span,
+}
+#[derive(Debug, Clone)]
+pub struct ResolvedModuleExports {
+    pub path: Box<str>,
+    pub values: Vec<ResolvedExport>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportKind {
+    Value,
+    Module,
+    Type,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedType {
+    pub name: Box<str>,
+    pub identity: Box<str>,
+}
+#[derive(Debug, Clone)]
+pub struct ResolvedExport {
+    pub kind: ExportKind,
+    pub name: Box<str>,
+    pub target: Box<str>,
+}
+/// A loader may install an independently resolved package under a private node.
+/// This changes lexical ancestry only; it never grants core provenance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModuleBoundary {
+    #[default]
+    Lexical,
+    Package,
 }
 #[derive(Debug, Clone)]
 pub struct ModuleDeclaration {
+    pub boundary: ModuleBoundary,
+    pub annotations: Vec<DeclarationAnnotation>,
     pub name: Box<str>,
     pub public: bool,
     pub body: Option<Box<Ast>>,
@@ -364,6 +486,8 @@ pub enum TraitOrigin {
 }
 #[derive(Debug, Clone)]
 pub struct Trait {
+    pub type_params: Vec<Box<str>>,
+    pub annotations: Vec<DeclarationAnnotation>,
     pub origin: TraitOrigin,
     pub name: Box<str>,
     pub methods: Vec<Function>,
@@ -377,6 +501,74 @@ pub struct Implementation {
     pub span: Span,
 }
 #[derive(Debug, Clone)]
+pub struct InherentImplementation {
+    pub type_params: Vec<Box<str>>,
+    pub receiver: Type,
+    pub methods: Vec<InherentMethod>,
+    pub span: Span,
+}
+#[derive(Debug, Clone)]
+pub struct InherentMethod {
+    pub public: bool,
+    pub function: Function,
+}
+/// Trusted native headers retained by the compilation after namespace linking.
+/// Source trust is checked by the loader/linker before populating this table.
+#[derive(Debug, Clone, Default)]
+pub struct NativeDeclarations {
+    pub import_policy: Option<NativeImportPolicy>,
+    pub types: Vec<NativeTypeDeclaration>,
+    pub functions: Vec<NativeFunctionDeclaration>,
+    pub methods: Vec<NativeMethodDeclaration>,
+    pub traits: Vec<(DeclarationId, Trait)>,
+    pub families: Vec<(DeclarationId, Record)>,
+}
+#[derive(Debug, Clone)]
+pub struct NativeTypeDeclaration {
+    pub id: DeclarationId,
+    pub name: Box<str>,
+    pub parameters: Vec<Box<str>>,
+    pub annotation: DeclarationAnnotation,
+}
+#[derive(Debug, Clone)]
+pub struct NativeFunctionDeclaration {
+    pub id: DeclarationId,
+    pub module: Option<DeclarationId>,
+    pub function: Function,
+}
+#[derive(Debug, Clone)]
+pub struct NativeMethodDeclaration {
+    pub id: DeclarationId,
+    pub module: Option<DeclarationId>,
+    pub owner: DeclarationId,
+    pub owner_parameters: Vec<Box<str>>,
+    pub receiver: Type,
+    pub function: Function,
+    pub public: bool,
+}
+#[derive(Debug, Clone, Default)]
+pub struct NativeImportPolicy {
+    pub modules: Vec<NativeModuleIdentity>,
+    pub access: Vec<NativeModuleAccess>,
+    pub requesters: std::collections::HashMap<u32, DeclarationId>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceTrust {
+    User,
+    Core,
+}
+#[derive(Debug, Clone)]
+pub struct NativeModuleIdentity {
+    pub trust: SourceTrust,
+    pub id: DeclarationId,
+    pub path: Box<str>,
+}
+#[derive(Debug, Clone)]
+pub struct NativeModuleAccess {
+    pub referrer: DeclarationId,
+    pub allowed: Vec<DeclarationId>,
+}
+#[derive(Debug, Clone)]
 pub struct Property {
     pub receiver: Type,
     pub name: Box<str>,
@@ -385,6 +577,7 @@ pub struct Property {
 }
 #[derive(Debug, Clone)]
 pub struct Record {
+    pub annotations: Vec<DeclarationAnnotation>,
     pub type_params: Vec<Box<str>>,
     pub name: Box<str>,
     pub fields: Vec<(Box<str>, Type)>,
@@ -501,6 +694,7 @@ impl GetSpanMut for Param {
     }
 }
 
+pub mod spans;
 pub mod visit;
 /// Runs one level of a recursive syntax pass, growing the stack first if it
 /// is nearly exhausted. Every pass that recurses over the AST calls this at

@@ -1,5 +1,5 @@
 //! Baseline lowering: canonical slots at every bytecode boundary, native edges.
-use crate::backend::abi::{native_enter, native_flush, native_step};
+use crate::backend::abi::{native_enter, native_flush, native_property_write, native_step};
 use crate::{
     Type,
     ir::{Op, Program},
@@ -28,6 +28,7 @@ fn scalar(t: &Type) -> bool {
             | Type::ServiceKey(_)
             | Type::ServiceRef(_)
             | Type::TraitObject(_)
+            | Type::Object(_)
     )
 }
 fn tag(t: &Type) -> u64 {
@@ -41,6 +42,7 @@ fn tag(t: &Type) -> u64 {
         Type::ServiceKey(_) => native::SERVICE_KEY,
         Type::ServiceRef(_) => native::SERVICE_REF,
         Type::TraitObject(_) => native::TRAIT_OBJECT,
+        Type::Object(_) => native::OBJECT,
         _ => unreachable!(),
     }
 }
@@ -74,6 +76,145 @@ struct Emit {
     cached: Option<usize>,
 }
 impl Emit {
+    fn store_field(&mut self, r: u8, offset: usize) {
+        self.imm(12, offset as u64);
+        self.a.binary(A::Add, 12, V, 12);
+        self.a.store(r, 12, 0);
+    }
+    fn object_stat(&mut self, offset: usize) {
+        let full = self.a.label();
+        self.field(8, offset_of!(NativeView, object_stats));
+        self.a.load(9, 8, offset as u32);
+        self.imm(10, u64::MAX);
+        self.a.compare(9, 10);
+        self.a.branch(C::Eq, full);
+        self.inc(9, 1);
+        self.a.store(9, 8, offset as u32);
+        self.a.bind(full);
+    }
+    fn property_ic(&mut self, fi: usize, pc: usize, op: &Op, program: &Program, done: Label) {
+        use crate::runtime::dynamic::{NativeCache, NativeCase, NativeObject, ObjectStats};
+        use cyallo_ir::dynamic::Operation as D;
+        let Op::Dynamic(destination, operation, args) = op else {
+            return;
+        };
+        if !matches!(operation, D::Get(_) | D::GetKey | D::Set(_) | D::SetKey) {
+            return;
+        }
+        let register = if matches!(operation, D::Set(_) | D::SetKey) {
+            *args.last().unwrap()
+        } else {
+            *destination
+        };
+        if !native::property_scalar_candidate(&program.functions[fi].registers[register]) {
+            return;
+        }
+        self.cached = None;
+        let miss = self.a.label();
+        let receiver_ok = self.a.label();
+        self.field(8, offset_of!(NativeView, property_caches));
+        self.zero(8, C::Eq, miss);
+        self.imm(12, (pc * size_of::<NativeCache>()) as u64);
+        self.a.binary(A::Add, 8, 8, 12);
+        self.regptr(args[0], 10);
+        self.a.load(5, 10, 8);
+        self.imm(12, 255);
+        self.a.binary(A::And, 5, 5, 12);
+        self.imm(6, native::OBJECT);
+        self.a.compare(5, 6);
+        self.a.branch(C::Eq, receiver_ok);
+        self.imm(6, native::DYNAMIC_OBJECT);
+        self.a.compare(5, 6);
+        self.a.branch(C::Ne, miss);
+        self.a.bind(receiver_ok);
+        self.a.load(4, 10, 0);
+        if matches!(operation, D::GetKey | D::SetKey) {
+            self.regptr(args[1], 10);
+            self.a.load(5, 10, 8);
+            self.imm(12, 255);
+            self.a.binary(A::And, 5, 5, 12);
+            let key_ok = self.a.label();
+            self.imm(6, native::STRING_KEY);
+            self.a.compare(5, 6);
+            self.a.branch(C::Eq, key_ok);
+            self.imm(6, native::DYNAMIC_STRING_KEY);
+            self.a.compare(5, 6);
+            self.a.branch(C::Ne, miss);
+            self.a.bind(key_ok);
+            self.a.load(5, 10, 0);
+            self.a.load(6, 8, offset_of!(NativeCache, key) as u32);
+            self.a.compare(5, 6);
+            self.a.branch(C::Ne, miss);
+        }
+        self.field(5, offset_of!(NativeView, object_count));
+        self.a.compare(4, 5);
+        self.a.branch(C::Hs, miss);
+        self.field(5, offset_of!(NativeView, objects));
+        self.a.shift(6, 4, 3);
+        self.a.binary(A::Add, 5, 5, 6);
+        self.a.load(5, 5, 0);
+        self.zero(5, C::Eq, miss);
+        self.a.load(6, 5, offset_of!(NativeObject, shape) as u32);
+        for index in 0..4 {
+            let next = self.a.label();
+            let offset = (offset_of!(NativeCache, cases) + index * size_of::<NativeCase>()) as u32;
+            self.a
+                .load(9, 8, offset + offset_of!(NativeCase, shape) as u32);
+            self.a.compare(6, 9);
+            self.a.branch(C::Ne, next);
+            self.a
+                .load(9, 8, offset + offset_of!(NativeCase, slot) as u32);
+            self.a.load(10, 5, offset_of!(NativeObject, length) as u32);
+            self.a.compare(9, 10);
+            self.a.branch(C::Hs, miss);
+            self.a.load(10, 5, offset_of!(NativeObject, slots) as u32);
+            self.a.shift(12, 9, 4);
+            self.a.binary(A::Add, 10, 10, 12);
+            self.a.load(11, 10, 8);
+            self.a
+                .load(12, 8, offset + offset_of!(NativeCase, kind) as u32);
+            self.a.compare(11, 12);
+            self.a.branch(C::Ne, miss);
+            if matches!(operation, D::Set(_) | D::SetKey) {
+                self.regptr(*args.last().unwrap(), 11);
+                self.a.load(11, 11, 8);
+                self.imm(12, 255);
+                self.a.binary(A::And, 11, 11, 12);
+                self.a
+                    .load(12, 8, offset + offset_of!(NativeCase, input_kind) as u32);
+                self.a.compare(11, 12);
+                self.a.branch(C::Ne, miss);
+                self.zero(11, C::Eq, miss);
+                self.store_field(4, offset_of!(NativeView, property_object));
+                self.store_field(9, offset_of!(NativeView, property_slot));
+                self.imm(4, *args.last().unwrap() as u64);
+                self.store_field(4, offset_of!(NativeView, property_input));
+                self.imm(4, *destination as u64);
+                self.store_field(4, offset_of!(NativeView, property_destination));
+                self.inc(P, -1);
+                self.save(pc);
+                self.a
+                    .call(native_property_write as *const () as usize as u64);
+                self.imm(P, 0);
+                self.field(4, offset_of!(NativeView, halted));
+                self.zero(4, C::Ne, done);
+                self.a.jump(self.targets[pc + 1]);
+            } else {
+                self.a
+                    .load(11, 8, offset + offset_of!(NativeCase, result_kind) as u32);
+                self.zero(11, C::Eq, miss);
+                self.a.load(7, 10, 0);
+                self.write(*destination, 7, 11);
+                self.object_stat(offset_of!(ObjectStats, native_reads));
+                self.a.jump(self.targets[pc + 1]);
+            }
+            self.a.bind(next);
+        }
+        self.a.jump(miss);
+        self.a.bind(miss);
+        self.object_stat(offset_of!(ObjectStats, native_misses));
+        self.cached = None;
+    }
     fn trait_target(&mut self, pc: usize, target: usize, ty: &Type) {
         use crate::runtime::services::{CallCache, NativeBinding, TargetCase};
         let done = self.a.label();
@@ -125,7 +266,13 @@ impl Emit {
         if r == 7 {
             self.cached = None;
         }
-        self.a.load(r, V, offset as u32);
+        if offset > 248 {
+            self.imm(12, offset as u64);
+            self.a.binary(A::Add, r, V, 12);
+            self.a.load(r, r, 0);
+        } else {
+            self.a.load(r, V, offset as u32);
+        }
     }
     fn inc(&mut self, r: u8, n: i64) {
         self.imm(12, n as u64);
@@ -561,6 +708,7 @@ pub(super) fn compile(program: &Program, fi: usize, version: u64) -> Vec<u8> {
         e.inc(FUEL, -1);
         e.inc(P, 1);
         let effects = program.functions[fi].gc.instructions[pc];
+        e.property_ic(fi, pc, &op, program, done);
         if !effects.may_collect && !effects.may_reenter && e.inline(fi, pc, &op, program) {
             if matches!(op, Op::Jump(..) | Op::Branch(..)) {
                 e.cached = None;

@@ -25,10 +25,44 @@ pub struct Notice {
     pub message: String,
     pub count: u64,
 }
+/// What the compiler decided for one call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InlineDecision {
+    /// The callee body is expanded into the caller's native code, frameless.
+    Frameless,
+    /// The callee body is embedded with a real VM frame.
+    Embedded,
+    /// The call stays a call: policy, deferred body or unsupported operations.
+    RemainsCall,
+}
+impl InlineDecision {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Frameless => "frameless",
+            Self::Embedded => "embedded",
+            Self::RemainsCall => "call",
+        }
+    }
+}
+/// A structured inline decision. Routine indexes refer to the program's
+/// function table; the same site compiled again is recorded once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InlineSite {
+    pub routine: usize,
+    pub pc: usize,
+    pub callee: usize,
+    pub decision: InlineDecision,
+    /// Expanded bytecode words (frameless) or body words (embedded); 0 otherwise.
+    pub cost: usize,
+    pub depth: usize,
+}
+const INLINE_SITE_LIMIT: usize = 4096;
 #[derive(Debug, Default)]
 struct Records {
     events: Vec<Notice>,
     index: BTreeMap<(String, String, String), usize>,
+    inlines: Vec<InlineSite>,
+    inline_index: std::collections::HashSet<InlineSite>,
     dropped: u64,
     errors: Vec<EmitError>,
 }
@@ -95,6 +129,21 @@ impl Inspection {
     }
     pub fn notices(&self) -> Vec<Notice> {
         self.records.lock().unwrap().events.clone()
+    }
+    /// Record a structured inline decision when notices are enabled.
+    pub fn inline_site(&self, site: InlineSite) {
+        if !self.options.notices {
+            return;
+        }
+        let mut records = self.records.lock().unwrap();
+        if records.inline_index.contains(&site) || records.inlines.len() >= INLINE_SITE_LIMIT {
+            return;
+        }
+        records.inline_index.insert(site);
+        records.inlines.push(site);
+    }
+    pub fn inline_sites(&self) -> Vec<InlineSite> {
+        self.records.lock().unwrap().inlines.clone()
     }
     pub fn render(&self) -> String {
         let records = self.records.lock().unwrap();

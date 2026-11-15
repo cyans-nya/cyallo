@@ -617,8 +617,10 @@ dependencies = [
  "cyallo-compile-jobs",
  "cyallo-concurrent-values",
  "cyallo-ir",
+ "cyallo-modules",
  "cyallo-parser",
  "cyallo-scheduler",
+ "cyallo-shapes",
  "cyallo-values",
  "kanal",
  "mimalloc",
@@ -678,6 +680,17 @@ version = "0.1.0"
 dependencies = [
  "cyallo-ast",
  "cyallo-compile-jobs",
+ "cyallo-parser",
+]
+
+[[package]]
+name = "cyallo-modules"
+version = "0.1.0"
+dependencies = [
+ "cyallo-ast",
+ "cyallo-host",
+ "cyallo-ir",
+ "cyallo-parser",
 ]
 
 [[package]]
@@ -698,11 +711,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyallo-shapes"
+version = "0.1.0"
+dependencies = [
+ "cyallo-ast",
+ "cyallo-modules",
+]
+
+[[package]]
 name = "cyallo-values"
 version = "0.1.0"
 dependencies = [
  "cyallo-ast",
  "cyallo-concurrent-values",
+ "cyallo-modules",
+ "cyallo-shapes",
 ]
 
 [[package]]

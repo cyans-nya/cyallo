@@ -28,16 +28,28 @@ pub fn has_borrow(ty: &Type) -> bool {
         _ => false,
     }
 }
-pub fn managed_type(kind: MemoryKind, allocator: Option<&Type>, value: Type) -> Type {
+pub fn managed_type(
+    kind: MemoryKind,
+    locality: Locality,
+    allocator: Option<&Type>,
+    value: Type,
+) -> Type {
     Type::Managed {
         kind,
+        locality,
         lifetime: allocator.filter(|ty| has_borrow(ty)).map(|_| "_".into()),
         pointee: Box::new(value),
     }
 }
 pub fn cloneable(ty: &Type) -> bool {
     match ty {
-        Type::Storage(StorageKind::Allocation, _) => false,
+        Type::Storage(
+            StorageKind::Allocation
+            | StorageKind::Task
+            | StorageKind::Generator
+            | StorageKind::PureGenerator,
+            _,
+        ) => false,
         Type::Storage(_, ty) | Type::Array(_, ty) | Type::SparseArray(ty) | Type::Slice(ty) => {
             cloneable(ty)
         }
@@ -70,55 +82,6 @@ pub fn resolve(id: Intrinsic, types: &[Type], arguments: &[Type]) -> Option<(Ope
     };
     Some((operation, result))
 }
-pub fn allocator_declaration() -> Trait {
-    let self_ty = Type::Reference {
-        mutable: true,
-        lifetime: None,
-        pointee: Box::new(Type::SelfType),
-    };
-    let method = |name: &str, parameter: Type, result: Type| Function {
-        generator: false,
-        name: name.into(),
-        source_name: name.into(),
-        origin: RoutineOrigin::Source,
-        attributes: Default::default(),
-        type_params: vec![],
-        kind: RoutineKind::Procedure,
-        params: vec![
-            Param {
-                receiver: true,
-                name: "self".into(),
-                ty: self_ty.clone(),
-                by_ref: false,
-                span: SPAN,
-            },
-            Param {
-                receiver: false,
-                name: "value".into(),
-                ty: parameter,
-                by_ref: false,
-                span: SPAN,
-            },
-        ],
-        result,
-        body: vec![],
-        span: SPAN,
-    };
-    Trait {
-        origin: TraitOrigin::Allocator,
-        name: "std::mem::Allocator".into(),
-        methods: vec![
-            method(
-                "allocate",
-                layout(),
-                lookup::result_type(allocation(), error()),
-            ),
-            method("deallocate", allocation(), Type::Void),
-        ],
-        span: SPAN,
-    }
-}
-
 /// Region names are local binders; owning allocation types must still retain
 /// whether their allocator is borrowed. This comparison never erases that fact.
 pub fn same_regions(left: &Type, right: &Type) -> bool {
@@ -132,15 +95,17 @@ pub fn same_regions(left: &Type, right: &Type) -> bool {
         (
             Type::Managed {
                 kind: a,
+                locality: c,
                 lifetime: x,
                 pointee: p,
             },
             Type::Managed {
                 kind: b,
+                locality: d,
                 lifetime: y,
                 pointee: q,
             },
-        ) => a == b && x.is_some() == y.is_some() && same_regions(p, q),
+        ) => a == b && c == d && x.is_some() == y.is_some() && same_regions(p, q),
         (
             Type::Reference {
                 mutable: a,

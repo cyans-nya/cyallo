@@ -1,5 +1,10 @@
 # Engine measurements
 
+Shape-guarded property measurements and differential-fuzz coverage are documented
+in [native object inline caches](native-object-ics.md). The reproduction command
+is `cargo bench --bench objects --profile dev`; release timings require a separate
+`cargo bench --bench objects` run.
+
 Current engine structure and measurements are documented in
 [the JIT remediation results](jit-remediation-results.md). Both eager modes now
 use linked per-routine all-PC code; automatic JIT speed retains selective
@@ -216,7 +221,7 @@ Tiered prewarm wall times included queueing, the initial baseline job, any reque
 | Arrays | 0.414 ms | 1.273 ms | 1.838 ms |
 | Strings | 0.310 ms | 0.670 ms | 0.974 ms |
 
-The first Winch measurement includes engine initialization. These wall times are not isolated backend compilation comparisons. Per-job worker timings and thread IDs are available through `TierInfo`/`--jit-report`. Asynchronous first-run behavior is different: normal execution interprets while code is pending and may complete before compilation finishes.
+The first Winch measurement includes engine initialization. These wall times are not isolated backend compilation comparisons. Per-job worker timings and thread IDs are available through `TierInfo`/`--jit-trace=summary`. Asynchronous first-run behavior is different: normal execution interprets while code is pending and may complete before compilation finishes.
 
 ## Before-change reference
 
@@ -229,7 +234,7 @@ Before direct scalar storage lowering, the previous seven-sample benchmark recor
 | Array indexing | 0.244 ms | 0.215 ms | 0.216 ms |
 | Strings | 0.102 ms | 0.106 ms | 0.102 ms |
 
-The small-loop speed result improved about 16× against that recorded result. Helper-heavy strings regressed; direct storage adds setup/synchronization without removing most string operations. The native scalar mirror is lazy, so pure interpreter/Winch sessions do not allocate it.
+The small-loop speed result improved about 16× against that recorded result. Helper-heavy strings regressed; direct storage adds setup/synchronization without removing most string operations. Native mirrors are lazy; pure interpreter Sessions do not allocate scalar or object-slot mirrors.
 
 At the start of this implementation batch, single-sample totals for 100 executions were:
 

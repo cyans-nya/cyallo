@@ -13,8 +13,8 @@ proc parse(s: &string, out: &mut std::collections::Vec<i64>) -> i64 {
     let mut value = 0
     let mut in_number = false
     // String positions are one-based; output array indices start at zero.
-    for i in 1..=std::string::len(*s) {
-        let ch = std::runtime::caie::mid(*s, i, 1)
+    for i in 1..=std::string::len(s.*) {
+        let ch = std::runtime::caie::mid(s.*, i, 1)
         if ch >= "0" && ch <= "9" {
             value = value * 10 + std::num::parse<i64>(ch).unwrap()
             in_number = true

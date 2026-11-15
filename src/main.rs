@@ -1,4 +1,5 @@
 mod report;
+mod tracer;
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -6,8 +7,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use cyallo::{
     Diagnostic, Session, Status,
     backend::{
-        CraneliftBackend, CraneliftSpeedBackend, Executable, NativeBackend, TieredArtifact,
-        TieredBackend,
+        CraneliftConfig, Executable, NativeBackend, TierPolicy, TieredArtifact, TieredBackend,
     },
     debugger::{Debugger, Mode},
 };
@@ -50,15 +50,41 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        help = "Report logical work, inlining and compiler activity without changing optimization"
+        require_equals = true,
+        num_args = 0..=1,
+        default_missing_value = "live",
+        value_enum,
+        help = "Report JIT execution: bare --jit-trace traces with a live view; --jit-trace=summary prints counters once"
     )]
-    jit_report: bool,
+    jit_trace: Option<TraceMode>,
     #[arg(
         long,
         global = true,
-        help = "Trace every invocation and tier entry; disables inlining and adds timing overhead"
+        value_enum,
+        default_value = "human",
+        help = "Format of the final JIT report (json goes to stderr)"
     )]
-    jit_trace: bool,
+    jit_trace_format: ReportFormat,
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        help = "JIT report style: plain (ASCII), color, or boxed (colors and frames); default follows the terminal"
+    )]
+    jit_trace_style: Option<ReportStyle>,
+    #[arg(
+        long,
+        global = true,
+        help = "Disable routine inlining in native code; compare against the default"
+    )]
+    jit_no_inline: bool,
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "Write the final JIT report to PATH instead of stderr (needs --jit-trace or --jit-trace=summary)"
+    )]
+    jit_trace_out: Option<PathBuf>,
     #[arg(
         long,
         global = true,
@@ -99,6 +125,24 @@ struct Cli {
     )]
     gc_stress: bool,
 }
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TraceMode {
+    /// Full trace with a live status block while the program runs.
+    Live,
+    /// Counter-based summary printed once at exit.
+    Summary,
+}
+#[derive(Clone, Copy, ValueEnum)]
+enum ReportFormat {
+    Human,
+    Json,
+}
+#[derive(Clone, Copy, ValueEnum)]
+enum ReportStyle {
+    Plain,
+    Color,
+    Boxed,
+}
 #[derive(Clone, Copy, ValueEnum)]
 enum Dialect {
     Modern,
@@ -137,6 +181,10 @@ enum Command {
     Debug {
         file: PathBuf,
     },
+    /// Browse a JIT trace written with --jit-trace --jit-trace-format=json.
+    Trace {
+        file: PathBuf,
+    },
 }
 impl Command {
     fn file(&self) -> Option<&Path> {
@@ -145,7 +193,8 @@ impl Command {
             | Self::Pretty { file }
             | Self::Check { file }
             | Self::Run { file, .. }
-            | Self::Debug { file } => Some(file),
+            | Self::Debug { file }
+            | Self::Trace { file } => Some(file),
             Self::Repl { .. } => None,
         }
     }
@@ -204,44 +253,85 @@ fn compile_engine(
     engine: Engine,
     program: Arc<cyallo::ir::Program>,
     reporting: Option<Instant>,
+    inlining: bool,
 ) -> color_eyre::Result<Option<Compiled>> {
     Ok(match engine {
         Engine::Interpreter => None,
         Engine::Cranelift => Some(Compiled::Direct(
-            CraneliftBackend
-                .compile(program)
-                .map(Box::new)
-                .map_err(|e| color_eyre::eyre::eyre!(e))?,
+            CraneliftConfig {
+                inlining,
+                ..CraneliftConfig::fast()
+            }
+            .compile(program)
+            .map(Box::new)
+            .map_err(|e| color_eyre::eyre::eyre!(e))?,
         )),
         Engine::CraneliftSpeed => Some(Compiled::Direct(
-            CraneliftSpeedBackend
-                .compile(program)
-                .map(Box::new)
-                .map_err(|e| color_eyre::eyre::eyre!(e))?,
+            CraneliftConfig {
+                inlining,
+                ..CraneliftConfig::speed()
+            }
+            .compile(program)
+            .map(Box::new)
+            .map_err(|e| color_eyre::eyre::eyre!(e))?,
         )),
-        Engine::Jit => Some(Compiled::Tiered(Box::new(
-            reporting
+        Engine::Jit => {
+            let backend = TieredBackend::new(TierPolicy {
+                inlining,
+                ..TierPolicy::default()
+            });
+            let artifact = reporting
                 .map_or_else(
-                    || TieredBackend::default().compile(program.clone()),
-                    |origin| {
-                        TieredBackend::default().compile_with_reporting(program.clone(), origin)
-                    },
+                    || backend.compile(program.clone()),
+                    |origin| backend.compile_with_reporting(program.clone(), origin),
                 )
-                .map_err(|e| color_eyre::eyre::eyre!(e))?,
-        ))),
+                .map_err(|e| color_eyre::eyre::eyre!(e))?;
+            Some(Compiled::Tiered(Box::new(artifact)))
+        }
     })
 }
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse();
+    let stderr_tty = io::stderr().is_terminal();
+    let color = use_color(cli.color, stderr_tty);
+    let look = match cli.jit_trace_style {
+        Some(ReportStyle::Plain) => report::Look::plain(),
+        Some(ReportStyle::Color) => report::Look::color(color),
+        Some(ReportStyle::Boxed) => report::Look::boxed(color),
+        None if color => report::Look::color(true),
+        None => report::Look::plain(),
+    };
+    let jit_report = cli.jit_trace.is_some();
+    if cli.jit_trace_out.is_some() && !jit_report {
+        return Err(color_eyre::eyre::eyre!(
+            "--jit-trace-out needs --jit-trace or --jit-trace=summary"
+        ));
+    }
+    let jit_trace = cli.jit_trace == Some(TraceMode::Live);
     let runtime = RuntimeOptions {
-        jit_report: cli.jit_report || cli.jit_trace,
-        jit_trace: cli.jit_trace,
+        jit_report,
+        jit_trace,
+        // The live block is human output; JSON keeps stderr for the document.
+        jit_live: jit_trace
+            && stderr_tty
+            && matches!(cli.jit_trace_format, ReportFormat::Human)
+            && std::env::var_os("TERM").is_none_or(|term| term != "dumb"),
+        jit_no_inline: cli.jit_no_inline,
+        jit_trace_out: cli.jit_trace_out.clone(),
+        report: report::Output {
+            format: match cli.jit_trace_format {
+                ReportFormat::Human => report::Format::Human,
+                ReportFormat::Json => report::Format::Json,
+            },
+            look,
+            inlining: !cli.jit_no_inline,
+        },
         jit_notices: cli.jit_notices,
         inspection: {
             let options = cyallo::inspection::InspectionOptions {
-                full_trace: cli.jit_trace,
-                notices: cli.jit_report || cli.jit_trace || cli.jit_notices,
+                full_trace: jit_trace,
+                notices: jit_report || cli.jit_notices,
                 warn_unfulfilled: cli.warn_unfulfilled_attributes,
                 emit_ir: cli.emit.iter().any(|v| matches!(v, EmitKind::Ir)),
                 emit_bytecode: cli.emit.iter().any(|v| matches!(v, EmitKind::Bytecode)),
@@ -305,6 +395,7 @@ fn main() -> color_eyre::Result<()> {
             }
             return Ok(());
         }
+        Command::Trace { file } => return tracer::run(file),
         _ => {}
     }
     let file = cli.command.file().expect("non-file commands handled above");
@@ -324,7 +415,17 @@ fn main() -> color_eyre::Result<()> {
             Ok(sources) => {
                 text = cyallo::modules::source_archive(&sources);
                 source_ranges = cyallo::modules::source_ranges(&sources);
-                cyallo::modules::compile_modules(sources.len() - 1, &sources, options, deferred)
+                cyallo::module_loader::ModuleLoader::for_entry(file)
+                    .map_err(cyallo::module_loader::module_load_diagnostic)
+                    .and_then(|loader| {
+                        cyallo::modules::compile_modules(
+                            sources.len() - 1,
+                            &sources,
+                            options,
+                            deferred,
+                        )
+                        .map(|program| program.with_module_loader(loader))
+                    })
             }
             Err(error) => Err(error),
         }
@@ -425,10 +526,20 @@ fn main() -> color_eyre::Result<()> {
 
     Ok(())
 }
+/// Instruction budget per run slice while the live view is on.
+const LIVE_SLICE: usize = 50_000;
 #[derive(Clone)]
 struct RuntimeOptions {
+    /// Any JIT report (`--jit-trace`, `--jit-trace=summary`).
     jit_report: bool,
+    /// Full observation with per-invocation events (`--jit-trace`).
     jit_trace: bool,
+    /// Redraw the live status block on stderr (trace mode on a terminal).
+    jit_live: bool,
+    jit_no_inline: bool,
+    /// Where the final report goes; stderr when absent.
+    jit_trace_out: Option<PathBuf>,
+    report: report::Output,
     jit_notices: bool,
     inspection: Option<Arc<cyallo::inspection::Inspection>>,
     gc: cyallo::runtime::gc::GcConfig,
@@ -452,7 +563,12 @@ fn run(
 ) -> color_eyre::Result<bool> {
     let jit_report = runtime.jit_report;
     let origin = Instant::now();
-    let artifact = compile_engine(engine, program.clone(), jit_report.then_some(origin))?;
+    let artifact = compile_engine(
+        engine,
+        program.clone(),
+        jit_report.then_some(origin),
+        !runtime.jit_no_inline,
+    )?;
     let mut timings = report::Timings {
         frontend: Some(frontend),
         backend: origin.elapsed(),
@@ -484,25 +600,46 @@ fn run(
     }
     let mut written = 0;
     let mut notice_cursor = 0;
+    let style = runtime.report.look;
+    let mut live = report::Live::new(runtime.jit_live);
+    // Live refreshes happen between slices, so slices are kept short; the
+    // budget only changes where the scheduler pauses, not what runs.
+    let slice = if runtime.jit_live {
+        LIVE_SLICE
+    } else {
+        1_000_000
+    };
     let success = loop {
         let execution = Instant::now();
         if let Some(artifact) = &artifact {
             artifact
-                .run(&mut session, 1_000_000)
+                .run(&mut session, slice)
                 .map_err(|e| color_eyre::eyre::eyre!(e))?;
         } else {
-            session.run(1_000_000);
+            session.run(slice);
         }
         timings.execution += execution.elapsed();
+        let output_pending = session.context.output.len() > written;
+        let notices_pending = runtime.jit_notices && has_new_notices(&program, notice_cursor);
+        if output_pending || notices_pending {
+            live.suspend();
+        }
         if runtime.jit_notices {
             print_live_notices(&program, &mut notice_cursor);
         }
-        print!("{}", &session.context.output[written..]);
-        written = session.context.output.len();
+        if output_pending {
+            print!("{}", &session.context.output[written..]);
+            written = session.context.output.len();
+        }
         io::stdout().flush()?;
+        live.refresh(output_pending, || {
+            report::live_frame(&artifact, &program, &session, origin, &timings, style)
+        });
         match session.status() {
             Status::Paused => {}
+            Status::Waiting => session.wait_for_wakeup(Duration::from_millis(50)),
             Status::WaitingForInput => {
+                live.suspend();
                 let mut line = String::new();
                 let waiting = Instant::now();
                 let bytes = io::stdin().read_line(&mut line)?;
@@ -517,7 +654,7 @@ fn run(
                         "{}",
                         cyallo::diagnostics::render_program(
                             source_name,
-                            &program,
+                            session.program(),
                             &d,
                             diagnostic_color,
                             dialect,
@@ -539,7 +676,7 @@ fn run(
                     "{}",
                     cyallo::diagnostics::render_program(
                         source_name,
-                        &program,
+                        session.program(),
                         &d.diagnostic(),
                         diagnostic_color,
                         dialect,
@@ -549,16 +686,25 @@ fn run(
             }
         }
     };
+    live.finish();
+    let program = session.program().clone();
     finish_inspection(&artifact, &program)?;
     if runtime.jit_notices {
         print_live_notices(&program, &mut notice_cursor);
     }
     if jit_report {
         timings.wall = origin.elapsed();
-        eprint!(
-            "{}",
-            report::render(&artifact, &program, &session, engine, &timings)
-        );
+        emit_report(
+            &report::render(
+                &artifact,
+                &program,
+                &session,
+                engine,
+                &timings,
+                runtime.report,
+            ),
+            runtime.jit_trace_out.as_deref(),
+        )?;
     }
     if !jit_report
         && !runtime.jit_notices
@@ -601,6 +747,20 @@ fn finish_inspection(
     }
     program.emit_inspection();
     check_emission(program)
+}
+/// Write the final report to the requested file, or to stderr.
+fn emit_report(text: &str, file: Option<&Path>) -> color_eyre::Result<()> {
+    match file {
+        Some(path) => std::fs::write(path, text)
+            .map_err(|error| color_eyre::eyre::eyre!("cannot write {}: {error}", path.display()))?,
+        None => eprint!("{text}"),
+    }
+    Ok(())
+}
+fn has_new_notices(program: &cyallo::ir::Program, cursor: usize) -> bool {
+    program
+        .inspection()
+        .is_some_and(|observer| observer.notices().len() > cursor)
 }
 fn print_live_notices(program: &cyallo::ir::Program, cursor: &mut usize) {
     if let Some(observer) = program.inspection() {
@@ -785,6 +945,7 @@ fn draw(frame: &mut Frame, debugger: &Debugger, input: &str, cursor: usize) {
         output,
     );
     let status = match debugger.session.status() {
+        Status::Waiting => "Waiting for runtime".into(),
         Status::WaitingForInput => "Waiting for input".into(),
         Status::Finished => "Finished".into(),
         Status::Failed(failure) => format!("{}: {}", failure.error.code(), failure.error),
@@ -909,6 +1070,7 @@ fn repl_cli(
             engine,
             repl.session().program().clone(),
             jit_report.then_some(origin),
+            !runtime.jit_no_inline,
         )?;
         let mut timings = report::Timings {
             frontend: Some(frontend),
@@ -925,6 +1087,8 @@ fn repl_cli(
         }
         let initial_count = repl.session().instruction_count();
         let mut notice_cursor = 0;
+        let style = runtime.report.look;
+        let mut live = report::Live::new(runtime.jit_live);
         loop {
             let execution = Instant::now();
             let remaining =
@@ -939,13 +1103,32 @@ fn repl_cli(
                 repl.run(remaining.min(10_000) as usize);
             }
             timings.execution += execution.elapsed();
+            let output_pending = repl.session().context.output.len() > written;
+            let notices_pending =
+                runtime.jit_notices && has_new_notices(repl.session().program(), notice_cursor);
+            if output_pending || notices_pending {
+                live.suspend();
+            }
             if runtime.jit_notices {
                 print_live_notices(repl.session().program(), &mut notice_cursor);
             }
-            output.write_all(&repl.session().context.output.as_bytes()[written..])?;
-            written = repl.session().context.output.len();
+            if output_pending {
+                output.write_all(&repl.session().context.output.as_bytes()[written..])?;
+                written = repl.session().context.output.len();
+            }
             output.flush()?;
+            live.refresh(output_pending, || {
+                report::live_frame(
+                    &artifact,
+                    repl.session().program(),
+                    repl.session(),
+                    origin,
+                    &timings,
+                    style,
+                )
+            });
             match repl.session().status() {
+                Status::Waiting => repl.session().wait_for_wakeup(Duration::from_millis(50)),
                 Status::Paused => continue,
                 Status::Finished => break,
                 Status::Failed(d) => {
@@ -962,6 +1145,7 @@ fn repl_cli(
                     break;
                 }
                 Status::WaitingForInput => {
+                    live.suspend();
                     if interactive {
                         write!(output, "input> ")?;
                         output.flush()?;
@@ -986,19 +1170,21 @@ fn repl_cli(
                                 dialect,
                             )
                         );
+                        live.finish();
                         finish_inspection(&artifact, repl.session().program())?;
                         if jit_report {
                             timings.wall = origin.elapsed();
-                            eprint!(
-                                "{}",
-                                report::render(
+                            emit_report(
+                                &report::render(
                                     &artifact,
                                     repl.session().program(),
                                     repl.session(),
                                     engine,
-                                    &timings
-                                )
-                            );
+                                    &timings,
+                                    runtime.report,
+                                ),
+                                runtime.jit_trace_out.as_deref(),
+                            )?;
                         }
                         return Ok(());
                     }
@@ -1012,19 +1198,21 @@ fn repl_cli(
                 }
             }
         }
+        live.finish();
         finish_inspection(&artifact, repl.session().program())?;
         if jit_report {
             timings.wall = origin.elapsed();
-            eprint!(
-                "{}",
-                report::render(
+            emit_report(
+                &report::render(
                     &artifact,
                     repl.session().program(),
                     repl.session(),
                     engine,
-                    &timings
-                )
-            );
+                    &timings,
+                    runtime.report,
+                ),
+                runtime.jit_trace_out.as_deref(),
+            )?;
         }
         check_emission(repl.session().program())?;
         if runtime.jit_notices {

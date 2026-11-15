@@ -36,6 +36,7 @@ impl std::error::Error for RuntimeFailure {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeError {
     /// Checked arithmetic and numeric conversion failures.
+    Dynamic(cyallo_shapes::DynamicError),
     Number(NumberError),
     Arithmetic(ArithmeticError),
     Bounds(BoundsError),
@@ -44,6 +45,7 @@ pub enum RuntimeError {
     Input(InputError),
     Ownership(OwnershipError),
     Generator(GeneratorError),
+    Concurrency(super::concurrent::ConcurrencyError),
     Unwrap(UnwrapError),
     Service(ServiceError),
     Lookup(LookupError),
@@ -63,6 +65,7 @@ impl RuntimeError {
     /// Stable diagnostic code for each failure family.
     pub fn code(&self) -> &'static str {
         match self {
+            Self::Dynamic(_) => "R240",
             Self::Number(_) | Self::Arithmetic(_) => "R100",
             Self::Bounds(_) => "R110",
             Self::Uninitialized(_) => "R120",
@@ -71,6 +74,7 @@ impl RuntimeError {
             Self::Input(_) => "R140",
             Self::Ownership(_) => "R150",
             Self::Generator(_) => "R160",
+            Self::Concurrency(_) => "R230",
             Self::Unwrap(_) => "R170",
             Self::Service(_) | Self::Lookup(_) => "R180",
             Self::CheckedTypeMismatch => "R190",
@@ -86,6 +90,7 @@ impl RuntimeError {
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Dynamic(error) => error.fmt(f),
             Self::Number(error) => error.fmt(f),
             Self::Arithmetic(error) => error.fmt(f),
             Self::Bounds(error) => error.fmt(f),
@@ -94,6 +99,7 @@ impl fmt::Display for RuntimeError {
             Self::Input(error) => error.fmt(f),
             Self::Ownership(error) => error.fmt(f),
             Self::Generator(error) => error.fmt(f),
+            Self::Concurrency(error) => error.fmt(f),
             Self::Unwrap(error) => error.fmt(f),
             Self::Service(error) => error.fmt(f),
             Self::Lookup(error) => error.fmt(f),
@@ -113,6 +119,7 @@ impl fmt::Display for RuntimeError {
 impl std::error::Error for RuntimeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Dynamic(error) => Some(error),
             Self::Number(error) => Some(error),
             Self::DeferredCheck(diagnostic) => Some(diagnostic),
             _ => None,
@@ -129,6 +136,7 @@ macro_rules! from_variant {
     )*};
 }
 from_variant! {
+    cyallo_shapes::DynamicError => Dynamic,
     NumberError => Number,
     ArithmeticError => Arithmetic,
     BoundsError => Bounds,
@@ -137,6 +145,7 @@ from_variant! {
     InputError => Input,
     OwnershipError => Ownership,
     GeneratorError => Generator,
+    super::concurrent::ConcurrencyError => Concurrency,
     UnwrapError => Unwrap,
     ServiceError => Service,
     LookupError => Lookup,
@@ -319,8 +328,8 @@ pub enum GeneratorError {
     Finished,
     AlreadyRunning,
     CloseWhileRunning,
-    StartWithArgument,
-    MissingResumeValue,
+    NotStarted,
+    AlreadyStarted,
     Invalid,
     LimitExceeded,
 }
@@ -328,8 +337,8 @@ messages!(GeneratorError {
     Finished => "cannot resume a completed or closed generator",
     AlreadyRunning => "generator is already running",
     CloseWhileRunning => "cannot close a running generator",
-    StartWithArgument => "start a generator with resume(); arguments belong to its factory",
-    MissingResumeValue => "resume requires the value expected by yield",
+    NotStarted => "generator has not started; call start() first",
+    AlreadyStarted => "generator has already started; continue it with resume()",
     Invalid => "invalid generator",
     LimitExceeded => "generator limit exceeded",
 });
@@ -523,6 +532,8 @@ messages!(EngineError {
 /// The runtime representation a VM operation required.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueKind {
+    ViewError,
+    LoadError,
     Integer,
     Number,
     Boolean,

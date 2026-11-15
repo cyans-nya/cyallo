@@ -1,33 +1,45 @@
 //! Package linking and lexical extension imports. Imports never execute plugin code.
 use crate::{CompileOptions, Diagnostic, Span};
-use cyallo_ast::*;
+pub use cyallo_modules::SourceModule;
 use std::path::Path;
 #[derive(Debug, Clone)]
-pub struct SourceModule {
-    pub path: String,
-    pub source: String,
-}
-#[derive(Debug, Clone)]
 pub struct SourceRange {
-    pub path: Box<str>,
+    /// None uses the entry name supplied by the diagnostic caller.
+    pub path: Option<Box<str>>,
     pub span: Span,
 }
 pub fn source_ranges(sources: &[SourceModule]) -> Vec<SourceRange> {
     let mut offset = 0;
-    sources
+    let mut ranges: Vec<_> = sources
         .iter()
         .map(|m| {
             offset += format!("// module: {}\n", m.path).len() as u32;
             let span = Span::new(offset, offset + m.source.len() as u32);
             offset = span.end + 1;
             SourceRange {
-                path: m.path.clone().into(),
+                path: Some(m.path.clone().into()),
                 span,
             }
         })
-        .collect()
+        .collect();
+    let mut archive = user_source_archive(sources);
+    if let Ok(core) = cyallo_ir::core_package::CorePackage::embedded().append_to(&mut archive) {
+        ranges.extend(core.ranges.into_iter().map(|range| SourceRange {
+            path: Some(range.path),
+            span: range.span,
+        }));
+    }
+    ranges
 }
 pub fn diagnostic_context<'a>(
+    source: &'a str,
+    ranges: &'a [SourceRange],
+    diagnostic: &Diagnostic,
+) -> Option<(&'a str, &'a str, Diagnostic)> {
+    diagnostic_context_with_name("<source>", source, ranges, diagnostic)
+}
+pub fn diagnostic_context_with_name<'a>(
+    name: &'a str,
     source: &'a str,
     ranges: &'a [SourceRange],
     diagnostic: &Diagnostic,
@@ -48,112 +60,48 @@ pub fn diagnostic_context<'a>(
         }
     });
     Some((
-        &range.path,
+        range.path.as_deref().unwrap_or(name),
         &source[range.span.start as usize..range.span.end as usize],
         local,
     ))
-}
-impl SourceModule {
-    pub fn new(path: impl Into<String>, source: impl Into<String>) -> Self {
-        Self {
-            path: path.into(),
-            source: source.into(),
-        }
-    }
-}
-fn shift_ast(ast: &mut Ast, offset: u32) -> Result<(), Diagnostic> {
-    fn span(s: &mut Span, o: u32) {
-        s.start += o;
-        s.end += o;
-    }
-    fn block(body: &mut [Stmt], o: u32) -> Result<(), Diagnostic> {
-        cyallo_ast::with_stack(|| {
-            fn statements(body: &mut [Stmt], o: u32) {
-                for s in body {
-                    span(&mut s.span, o);
-                    match &mut s.kind {
-                        StmtKind::If(_, a, b) => {
-                            statements(a, o);
-                            statements(b, o);
-                        }
-                        StmtKind::While(_, b)
-                        | StmtKind::Repeat(b, _)
-                        | StmtKind::For(_, _, _, _, b)
-                        | StmtKind::ForIn(_, _, b) => statements(b, o),
-                        StmtKind::Case(_, arms, b) => {
-                            for (_, b) in arms {
-                                statements(b, o);
-                            }
-                            statements(b, o);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            statements(body, o);
-            cyallo_ast::visit::visit_block(
-                body,
-                &mut |e| {
-                    span(&mut e.span, o);
-                    if let ExprKind::Closure(f, _) = &mut e.kind {
-                        function(f, o)?;
-                    }
-                    Ok(())
-                },
-                &mut |_, _| Ok(()),
-            )
-        })
-    }
-    fn function(f: &mut Function, o: u32) -> Result<(), Diagnostic> {
-        span(&mut f.span, o);
-        for attribute in [
-            &mut f.attributes.heat_span,
-            &mut f.attributes.compilation_span,
-            &mut f.attributes.inline_span,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            span(attribute, o);
-        }
-        for p in &mut f.params {
-            span(&mut p.span, o);
-        }
-        block(&mut f.body, o)
-    }
-    block(&mut ast.body, offset)?;
-    for f in &mut ast.functions {
-        function(f, offset)?;
-    }
-    for r in &mut ast.records {
-        span(&mut r.span, offset);
-    }
-    for t in &mut ast.traits {
-        span(&mut t.span, offset);
-        for f in &mut t.methods {
-            function(f, offset)?;
-        }
-    }
-    for imp in &mut ast.implementations {
-        span(&mut imp.span, offset);
-        for f in &mut imp.methods {
-            function(f, offset)?;
-        }
-    }
-    for p in &mut ast.properties {
-        span(&mut p.span, offset);
-        function(&mut p.getter, offset)?;
-    }
-    for i in &mut ast.imports {
-        span(&mut i.span, offset);
-    }
-    Ok(())
 }
 pub fn compile_modules(
     entry: usize,
     sources: &[SourceModule],
     options: CompileOptions,
     deferred: bool,
+) -> Result<crate::ir::Program, Diagnostic> {
+    compile_modules_with_policy(
+        entry,
+        sources,
+        options,
+        deferred,
+        &cyallo_ir::import_policy::ImportPolicy::default(),
+    )
+}
+pub fn compile_modules_with_policy(
+    entry: usize,
+    sources: &[SourceModule],
+    options: CompileOptions,
+    deferred: bool,
+    policy: &cyallo_ir::import_policy::ImportPolicy,
+) -> Result<crate::ir::Program, Diagnostic> {
+    compile_modules_with_core(
+        entry,
+        sources,
+        options,
+        deferred,
+        policy,
+        &cyallo_ir::core_package::CorePackage::embedded(),
+    )
+}
+pub fn compile_modules_with_core(
+    entry: usize,
+    sources: &[SourceModule],
+    options: CompileOptions,
+    deferred: bool,
+    policy: &cyallo_ir::import_policy::ImportPolicy,
+    core: &cyallo_ir::core_package::CorePackage<'_>,
 ) -> Result<crate::ir::Program, Diagnostic> {
     if entry >= sources.len() {
         return Err(Diagnostic::new(
@@ -176,6 +124,9 @@ pub fn compile_modules(
     u32::try_from(source.len()).map_err(|_| {
         Diagnostic::new("E140", "module source exceeds span limit", Span::default())
     })?;
+    let core_archive = core
+        .append_to(&mut source)
+        .map_err(cyallo_ir::core_package::invalid_core_source)?;
     let jobs = cyallo_compile_jobs::Jobs(options.jobs);
     let indexed = jobs.map(sources, 2, |_, _, module| {
         cyallo_parser::index_modern(&module.source)
@@ -212,16 +163,48 @@ pub fn compile_modules(
                 }
                 d
             })?;
-        shift_ast(&mut ast, offsets[i])?;
+        cyallo_ast::spans::shift_ast(&mut ast, offsets[i])?;
         asts.push(ast);
     }
-    let ast = crate::namespace::link(
+    let raw = asts.clone();
+    let ast = crate::namespace::link_with_core(
         asts,
         &sources.iter().map(|s| s.path.clone()).collect::<Vec<_>>(),
         entry,
+        policy,
+        core,
+        core_archive.base,
     )?;
+    let authorization = ast.native.import_policy.clone();
     let mut program = crate::compiler::compile_ast(&source, ast, options, deferred)?;
-    program.source_modules = source_ranges(sources).into_boxed_slice();
+    let mut ranges: Vec<_> = sources
+        .iter()
+        .zip(offsets)
+        .map(|(module, offset)| SourceRange {
+            path: Some(module.path.clone().into()),
+            span: Span::new(offset, offset + module.source.len() as u32),
+        })
+        .collect();
+    ranges.extend(core_archive.ranges.into_iter().map(|range| SourceRange {
+        path: Some(range.path),
+        span: range.span,
+    }));
+    let mut plan = crate::dynamic_modules::CompilePlan::new(
+        crate::dynamic_modules::CompileSources {
+            asts: raw,
+            paths: sources.iter().map(|s| s.path.clone()).collect(),
+            entry,
+            archive: source,
+            ranges: ranges.clone(),
+            core_base: core_archive.base,
+        },
+        options,
+        policy,
+        core,
+    );
+    plan.authorization = authorization;
+    program.dynamic_plan = Some(std::sync::Arc::new(plan));
+    program.source_modules = ranges.into_boxed_slice();
     Ok(program)
 }
 pub fn compile_path(
@@ -229,87 +212,27 @@ pub fn compile_path(
     options: CompileOptions,
     deferred: bool,
 ) -> Result<crate::ir::Program, Diagnostic> {
-    let sources = load_path(path)?;
-    compile_modules(sources.len() - 1, &sources, options, deferred)
+    let loader = crate::module_loader::ModuleLoader::for_entry(path)
+        .map_err(crate::module_loader::module_load_diagnostic)?;
+    let sources = loader
+        .load(path)
+        .map_err(crate::module_loader::module_load_diagnostic)?;
+    Ok(compile_modules(sources.len() - 1, &sources, options, deferred)?.with_module_loader(loader))
 }
-pub fn source_archive(sources: &[SourceModule]) -> String {
+fn user_source_archive(sources: &[SourceModule]) -> String {
     sources
         .iter()
         .map(|m| format!("// module: {}\n{}\n", m.path, m.source))
         .collect()
 }
 pub fn load_path(path: &Path) -> Result<Vec<SourceModule>, Diagnostic> {
-    fn declarations(
-        dir: &Path,
-        modules: &[ModuleDeclaration],
-        out: &mut Vec<SourceModule>,
-        active: &mut std::collections::HashSet<std::path::PathBuf>,
-    ) -> Result<(), Diagnostic> {
-        for module in modules {
-            let child_dir = dir.join(module.name.as_ref());
-            if let Some(body) = &module.body {
-                declarations(&child_dir, &body.modules, out, active)?;
-                continue;
-            }
-            let candidates = [
-                dir.join(format!("{}.ya", module.name)),
-                child_dir.join("mod.ya"),
-            ];
-            let files: Vec<_> = candidates.iter().filter(|p| p.is_file()).collect();
-            if files.len() != 1 {
-                return Err(Diagnostic::new(
-                    "E140",
-                    format!("expected exactly one source for module {}", module.name),
-                    module.span,
-                ));
-            }
-            let file = files[0];
-            if std::fs::symlink_metadata(file)
-                .map_err(|e| Diagnostic::new("E140", e.to_string(), module.span))?
-                .file_type()
-                .is_symlink()
-            {
-                return Err(Diagnostic::new(
-                    "E140",
-                    "module sources cannot be symlinks",
-                    module.span,
-                ));
-            }
-            load(file, &child_dir, out, active)?;
-        }
-        Ok(())
-    }
-    fn load(
-        path: &Path,
-        dir: &Path,
-        out: &mut Vec<SourceModule>,
-        active: &mut std::collections::HashSet<std::path::PathBuf>,
-    ) -> Result<(), Diagnostic> {
-        let canonical = std::fs::canonicalize(path)
-            .map_err(|e| Diagnostic::new("E140", e.to_string(), Span::default()))?;
-        if !active.insert(canonical.clone()) {
-            return Err(Diagnostic::new(
-                "E140",
-                "cyclic module source",
-                Span::default(),
-            ));
-        }
-        let text = std::fs::read_to_string(&canonical)
-            .map_err(|e| Diagnostic::new("E140", e.to_string(), Span::default()))?;
-        let ast = cyallo_parser::parse_modern(&text, false)?;
-        declarations(dir, &ast.modules, out, active)?;
-        active.remove(&canonical);
-        out.push(SourceModule::new(canonical.display().to_string(), text));
-        Ok(())
-    }
-    let entry = std::fs::canonicalize(path)
-        .map_err(|e| Diagnostic::new("E140", e.to_string(), Span::default()))?;
-    let mut sources = Vec::new();
-    load(
-        &entry,
-        entry.parent().unwrap_or(Path::new(".")),
-        &mut sources,
-        &mut std::collections::HashSet::new(),
-    )?;
-    Ok(sources)
+    crate::module_loader::load_path(path)
+}
+
+pub fn source_archive(sources: &[SourceModule]) -> String {
+    let mut archive = user_source_archive(sources);
+    // Compilation reports layout failures through the checked package API;
+    // diagnostics can still render the user archive if its suffix cannot fit.
+    let _ = cyallo_ir::core_package::CorePackage::embedded().append_to(&mut archive);
+    archive
 }

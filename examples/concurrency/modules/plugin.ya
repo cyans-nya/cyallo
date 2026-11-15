@@ -1,0 +1,7 @@
+// Each importing coroutine owns its module values.
+pub const VALUE = 21
+pub proc answer() -> i64 {
+    let clock = std::time::clock()
+    clock.sleep(1)
+    return VALUE
+}

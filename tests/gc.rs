@@ -106,7 +106,7 @@ fn aliases_and_sparse_nested_values_survive_every_allocation() {
     let p = Arc::new(
         compile(
             r#"
-proc change(a: &mut i64) { let b = a; let temp = [1,2,3]; *a += temp[0]; *b += 2 }
+proc change(a: &mut i64) { let b = a; let temp = [1,2,3]; a.* += temp[0]; b.* += 2 }
 proc compute() -> i64 {
     let mut n = 0
     for i in 1..=20 { change(&mut n) }
@@ -317,7 +317,7 @@ fn cell_limit_collects_before_failing_and_keeps_failed_locals_inspectable() {
 fn metadata_distinguishes_integer_values_from_integer_locations() {
     use cyallo::{gc_metadata::ReferenceKind, ir::Op};
     let p = cyallo::compile_for_execution(
-        "let mut a = std::collections::Vec::from(0..0)\nproc work(n: &mut i64) { *n += 1 }\na[10] = 7\nwork(&mut a[10])\n",
+        "let mut a = std::collections::Vec::from(0..0)\nproc work(n: &mut i64) { n.* += 1 }\na[10] = 7\nwork(&mut a[10])\n",
         Default::default(),
     )
     .unwrap();

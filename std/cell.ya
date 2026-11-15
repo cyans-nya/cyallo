@@ -1,0 +1,9 @@
+#[cyallo_internal("cell_struct")]
+pub record Cell<T> {}
+
+impl<T> Cell<T> {
+    #[cyallo_internal("cell_new")]
+    pub proc new(value: T) -> Cell<T>;
+    #[cyallo_internal("cell_replace")]
+    pub proc replace(self: &Self, value: T) -> T;
+}

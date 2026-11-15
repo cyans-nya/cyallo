@@ -540,7 +540,9 @@ impl Collector {
                             value,
                         )) => owners(value, pending),
                         Value::SendError(error) => owners(&error.value, pending),
-                        Value::ArraySnapshot(values) | Value::Function(_, values) => {
+                        Value::ObjectStorage { slots: values, .. }
+                        | Value::ArraySnapshot(values)
+                        | Value::Function(_, values) => {
                             for value in values {
                                 owners(value, pending);
                             }
@@ -557,6 +559,7 @@ impl Collector {
                         | Value::Cell(value)
                         | Value::Optional(Some(value))
                         | Value::Result(Ok(value) | Err(value))
+                        | Value::Dynamic(_, value)
                         | Value::Erased(_, value)
                         | Value::StoragePath(value, _) => owners(value, pending),
                         _ => {}
@@ -590,7 +593,9 @@ fn trace(
         // Task results and failed sends retain values that may hold heap cells.
         Value::TaskOutcome(cyallo_concurrent_values::TaskOutcome::Completed(v)) => trace(v, visit)?,
         Value::SendError(error) => trace(&error.value, visit)?,
-        Value::Managed(id) | Value::Address(id) | Value::TraitObject(id, _) => visit(*id)?,
+        Value::Object(id) | Value::Managed(id) | Value::Address(id) | Value::TraitObject(id, _) => {
+            visit(*id)?
+        }
         Value::Slice { owner, .. } => visit(*owner)?,
         Value::GeneratorStep(
             cyallo_values::GeneratorStep::Yielded(v) | cyallo_values::GeneratorStep::Complete(v),
@@ -598,6 +603,7 @@ fn trace(
         | Value::Cell(v)
         | Value::Optional(Some(v))
         | Value::Result(Ok(v) | Err(v))
+        | Value::Dynamic(_, v)
         | Value::Erased(_, v)
         | Value::StoragePath(v, _) => trace(v, visit)?,
         Value::Array(ids) => {
@@ -615,7 +621,9 @@ fn trace(
                 visit(id)?
             }
         }
-        Value::ArraySnapshot(values) | Value::Function(_, values) => {
+        Value::ObjectStorage { slots: values, .. }
+        | Value::ArraySnapshot(values)
+        | Value::Function(_, values) => {
             for value in values {
                 trace(value, visit)?
             }
@@ -635,7 +643,9 @@ fn relocate(value: &mut Value, rewrite: &impl Fn(&mut usize)) {
             relocate(v, rewrite)
         }
         Value::SendError(error) => relocate(&mut error.value, rewrite),
-        Value::Managed(id) | Value::Address(id) | Value::TraitObject(id, _) => rewrite(id),
+        Value::Object(id) | Value::Managed(id) | Value::Address(id) | Value::TraitObject(id, _) => {
+            rewrite(id)
+        }
         Value::Slice { owner, .. } => rewrite(owner),
         Value::GeneratorStep(
             cyallo_values::GeneratorStep::Yielded(v) | cyallo_values::GeneratorStep::Complete(v),
@@ -643,6 +653,7 @@ fn relocate(value: &mut Value, rewrite: &impl Fn(&mut usize)) {
         | Value::Cell(v)
         | Value::Optional(Some(v))
         | Value::Result(Ok(v) | Err(v))
+        | Value::Dynamic(_, v)
         | Value::Erased(_, v)
         | Value::StoragePath(v, _) => relocate(v, rewrite),
         Value::Array(ids) => {
@@ -660,7 +671,9 @@ fn relocate(value: &mut Value, rewrite: &impl Fn(&mut usize)) {
                 rewrite(id)
             }
         }
-        Value::ArraySnapshot(values) | Value::Function(_, values) => {
+        Value::ObjectStorage { slots: values, .. }
+        | Value::ArraySnapshot(values)
+        | Value::Function(_, values) => {
             for value in values {
                 relocate(value, rewrite)
             }
@@ -968,10 +981,10 @@ mod tests {
                 r#"
 let mut saved = std::collections::Vec::from(0..0)
 proc work(n: &mut i64) {
-    let incremented = *n + 1
-    let a = [*n, incremented]
+    let incremented = n.* + 1
+    let a = [n.*, incremented]
     saved.push(a[0])
-    *n = incremented
+    n.* = incremented
 }
 let mut n = 0
 for i in 0..=4 { work(&mut n) }

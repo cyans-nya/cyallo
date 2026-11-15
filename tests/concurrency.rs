@@ -1,0 +1,196 @@
+use cyallo::backend::{
+    CraneliftBackend, CraneliftSpeedBackend, Executable, NativeBackend, Tier, TieredBackend,
+};
+use cyallo::{CompileOptions, Context, Session, Status, compile, compile_for_execution};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+fn parity(source: &str, expected: &str) {
+    for deferred in [false, true] {
+        let program = Arc::new(
+            if deferred {
+                compile_for_execution(source, CompileOptions::default())
+            } else {
+                compile(source)
+            }
+            .unwrap(),
+        );
+        let winch = TieredBackend::default().compile(program.clone()).unwrap();
+        for function in 0..program.functions().len() {
+            winch.precompile(function, Tier::Winch).unwrap();
+        }
+        assert!(winch.wait_for_compilation(Duration::from_secs(30)));
+        let engines: Vec<Option<Box<dyn Executable>>> = vec![
+            None,
+            Some(Box::new(winch)),
+            Some(Box::new(CraneliftBackend.compile(program.clone()).unwrap())),
+            Some(Box::new(
+                CraneliftSpeedBackend.compile(program.clone()).unwrap(),
+            )),
+        ];
+        for (engine_index, engine) in engines.into_iter().enumerate() {
+            let context = Context {
+                gc: cyallo::runtime::gc::GcConfig::stress(),
+                concurrency: cyallo_scheduler::Config {
+                    processors: 1,
+                    quantum: 7,
+                    blocking_threads: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut session = Session::with_context(program.clone(), context).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            for step in 0..100_000 {
+                match &engine {
+                    Some(engine) if step % 3 != 0 => engine.run(&mut session, 1).unwrap(),
+                    _ => {
+                        session.run(1);
+                    }
+                }
+                if session.status() == &Status::Waiting {
+                    session.wait_for_wakeup(Duration::from_millis(5));
+                } else if session.status() != &Status::Paused {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out: deferred={deferred}, engine={engine_index}, output={:?}",
+                    session.context.output
+                );
+            }
+            assert_eq!(
+                session.status(),
+                &Status::Finished,
+                "deferred={deferred}, engine={engine_index}, output={:?}",
+                session.context.output
+            );
+            assert_eq!(
+                session.context.output, expected,
+                "deferred={deferred}, engine={engine_index}"
+            );
+            if let Some(stats) = session.scheduler_stats() {
+                assert_eq!(stats.processors, 1);
+                assert_eq!(stats.peak_running, 1);
+            }
+        }
+    }
+}
+#[test]
+fn buffered_channels_keep_typed_errors_and_unsent_values() {
+    parity(
+        include_str!("../examples/concurrency/channels/buffered.ya"),
+        "true\n42\ntrue\n99\n",
+    );
+}
+#[test]
+fn rendezvous_and_task_join_park_on_one_processor() {
+    parity(
+        include_str!("../examples/concurrency/channels/rendezvous.ya"),
+        "42\n7\n",
+    );
+}
+#[test]
+fn clock_waits_resume_through_every_engine() {
+    parity(
+        include_str!("../examples/concurrency/scheduling/clock.ya"),
+        "before\nafter\n",
+    );
+}
+#[test]
+fn runtime_failures_and_returned_errors_are_distinct() {
+    parity(
+        r#"
+        use std::task::spawn
+        use std::io::print
+        let failed = spawn(proc() -> i64 { let zero = 0; return 1 / zero })
+        print(failed.join().is_failed())
+        let ordinary = spawn(proc() -> Result<i64, string> { return std::result::err<i64, string>("ordinary") })
+        print(ordinary.join().completed().unwrap_err())
+    "#,
+        "true\nordinary\n",
+    );
+}
+#[test]
+fn channels_reject_local_elements_and_tasks_reject_local_captures() {
+    for source in [
+        "let bad = std::channel::unbounded<gc i64>()",
+        "let bad = std::channel::unbounded<&i64>()",
+        "let n = gc 1; let bad = std::task::spawn(proc() -> i64 { return n.* })",
+        "let n = 1; let bad = std::task::spawn(proc[&n]() -> i64 { return n })",
+        "proc forward(work: proc() -> i64) { let bad = std::task::spawn(work) }",
+        "let bad = std::task::spawn(proc() -> gc i64 { return gc 1 })",
+        "fn bad() { let c = std::time::clock() }",
+    ] {
+        assert!(compile(source).is_err(), "accepted {source}");
+    }
+}
+#[test]
+fn multiple_producers_and_consumers_share_a_bounded_channel() {
+    parity(
+        r#"
+        use std::task::spawn
+        use std::io::print
+        let endpoints = std::channel::bounded<i64>(1 as usize)
+        let first_sender = endpoints.0.clone()
+        let second_sender = endpoints.0.clone()
+        let first_receiver = endpoints.1.clone()
+        let second_receiver = endpoints.1.clone()
+        let first = spawn(proc() { for i in 1..=3 { first_sender.send(i).unwrap() } })
+        let second = spawn(proc() { for i in 4..=6 { second_sender.send(i).unwrap() } })
+        let left = spawn(proc() -> i64 { let mut total = 0; for i in 0..3 { total += first_receiver.recv().unwrap() }; return total })
+        let right = spawn(proc() -> i64 { let mut total = 0; for i in 0..3 { total += second_receiver.recv().unwrap() }; return total })
+        first.join().completed()
+        second.join().completed()
+        print(left.join().completed() + right.join().completed())
+    "#,
+        "21\n",
+    );
+}
+#[test]
+fn cancellation_releases_the_last_receiver_and_preserves_unsent_values() {
+    parity(
+        r#"
+        use std::task::spawn
+        use std::io::print
+        let endpoints = std::channel::bounded<i64>(0 as usize)
+        let sender = endpoints.0.clone()
+        let receiver = endpoints.1.clone()
+        std::mem::drop(endpoints)
+        let worker = spawn(proc() -> i64 { return receiver.recv().unwrap() })
+        worker.cancel()
+        print(worker.join().is_cancelled())
+        print(sender.is_closed())
+        print(sender.send(99).unwrap_err().into_value())
+    "#,
+        "true\ntrue\n99\n",
+    );
+}
+#[test]
+fn owned_aggregates_cross_sessions_without_local_cell_ids() {
+    parity(
+        r#"
+        let values = [10, 20, 30]
+        let worker = std::task::spawn(proc() -> [3]i64 { return values })
+        let result = worker.join().completed()
+        std::io::print(result[0] + result[1] + result[2])
+    "#,
+        "60\n",
+    );
+}
+#[test]
+fn declaration_aliases_and_user_spellings_keep_their_identity() {
+    parity(
+        r#"
+        use std::task::spawn as launch
+        proc spawn() -> i64 { return 99 }
+        let work = proc() -> i64 { return 42 }
+        let task = launch(work)
+        std::io::print(task.join().completed())
+        std::io::print(spawn())
+    "#,
+        "42\n99\n",
+    );
+}

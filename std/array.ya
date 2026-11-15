@@ -1,0 +1,34 @@
+use std::num::{Numeric, Integer};
+use std::collections::{Collection, NumericCollection};
+
+#[cyallo_internal("range_struct")]
+pub record Range<T> {}
+
+// These type families retain their declaration identity until call checking.
+#[cyallo_internal("range_array_type")]
+pub record RangeArray<RangeValue> {}
+#[cyallo_internal("empty_array_type")]
+pub record EmptyArray<T> {}
+
+#[cyallo_internal("array_empty")]
+pub fn empty<T>() -> EmptyArray<T>;
+#[cyallo_internal("array_from")]
+pub fn from<T: Integer>(read range: Range<T>) -> RangeArray<range>;
+#[cyallo_internal("array_length")]
+pub fn len<T, C: Collection<T>>(read values: C) -> i64;
+#[cyallo_internal("array_sum")]
+pub fn sum<T: Numeric, C: NumericCollection<T>>(read values: C) -> T;
+
+impl<T> Range<T> {
+    #[cyallo_internal("range_reverse")]
+    pub fn rev(read self) -> Self;
+}
+
+impl<T> []T {
+    #[cyallo_internal("collection_length")]
+    pub fn len(self: &Self) -> usize;
+    #[cyallo_internal("slice")]
+    pub fn as_slice(self: &Self) -> &[]T;
+    #[cyallo_internal("mutable_slice")]
+    pub fn as_mut_slice(self: &mut Self) -> &mut []T;
+}

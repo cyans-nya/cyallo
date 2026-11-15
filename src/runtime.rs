@@ -1,18 +1,23 @@
 //! Safe storage, checked operations, and resumable interpreter state.
 use cyallo_ast::IdentifierEq as _;
 use cyallo_ast::Operator;
+mod concurrent;
+pub(crate) mod dynamic;
 mod error;
 pub mod gc;
 mod generator;
 mod lookup;
 mod memory;
+mod modules;
 pub(crate) mod native;
 pub(crate) mod services;
 mod utilities;
 use crate::ir::{LocalStorage, Op, Program, Reg, TextStyle};
 use crate::metrics::{ExecutionEngine, ExecutionReport, FrameMetrics};
+pub use concurrent::ConcurrencyError;
 use cyallo_ast::{Diagnostic, Span, Type};
 pub use cyallo_values::Value;
+pub use dynamic::{ObjectIcMode, ObjectStats};
 use error::expected;
 pub use error::{
     AllocatorError, ArithmeticError, BoundsError, EngineError, GcError, GeneratorError,
@@ -35,6 +40,7 @@ pub struct Context {
     pub max_frames: usize,
     /// Captured when the Session is constructed; later edits do not reconfigure GC.
     pub gc: gc::GcConfig,
+    pub concurrency: cyallo_scheduler::Config,
 }
 impl Default for Context {
     fn default() -> Self {
@@ -45,6 +51,7 @@ impl Default for Context {
             max_cells: 1_000_000,
             max_frames: 1024,
             gc: gc::GcConfig::default(),
+            concurrency: cyallo_scheduler::Config::default(),
         }
     }
 }
@@ -52,6 +59,7 @@ impl Default for Context {
 pub enum Status {
     Paused,
     WaitingForInput,
+    Waiting,
     Finished,
     Failed(RuntimeFailure),
 }
@@ -66,6 +74,7 @@ struct Cell {
 }
 #[derive(Debug)]
 pub(crate) struct Frame {
+    namespace: Option<usize>,
     generator: Option<usize>,
     memory_finalizer: Option<usize>,
     service_scope: Option<usize>,
@@ -85,6 +94,13 @@ pub(crate) struct Frame {
     return_to: Option<Reg>,
 }
 pub struct Session {
+    objects: dynamic::Objects,
+    module_namespaces: std::collections::HashMap<usize, modules::CachedNamespace>,
+    concurrency: Option<concurrent::State>,
+    execution_depth: usize,
+    entry_lifetime: concurrent::EntryLifetime,
+    execution_permit: Option<cyallo_scheduler::ExecutionPermit>,
+    final_value: Option<Value>,
     generators: generator::Generators,
     memory: memory::Memory,
     lookups: lookup::Lookups,
@@ -97,6 +113,8 @@ pub struct Session {
     global_roots: Option<gc::RootScope>,
     heap: gc::Arena<Cell>,
     globals: gc::Slots<usize>,
+    initialized_modules: std::collections::HashSet<usize>,
+    worker_globals: Option<usize>,
     status: Status,
     initial_context: Context,
     instructions: u64,
@@ -131,6 +149,13 @@ impl Session {
         context.gc.enabled |= program.requires_tracing;
         let function_count = program.functions.len();
         let mut s = Self {
+            objects: Default::default(),
+            module_namespaces: Default::default(),
+            concurrency: None,
+            execution_depth: 0,
+            entry_lifetime: Default::default(),
+            execution_permit: None,
+            final_value: None,
             generators: Default::default(),
             memory: memory::Memory::default(),
             lookups: lookup::Lookups::default(),
@@ -145,6 +170,8 @@ impl Session {
             heap: gc::Arena::default(),
             global_roots: None,
             globals: vec![].into(),
+            initialized_modules: Default::default(),
+            worker_globals: None,
             status: Status::Paused,
             instructions: 0,
             constant_memory: None,
@@ -306,10 +333,15 @@ impl Session {
             .locals
             .iter()
             .zip(self.program.functions[f.function].local_storage.iter())
-            .filter_map(|(local, storage)| {
+            .enumerate()
+            .filter_map(|(local_index, (local, storage))| {
                 let name = local.display_name.as_ref()?;
                 let value = match *storage {
-                    LocalStorage::Cell(index) => self.inspect(f.locals[index]),
+                    LocalStorage::Cell(index) => self.inspect(if f.function == 0 {
+                        self.globals[local_index]
+                    } else {
+                        f.locals[index]
+                    }),
                     LocalStorage::Register(register) => f.registers[register].to_string(),
                 };
                 Some((name.to_string(), value))
@@ -357,9 +389,19 @@ impl Session {
     /// Replace code between REPL entries, preserving storage by name rather than slot number.
     pub(crate) fn continue_with(
         &mut self,
-        program: Arc<Program>,
+        mut program: Arc<Program>,
         offset: u32,
     ) -> Result<(), Diagnostic> {
+        if let Some(plan) = &self.program.dynamic_plan {
+            let requests = plan.call_requests();
+            if !requests.is_empty() {
+                program = crate::dynamic_modules::specialize_calls(program, requests)
+                    .map_err(|error| {
+                        RuntimeFailure::new(error.into(), Span::new(offset, offset)).diagnostic()
+                    })?
+                    .program;
+            }
+        }
         if program.requires_tracing && !self.gc_config.enabled {
             self.gc_config.enabled = true;
             self.context.gc.enabled = true;
@@ -437,6 +479,7 @@ impl Session {
             .unwrap_or(main.code.len() - 1);
         let registers = vec![Value::Uninitialized; main.registers.len()];
         self.frames = vec![Frame {
+            namespace: None,
             generator: None,
             memory_finalizer: None,
             service_scope: None,
@@ -487,6 +530,7 @@ impl Session {
                     .expect("accepted declarations persist")
             })
             .collect();
+        self.objects.relink(&remap);
         let key_remap: Vec<_> = self
             .program
             .services
@@ -620,11 +664,21 @@ impl Session {
     }
     /// Execute one IR instruction. Waiting input does not advance the program counter.
     pub fn step(&mut self) -> bool {
+        self.enter_execution();
+        let result = self.step_inner();
+        self.leave_execution();
+        result
+    }
+    fn step_inner(&mut self) -> bool {
+        if !self.poll_concurrent() {
+            return false;
+        }
         match self.status {
             Status::Finished | Status::Failed(_) => return false,
             Status::WaitingForInput if self.context.input.is_empty() => return false,
             Status::WaitingForInput => self.status = Status::Paused,
             Status::Paused => {}
+            Status::Waiting => return false,
         }
         // The failing instruction's span is only looked up if it fails.
         let at = self.frames.last().map(|f| (f.function, f.pc));
@@ -646,7 +700,7 @@ impl Session {
         }
         !matches!(
             self.status,
-            Status::Finished | Status::Failed(_) | Status::WaitingForInput
+            Status::Finished | Status::Failed(_) | Status::WaitingForInput | Status::Waiting
         )
     }
     pub(crate) fn fail(&mut self, error: impl Into<RuntimeError>, span: Span) {
@@ -924,6 +978,7 @@ impl Session {
             }
         };
         let mut frame = Frame {
+            namespace: None,
             generator: None,
             memory_finalizer: None,
             service_scope: None,
@@ -1173,6 +1228,9 @@ impl Session {
         self.check_constant_allocation(&op)?;
         self.frames.last_mut().unwrap().pc += 1;
         match &*op {
+            &Op::Dynamic(result, ref operation, ref arguments) => {
+                self.execute_dynamic(result, operation, arguments)?
+            }
             &Op::Yield(input, value) => self.yield_generator(input, value)?,
             &Op::Frozen(r, ref value) => self.set(r, Value::from(value.as_ref())),
             &Op::Lookup(r, operation, ref args) => self.execute_lookup(r, operation, args)?,
@@ -1280,6 +1338,9 @@ impl Session {
             &Op::Literal(r, ref l) => self.set(r, l.clone().into()),
             &Op::LiteralString(r, ref text) => self.set(r, Value::String(text.clone())),
             &Op::Address(r, s) => {
+                if s.global && self.worker_globals.is_some_and(|count| s.index < count) {
+                    return Err(ConcurrencyError::GlobalAccess.into());
+                }
                 let id = if s.global {
                     self.globals[s.index]
                 } else {
@@ -1494,6 +1555,16 @@ impl Session {
                 }
                 let mut frame = self.frames.pop().unwrap();
                 let function = frame.function;
+                let namespace = frame.namespace;
+                if let Some(key) = namespace
+                    && let Some(root) = returned_value
+                    && let Value::Result(Ok(value)) = returned.value_copy(root)
+                {
+                    let scope = self.root_scope();
+                    let value = scope.value(*value);
+                    self.module_namespaces
+                        .insert(key, modules::CachedNamespace { scope, value });
+                }
                 let return_to = frame.return_to;
                 let service_lease = frame.service_lease;
                 let memory_finalizer = frame.memory_finalizer;
@@ -1501,11 +1572,25 @@ impl Session {
                 let result = self.program.functions[function].result.clone();
                 drop(frame);
                 if self.frames.is_empty() {
+                    self.final_value = returned_value.map(|root| returned.value_copy(root));
                     self.status = Status::Finished;
                 } else if let Some(r) = return_to {
+                    let caller = self.frames.last().unwrap();
+                    let destination_type = &self.program.functions[caller.function].registers[r];
+                    let unit = result == Type::Void
+                        && (matches!(destination_type, Type::Dynamic)
+                            || matches!(destination_type,Type::Tuple(items) if items.is_empty()));
                     let mut value = returned_value
                         .map(|root| returned.value_copy(root))
+                        .or_else(|| unit.then(|| Value::ArraySnapshot(vec![])))
                         .ok_or(Invariant::MissingReturnValue)?;
+                    if *destination_type == Type::Dynamic && result != Type::Dynamic {
+                        if !cyallo_ir::dynamic::owned(&result) {
+                            return Err(cyallo_shapes::DynamicError::BorrowedValue.into());
+                        }
+                        self.validate_dynamic_owner(&value)?;
+                        value = Value::Dynamic(result.clone(), Box::new(value));
+                    }
                     if lookup_return.is_none()
                         && result == Type::Real
                         && let Value::Integer(n) = value
@@ -1552,8 +1637,7 @@ impl Session {
                         (_, value) => value.to_string(),
                     })
                     .collect::<String>();
-                self.context.output.push_str(&text);
-                self.context.output.push('\n');
+                self.concurrent_output(&text);
             }
             &Op::Input(r, ref ty) | &Op::FrameInput(r, ref ty) => {
                 if let Some(line) = self.context.input.pop_front() {
@@ -1621,6 +1705,7 @@ fn remap_functions(value: &mut Value, remap: &[usize]) {
             cyallo_values::GeneratorStep::Yielded(v) | cyallo_values::GeneratorStep::Complete(v),
         )
         | Value::Optional(Some(v))
+        | Value::Dynamic(_, v)
         | Value::Erased(_, v)
         | Value::StoragePath(v, _) => remap_functions(v, remap),
         Value::Function(id, captures) => {
@@ -1648,6 +1733,7 @@ fn remap_service_keys(value: &mut Value, remap: &[usize]) {
             cyallo_values::GeneratorStep::Yielded(v) | cyallo_values::GeneratorStep::Complete(v),
         )
         | Value::Optional(Some(v))
+        | Value::Dynamic(_, v)
         | Value::Erased(_, v)
         | Value::StoragePath(v, _) => remap_service_keys(v, remap),
         Value::ServiceKey(key) | Value::ServiceRef(_, key) => *key = remap[*key],

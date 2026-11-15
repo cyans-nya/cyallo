@@ -166,7 +166,7 @@ errors/source locations, and resumed execution. Extend existing integration
 fixtures rather than duplicating shallow tests of policy calculations.
 
 For performance, rebuild the same revision with identical build settings, then
-measure cold CLI runs and warm fixed-tier sessions without `--jit-report`.
+measure cold CLI runs and warm fixed-tier sessions without `--jit-trace=summary`.
 Use at least 40 cold samples after warmup and rotate warm engine order. Record
 median/p95 latency, isolated compilation, and code size. Use reporting in
 separate runs to explain boundaries and promotion events.

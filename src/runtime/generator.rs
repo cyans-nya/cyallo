@@ -6,6 +6,13 @@ use crate::{
     metrics::FrameMetrics,
 };
 
+/// How a call enters a generator.
+pub(super) enum Advance {
+    Start,
+    Resume(Value),
+    Next,
+}
+#[derive(Clone, Copy)]
 enum State {
     New,
     Suspended(Reg),
@@ -47,6 +54,7 @@ impl Activation {
     fn restore(self, id: usize, result: Reg) -> Frame {
         let native_registers = self.registers.iter().map(NativeSlot::from_value).collect();
         Frame {
+            namespace: None,
             generator: Some(id),
             roots: self.roots,
             function: self.function,
@@ -68,7 +76,6 @@ impl Activation {
 struct Generator {
     state: State,
     activation: Option<Activation>,
-    unit_input: bool,
 }
 pub(super) struct Generators {
     next: usize,
@@ -83,6 +90,88 @@ impl Default for Generators {
     }
 }
 impl Session {
+    pub(super) fn generator_owned_values(
+        &self,
+        id: usize,
+    ) -> Result<Vec<&Value>, cyallo_shapes::DynamicError> {
+        let mut values = vec![];
+        if let Some(activation) = self
+            .generators
+            .entries
+            .get(&id)
+            .and_then(|entry| entry.activation.as_ref())
+        {
+            if self.program.functions[activation.function]
+                .params
+                .iter()
+                .any(|borrowed| *borrowed)
+            {
+                return Err(cyallo_shapes::DynamicError::BorrowedValue);
+            }
+            let function = &self.program.functions[activation.function];
+            let mut live = vec![];
+            function.resume.live_at(function, activation.pc, &mut live);
+            values.extend(
+                activation
+                    .registers
+                    .iter()
+                    .enumerate()
+                    .filter(|(r, _)| {
+                        live.get(r / 64)
+                            .is_some_and(|bits| bits & (1 << (r % 64)) != 0)
+                            && function.gc.registers[*r]
+                                == cyallo_ir::gc_metadata::ReferenceKind::OwnedValue
+                    })
+                    .map(|(_, value)| value),
+            );
+            values.extend(activation.locals.iter().map(|cell| &self.heap[*cell].value));
+        }
+        for frame in self
+            .frames
+            .iter()
+            .filter(|frame| frame.generator == Some(id))
+        {
+            if self.program.functions[frame.function]
+                .params
+                .iter()
+                .any(|borrowed| *borrowed)
+            {
+                return Err(cyallo_shapes::DynamicError::BorrowedValue);
+            }
+            let function = &self.program.functions[frame.function];
+            let mut live = vec![];
+            function.resume.live_at(function, frame.pc, &mut live);
+            values.extend(
+                frame
+                    .registers
+                    .iter()
+                    .enumerate()
+                    .filter(|(r, _)| {
+                        live.get(r / 64)
+                            .is_some_and(|bits| bits & (1 << (r % 64)) != 0)
+                            && function.gc.registers[*r]
+                                == cyallo_ir::gc_metadata::ReferenceKind::OwnedValue
+                    })
+                    .map(|(_, value)| value),
+            );
+            values.extend(frame.locals.iter().map(|cell| &self.heap[*cell].value));
+        }
+        Ok(values)
+    }
+    pub(super) fn prepare_generator_unwind(&mut self) {
+        for generator in self.generators.entries.values_mut() {
+            if matches!(generator.state, State::Running) {
+                generator.state = State::Closed;
+            }
+        }
+    }
+    pub(super) fn close_remaining_generators(&mut self) -> RunResult<()> {
+        let ids: Vec<_> = self.generators.entries.keys().copied().collect();
+        for id in ids {
+            self.close_generator(id)?;
+        }
+        Ok(())
+    }
     pub(super) fn construct_generator(
         &mut self,
         function: usize,
@@ -92,9 +181,6 @@ impl Session {
         if self.generators.entries.len() >= self.context.max_cells {
             return Err(GeneratorError::LimitExceeded.into());
         }
-        let ty = self.program.functions[function].generator.as_ref().unwrap();
-        let (_, input, _) = cyallo_ir::generator::parts(ty).unwrap();
-        let unit_input = cyallo_ir::generator::unit(input);
         self.push_frame(function, args, None)?;
         let activation = Activation::save(self.frames.pop().unwrap());
         let id = self.generators.next;
@@ -104,7 +190,6 @@ impl Session {
             Generator {
                 state: State::New,
                 activation: Some(activation),
-                unit_input,
             },
         );
         self.publish_generator_roots();
@@ -122,10 +207,12 @@ impl Session {
             _ => Err(expected(ValueKind::Generator)),
         }
     }
-    pub(super) fn resume_generator(
+    /// Runs a generator until it yields or completes. `start()` requires a new
+    /// generator and `resume(…)` a suspended one; `next()` accepts either.
+    pub(super) fn advance_generator(
         &mut self,
         id: usize,
-        input: Option<Value>,
+        advance: Advance,
         result: Reg,
     ) -> RunResult<()> {
         if self.frames.len() >= self.context.max_frames {
@@ -136,22 +223,25 @@ impl Session {
             .entries
             .get_mut(&id)
             .ok_or(GeneratorError::Finished)?;
-        match generator.state {
-            State::New if input.is_some() => return Err(GeneratorError::StartWithArgument.into()),
-            State::Running => return Err(GeneratorError::AlreadyRunning.into()),
-            State::Complete | State::Closed => return Err(GeneratorError::Finished.into()),
-            State::Suspended(_) if input.is_none() && !generator.unit_input => {
-                return Err(GeneratorError::MissingResumeValue.into());
+        let input = match (generator.state, advance) {
+            (State::Running, _) => return Err(GeneratorError::AlreadyRunning.into()),
+            (State::Complete | State::Closed, _) => return Err(GeneratorError::Finished.into()),
+            (State::New, Advance::Resume(_)) => return Err(GeneratorError::NotStarted.into()),
+            (State::Suspended(_), Advance::Start) => {
+                return Err(GeneratorError::AlreadyStarted.into());
             }
-            _ => {}
-        }
+            (State::New, Advance::Start | Advance::Next) => None,
+            (State::Suspended(destination), Advance::Resume(value)) => Some((destination, value)),
+            (State::Suspended(destination), Advance::Next) => {
+                Some((destination, Value::ArraySnapshot(vec![])))
+            }
+        };
         let mut activation = generator
             .activation
             .take()
             .ok_or(Invariant::MissingContinuation)?;
-        if let State::Suspended(destination) = generator.state {
-            activation.registers[destination] =
-                input.unwrap_or_else(|| Value::ArraySnapshot(vec![]));
+        if let Some((destination, value)) = input {
+            activation.registers[destination] = value;
         }
         generator.state = State::Running;
         self.frames.push(activation.restore(id, result));

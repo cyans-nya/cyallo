@@ -2,7 +2,7 @@ use crate::registry::{Key, Directory, ServiceHandle, service, acquire}
 
 pub trait Logger { proc info(self: &Self, message: string) }
 pub const LOGGER = Key<dyn Logger> { id: "lookup.logging.logger" }
-pub property @gc Directory.logger: ServiceHandle<dyn Logger> {
+pub property gc Directory.logger: ServiceHandle<dyn Logger> {
     proc get() { return service(self, LOGGER) }
 }
 impl Logger for ServiceHandle<dyn Logger> {

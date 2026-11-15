@@ -43,7 +43,7 @@ registered owners and then repeatedly collects; slot storage uses `Rc` plus
 `UnsafeCell` so owner moves cannot invalidate published root pointers.
 
 `examples/gc-cells.ya` exercises more than the default million-cell cumulative
-allocation limit. An ARM64 Cranelift speed run with `--gc --jit-report` finished
+allocation limit. An ARM64 Cranelift speed run with `--gc --jit-trace=summary` finished
 with output `40000400001:200000`. Frame slots reduced cell allocations from
 1,400,074 to 1,200,073 and collections from 341 to 292. The run peaked at 4,168
 occupied cells.

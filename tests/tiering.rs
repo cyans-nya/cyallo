@@ -329,7 +329,7 @@ fn winch_checked_arithmetic_and_input_match_interpreter() {
 }
 #[test]
 fn osr_keeps_byref_aliases_to_caller_storage() {
-    let source = "let mut n = 0\nproc work(left: &mut i64) { let right = left; while *left < 1000 { *left += 1; *right += 1 } }\nwork(&mut n)\nstd::io::print(n)\n";
+    let source = "let mut n = 0\nproc work(left: &mut i64) { let right = left; while left.* < 1000 { left.* += 1; right.* += 1 } }\nwork(&mut n)\nstd::io::print(n)\n";
     let program = Arc::new(compile(source).unwrap());
     let artifact = TieredBackend::new(TierPolicy {
         hot_instructions: 32,

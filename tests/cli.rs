@@ -18,7 +18,7 @@ fn moving_gc_cli_and_repl_reset_report_collections() {
             "--engine",
             engine,
             "--gc-stress",
-            "--jit-report",
+            "--jit-trace=summary",
         ])
         .output()
         .unwrap();
@@ -28,12 +28,12 @@ fn moving_gc_cli_and_repl_reset_report_collections() {
             String::from_utf8_lossy(&result.stderr)
         );
         assert_eq!(result.stdout, b"3:11:3:123\n");
-        assert!(String::from_utf8_lossy(&result.stderr).contains("GC totals:"));
+        assert!(String::from_utf8_lossy(&result.stderr).contains("collections"));
     }
     let result = piped_repl(
         "interpreter",
         "let a = [1,2]\n:reset\nlet b = [3,4]\nstd::io::print(b[1])\n",
-        &["--gc-stress", "--jit-report"],
+        &["--gc-stress", "--jit-trace=summary"],
     );
     assert!(
         result.status.success(),
@@ -41,7 +41,7 @@ fn moving_gc_cli_and_repl_reset_report_collections() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert_eq!(result.stdout, b"4\n");
-    assert!(String::from_utf8_lossy(&result.stderr).contains("GC totals:"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("collections"));
 }
 #[test]
 fn extensions_select_dialects_and_simplified_is_explicit() {
@@ -290,22 +290,22 @@ fn reports_show_metrics_without_changing_program_output() {
         let report = String::from_utf8_lossy(&result.stderr);
         for label in [
             "Execution report:",
-            "VM execution:",
-            "bytecode instructions:",
+            "VM execution",
+            "bytecode instructions",
             "Timeline",
-            "Executed by tier",
-            "OSR transitions:",
+            "Tiers",
+            "OSR transitions",
         ] {
             assert!(report.contains(label), "missing {label}: {report}");
         }
         if engine == "jit" {
-            assert!(report.contains("tier policy: interp -> winch"));
+            assert!(report.contains("interp -> winch"));
         }
     }
     let result = piped_repl(
         "cranelift_speed",
         "let n = 42\nn\n:quit\n",
-        &["--jit-report"],
+        &["--jit-trace=summary"],
     );
     assert!(result.status.success());
     assert_eq!(result.stdout, b"42\n");
@@ -323,7 +323,7 @@ fn jit_report_preserves_inlining_and_has_compact_output() {
         "examples/modern.ya",
         "--engine",
         "cranelift_speed",
-        "--jit-report",
+        "--jit-trace=summary",
     ])
     .output()
     .unwrap();
@@ -331,8 +331,10 @@ fn jit_report_preserves_inlining_and_has_compact_output() {
     assert_eq!(result.stdout, b"ADA\n288212784234102776:10:3\n");
     let report = String::from_utf8_lossy(&result.stderr);
     assert!(
-        report.contains("frameless calls: 65534"),
-        "summary must preserve inlining"
+        report
+            .lines()
+            .any(|line| line.trim_start().starts_with("frameless calls") && line.contains("65,534")),
+        "summary must preserve inlining: {report}"
     );
     assert!(
         report.lines().count() < 200,
@@ -344,7 +346,7 @@ fn summary_repl_counts_only_the_current_entry() {
     let result = piped_repl(
         "cranelift_speed",
         "fn inc(n: i64) -> i64 { return n + 1 }\ninc(1)\ninc(2)\n:quit\n",
-        &["--jit-report"],
+        &["--jit-trace=summary"],
     );
     assert!(result.status.success());
     assert_eq!(result.stdout, b"2\n3\n");
@@ -352,16 +354,258 @@ fn summary_repl_counts_only_the_current_entry() {
     let reports: Vec<_> = text.split("Execution report:").skip(1).collect();
     assert_eq!(reports.len(), 3);
     for report in &reports[1..] {
-        assert!(report.contains("report mode: summary"));
-        assert!(report.contains("inc: calls=1 instructions="));
-        assert!(!report.contains("inc: calls=2"));
+        assert!(report.contains("summary (counters only"));
+        assert_eq!(routine_row(report, "inc").0, 1);
     }
     let work = |report: &str| {
         report
             .lines()
-            .find(|line| line.contains("bytecode instructions:"))
+            .find(|line| line.contains("bytecode instructions"))
             .unwrap()
             .to_owned()
     };
     assert_eq!(work(reports[1]), work(reports[2]));
+}
+
+#[test]
+fn concurrency_language_examples_execute_through_the_cli() {
+    for engine in ["interpreter", "jit", "cranelift", "cranelift_speed"] {
+        for (path, expected) in [
+            (
+                "examples/concurrency/ownership/local-managed.ya",
+                "42\n2\n7\ntrue\n",
+            ),
+            (
+                "examples/concurrency/channels/buffered.ya",
+                "true\n42\ntrue\n99\n",
+            ),
+            ("examples/concurrency/channels/rendezvous.ya", "42\n7\n"),
+            ("examples/concurrency/channels/mpmc.ya", "21\n"),
+            (
+                "examples/concurrency/scheduling/clock.ya",
+                "before\nafter\n",
+            ),
+            (
+                "examples/concurrency/scheduling/cancellation.ya",
+                "true\ntrue\n99\n",
+            ),
+        ] {
+            let result = cli(&["run", path, "--engine", engine, "--gc-stress"])
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{path} {engine}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(result.stdout, expected.as_bytes(), "{path} {engine}");
+        }
+    }
+}
+
+#[test]
+fn runtime_import_examples_execute_and_report_published_functions() {
+    for engine in ["interpreter", "jit", "cranelift", "cranelift_speed"] {
+        for (path, expected) in [
+            (
+                "examples/modules/dynamic/main.ya",
+                "runtime\n42\n42\ntrue\n",
+            ),
+            ("examples/concurrency/modules/main.ya", "42\n"),
+        ] {
+            let result = cli(&[
+                "run",
+                path,
+                "--engine",
+                engine,
+                "--gc-stress",
+                "--jit-trace",
+            ])
+            .output()
+            .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(result.stdout, expected.as_bytes());
+        }
+    }
+}
+
+/// Value of the last column on the first line that starts with `label`.
+fn kv_value(report: &str, label: &str) -> u64 {
+    let line = report
+        .lines()
+        .find(|line| line.trim_start().starts_with(label))
+        .unwrap_or_else(|| panic!("no {label} row: {report}"));
+    line.split_whitespace()
+        .last()
+        .unwrap()
+        .replace(',', "")
+        .parse()
+        .unwrap()
+}
+
+/// (calls, instructions) for a routine row in the Routines table.
+fn routine_row(report: &str, name: &str) -> (u64, u64) {
+    let fields: Vec<&str> = report
+        .lines()
+        .map(str::split_whitespace)
+        .map(Iterator::collect::<Vec<_>>)
+        .find(|fields| fields.first() == Some(&name))
+        .unwrap_or_else(|| panic!("no routine row for {name}: {report}"));
+    let number = |text: &str| text.replace(',', "").parse().unwrap();
+    (number(fields[1]), number(fields[2]))
+}
+
+#[test]
+fn trace_keeps_inlining_and_no_inline_turns_it_off() {
+    let traced = cli(&[
+        "run",
+        "examples/modern.ya",
+        "--engine",
+        "cranelift_speed",
+        "--jit-trace",
+    ])
+    .output()
+    .unwrap();
+    assert!(traced.status.success());
+    assert_eq!(traced.stdout, b"ADA\n288212784234102776:10:3\n");
+    let report = String::from_utf8_lossy(&traced.stderr);
+    assert!(kv_value(&report, "frameless calls") > 0, "{report}");
+
+    let untraced = cli(&[
+        "run",
+        "examples/modern.ya",
+        "--engine",
+        "cranelift_speed",
+        "--jit-trace",
+        "--jit-no-inline",
+    ])
+    .output()
+    .unwrap();
+    assert!(untraced.status.success());
+    assert_eq!(untraced.stdout, b"ADA\n288212784234102776:10:3\n");
+    let report = String::from_utf8_lossy(&untraced.stderr);
+    assert_eq!(kv_value(&report, "frameless calls"), 0, "{report}");
+}
+
+#[test]
+fn report_styles_follow_the_style_flag_and_color_policy() {
+    let run = |extra: &[&str]| {
+        let mut args = vec!["run", "examples/loops.psc", "--jit-trace=summary"];
+        args.extend_from_slice(extra);
+        cli(&args).output().unwrap()
+    };
+    let styled = |extra: &[&str]| String::from_utf8_lossy(&run(extra).stderr).into_owned();
+
+    let color = styled(&["--color", "always"]);
+    assert!(color.contains("\x1b["), "{color}");
+    assert!(!styled(&["--color", "never"]).contains("\x1b["));
+    assert!(!styled(&["--color", "always", "--jit-trace-style=plain"]).contains("\x1b["));
+    let boxed = styled(&["--color", "never", "--jit-trace-style=boxed"]);
+    assert!(boxed.contains("╭─") && boxed.contains("│ ") && !boxed.contains("\x1b["));
+    assert!(styled(&["--color", "always", "--jit-trace-style=boxed"]).contains("\x1b["));
+}
+
+#[test]
+fn json_report_is_one_object_and_stdout_is_unchanged() {
+    let result = cli(&[
+        "run",
+        "examples/loops.psc",
+        "--jit-trace=summary",
+        "--jit-trace-format=json",
+    ])
+    .output()
+    .unwrap();
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"5050\n");
+    let text = String::from_utf8_lossy(&result.stderr);
+    let json = text.trim();
+    assert!(json.starts_with("{\"title\":\"Execution report:"), "{json}");
+    assert!(json.ends_with('}'), "{json}");
+    assert!(json.contains("\"kind\":\"table\""), "{json}");
+    assert!(!json.contains("\x1b["));
+}
+
+#[test]
+fn live_block_is_not_drawn_when_stderr_is_not_a_terminal() {
+    let result = cli(&["run", "examples/loops.psc", "--jit-trace"])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let text = String::from_utf8_lossy(&result.stderr);
+    assert!(text.contains("Execution report:"), "{text}");
+    assert!(!text.contains("JIT live"), "{text}");
+    assert!(!text.contains("\x1b["), "{text}");
+}
+
+#[test]
+fn json_trace_carries_the_timeline_for_the_viewer() {
+    let result = cli(&[
+        "run",
+        "examples/mergesort.ya",
+        "--jit-trace",
+        "--jit-trace-format=json",
+    ])
+    .output()
+    .unwrap();
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"398403790:1921:999272\n");
+    let text = String::from_utf8_lossy(&result.stderr);
+    let json = text.trim();
+    assert!(
+        json.contains("\"trace\":{\"version\":1,\"mode\":\"trace\""),
+        "{json}"
+    );
+    for kind in [
+        "\"kind\":\"install\"",
+        "\"kind\":\"compile_end\"",
+        "\"kind\":\"osr\"",
+    ] {
+        assert!(json.contains(kind), "missing {kind}");
+    }
+    assert!(json.contains("\"duration_ms\":"));
+    assert!(json.contains("\"engines\":{\"interpreter\":"));
+    assert!(!json.contains("JIT live"));
+}
+
+#[test]
+fn trace_viewer_needs_an_interactive_terminal() {
+    let result = cli(&["trace", "examples/mergesort.ya"]).output().unwrap();
+    assert!(!result.status.success());
+    let text = String::from_utf8_lossy(&result.stderr);
+    assert!(text.contains("interactive"), "{text}");
+}
+
+#[test]
+fn jit_trace_out_writes_the_report_to_a_file_and_keeps_stderr_quiet() {
+    let path = std::env::temp_dir().join(format!("cyallo-trace-out-{}.json", std::process::id()));
+    let result = cli(&[
+        "run",
+        "examples/mergesort.ya",
+        "--jit-trace",
+        "--jit-trace-format=json",
+        "--jit-trace-out",
+        path.to_str().unwrap(),
+    ])
+    .output()
+    .unwrap();
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"398403790:1921:999272\n");
+    assert!(
+        result.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(text.contains("\"trace\":{\"version\":1"), "{text}");
+
+    let rejected = cli(&["run", "examples/mergesort.ya", "--jit-trace-out", "x.json"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("needs --jit-trace"));
 }

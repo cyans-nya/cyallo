@@ -1,6 +1,9 @@
 //! Lexical, case-sensitive resolution shared by single-source and module builds.
+use crate::declarations::{
+    self, DeclarationError, DeclarationKind, SourceTrust, invalid_declaration,
+};
+use crate::internal::{InternalSemantic, NativeType};
 use crate::intrinsic::Intrinsic;
-use crate::stdlib::{self, BuiltinType, Item};
 use cyallo_ast::*;
 use std::collections::HashMap;
 use std::path::Path;
@@ -15,18 +18,31 @@ enum Kind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SymbolOrigin {
     Source,
-    Standard,
+    Core,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Symbol {
+    id: DeclarationId,
+    native: Option<InternalSemantic>,
     origin: SymbolOrigin,
     target: Box<str>,
     kind: Kind,
     owner: usize,
+    defining_module: usize,
     public: bool,
     intrinsic: Option<Intrinsic>,
 }
+#[derive(Clone, Copy)]
+struct Placement {
+    trust: SourceTrust,
+    parent: Option<usize>,
+    boundary: ModuleBoundary,
+}
 struct Node {
+    parent: Option<usize>,
+    package: usize,
+    id: DeclarationId,
+    trust: SourceTrust,
     path: String,
     ast: Ast,
     names: HashMap<String, Vec<Symbol>>,
@@ -38,32 +54,27 @@ struct Local {
     writable: bool,
 }
 struct Resolver {
+    aliases: HashMap<Box<str>, (usize, Type)>,
     source_names: HashMap<Box<str>, Box<str>>,
     nodes: Vec<Node>,
     next_binding: usize,
+    next_declaration: u32,
+    prelude: Option<usize>,
+    packages: HashMap<String, usize>,
+    associated: HashMap<DeclarationId, HashMap<String, Vec<Symbol>>>,
+    associated_functions: Vec<(usize, NativeFunctionDeclaration)>,
+    permissions: Option<crate::import_policy::ResolvedPolicy>,
+    requesting_modules: HashMap<u32, DeclarationId>,
 }
 fn error(message: impl Into<String>, span: Span) -> Diagnostic {
     Diagnostic::new("E140", message, span)
 }
-fn standard(path: &str) -> Option<Symbol> {
-    let (target, kind) = match stdlib::item(path)? {
-        Item::Module(p) => (p.to_owned(), Kind::Module),
-        Item::Type(_) | Item::Trait => (path.to_owned(), Kind::Type),
-        Item::Function(id) => (format!("$intrinsic${}", id.id().0), Kind::Value),
-    };
-    Some(Symbol {
-        origin: SymbolOrigin::Standard,
-        target: target.into(),
-        kind,
-        owner: usize::MAX,
-        public: true,
-        intrinsic: match stdlib::item(path) {
-            Some(Item::Function(id)) => Some(id),
-            _ => None,
-        },
-    })
-}
 impl Resolver {
+    fn declaration_id(&mut self) -> DeclarationId {
+        let id = DeclarationId(self.next_declaration);
+        self.next_declaration += 1;
+        id
+    }
     fn add(
         &mut self,
         path: String,
@@ -71,13 +82,27 @@ impl Resolver {
         files: &mut [Option<Ast>],
         paths: &[String],
         dir: &Path,
+        placement: Placement,
     ) -> Result<usize> {
+        let trust = placement.trust;
         if self.nodes.iter().any(|n| n.path == path) {
             return Err(error("duplicate module", Span::default()));
         }
         let index = self.nodes.len();
+        let id = self.declaration_id();
         let declarations = std::mem::take(&mut ast.modules);
+        let package = if placement.boundary == ModuleBoundary::Package {
+            index
+        } else {
+            placement
+                .parent
+                .map_or(index, |parent| self.nodes[parent].package)
+        };
         self.nodes.push(Node {
+            parent: placement.parent,
+            package,
+            id,
+            trust,
             path: path.clone(),
             ast,
             names: HashMap::new(),
@@ -115,24 +140,54 @@ impl Resolver {
                     )
                 })?
             };
-            self.add(child_path.clone(), body, files, paths, &child_dir)?;
+            let semantic =
+                declarations::bind(&declaration.annotations, trust, DeclarationKind::Module)?;
+            let child = self.add(
+                child_path.clone(),
+                body,
+                files,
+                paths,
+                &child_dir,
+                Placement {
+                    trust,
+                    parent: Some(index),
+                    boundary: declaration.boundary,
+                },
+            )?;
+            if semantic == Some(InternalSemantic::Prelude) && self.prelude.replace(child).is_some()
+            {
+                return Err(invalid_declaration(
+                    DeclarationError::DuplicateCanonical,
+                    declaration.span,
+                ));
+            }
+            let child_id = self.nodes[child].id;
             self.nodes[index]
                 .names
                 .entry(declaration.name.to_string())
                 .or_default()
                 .push(Symbol {
-                    origin: SymbolOrigin::Source,
+                    id: child_id,
+                    native: semantic,
+                    origin: if trust == SourceTrust::Core {
+                        SymbolOrigin::Core
+                    } else {
+                        SymbolOrigin::Source
+                    },
                     target: child_path.into(),
                     kind: Kind::Module,
                     owner: index,
+                    defining_module: child,
                     public: declaration.public,
                     intrinsic: None,
                 });
         }
         Ok(index)
     }
-    fn declarations(&mut self) -> Result<()> {
-        for (index, node) in self.nodes.iter_mut().enumerate() {
+    fn declarations(&mut self, start: usize) -> Result<()> {
+        let mut canonical = HashMap::new();
+        let mut next_declaration = self.next_declaration;
+        for (index, node) in self.nodes.iter_mut().enumerate().skip(start) {
             let mut definitions: Vec<(Box<str>, Kind, bool)> = node
                 .ast
                 .functions
@@ -145,6 +200,15 @@ impl Resolver {
                     )
                 })
                 .collect();
+            definitions.extend(node.ast.type_aliases.iter().map(|alias| {
+                (
+                    alias.name.clone(),
+                    Kind::Type,
+                    node.ast
+                        .exports
+                        .contains(&format!("$type${}", alias.name).into_boxed_str()),
+                )
+            }));
             definitions.extend(node.ast.records.iter().map(|r| {
                 (
                     r.name.clone(),
@@ -182,6 +246,99 @@ impl Resolver {
                 _ => None,
             }));
             for (name, kind, public) in definitions {
+                let (annotations, declaration_kind, span) = match kind {
+                    Kind::Value => node
+                        .ast
+                        .functions
+                        .iter()
+                        .find(|f| f.name == name)
+                        .map(|f| (&f.annotations[..], DeclarationKind::Function, f.span)),
+                    Kind::Type => node
+                        .ast
+                        .records
+                        .iter()
+                        .find(|r| r.name == name)
+                        .map(|r| (&r.annotations[..], DeclarationKind::Record, r.span))
+                        .or_else(|| {
+                            node.ast
+                                .traits
+                                .iter()
+                                .find(|t| t.name == name)
+                                .map(|t| (&t.annotations[..], DeclarationKind::Trait, t.span))
+                        }),
+                    _ => None,
+                }
+                .unwrap_or((&[], DeclarationKind::Function, Span::default()));
+                let semantic = declarations::bind(annotations, node.trust, declaration_kind)?;
+                if let Some(
+                    semantic @ (InternalSemantic::Type(_)
+                    | InternalSemantic::TypeFamily(_)
+                    | InternalSemantic::Trait(_)
+                    | InternalSemantic::AllocatorTrait),
+                ) = semantic
+                    && let Some(previous) = canonical.insert(semantic, span)
+                {
+                    return Err(
+                        invalid_declaration(DeclarationError::DuplicateCanonical, span)
+                            .with_related(previous, "first declaration"),
+                    );
+                }
+                if let Some(record) = node.ast.records.iter().find(|r| r.name == name) {
+                    let expected = match semantic {
+                        Some(InternalSemantic::Type(t)) => Some(declarations::type_arity(t)),
+                        Some(InternalSemantic::TypeFamily(f)) => {
+                            Some(declarations::family_arity(f))
+                        }
+                        _ => None,
+                    };
+                    if let Some(expected) = expected {
+                        if !record.fields.is_empty() {
+                            return Err(invalid_declaration(
+                                DeclarationError::OpaqueFields,
+                                record.span,
+                            ));
+                        }
+                        if expected != record.type_params.len() {
+                            return Err(invalid_declaration(
+                                DeclarationError::GenericArity {
+                                    expected,
+                                    actual: record.type_params.len(),
+                                },
+                                record.span,
+                            ));
+                        }
+                    }
+                }
+                if let Some(function) = node.ast.functions.iter().find(|f| f.name == name) {
+                    if function.body_kind == FunctionBodyKind::Source
+                        && (function.params.iter().any(|param| {
+                            param.passing != ParameterPassing::Value
+                                || param.arity != ParameterArity::One
+                        }) || !function.type_packs.is_empty())
+                    {
+                        return Err(invalid_declaration(
+                            DeclarationError::InvalidPack,
+                            function.span,
+                        ));
+                    }
+                    match (semantic, function.body_kind) {
+                        (Some(_), FunctionBodyKind::Source) => {
+                            return Err(invalid_declaration(
+                                DeclarationError::NativeBodyForbidden,
+                                function.span,
+                            ));
+                        }
+                        (None, FunctionBodyKind::Declaration) => {
+                            return Err(invalid_declaration(
+                                DeclarationError::BodyRequired,
+                                function.span,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                let id = DeclarationId(next_declaration);
+                next_declaration += 1;
                 let entries = node.names.entry(name.to_string()).or_default();
                 if entries.iter().any(|s| s.kind == kind) {
                     return Err(error(
@@ -191,13 +348,32 @@ impl Resolver {
                 }
                 let target: Box<str> = format!("$module{index}${kind:?}${name}").into();
                 self.source_names.insert(target.clone(), name.clone());
+                if let Some(alias) = node
+                    .ast
+                    .type_aliases
+                    .iter()
+                    .find(|alias| alias.name == name)
+                {
+                    self.aliases
+                        .insert(target.clone(), (index, alias.ty.clone()));
+                }
                 entries.push(Symbol {
-                    origin: SymbolOrigin::Source,
+                    id,
+                    native: semantic,
+                    origin: if node.trust == SourceTrust::Core {
+                        SymbolOrigin::Core
+                    } else {
+                        SymbolOrigin::Source
+                    },
                     target,
                     kind,
                     owner: index,
+                    defining_module: index,
                     public,
-                    intrinsic: None,
+                    intrinsic: match semantic {
+                        Some(InternalSemantic::Function(id)) => Some(id),
+                        _ => None,
+                    },
                 });
             }
             let mut versions: HashMap<Box<str>, (usize, bool)> = HashMap::new();
@@ -225,24 +401,166 @@ impl Resolver {
                 node.bindings.insert(statement.span.start, target.clone());
                 entries.retain(|symbol| symbol.kind != Kind::Value);
                 entries.push(Symbol {
+                    id: DeclarationId(next_declaration),
+                    native: None,
                     origin: SymbolOrigin::Source,
                     target,
                     kind: Kind::Value,
                     owner: index,
+                    defining_module: index,
                     public: node.ast.exports.contains(name),
                     intrinsic: None,
                 });
+                next_declaration += 1;
+            }
+        }
+        self.next_declaration = next_declaration;
+        self.associated_declarations(start)?;
+        Ok(())
+    }
+    fn associated_declarations(&mut self, start: usize) -> Result<()> {
+        for module in start..self.nodes.len() {
+            let implementations = self.nodes[module].ast.inherent_implementations.clone();
+            for implementation in implementations {
+                let owner_name = match &implementation.receiver {
+                    Type::Named(n) | Type::Applied(n, _) => Some(n.as_ref()),
+                    _ => None,
+                };
+                let owner = owner_name.and_then(|name| self.path(module, name, Some(Kind::Type)));
+                for method in implementation.methods {
+                    if method
+                        .function
+                        .params
+                        .first()
+                        .is_some_and(|param| param.receiver)
+                    {
+                        continue;
+                    }
+                    let owner = owner.as_ref().ok_or_else(|| {
+                        invalid_declaration(DeclarationError::UnresolvedOwner, implementation.span)
+                    })?;
+                    let semantic = declarations::bind(
+                        &method.function.annotations,
+                        self.nodes[module].trust,
+                        DeclarationKind::Member,
+                    )?;
+                    let id = self.declaration_id();
+                    let mut function = method.function;
+                    let name = function.name.clone();
+                    // Source positions remain stable when independent packages
+                    // append nodes; allocation-order IDs do not.
+                    let target: Box<str> =
+                        format!("$associated{}${name}", function.span.start).into();
+                    function.name = target.clone();
+                    for parameter in &mut function.params {
+                        cyallo_ast::visit::visit_type(&mut parameter.ty, &mut |ty| {
+                            if *ty == Type::SelfType {
+                                *ty = implementation.receiver.clone();
+                            }
+                        });
+                    }
+                    cyallo_ast::visit::visit_type(&mut function.result, &mut |ty| {
+                        if *ty == Type::SelfType {
+                            *ty = implementation.receiver.clone();
+                        }
+                    });
+                    let mut parameters = implementation.type_params.clone();
+                    parameters.extend(function.type_params);
+                    function.type_params = parameters;
+                    self.source_names.insert(target.clone(), name.clone());
+                    self.associated
+                        .entry(owner.id)
+                        .or_default()
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(Symbol {
+                            id,
+                            native: semantic,
+                            origin: owner.origin,
+                            target,
+                            kind: Kind::Value,
+                            owner: module,
+                            defining_module: module,
+                            public: method.public,
+                            intrinsic: match semantic {
+                                Some(InternalSemantic::Function(id)) => Some(id),
+                                _ => None,
+                            },
+                        });
+                    self.associated_functions.push((
+                        module,
+                        NativeFunctionDeclaration {
+                            id,
+                            module: Some(self.nodes[module].id),
+                            function,
+                        },
+                    ));
+                }
             }
         }
         Ok(())
     }
+    fn parent_in_package(&self, module: usize) -> Option<usize> {
+        (module != self.nodes[module].package)
+            .then_some(self.nodes[module].parent)
+            .flatten()
+    }
     fn accessible(&self, from: usize, symbol: &Symbol) -> bool {
-        symbol.public
-            || symbol.origin == SymbolOrigin::Standard
-            || self.nodes[from].path == self.nodes[symbol.owner].path
-            || self.nodes[from]
-                .path
-                .starts_with(&format!("{}::", self.nodes[symbol.owner].path))
+        if symbol.public {
+            return true;
+        }
+        let mut module = Some(from);
+        while let Some(index) = module {
+            if index == symbol.owner {
+                return true;
+            }
+            module = self.parent_in_package(index);
+        }
+        false
+    }
+    fn module_symbol(&self, index: usize) -> Symbol {
+        let node = &self.nodes[index];
+        Symbol {
+            id: node.id,
+            native: None,
+            origin: if node.trust == SourceTrust::Core {
+                SymbolOrigin::Core
+            } else {
+                SymbolOrigin::Source
+            },
+            target: node.path.clone().into(),
+            kind: Kind::Module,
+            owner: index,
+            defining_module: index,
+            public: true,
+            intrinsic: None,
+        }
+    }
+    fn native_target(&self, target: &str) -> Option<(DeclarationId, InternalSemantic)> {
+        self.nodes
+            .iter()
+            .flat_map(|node| node.names.values().flatten())
+            .find(|symbol| symbol.target.as_ref() == target && symbol.native.is_some())
+            .map(|symbol| (symbol.id, symbol.native.unwrap()))
+    }
+    fn check_import(&self, from: usize, symbol: &Symbol, span: Span) -> Result<()> {
+        if let Some(permissions) = &self.permissions {
+            permissions
+                .check(self.nodes[from].id, self.nodes[symbol.defining_module].id)
+                .map_err(|error| crate::import_policy::import_policy_diagnostic(error, span))?;
+        }
+        Ok(())
+    }
+    fn module_graph(&self) -> Vec<crate::import_policy::ModuleDescriptor> {
+        self.nodes
+            .iter()
+            .map(|node| crate::import_policy::ModuleDescriptor {
+                id: node.id,
+                path: node.path.clone().into(),
+                parent: node.parent.map(|index| self.nodes[index].id),
+                trust: node.trust,
+            })
+            .collect()
     }
     fn path(&self, from: usize, path: &str, kind: Option<Kind>) -> Option<Symbol> {
         let parts: Vec<_> = path.split("::").collect();
@@ -255,64 +573,47 @@ impl Resolver {
         };
         let mut position = 1;
         let mut symbol = match parts[0] {
-            "std" => standard("std")?,
-            "crate" => Symbol {
-                origin: SymbolOrigin::Source,
-                target: "crate".into(),
-                kind: Kind::Module,
-                owner: 0,
-                public: true,
-                intrinsic: None,
-            },
-            "self" => Symbol {
-                origin: SymbolOrigin::Source,
-                target: self.nodes[from].path.clone().into(),
-                kind: Kind::Module,
-                owner: from,
-                public: true,
-                intrinsic: None,
-            },
-            "super" => {
-                let parent = self.nodes[from].path.rsplit_once("::")?.0;
-                Symbol {
-                    origin: SymbolOrigin::Source,
-                    target: parent.into(),
-                    kind: Kind::Module,
-                    owner: from,
-                    public: true,
-                    intrinsic: None,
-                }
-            }
+            "crate" => self.module_symbol(self.nodes[from].package),
+            "self" => self.module_symbol(from),
+            "super" => self.module_symbol(self.parent_in_package(from)?),
             first => {
                 if let Some(symbols) = self.nodes[from].names.get(first) {
                     select(symbols, if parts.len() == 1 { kind } else { None })?
+                } else if let Some(root) = self.packages.get(first) {
+                    self.module_symbol(*root)
                 } else {
-                    let (_, target) = stdlib::PRELUDE.iter().find(|(name, _)| *name == first)?;
-                    standard(target)?
+                    let symbols = self.nodes[self.prelude?].names.get(first)?;
+                    let symbol = select(symbols, if parts.len() == 1 { kind } else { None })?;
+                    if !symbol.public {
+                        return None;
+                    }
+                    symbol
                 }
             }
         };
         while position < parts.len() {
             let part = parts[position];
             position += 1;
-            if symbol.origin == SymbolOrigin::Standard {
-                symbol = standard(&format!("{}::{part}", symbol.target))?;
-            } else if symbol.kind == Kind::Module {
-                if part == "super" {
-                    symbol.target = symbol.target.rsplit_once("::")?.0.into();
-                    continue;
-                }
+            if symbol.kind == Kind::Module {
                 let owner = self
                     .nodes
                     .iter()
                     .position(|n| n.path == symbol.target.as_ref())?;
+                if part == "super" {
+                    symbol = self.module_symbol(self.parent_in_package(owner)?);
+                    continue;
+                }
                 let symbols = self.nodes[owner].names.get(part)?;
                 symbol = select(symbols, if position == parts.len() { kind } else { None })?;
                 if !self.accessible(from, &symbol) {
                     return None;
                 }
             } else {
-                return None;
+                let symbols = self.associated.get(&symbol.id)?.get(part)?;
+                symbol = select(symbols, if position == parts.len() { kind } else { None })?;
+                if !self.accessible(from, &symbol) {
+                    return None;
+                }
             }
         }
         if kind.is_some_and(|k| k != symbol.kind) {
@@ -346,16 +647,12 @@ impl Resolver {
                     unresolved.get_or_insert(import);
                     continue;
                 };
+                self.check_import(*module, &target, import.span)?;
                 let entries = if import.glob {
                     if target.kind != Kind::Module {
                         return Err(error("glob import requires a module", import.span));
                     }
-                    if target.origin == SymbolOrigin::Standard {
-                        stdlib::exports(&target.target)
-                            .into_iter()
-                            .map(|(name, path)| (name, standard(&path).expect("standard export")))
-                            .collect::<Vec<_>>()
-                    } else {
+                    {
                         let node = self
                             .nodes
                             .iter()
@@ -382,6 +679,7 @@ impl Resolver {
                     )]
                 };
                 for (name, mut symbol) in entries {
+                    self.check_import(*module, &symbol, import.span)?;
                     if !installed[ordinal].insert((
                         name.clone(),
                         symbol.kind,
@@ -437,16 +735,26 @@ impl Resolver {
         }
     }
     fn symbol(&self, module: usize, name: &str, kind: Kind, span: Span) -> Result<Box<str>> {
-        self.path(module, name, Some(kind))
-            .map(|s| s.target)
-            .ok_or_else(|| {
-                error(
-                    format!("unresolved name `{}`", cyallo_ast::source_name(name)),
-                    span,
-                )
-            })
+        let symbol = self.path(module, name, Some(kind)).ok_or_else(|| {
+            error(
+                format!("unresolved name `{}`", cyallo_ast::source_name(name)),
+                span,
+            )
+        })?;
+        self.check_import(module, &symbol, span)?;
+        Ok(symbol.target)
     }
     fn ty(&self, module: usize, ty: &mut Type, params: &[Box<str>], span: Span) -> Result<()> {
+        self.ty_alias(module, ty, params, span, &mut vec![])
+    }
+    fn ty_alias(
+        &self,
+        module: usize,
+        ty: &mut Type,
+        params: &[Box<str>],
+        span: Span,
+        seen: &mut Vec<Box<str>>,
+    ) -> Result<()> {
         match ty {
             Type::Lifetime(_) => {
                 return Err(error("lifetime is only valid as a lifetime argument", span));
@@ -454,17 +762,36 @@ impl Resolver {
             Type::Named(n) if params.contains(n) => {}
             Type::Named(n) | Type::TraitObject(n) => {
                 let target = self.symbol(module, n, Kind::Type, span)?;
-                if let Some(Item::Type(id)) = stdlib::item(&target) {
+                if let Some((owner, alias)) = self.aliases.get(&target) {
+                    if seen.contains(&target) {
+                        return Err(cyallo_ast::diagnostic::cyclic_type_alias(span));
+                    }
+                    if seen.len() >= 256 {
+                        return Err(cyallo_ast::diagnostic::type_alias_depth(span));
+                    }
+                    seen.push(target);
+                    let mut alias = alias.clone();
+                    cyallo_ast::with_stack(|| self.ty_alias(*owner, &mut alias, &[], span, seen))?;
+                    seen.pop();
+                    *ty = alias;
+                    return Ok(());
+                }
+                if let Some((_, InternalSemantic::Type(id))) = self.native_target(&target) {
                     *ty = match id {
-                        BuiltinType::Any => Type::Any,
-                        BuiltinType::Symbol => Type::Symbol,
-                        BuiltinType::Context => Type::Context,
-                        BuiltinType::Registration => Type::Registration,
-                        BuiltinType::Storage(
-                            kind @ (StorageKind::ParseError
+                        NativeType::Any => Type::Any,
+                        NativeType::Symbol => Type::Symbol,
+                        NativeType::Context => Type::Context,
+                        NativeType::Registration => Type::Registration,
+                        NativeType::Storage(
+                            kind @ (StorageKind::TypeDescriptor
+                            | StorageKind::ViewError
+                            | StorageKind::LoadError
+                            | StorageKind::ParseError
                             | StorageKind::Layout
                             | StorageKind::Allocation
-                            | StorageKind::AllocError),
+                            | StorageKind::AllocError
+                            | StorageKind::ReceiveError
+                            | StorageKind::Clock),
                         ) => Type::Storage(kind, Box::new(Type::Void)),
                         _ => return Err(error("generic type requires element arguments", span)),
                     };
@@ -475,8 +802,11 @@ impl Resolver {
             Type::Applied(n, arguments) => {
                 let target = self.symbol(module, n, Kind::Type, span)?;
                 if matches!(
-                    stdlib::item(&target),
-                    Some(Item::Type(BuiltinType::Storage(StorageKind::Weak)))
+                    self.native_target(&target),
+                    Some((
+                        _,
+                        InternalSemantic::Type(NativeType::Storage(StorageKind::Weak))
+                    ))
                 ) {
                     let lifetime = if matches!(arguments.first(), Some(Type::Lifetime(_))) {
                         let Type::Lifetime(lifetime) = arguments.remove(0) else {
@@ -493,11 +823,12 @@ impl Resolver {
                         ));
                     }
                     let mut pointee = arguments.remove(0);
-                    self.ty(module, &mut pointee, params, span)?;
+                    self.ty_alias(module, &mut pointee, params, span, seen)?;
                     *ty = Type::Storage(
                         StorageKind::Weak,
                         Box::new(Type::Managed {
                             kind: MemoryKind::Rc,
+                            locality: Locality::Local,
                             lifetime,
                             pointee: Box::new(pointee),
                         }),
@@ -505,47 +836,42 @@ impl Resolver {
                     return Ok(());
                 }
                 for t in arguments.iter_mut() {
-                    self.ty(module, t, params, span)?;
+                    self.ty_alias(module, t, params, span, seen)?;
                 }
                 let target = self.symbol(module, n, Kind::Type, span)?;
-                if let Some(Item::Type(id)) = stdlib::item(&target) {
-                    if id == BuiltinType::Storage(StorageKind::Generator) {
-                        if arguments.len() != 3 {
-                            return Err(error(
-                                "Generator requires yield, resume, and return types",
-                                span,
-                            ));
-                        }
-                        *ty = Type::Storage(
-                            StorageKind::Generator,
-                            Box::new(Type::Tuple(std::mem::take(arguments))),
-                        );
-                        return Ok(());
+                if let Some((declaration, InternalSemantic::TypeFamily(_))) =
+                    self.native_target(&target)
+                {
+                    *ty = Type::Dependent(declaration, std::mem::take(arguments));
+                } else if let Some((_, InternalSemantic::Type(id))) = self.native_target(&target) {
+                    let expected = declarations::type_arity(id);
+                    if arguments.len() != expected {
+                        return Err(invalid_declaration(
+                            DeclarationError::GenericArity {
+                                expected,
+                                actual: arguments.len(),
+                            },
+                            span,
+                        ));
                     }
-                    if id == BuiltinType::Storage(StorageKind::Result) {
-                        let [value, error]: [Type; 2] =
-                            std::mem::take(arguments).try_into().map_err(|_| {
-                                error("Result requires a value type and an error type", span)
-                            })?;
-                        *ty = crate::lookup::result_type(value, error);
-                        return Ok(());
-                    }
-                    if arguments.len() != 1 {
-                        return Err(error("expected one element type", span));
-                    }
-                    let inner = Box::new(arguments.remove(0));
+                    let inner = Box::new(if expected == 1 {
+                        arguments.remove(0)
+                    } else {
+                        Type::Tuple(std::mem::take(arguments))
+                    });
                     *ty = match id {
-                        BuiltinType::ServiceKey => Type::ServiceKey(inner),
-                        BuiltinType::ServiceRef => Type::ServiceRef(inner),
-                        BuiltinType::Storage(StorageKind::Weak) => Type::Storage(
+                        NativeType::ServiceKey => Type::ServiceKey(inner),
+                        NativeType::ServiceRef => Type::ServiceRef(inner),
+                        NativeType::Storage(StorageKind::Weak) => Type::Storage(
                             StorageKind::Weak,
                             Box::new(Type::Managed {
                                 kind: MemoryKind::Rc,
+                                locality: Locality::Local,
                                 lifetime: None,
                                 pointee: inner,
                             }),
                         ),
-                        BuiltinType::Storage(kind) => Type::Storage(kind, inner),
+                        NativeType::Storage(kind) => Type::Storage(kind, inner),
                         _ => return Err(error("type does not accept element arguments", span)),
                     };
                 } else {
@@ -558,24 +884,39 @@ impl Resolver {
             | Type::Slice(t)
             | Type::ServiceKey(t)
             | Type::ServiceRef(t)
-            | Type::Storage(_, t) => self.ty(module, t, params, span)?,
+            | Type::Storage(_, t) => self.ty_alias(module, t, params, span, seen)?,
+            Type::Managed {
+                locality: Locality::Shared,
+                ..
+            } => return Err(cyallo_ast::diagnostic::shared_managed_unavailable(span)),
             Type::Reference { pointee, .. } | Type::Managed { pointee, .. } => {
-                self.ty(module, pointee, params, span)?
+                self.ty_alias(module, pointee, params, span, seen)?
             }
             Type::Tuple(ts) => {
                 for t in ts {
-                    self.ty(module, t, params, span)?;
+                    self.ty_alias(module, t, params, span, seen)?;
+                }
+            }
+            Type::Dependent(_, arguments) => {
+                for argument in arguments {
+                    self.ty_alias(module, argument, params, span, seen)?;
                 }
             }
             Type::Function(_, ps, r) => {
                 for (t, _) in ps {
-                    self.ty(module, t, params, span)?;
+                    self.ty_alias(module, t, params, span, seen)?;
                 }
-                self.ty(module, r, params, span)?;
+                self.ty_alias(module, r, params, span, seen)?;
             }
-            Type::Record(_, fs) => {
+            Type::Record(_, fs) | Type::Object(fs) => {
+                let mut names = std::collections::HashSet::new();
+                for (name, _) in fs.iter() {
+                    if !names.insert(name) {
+                        return Err(cyallo_ast::diagnostic::duplicate_object_property(span));
+                    }
+                }
                 for (_, t) in fs {
-                    self.ty(module, t, params, span)?;
+                    self.ty_alias(module, t, params, span, seen)?;
                 }
             }
             _ => {}
@@ -599,6 +940,8 @@ impl Resolver {
         params: &[Box<str>],
     ) -> Result<()> {
         cyallo_ast::with_stack(|| {
+            self.requesting_modules
+                .insert(e.span.start, self.nodes[module].id);
             let constructor = match &e.kind {
                 ExprKind::Index(base, _) => match &base.kind {
                     ExprKind::Name(n) if Self::local(scopes, n).is_none() => Some(n.as_ref()),
@@ -607,12 +950,15 @@ impl Resolver {
                 ExprKind::TypedCollection(n, _, _) => Some(n.as_ref()),
                 _ => None,
             }
-            .and_then(|name| self.path(module, name, Some(Kind::Type)))
-            .and_then(|symbol| match stdlib::item(&symbol.target) {
-                Some(Item::Type(BuiltinType::Storage(StorageKind::Vec))) => {
+            .and_then(|name| self.path(module, name, Some(Kind::Type)));
+            if let Some(symbol) = &constructor {
+                self.check_import(module, symbol, e.span)?;
+            }
+            let constructor = constructor.and_then(|symbol| match symbol.native {
+                Some(InternalSemantic::Type(NativeType::Storage(StorageKind::Vec))) => {
                     Some(Intrinsic::VecLiteral)
                 }
-                Some(Item::Type(BuiltinType::Storage(StorageKind::VecDeque))) => {
+                Some(InternalSemantic::Type(NativeType::Storage(StorageKind::VecDeque))) => {
                     Some(Intrinsic::DequeLiteral)
                 }
                 _ => None,
@@ -633,8 +979,22 @@ impl Resolver {
                 }
             }
             match &mut e.kind {
+                ExprKind::ObjectLiteral(_, fields) => {
+                    for (_, value) in fields {
+                        self.expr(module, value, scopes, params)?;
+                    }
+                }
+                ExprKind::DeleteProperty(value) => self.expr(module, value, scopes, params)?,
+                ExprKind::TypeDescriptor(_) | ExprKind::DeferredCallable(_) => {}
+                ExprKind::NativeCoerce(value, thunk) => {
+                    self.expr(module, value, scopes, params)?;
+                    self.expr(module, thunk, scopes, params)?;
+                }
                 ExprKind::Yield(value, _) => self.expr(module, value, scopes, params)?,
-                ExprKind::ManagedNew(_, allocator, value) => {
+                ExprKind::ManagedNew(_, locality, allocator, value) => {
+                    if *locality == Locality::Shared {
+                        return Err(cyallo_ast::diagnostic::shared_managed_unavailable(e.span));
+                    }
                     if let Some(allocator) = allocator {
                         self.expr(module, allocator, scopes, params)?;
                     }
@@ -658,6 +1018,7 @@ impl Resolver {
                     *n = if let Some(local) = Self::local(scopes, n) {
                         local.target
                     } else if let Some(symbol) = self.path(module, n, Some(Kind::Value)) {
+                        self.check_import(module, &symbol, e.span)?;
                         symbol.target
                     } else {
                         e.kind = ExprKind::Invalid(Diagnostic::new(
@@ -674,6 +1035,9 @@ impl Resolver {
                     } else {
                         None
                     };
+                    if let Some(symbol) = &symbol {
+                        self.check_import(module, symbol, e.span)?;
+                    }
                     for a in args.iter_mut() {
                         self.expr(module, a, scopes, params)?;
                     }
@@ -691,7 +1055,11 @@ impl Resolver {
                             }
                             _ => unreachable!(),
                         };
-                        e.kind = ExprKind::IntrinsicCall(id.id(), types, args);
+                        e.kind = ExprKind::IntrinsicCall(
+                            id.id().declared(symbol.as_ref().unwrap().id),
+                            types,
+                            args,
+                        );
                     } else {
                         let name = match &mut e.kind {
                             ExprKind::Call(n, _) | ExprKind::GenericCall(n, _, _) => n,
@@ -720,6 +1088,15 @@ impl Resolver {
                     }
                 }
                 ExprKind::Record(n, fs) | ExprKind::GenericRecord(n, _, fs) => {
+                    if let Some(symbol) = self.path(module, n, Some(Kind::Type)) {
+                        self.check_import(module, &symbol, e.span)?;
+                        if symbol.native.is_some() {
+                            return Err(invalid_declaration(
+                                DeclarationError::OpaqueConstruction,
+                                e.span,
+                            ));
+                        }
+                    }
                     *n = self.symbol(module, n, Kind::Type, e.span)?;
                     for (_, value) in fs {
                         self.expr(module, value, scopes, params)?;
@@ -738,6 +1115,7 @@ impl Resolver {
                 ExprKind::Field(base, name) => {
                     self.expr(module, base, scopes, params)?;
                     if let Some(property) = self.path(module, name, Some(Kind::Property)) {
+                        self.check_import(module, &property, e.span)?;
                         e.kind =
                             ExprKind::ExtensionField(base.clone(), name.clone(), property.target);
                     }
@@ -926,10 +1304,35 @@ impl Resolver {
         outer: &[HashMap<String, Local>],
         inherited_params: &[Box<str>],
     ) -> Result<()> {
+        if !f.annotations.is_empty() {
+            declarations::bind(
+                &f.annotations,
+                self.nodes[module].trust,
+                DeclarationKind::Member,
+            )?;
+        }
         let mut scopes = outer.to_vec();
         let mut parameters = HashMap::new();
         let mut type_params = inherited_params.to_vec();
         type_params.extend(f.type_params.iter().cloned());
+        for constraint in &mut f.constraints {
+            for bound in &mut constraint.bounds {
+                self.ty(module, bound, &type_params, f.span)?;
+            }
+        }
+        if f.body_kind == FunctionBodyKind::Declaration
+            && self.nodes[module].trust == SourceTrust::Core
+        {
+            let names: Vec<_> = f.params.iter().map(|param| param.name.clone()).collect();
+            cyallo_ast::visit::visit_type(&mut f.result, &mut |ty| {
+                if let Type::Named(name) = ty
+                    && !type_params.contains(name)
+                    && let Some(index) = names.iter().position(|parameter| parameter == name)
+                {
+                    *ty = Type::ValueParameter(index);
+                }
+            });
+        }
         for p in &mut f.params {
             self.ty(module, &mut p.ty, &type_params, p.span)?;
             if parameters.contains_key(p.name.as_ref()) {
@@ -949,16 +1352,26 @@ impl Resolver {
         scopes.push(parameters);
         self.block(module, &mut f.body, &mut scopes, &type_params, false)
     }
-    fn finish(mut self) -> Result<Ast> {
-        self.declarations()?;
+    fn finish(mut self, entry: usize) -> Result<Ast> {
+        self.declarations(entry)?;
         self.imports()?;
         let mut linked = Ast::default();
-        linked.traits.push(crate::memory::allocator_declaration());
+        for (module, mut declaration) in std::mem::take(&mut self.associated_functions) {
+            self.function(module, &mut declaration.function, &[], &[])?;
+            if declaration.function.body_kind == FunctionBodyKind::Source
+                && declaration.function.annotations.is_empty()
+            {
+                linked.functions.push(declaration.function);
+            } else {
+                linked.native.functions.push(declaration);
+            }
+        }
         let mut constants = Vec::new();
         for index in 0..self.nodes.len() {
             let mut ast = std::mem::take(&mut self.nodes[index].ast);
             for record in &mut ast.records {
-                record.name = self.symbol(index, &record.name, Kind::Type, record.span)?;
+                let symbol = self.path(index, &record.name, Some(Kind::Type)).unwrap();
+                record.name = symbol.target;
                 for (_, t) in &mut record.fields {
                     self.ty(index, t, &record.type_params, record.span)?;
                 }
@@ -968,9 +1381,13 @@ impl Resolver {
                 self.function(index, f, &[], &[])?;
             }
             for t in &mut ast.traits {
-                t.name = self.symbol(index, &t.name, Kind::Type, t.span)?;
+                let symbol = self.path(index, &t.name, Some(Kind::Type)).unwrap();
+                if symbol.native == Some(InternalSemantic::AllocatorTrait) {
+                    t.origin = TraitOrigin::Allocator;
+                }
+                t.name = symbol.target;
                 for f in &mut t.methods {
-                    self.function(index, f, &[], &[])?;
+                    self.function(index, f, &[], &t.type_params)?;
                 }
             }
             for imp in &mut ast.implementations {
@@ -986,7 +1403,108 @@ impl Resolver {
                     self.symbol(index, &property.name, Kind::Property, property.span)?;
                 self.function(index, &mut property.getter, &[], &[])?;
             }
-            if index != 0
+            for implementation in &mut ast.inherent_implementations {
+                let mut receiver = implementation.receiver.clone();
+                let owner = match &receiver {
+                    Type::Named(name) | Type::Applied(name, _) => self
+                        .path(index, name, Some(Kind::Type))
+                        .map(|symbol| symbol.id),
+                    _ => None,
+                }
+                .unwrap_or_else(|| self.declaration_id());
+                self.ty(
+                    index,
+                    &mut receiver,
+                    &implementation.type_params,
+                    implementation.span,
+                )?;
+                for method in &mut implementation.methods {
+                    if !method
+                        .function
+                        .params
+                        .first()
+                        .is_some_and(|param| param.receiver)
+                    {
+                        continue;
+                    }
+                    let semantic = declarations::bind(
+                        &method.function.annotations,
+                        self.nodes[index].trust,
+                        DeclarationKind::Member,
+                    )?;
+                    if semantic.is_none() {
+                        return Err(invalid_declaration(
+                            DeclarationError::InvalidSignature,
+                            method.function.span,
+                        ));
+                    }
+                    let mut function = method.function.clone();
+                    for param in &mut function.params {
+                        cyallo_ast::visit::visit_type(&mut param.ty, &mut |ty| {
+                            if *ty == Type::SelfType {
+                                *ty = receiver.clone();
+                            }
+                        });
+                    }
+                    cyallo_ast::visit::visit_type(&mut function.result, &mut |ty| {
+                        if *ty == Type::SelfType {
+                            *ty = receiver.clone();
+                        }
+                    });
+                    self.function(index, &mut function, &[], &implementation.type_params)?;
+                    linked.native.methods.push(NativeMethodDeclaration {
+                        id: self.declaration_id(),
+                        module: Some(self.nodes[index].id),
+                        owner,
+                        owner_parameters: implementation.type_params.clone(),
+                        receiver: receiver.clone(),
+                        function,
+                        public: method.public,
+                    });
+                }
+            }
+            ast.functions.retain(|function| {
+                if function.annotations.is_empty() {
+                    true
+                } else {
+                    let id = self.native_target(&function.name).unwrap().0;
+                    linked.native.functions.push(NativeFunctionDeclaration {
+                        id,
+                        module: Some(self.nodes[index].id),
+                        function: function.clone(),
+                    });
+                    false
+                }
+            });
+            ast.records
+                .retain(|record| match self.native_target(&record.name) {
+                    Some((id, InternalSemantic::Type(_))) => {
+                        linked.native.types.push(NativeTypeDeclaration {
+                            id,
+                            name: record.name.clone(),
+                            parameters: record.type_params.clone(),
+                            annotation: record.annotations[0].clone(),
+                        });
+                        false
+                    }
+                    Some((id, InternalSemantic::TypeFamily(_))) => {
+                        linked.native.families.push((id, record.clone()));
+                        false
+                    }
+                    _ => true,
+                });
+            ast.traits.retain(|t| match self.native_target(&t.name) {
+                Some((id, InternalSemantic::Trait(_))) => {
+                    linked.native.traits.push((id, t.clone()));
+                    false
+                }
+                Some((id, InternalSemantic::AllocatorTrait)) => {
+                    linked.native.traits.push((id, t.clone()));
+                    true
+                }
+                _ => true,
+            });
+            if index != entry
                 && ast.body.iter().any(|s| {
                     !matches!(
                         s.kind,
@@ -1000,7 +1518,7 @@ impl Resolver {
                 ));
             }
             self.block(index, &mut ast.body, &mut Vec::new(), &[], true)?;
-            if index == 0 {
+            if index == entry {
                 linked.body.append(&mut ast.body);
             } else {
                 constants.append(&mut ast.body);
@@ -1011,6 +1529,8 @@ impl Resolver {
             linked.implementations.append(&mut ast.implementations);
             linked.properties.append(&mut ast.properties);
         }
+        declarations::validate_source_ast(&linked)?;
+        declarations::validate_native_declarations(&linked.native)?;
         // Topologically order imported constants without executing module code.
         let names: HashMap<_, _> = constants
             .iter()
@@ -1064,23 +1584,161 @@ impl Resolver {
         let mut body: Vec<_> = sorted.into_iter().map(|i| constants[i].clone()).collect();
         body.append(&mut linked.body);
         linked.body = body;
-        linked.source_names = self.source_names;
+        linked.source_names = std::mem::take(&mut self.source_names);
+        linked.resolved_modules = self
+            .nodes
+            .iter()
+            .map(|node| {
+                let mut values: Vec<_> = node
+                    .names
+                    .iter()
+                    .flat_map(|(name, symbols)| {
+                        symbols
+                            .iter()
+                            .filter(|symbol| symbol.kind != Kind::Property && symbol.public)
+                            .map(|symbol| ResolvedExport {
+                                kind: match symbol.kind {
+                                    Kind::Value => ExportKind::Value,
+                                    Kind::Module => ExportKind::Module,
+                                    Kind::Type => ExportKind::Type,
+                                    Kind::Property => unreachable!(),
+                                },
+                                name: name.clone().into(),
+                                target: symbol.target.clone(),
+                            })
+                    })
+                    .collect();
+                values.sort_by(|left, right| left.name.cmp(&right.name));
+                ResolvedModuleExports {
+                    path: node.path.clone().into(),
+                    values,
+                }
+            })
+            .collect();
+        if let Some(permissions) = &self.permissions {
+            let graph = self.module_graph();
+            linked.native.import_policy = Some(NativeImportPolicy {
+                modules: graph
+                    .iter()
+                    .map(|module| NativeModuleIdentity {
+                        trust: module.trust,
+                        id: module.id,
+                        path: module.path.clone(),
+                    })
+                    .collect(),
+                access: graph
+                    .iter()
+                    .map(|from| NativeModuleAccess {
+                        referrer: from.id,
+                        allowed: graph
+                            .iter()
+                            .filter(|target| permissions.check(from.id, target.id).is_ok())
+                            .map(|module| module.id)
+                            .collect(),
+                    })
+                    .collect(),
+                requesters: self.requesting_modules,
+            });
+        }
         Ok(linked)
     }
 }
 pub fn link(asts: Vec<Ast>, paths: &[String], entry: usize) -> Result<Ast> {
+    link_with_policy(
+        asts,
+        paths,
+        entry,
+        &crate::import_policy::ImportPolicy::default(),
+    )
+}
+pub fn link_with_policy(
+    asts: Vec<Ast>,
+    paths: &[String],
+    entry: usize,
+    policy: &crate::import_policy::ImportPolicy,
+) -> Result<Ast> {
+    link_with_core(
+        asts,
+        paths,
+        entry,
+        policy,
+        &crate::core_package::CorePackage::embedded(),
+        0,
+    )
+}
+pub fn link_with_core(
+    asts: Vec<Ast>,
+    paths: &[String],
+    entry: usize,
+    policy: &crate::import_policy::ImportPolicy,
+    package: &crate::core_package::CorePackage<'_>,
+    core_offset: u32,
+) -> Result<Ast> {
     let mut files: Vec<_> = asts.into_iter().map(Some).collect();
     let root = files[entry]
         .take()
         .ok_or_else(|| error("missing entry module", Span::default()))?;
     let dir = Path::new(&paths[entry]).parent().unwrap_or(Path::new(""));
     let mut resolver = Resolver {
+        aliases: HashMap::new(),
         source_names: HashMap::new(),
         nodes: Vec::new(),
         next_binding: 0,
+        next_declaration: 0,
+        prelude: None,
+        packages: HashMap::new(),
+        associated: HashMap::new(),
+        associated_functions: vec![],
+        permissions: None,
+        requesting_modules: HashMap::new(),
     };
-    resolver.add("crate".into(), root, &mut files, paths, dir)?;
-    resolver.finish()
+    // Only bytes furnished by the sealed core source provider receive Core
+    // provenance. User-controlled filenames and module labels confer no trust.
+    let parsed = package.parse(core_offset)?;
+    let core_paths = parsed.paths;
+    let mut core_files: Vec<_> = parsed.asts.into_iter().map(Some).collect();
+    let core_root = parsed.entry;
+    let core_ast = core_files[core_root].take().unwrap();
+    let core_path = Path::new(package.root());
+    let core_name = core_path
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let core = resolver.add(
+        core_name.clone(),
+        core_ast,
+        &mut core_files,
+        &core_paths,
+        &core_path.with_extension(""),
+        Placement {
+            trust: SourceTrust::Core,
+            parent: None,
+            boundary: ModuleBoundary::Package,
+        },
+    )?;
+    resolver.packages.insert(core_name, core);
+    // Allocate core identities before user declarations, so appending REPL
+    // definitions cannot change the identity of a saved native function item.
+    resolver.declarations(0)?;
+    let user = resolver.add(
+        "crate".into(),
+        root,
+        &mut files,
+        paths,
+        dir,
+        Placement {
+            trust: SourceTrust::User,
+            parent: None,
+            boundary: ModuleBoundary::Package,
+        },
+    )?;
+    resolver.packages.insert("crate".into(), user);
+    resolver.permissions =
+        Some(policy.resolve(&resolver.module_graph()).map_err(|error| {
+            crate::import_policy::import_policy_diagnostic(error, Span::default())
+        })?);
+    resolver.finish(user)
 }
 pub fn single(ast: Ast) -> Result<Ast> {
     link(vec![ast], &["main.ya".into()], 0)

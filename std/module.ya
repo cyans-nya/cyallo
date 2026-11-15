@@ -1,0 +1,18 @@
+use std::result::Result;
+#[cyallo_internal("load_error_struct")]
+pub record LoadError {}
+
+// The namespace is a readonly general object; structural views are optional.
+#[cyallo_internal("module_load")]
+pub proc load(read path: string) -> Result<dynamic, LoadError>;
+
+impl LoadError {
+    #[cyallo_internal("load_error_not_found")]
+    pub fn is_not_found(self: &Self) -> bool;
+    #[cyallo_internal("load_error_denied")]
+    pub fn is_denied(self: &Self) -> bool;
+    #[cyallo_internal("load_error_check")]
+    pub fn is_check_error(self: &Self) -> bool;
+    #[cyallo_internal("load_error_message")]
+    pub fn message(self: &Self) -> string;
+}

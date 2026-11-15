@@ -187,7 +187,7 @@ fn recursive_record_layouts_require_indirection_on_every_cycle() {
         "record Node { next: Node }",
         "record Node { next: Cell<Node> }",
         "record Node { next: [1]Node }",
-        "record First { next: @gc Second }\nrecord Second { next: Second }",
+        "record First { next: gc Second }\nrecord Second { next: Second }",
         "record Node<T> { value: T, next: Node<T> }\nlet root: Node<i64> = 0",
     ] {
         let errors = compile(source).unwrap_err();
@@ -202,8 +202,8 @@ fn recursive_record_layouts_require_indirection_on_every_cycle() {
         "record Node { next: Vec<Node> }",
         "record Node { next: VecDeque<Node> }",
         "record Node { next: Cell<Option<std::rc::Weak<Node>>> }",
-        "record First { next: @gc Second }\nrecord Second { next: First }",
-        "record Node<T> { value: T, next: Vec<@gc Node<T>> }\nproc read(node: &Node<i64>) -> i64 { return node.value }",
+        "record First { next: gc Second }\nrecord Second { next: First }",
+        "record Node<T> { value: T, next: Vec<gc Node<T>> }\nproc read(node: &Node<i64>) -> i64 { return node.value }",
     ] {
         compile(source).unwrap_or_else(|errors| panic!("{source}: {errors:?}"));
     }

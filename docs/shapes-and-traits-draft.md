@@ -1,9 +1,13 @@
 # Shapes, records, objects, and traits — design draft
 
-Status: proposal for discussion, 2026-11-11. The syntax below is illustrative;
-it is not a claim that these examples run in the current interpreter.
-The module/service stages 1–4 are implemented; see [the shipped reference](services.md).
-The remaining object/shape and optimization features below remain proposals.
+Status: design and optimization roadmap, updated 2026-11-15. General open objects,
+required-field contracts, dynamic values/calls, structural views, immutable shapes
+and interpreter feedback are implemented; see [the current reference](objects.md).
+The module/service stages 1–4 are implemented; see [services](services.md).
+Scalar native property ICs are implemented; see [their contract and measurements](native-object-ics.md).
+Speculative call specialization, custom hash plans, unboxed storage, general resolver
+protocols and other illustrative APIs below remain proposals. Use the linked
+references and executable examples as the source of current syntax/behavior.
 
 ## 1. Language model
 

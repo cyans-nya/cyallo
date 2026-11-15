@@ -1,6 +1,6 @@
-// Run: cargo run -- run examples/gc-cells.ya --gc --jit-report
+// Run: cargo run -- run examples/gc-cells.ya --gc --jit-trace=summary
 // Repeated aggregate moves keep 64 saved values and each invocation's temporary
-// arrays. Observe collection and peak occupied cells with --gc --jit-report.
+// arrays. Observe collection and peak occupied cells with --gc --jit-trace=summary.
 let mut saved = std::collections::Vec::from(0..64)
 
 proc work(n: i64) -> i64 {

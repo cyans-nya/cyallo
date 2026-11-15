@@ -128,7 +128,9 @@ pub fn uses_defs(op: &Op) -> (Vec<Reg>, Option<Reg>) {
         | Op::Frozen(r, _)
         | Op::Address(r, _)
         | Op::ServiceKey(r, _) => (vec![], Some(*r)),
-        Op::Lookup(r, _, rs) | Op::Service(r, _, rs) => (rs.clone(), Some(*r)),
+        Op::Dynamic(r, _, rs) | Op::Lookup(r, _, rs) | Op::Service(r, _, rs) => {
+            (rs.clone(), Some(*r))
+        }
         Op::TraitBox(r, a, _) => (vec![*a], Some(*r)),
         Op::TraitCall(r, a, _, rs) => {
             let mut uses = rs.clone();

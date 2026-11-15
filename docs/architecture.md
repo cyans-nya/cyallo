@@ -22,8 +22,12 @@ LLVM backend.
 
 The [concurrency runtime](concurrency.md) separates C/T/P scheduling, channels,
 single-commit operations, clocks, and blocking host work into independent crates.
-Those APIs currently support owned host continuations; source-language and VM
-heap integration are described there as remaining work.
+Source-language integration and remaining capabilities are recorded in the
+[language tracker](concurrency-language-progress.md). The `cyallo-modules` crate
+owns explicit file grants/loading. `cyallo-shapes` owns immutable object layouts,
+property contracts and lookup plans; each Session owns its shape domain and
+feedback. [Runtime loading](dynamic-import.md) uses the same general object and
+dynamic-call operations as [open objects](objects.md).
 
 ## Declarations and deferred analysis
 
@@ -132,14 +136,15 @@ entry, preserving observed frames and per-tier metrics. This procedure path is
 opt-in (`CraneliftConfig.procedure_inlining`): measured code growth
 does not generally repay the retained frame/helper costs.
 
-The CLI's `--jit-report` captures counter baselines and renders logical work,
+The CLI's `--jit-trace=summary` captures counter baselines and renders logical work,
 calls, inline counts and compiler events after execution. It leaves Session
 tracing disabled, preserving optimized execution. REPL baselines are captured
 after each accepted Program replacement, so summaries cover only that entry.
-`--jit-trace` explicitly enables full Session reporting, physical invocation
-events and per-tier clocks. Only this intrusive mode disables inlining. Summary
-execution time includes helper-driven checks, compiler admission waits and GC;
-it does not claim the separate phase timings that require full tracing.
+`--jit-trace` enables full Session reporting, physical invocation events and
+per-tier clocks. Frameless inlining stays on; inlined calls appear in the logical
+counters rather than as invocation events, and `--jit-no-inline` turns inlining
+off. Summary execution time includes helper-driven checks, compiler admission waits
+and GC; it does not claim the separate phase timings that require full tracing.
 
 Both paths share a 256-bytecode growth budget per caller; frameless callees are
 limited to 32 reachable bytecodes, 64 expanded bytecodes per site and three inline

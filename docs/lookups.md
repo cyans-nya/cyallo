@@ -11,17 +11,17 @@ validates dependencies and applies the recipe to the current receiver.
 | API | Meaning |
 | --- | --- |
 | `std::cell::Cell::new(value)` | Owned interior-mutable cell |
-| `*cell` | Copy the contents; requires Copy |
-| `*cell = value` | Replace the contents and drop the old value |
+| `cell.*` | Copy the contents; requires Copy |
+| `cell.* = value` | Replace the contents and drop the old value |
 | `cell.replace(value)` | Replace the contents and return the old owned value |
-| `@gc Cell<T>` | Explicitly shared traced cell |
-| `std::collections::Vec<@gc Cell<T>>` | Growable collection of shared cells |
+| `gc Cell<T>` | Aliased traced cell within one coroutine |
+| `std::collections::Vec<gc Cell<T>>` | Growable collection of local traced cell handles |
 | `std::lookup::field(&owner, "field")` | Strong retained field `Location<T>` |
 | `Location<T>.load()` / `.store(value)` | Read / replace the retained field |
 | `std::lookup::path(receiver)` | Start a relative `StoragePath<Receiver>` |
 | `StoragePath<R>.field("name")` | Append a statically checked field projection |
 | `StoragePath<Vec<T>>.element(index)` | Append a checked collection index |
-| `StoragePath<@gc T>.target()` | Follow the managed owner |
+| `StoragePath<gc T>.target()` | Follow the managed owner |
 | `StoragePath<Cell<T>>.target()` | Read the cell contents |
 | `std::lookup::missing<T>()` | Negative `StoragePath<T>` |
 | `std::lookup::mapped(receiver, key, mapper)` | Resolve the current `Option<T>` |
@@ -32,14 +32,20 @@ A retained `Location<T>` refers to a field, not a movable collection element.
 A collection path rechecks its index each time it is applied. To share an element
 across vector growth, store an explicit managed owner in the vector.
 
+`Any` owns its erased contents. Both erasure and checked recovery are procedures;
+`checked<T>` consumes the erased value and transfers its contents on an exact
+type match. Drop releases any contained resource. Use an explicit clone when
+another independent owner is required; cloning a hidden move-only resource fails
+with its typed ownership error.
+
 ```text
-record Directory { values: Cell<Vec<@gc Cell<i64>>> }
-proc route(root: @gc Directory, key: i64) -> std::lookup::StoragePath<@gc Cell<i64>> {
+record Directory { values: Cell<Vec<gc Cell<i64>>> }
+proc route(root: gc Directory, key: i64) -> std::lookup::StoragePath<gc Cell<i64>> {
     return std::lookup::path(root).target().field("values").target().element(key)
 }
-let root = @gc Directory { values: Cell::new(Vec[@gc Cell::new(42)]) }
+let root = gc Directory { values: Cell::new(Vec[gc Cell::new(42)]) }
 let found = std::lookup::mapped(root, 0, route).unwrap()
-std::io::print(**found)
+std::io::print(found.*.*)
 ```
 
 ## Guards and native execution
@@ -73,7 +79,7 @@ cargo run -- run examples/lookup-services/main.ya --engine cranelift_speed --gc-
 
 The [registry](../examples/lookup-services/registry.ya) has an explicit GC-owned
 `Directory` containing owned cells holding immutable GC snapshots of its key list
-and entry vector. Each entry is an `@gc Cell<@gc Binding>`. The mapper reads the key directory and returns a path to
+and entry vector. Each entry is an `gc Cell<gc Binding>`. The mapper reads the key directory and returns a path to
 that entry's managed owner. A service handle keeps that owner, then loads its
 current provider on each acquisition. Replacement preserves the entry identity.
 A generation check prevents an old lease from disposing a replacement.

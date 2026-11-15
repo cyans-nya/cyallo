@@ -1,0 +1,6 @@
+#[cyallo_internal("printable_trait")]
+pub trait Printable {}
+
+// Each pack element has its own concrete Printable type. No values are erased.
+#[cyallo_internal("print")]
+pub proc print<...T: Printable>(...read values: T);

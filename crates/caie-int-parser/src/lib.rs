@@ -202,6 +202,8 @@ impl Parser<'_> {
                 self.expect(":")?;
                 let ty = self.ty()?;
                 params.push(Param {
+                    arity: ParameterArity::One,
+                    passing: ParameterPassing::Value,
                     receiver: false,
                     name: pname,
                     ty,
@@ -231,6 +233,10 @@ impl Parser<'_> {
         let span = self.finish_span(span);
         self.eol()?;
         Ok(Function {
+            annotations: vec![],
+            body_kind: FunctionBodyKind::Source,
+            constraints: vec![],
+            type_packs: vec![],
             generator: false,
             origin: RoutineOrigin::Source,
             attributes: Default::default(),

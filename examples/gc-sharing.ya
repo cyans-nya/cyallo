@@ -1,16 +1,17 @@
 // Run: cargo run -- run examples/gc-sharing.ya
-// Add --gc-stress to collect during every allocation. @gc enables tracing itself.
+// Add --gc-stress to collect during every allocation. gc enables tracing itself.
+// Every alias in this example stays local to one coroutine.
 use std::cell::Cell
 use std::collections::Vec
 
 record Counter { value: Cell<i64> }
 
-proc make_counter(value: i64) -> @gc Counter {
-    return @gc Counter { value: Cell::new(value) }
+proc make_counter(value: i64) -> gc Counter {
+    return gc Counter { value: Cell::new(value) }
 }
 
-proc increment(counter: @gc Counter) {
-    *counter.value = *counter.value + 1
+proc increment(counter: gc Counter) {
+    counter.value.* = counter.value.* + 1
 }
 
 proc churn() {
@@ -21,15 +22,15 @@ proc churn() {
 
 let counter = make_counter(10)
 let alias = counter // Copying a GC reference shares the same Counter.
-let snapshot = *counter.value // Reading the integer produces a value snapshot.
+let snapshot = counter.value.* // Reading the integer produces a value snapshot.
 increment(alias)
 std::io::print("snapshot: ", snapshot)
-std::io::print("shared: ", *counter.value, ":", *alias.value)
+std::io::print("shared: ", counter.value.*, ":", alias.value.*)
 
 let mut counters = Vec[counter]
 let retained = counters[0]
 counters.push(make_counter(100))
 churn()
 // The managed Counter remains shared across vector growth and collection.
-*retained.value = 21
-std::io::print("retained: ", *counters[0].value)
+retained.value.* = 21
+std::io::print("retained: ", counters[0].value.*)

@@ -1,0 +1,46 @@
+use std::mem::{Allocator, AllocError};
+use std::option::Option;
+use std::result::Result;
+use std::lookup::Target;
+
+#[cyallo_internal("rc_owner_trait")]
+pub trait RcOwner {}
+#[cyallo_internal("weak_owner_trait")]
+pub trait WeakOwner {}
+
+#[cyallo_internal("weak_struct")]
+pub record Weak<T> {}
+
+#[cyallo_internal("allocated_rc_type")]
+pub record AllocatedRc<T, AllocatorValue> {}
+#[cyallo_internal("weak_of_type")]
+pub record WeakOf<Owner> {}
+
+#[cyallo_internal("rc_try_new_in")]
+pub proc try_new_in<T, A: Allocator>(value: T, allocator: A) -> Result<AllocatedRc<T, allocator>, AllocError>;
+#[cyallo_internal("rc_clone")]
+pub proc clone<O: RcOwner>(owner: &O) -> O;
+#[cyallo_internal("rc_downgrade")]
+pub proc downgrade<O: RcOwner>(owner: &O) -> WeakOf<O>;
+#[cyallo_internal("rc_upgrade")]
+pub proc upgrade<W: WeakOwner>(owner: &W) -> Option<Target<W>>;
+#[cyallo_internal("rc_strong_count")]
+pub proc strong_count<O: RcOwner>(owner: &O) -> usize;
+#[cyallo_internal("rc_weak_count")]
+pub proc weak_count<O: RcOwner>(owner: &O) -> usize;
+
+impl<T> rc T {
+    #[cyallo_internal("rc_clone_member")]
+    pub proc clone(self: &Self) -> Self;
+    #[cyallo_internal("rc_downgrade_member")]
+    pub proc downgrade(self: &Self) -> WeakOf<Self>;
+    #[cyallo_internal("rc_strong_count_member")]
+    pub proc strong_count(self: &Self) -> usize;
+    #[cyallo_internal("rc_weak_count_member")]
+    pub proc weak_count(self: &Self) -> usize;
+}
+
+impl<T> Weak<T> {
+    #[cyallo_internal("rc_upgrade_member")]
+    pub proc upgrade(self: &Self) -> Option<Target<Self>>;
+}

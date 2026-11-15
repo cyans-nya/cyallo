@@ -2,44 +2,127 @@
 //! checking, lowering and execution use these variants.
 use cyallo_ast::{IntrinsicId, NumberKind};
 macro_rules! intrinsics {
-    ($($variant:ident => $name:literal),* $(,)?) => {
+    ($($variant:ident),* $(,)?) => {
         #[derive(Debug,Clone,Copy,PartialEq,Eq,Hash)]
         #[repr(u16)]
         pub enum Intrinsic { $($variant),* }
         impl Intrinsic {
             pub const ALL:&'static [Self]=&[$(Self::$variant),*];
-            pub fn id(self)->IntrinsicId {IntrinsicId(self as u16)}
+            pub fn id(self)->IntrinsicId {IntrinsicId(self as u16, None)}
             pub fn from_id(id:IntrinsicId)->Option<Self>{Self::ALL.get(id.0 as usize).copied()}
-            pub fn diagnostic_name(self)->&'static str {match self{$(Self::$variant=>$name),*}}
+            pub fn diagnostic_name(self)->&'static str {match self{$(Self::$variant=>stringify!($variant)),*}}
         }
     }
 }
 intrinsics! {
-    LayoutNew=>"std::mem::Layout::new",Allocate=>"std::mem::allocate",Deallocate=>"std::mem::deallocate",AllocErrorNew=>"std::mem::AllocError::new",ResultOk=>"std::result::ok",ResultErr=>"std::result::err",RcTryNewIn=>"std::rc::try_new_in",
-    Left=>"std::runtime::caie::left",Right=>"std::runtime::caie::right",Mid=>"std::runtime::caie::mid",Length=>"std::runtime::caie::length",LowerChar=>"std::runtime::caie::lcase",UpperChar=>"std::runtime::caie::ucase",
-    Truncate=>"std::runtime::caie::int",Random=>"std::random::uniform",CharCode=>"std::char::code",CharFromCode=>"std::char::from_code",StringFrom=>"std::string::from",
-    ParseLegacy=>"std::runtime::caie::str_to_num",IsNumeric=>"std::runtime::caie::is_num",Trim=>"std::string::trim",Upper=>"std::string::upper",Lower=>"std::string::lower",
-    Contains=>"std::string::contains",StartsWith=>"std::string::starts_with",EndsWith=>"std::string::ends_with",Replace=>"std::string::replace",
-    Abs=>"ABS",Min=>"MIN",Max=>"MAX",Clamp=>"CLAMP",NumAbs=>"std::num::abs",NumMin=>"std::num::min",NumMax=>"std::num::max",NumClamp=>"std::num::clamp",Round=>"ROUND",Floor=>"FLOOR",Ceil=>"CEIL",
-    Sqrt=>"SQRT",Pow=>"POW",FloatRound=>"std::num::round",FloatFloor=>"std::num::floor",FloatCeil=>"std::num::ceil",FloatSqrt=>"std::num::sqrt",FloatPow=>"std::num::pow",Keys=>"KEYS",Values=>"VALUES",Count=>"COUNT",Sum=>"SUM",
-    CellNew=>"std::cell::Cell::new",ArrayEmpty=>"std::array::empty",ArrayFrom=>"std::array::from",
-    VecLiteral=>"std::collections::Vec",DequeLiteral=>"std::collections::VecDeque",VecFrom=>"std::collections::Vec::from",DequeFrom=>"std::collections::VecDeque::from",
-    OptionSome=>"std::option::some",OptionNone=>"std::option::none",Erase=>"std::any::erase",
-    Checked=>"std::any::checked",FreshSymbol=>"std::any::fresh_symbol",LookupPath=>"std::lookup::path",MissingPath=>"std::lookup::missing",
-    MappedLookup=>"std::lookup::mapped",ContextNew=>"std::service::Context::new",ServiceKeyNew=>"std::service::ServiceKey::new",Print=>"std::io::print",Input=>"std::runtime::caie::input",Parse=>"std::num::parse",
-    CastI8=>"CAST_I8",CastI16=>"CAST_I16",CastI32=>"CAST_I32",CastI64=>"CAST_I64",
-    CastU8=>"CAST_U8",CastU16=>"CAST_U16",CastU32=>"CAST_U32",CastU64=>"CAST_U64",
-    CastIsize=>"CAST_ISIZE",CastUsize=>"CAST_USIZE",CastF32=>"CAST_F32",CastF64=>"CAST_F64",
-    RcClone=>"std::rc::clone",RcDowngrade=>"std::rc::downgrade",RcUpgrade=>"std::rc::upgrade",RcStrongCount=>"std::rc::strong_count",RcWeakCount=>"std::rc::weak_count",GcClone=>"std::gc::clone",DropValue=>"std::mem::drop",
-    CloneValue=>"std::mem::clone",FieldLocation=>"std::lookup::field",
-    ArrayLength=>"std::array::len",StringLength=>"std::string::len",ArraySum=>"std::array::sum",
+    ObjectView,
+    ObjectFreeze,
+    ModuleLoad,
+    ChannelBounded,
+    ChannelUnbounded,
+    ClockNew,
+    TaskSpawn,
+    LayoutNew,
+    Allocate,
+    Deallocate,
+    AllocErrorNew,
+    ResultOk,
+    ResultErr,
+    RcTryNewIn,
+    Left,
+    Right,
+    Mid,
+    Length,
+    LowerChar,
+    UpperChar,
+    Truncate,
+    Random,
+    CharCode,
+    CharFromCode,
+    StringFrom,
+    ParseLegacy,
+    IsNumeric,
+    Trim,
+    Upper,
+    Lower,
+    Contains,
+    StartsWith,
+    EndsWith,
+    Replace,
+    Abs,
+    Min,
+    Max,
+    Clamp,
+    NumAbs,
+    NumMin,
+    NumMax,
+    NumClamp,
+    Round,
+    Floor,
+    Ceil,
+    Sqrt,
+    Pow,
+    FloatRound,
+    FloatFloor,
+    FloatCeil,
+    FloatSqrt,
+    FloatPow,
+    Keys,
+    Values,
+    Count,
+    Sum,
+    CellNew,
+    ArrayEmpty,
+    ArrayFrom,
+    VecLiteral,
+    DequeLiteral,
+    VecFrom,
+    DequeFrom,
+    OptionSome,
+    OptionNone,
+    Erase,
+    Checked,
+    FreshSymbol,
+    LookupPath,
+    MissingPath,
+    MappedLookup,
+    ContextNew,
+    ServiceKeyNew,
+    Print,
+    Input,
+    Parse,
+    CastI8,
+    CastI16,
+    CastI32,
+    CastI64,
+    CastU8,
+    CastU16,
+    CastU32,
+    CastU64,
+    CastIsize,
+    CastUsize,
+    CastF32,
+    CastF64,
+    RcClone,
+    RcDowngrade,
+    RcUpgrade,
+    RcStrongCount,
+    RcWeakCount,
+    GcClone,
+    DropValue,
+    CloneValue,
+    FieldLocation,
+    ArrayLength,
+    StringLength,
+    ArraySum,
 }
 impl Intrinsic {
     /// Ownership is part of each intrinsic declaration's parameter contract.
     pub fn consumes_argument(self, _index: usize) -> bool {
         matches!(
             self,
-            Self::CellNew
+            Self::TaskSpawn
+                | Self::CellNew
                 | Self::Allocate
                 | Self::Deallocate
                 | Self::ResultOk
@@ -49,6 +132,7 @@ impl Intrinsic {
                 | Self::DequeLiteral
                 | Self::OptionSome
                 | Self::Erase
+                | Self::Checked
                 | Self::LookupPath
                 | Self::DropValue
         )
@@ -202,6 +286,41 @@ pub fn resolve(
     span: cyallo_ast::Span,
 ) -> Result<ResolvedCall, cyallo_ast::Diagnostic> {
     use cyallo_ast::Type;
+    if id == Intrinsic::ObjectView
+        && let ([view @ Type::Object(_)], [Type::Dynamic]) = (type_args, arguments)
+    {
+        return Ok(ResolvedCall {
+            intrinsic: id,
+            result: crate::lookup::result_type(
+                view.clone(),
+                crate::lookup::storage(cyallo_ast::StorageKind::ViewError, Type::Void),
+            ),
+            lowering: Lowering::Storage(crate::lookup::Operation::ObjectView),
+        });
+    }
+    if id == Intrinsic::ObjectFreeze
+        && let [ty] = arguments
+        && crate::dynamic::object(ty.pointee_or_self())
+    {
+        return Ok(ResolvedCall {
+            intrinsic: id,
+            result: ty.clone(),
+            lowering: Lowering::Storage(crate::lookup::Operation::ObjectFreeze),
+        });
+    }
+    if id == Intrinsic::ModuleLoad && type_args.is_empty() && arguments == [Type::String] {
+        return Ok(ResolvedCall {
+            intrinsic: id,
+            result: crate::lookup::result_type(
+                Type::Dynamic,
+                crate::lookup::storage(cyallo_ast::StorageKind::LoadError, Type::Void),
+            ),
+            lowering: Lowering::Storage(crate::lookup::Operation::ModuleLoad),
+        });
+    }
+    if crate::concurrent::is_intrinsic(id) {
+        return crate::concurrent::resolve(id, type_args, arguments, span);
+    }
     if id == Intrinsic::RcTryNewIn
         && type_args.is_empty()
         && let [value, allocator] = arguments
@@ -211,6 +330,7 @@ pub fn resolve(
             result: crate::lookup::result_type(
                 crate::memory::managed_type(
                     cyallo_ast::MemoryKind::Rc,
+                    cyallo_ast::Locality::Local,
                     Some(allocator),
                     value.clone(),
                 ),
@@ -237,7 +357,11 @@ pub fn resolve(
     if id == Intrinsic::Print
         && type_args.is_empty()
         && arguments.iter().all(|ty| {
-            ty.number_kind().is_some() || matches!(ty, Type::String | Type::Char | Type::Boolean)
+            ty.number_kind().is_some()
+                || matches!(
+                    ty,
+                    Type::String | Type::Char | Type::Boolean | Type::Dynamic | Type::Object(_)
+                )
         })
     {
         return Ok(ResolvedCall {
@@ -341,4 +465,78 @@ pub fn resolve(
         });
     }
     Err(invalid())
+}
+
+/// Checks the actual source declaration, then validates its native ABI
+/// specialization. Generic substitutions belong to the declaration; their
+/// ordering is independent of an operation's internal specialization inputs.
+pub fn resolve_declared(
+    reference: IntrinsicId,
+    env: &crate::declarations::TypeEnvironment,
+    type_args: &[cyallo_ast::Type],
+    arguments: &[cyallo_ast::Expr],
+    types: &[cyallo_ast::Type],
+    span: cyallo_ast::Span,
+) -> Result<ResolvedCall, cyallo_ast::Diagnostic> {
+    use crate::declarations::{DeclarationError, invalid_declaration};
+    use crate::internal::InternalSemantic;
+    use cyallo_ast::{StorageKind as K, Type};
+    let id = Intrinsic::from_id(reference)
+        .ok_or_else(|| invalid_declaration(DeclarationError::InvalidSignature, span))?;
+    let Some(declaration) = reference.1 else {
+        return resolve_at_call(id, type_args, arguments, types, span);
+    };
+    env.check_native_access(declaration, span)?;
+    let contract =
+        crate::native_contract::function(env, declaration, type_args, arguments, types, span)?;
+    if contract.semantic != InternalSemantic::Function(id) {
+        return Err(invalid_declaration(
+            DeclarationError::InvalidSignature,
+            span,
+        ));
+    }
+    let inner = |kind| crate::lookup::inner(&contract.result, kind).cloned();
+    let result_arguments = || match &contract.result {
+        Type::Storage(K::Result, tuple) => match tuple.as_ref() {
+            Type::Tuple(types) => Some(types.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let specialization = match id {
+        Intrinsic::ResultOk | Intrinsic::ResultErr => result_arguments(),
+        Intrinsic::ObjectView | Intrinsic::Parse => result_arguments()
+            .and_then(|types| types.first().cloned())
+            .map(|ty| vec![ty]),
+        Intrinsic::OptionNone => inner(K::Option).map(|ty| vec![ty]),
+        Intrinsic::Checked => Some(vec![contract.result.clone()]),
+        Intrinsic::MissingPath => inner(K::StoragePath).map(|ty| vec![ty]),
+        Intrinsic::ArrayEmpty => match &contract.result {
+            Type::Array(_, element) => Some(vec![*element.clone()]),
+            _ => None,
+        },
+        Intrinsic::ServiceKeyNew => match &contract.result {
+            Type::ServiceKey(ty) => Some(vec![*ty.clone()]),
+            _ => None,
+        },
+        Intrinsic::ChannelBounded | Intrinsic::ChannelUnbounded => match &contract.result {
+            Type::Tuple(types) => types
+                .first()
+                .and_then(|ty| crate::lookup::inner(ty, K::Sender))
+                .cloned()
+                .map(|ty| vec![ty]),
+            _ => None,
+        },
+        _ => Some(vec![]),
+    }
+    .ok_or_else(|| invalid_declaration(DeclarationError::InvalidSignature, span))?;
+    let mut resolved = resolve_at_call(id, &specialization, arguments, types, span)?;
+    if !crate::declarations::equivalent_types(&resolved.result, &contract.result) {
+        return Err(invalid_declaration(
+            DeclarationError::InvalidSignature,
+            span,
+        ));
+    }
+    resolved.result = contract.result;
+    Ok(resolved)
 }

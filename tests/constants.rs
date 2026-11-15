@@ -64,7 +64,7 @@ fn rejects_runtime_dependencies_effects_and_mutable_identity() {
         "record R { n: Cell<i64> }\nconst r = R { n: std::cell::Cell::new(1) }\n",
         "fn f(n: i64) -> i64 { const k = n + 1; return k }\n",
         "const n = 1\nfn f(n: i64) -> i64 { const k = n; return k }\n",
-        "fn bad(n: Cell<i64>) -> i64 { return *n }\n",
+        "fn bad(n: Cell<i64>) -> i64 { return n.* }\n",
         "fn bad(n: &mut Vec<i64>) -> i64 { n.push(1); return n[0] }\n",
         "const a = [1]\na[0] = 2\n",
         "const p = (1, [2])\np.1[0] = 3\n",
@@ -114,7 +114,7 @@ fn aggregate_payloads_share_a_pool_and_preserve_fixed_shape() {
 }
 #[test]
 fn compile_time_strings_work_as_service_labels_and_plan_fields() {
-    let source = "trait T { proc f(self: &mut Self) }\nconst label = \"service\"\nconst KEY = std::service::ServiceKey::new<dyn T>(label)\nconst FIELD = \"value\"\nrecord R { value: Cell<i64> }\nfn route(r: @gc R, key: i64) -> std::lookup::StoragePath<i64> { return std::lookup::path(r).target().field(FIELD).target() }\nlet r = @gc R { value: std::cell::Cell::new(42) }\nstd::io::print(std::lookup::mapped(r, 0, route).unwrap())\n";
+    let source = "trait T { proc f(self: &mut Self) }\nconst label = \"service\"\nconst KEY = std::service::ServiceKey::new<dyn T>(label)\nconst FIELD = \"value\"\nrecord R { value: Cell<i64> }\nfn route(r: gc R, key: i64) -> std::lookup::StoragePath<i64> { return std::lookup::path(r).target().field(FIELD).target() }\nlet r = gc R { value: std::cell::Cell::new(42) }\nstd::io::print(std::lookup::mapped(r, 0, route).unwrap())\n";
     let p = Arc::new(compile(source).unwrap());
     assert_eq!(p.services().keys.len(), 1);
     assert_eq!(p.services().keys[0].label.as_ref(), "service");

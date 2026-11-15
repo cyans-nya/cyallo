@@ -4,7 +4,7 @@ The language supports Rust-style module paths and imports, extension properties,
 traits with erased dispatch, and typed service contexts. Run the complete example:
 
 ```sh
-cargo run -- run examples/services/main.ya --gc-stress --jit-report
+cargo run -- run examples/services/main.ya --gc-stress --jit-trace=summary
 cargo run -- check examples/services/main.ya
 ```
 
@@ -111,7 +111,7 @@ immutable Program metadata; native installation uses the existing execution-thre
 entry slots. REPL source replacement remaps existing function/key identities and
 resets target caches. Moving GC repairs trait receivers and refreshes native views.
 
-`Session::service_stats()` and `--jit-report` expose slot hits, route resolutions,
+`Session::service_stats()` and `--jit-trace=summary` expose slot hits, route resolutions,
 target hits/misses, native target hits, maximum target cases (library API),
 provisions, withdrawals, and released bindings. Tests cover full native execution
 and one-instruction engine handoffs with GC stress, replacement, isolation,

@@ -116,6 +116,7 @@ pub(super) struct Request {
     mailbox: Arc<Mailbox>,
     alive: Weak<()>,
     reporting: bool,
+    inlining: bool,
     state: Mutex<RequestState>,
 }
 impl Request {
@@ -128,6 +129,7 @@ impl Request {
         mailbox: Arc<Mailbox>,
         alive: Weak<()>,
         reporting: bool,
+        inlining: bool,
         slots: Arc<Slots>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -137,6 +139,7 @@ impl Request {
             mailbox,
             alive,
             reporting,
+            inlining,
             state: Mutex::default(),
         })
     }
@@ -461,14 +464,20 @@ fn work(compiler: &Service, receiver: &kanal::Receiver<()>) {
                 Err(error) => {
                     fallback = Some(error);
                     actual = Tier::CraneliftFast;
-                    compile_unit(request.program.clone(), request.function, false)
-                        .map(|unit| Unit::Cranelift(Box::new(unit)))
+                    compile_unit(
+                        request.program.clone(),
+                        request.function,
+                        false,
+                        request.inlining,
+                    )
+                    .map(|unit| Unit::Cranelift(Box::new(unit)))
                 }
             },
             Tier::CraneliftFast | Tier::CraneliftSpeed => compile_unit(
                 request.program.clone(),
                 request.function,
                 tier == Tier::CraneliftSpeed,
+                request.inlining,
             )
             .map(|unit| Unit::Cranelift(Box::new(unit))),
         };
@@ -520,6 +529,7 @@ mod tests {
             0,
             Mailbox::new(),
             Arc::downgrade(&owner),
+            true,
             true,
             Slots::new(1),
         );
@@ -639,6 +649,7 @@ mod tests {
             Mailbox::new(),
             Arc::downgrade(&owner),
             false,
+            true,
             a.slots.clone(),
         );
         service.request(&a, Tier::Winch, None, false);
@@ -651,6 +662,7 @@ mod tests {
             Mailbox::new(),
             Arc::downgrade(&owner),
             false,
+            true,
             Slots::new(1),
         );
         service.request(&c, Tier::Winch, None, false);

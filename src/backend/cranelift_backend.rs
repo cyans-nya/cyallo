@@ -1,6 +1,6 @@
 use super::{
     CompileError, Executable, NativeBackend,
-    abi::{native_enter, native_flush, native_step},
+    abi::{native_enter, native_flush, native_property_write, native_step},
 };
 use crate::{
     Type,
@@ -145,6 +145,11 @@ impl CraneliftUnit {
                 .is_some_and(|f| f.speed_version == self.version)
     }
     fn invoke(&self, session: &mut Session, budget: usize) -> u64 {
+        session.enter_execution();
+        if !session.poll_concurrent() {
+            session.leave_execution();
+            return budget as u64;
+        }
         let previous = session.select_execution_engine(self.engine);
         session.reset_native_exit();
         let view = session.prepare_native();
@@ -155,12 +160,18 @@ impl CraneliftUnit {
         session.observe_native_exit();
         session.pause_reporting();
         session.select_execution_engine(previous);
+        session.leave_execution();
         remaining
     }
 }
 impl Executable for CraneliftUnit {
     fn run(&self, session: &mut Session, budget: usize) -> Result<(), EngineError> {
         if !Arc::ptr_eq(&self.program, &session.program) {
+            if session.program.extends(&self.program) {
+                session.run(budget);
+                return Ok(());
+            }
+
             self.program.notice(
                 "invalidation",
                 0,
@@ -304,6 +315,11 @@ impl EagerCraneliftArtifact {
 impl Executable for EagerCraneliftArtifact {
     fn run(&self, session: &mut Session, budget: usize) -> Result<(), EngineError> {
         if !Arc::ptr_eq(&self.program, &session.program) {
+            if session.program.extends(&self.program) {
+                session.run(budget);
+                return Ok(());
+            }
+
             self.program.notice(
                 "invalidation",
                 0,
@@ -319,6 +335,9 @@ impl Executable for EagerCraneliftArtifact {
         });
         let result = (|| {
             while session.instruction_count() - start < budget as u64 {
+                if !session.resume_pending() {
+                    break;
+                }
                 if matches!(
                     session.status(),
                     crate::Status::Finished | crate::Status::Failed(_)
@@ -365,6 +384,7 @@ fn scalar(ty: &Type) -> bool {
             | Type::ServiceKey(_)
             | Type::ServiceRef(_)
             | Type::TraitObject(_)
+            | Type::Object(_)
     )
 }
 fn kind(ty: &Type) -> u64 {
@@ -378,6 +398,7 @@ fn kind(ty: &Type) -> u64 {
         Type::ServiceKey(_) => native::SERVICE_KEY,
         Type::ServiceRef(_) => native::SERVICE_REF,
         Type::TraitObject(_) => native::TRAIT_OBJECT,
+        Type::Object(_) => native::OBJECT,
         _ => unreachable!(),
     }
 }
@@ -394,10 +415,164 @@ struct Lower<'a, 'b> {
     targets: HashMap<(usize, usize), Block>,
     step: FuncRef,
     flush: FuncRef,
+    property_write: FuncRef,
     signature: SigRef,
     inline_plans: HashMap<(usize, usize), super::inlining::Plan>,
 }
 impl Lower<'_, '_> {
+    fn property_ic(
+        &mut self,
+        fi: usize,
+        pc: usize,
+        op: &Op,
+        fuel: cranelift::prelude::Value,
+        pending: cranelift::prelude::Value,
+    ) {
+        use crate::runtime::dynamic::{NativeCache, NativeCase, NativeObject, ObjectStats};
+        use cyallo_ir::dynamic::Operation as D;
+        let Op::Dynamic(destination, operation, args) = op else {
+            return;
+        };
+        if !matches!(operation, D::Get(_) | D::GetKey | D::Set(_) | D::SetKey) {
+            return;
+        }
+        let register = if matches!(operation, D::Set(_) | D::SetKey) {
+            *args.last().unwrap()
+        } else {
+            *destination
+        };
+        if !native::property_scalar_candidate(&self.program.functions[fi].registers[register]) {
+            return;
+        }
+        let write = matches!(operation, D::Set(_) | D::SetKey);
+        let computed = matches!(operation, D::GetKey | D::SetKey);
+        let miss = self.b.create_block();
+        let guard = |this: &mut Self, condition| {
+            let valid = this.b.create_block();
+            this.b.ins().brif(condition, valid, &[], miss, &[]);
+            this.b.switch_to_block(valid);
+        };
+        let table = self.field(offset_of!(NativeView, property_caches));
+        let present = self.b.ins().icmp_imm_s(IntCC::NotEqual, table, 0);
+        guard(self, present);
+        let cache = self
+            .b
+            .ins()
+            .iadd_imm_s(table, (pc * size_of::<NativeCache>()) as i64);
+        let receiver = self.regptr(args[0]);
+        let kind = self.load(receiver, 8);
+        let kind = self.b.ins().band_imm_s(kind, 255);
+        let bare = self
+            .b
+            .ins()
+            .icmp_imm_s(IntCC::Equal, kind, native::OBJECT as i64);
+        let erased = self
+            .b
+            .ins()
+            .icmp_imm_s(IntCC::Equal, kind, native::DYNAMIC_OBJECT as i64);
+        let valid = self.b.ins().bor(bare, erased);
+        guard(self, valid);
+        if computed {
+            let key = self.regptr(args[1]);
+            let kind = self.load(key, 8);
+            let kind = self.b.ins().band_imm_s(kind, 255);
+            let bare = self
+                .b
+                .ins()
+                .icmp_imm_s(IntCC::Equal, kind, native::STRING_KEY as i64);
+            let erased =
+                self.b
+                    .ins()
+                    .icmp_imm_s(IntCC::Equal, kind, native::DYNAMIC_STRING_KEY as i64);
+            let valid = self.b.ins().bor(bare, erased);
+            guard(self, valid);
+            let key = self.load(key, 0);
+            let expected = self.load(cache, offset_of!(NativeCache, key));
+            let equal = self.b.ins().icmp(IntCC::Equal, key, expected);
+            guard(self, equal);
+        }
+        let id = self.load(receiver, 0);
+        let count = self.field(offset_of!(NativeView, object_count));
+        let in_bounds = self.b.ins().icmp(IntCC::UnsignedLessThan, id, count);
+        guard(self, in_bounds);
+        let table = self.field(offset_of!(NativeView, objects));
+        let offset = self.b.ins().ishl_imm_s(id, 3);
+        let address = self.b.ins().iadd(table, offset);
+        let object = self.load(address, 0);
+        let present = self.b.ins().icmp_imm_s(IntCC::NotEqual, object, 0);
+        guard(self, present);
+        let shape = self.load(object, offset_of!(NativeObject, shape));
+        for index in 0..4 {
+            let next = self.b.create_block();
+            let hit = self.b.create_block();
+            let case = self.b.ins().iadd_imm_s(
+                cache,
+                (offset_of!(NativeCache, cases) + index * size_of::<NativeCase>()) as i64,
+            );
+            let expected = self.load(case, offset_of!(NativeCase, shape));
+            let equal = self.b.ins().icmp(IntCC::Equal, shape, expected);
+            self.b.ins().brif(equal, hit, &[], next, &[]);
+            self.b.switch_to_block(hit);
+            let slot = self.load(case, offset_of!(NativeCase, slot));
+            let length = self.load(object, offset_of!(NativeObject, length));
+            let valid = self.b.ins().icmp(IntCC::UnsignedLessThan, slot, length);
+            guard(self, valid);
+            let slots = self.load(object, offset_of!(NativeObject, slots));
+            let offset = self.b.ins().ishl_imm_s(slot, 4);
+            let value = self.b.ins().iadd(slots, offset);
+            let kind = self.load(value, 8);
+            let expected = self.load(case, offset_of!(NativeCase, kind));
+            let equal = self.b.ins().icmp(IntCC::Equal, kind, expected);
+            guard(self, equal);
+            if write {
+                let input = self.regptr(*args.last().unwrap());
+                let kind = self.load(input, 8);
+                let kind = self.b.ins().band_imm_s(kind, 255);
+                let expected = self.load(case, offset_of!(NativeCase, input_kind));
+                let valid = self.b.ins().icmp_imm_s(IntCC::NotEqual, expected, 0);
+                let equal = self.b.ins().icmp(IntCC::Equal, kind, expected);
+                let valid = self.b.ins().band(valid, equal);
+                guard(self, valid);
+                self.store(self.view, offset_of!(NativeView, property_object), id);
+                self.store(self.view, offset_of!(NativeView, property_slot), slot);
+                let input = self.constant(*args.last().unwrap() as u64);
+                self.store(self.view, offset_of!(NativeView, property_input), input);
+                let result = self.constant(*destination as u64);
+                self.store(
+                    self.view,
+                    offset_of!(NativeView, property_destination),
+                    result,
+                );
+                let before = self.b.ins().iadd_imm_s(pending, -1);
+                self.save(pc, before);
+                self.b.ins().call(self.property_write, &[self.session]);
+                let halted = self.field(offset_of!(NativeView, halted));
+                let active = self.b.ins().icmp_imm_s(IntCC::Equal, halted, 0);
+                let zero = self.constant(0);
+                self.b.ins().brif(
+                    active,
+                    self.targets[&(fi, pc + 1)],
+                    &[fuel.into(), zero.into()],
+                    self.done,
+                    &[fuel.into()],
+                );
+            } else {
+                let result_kind = self.load(case, offset_of!(NativeCase, result_kind));
+                let valid = self.b.ins().icmp_imm_s(IntCC::NotEqual, result_kind, 0);
+                guard(self, valid);
+                let bits = self.load(value, 0);
+                self.write(*destination, bits, result_kind);
+                let stats = self.field(offset_of!(NativeView, object_stats));
+                self.saturating_add(stats, offset_of!(ObjectStats, native_reads), 1);
+                self.next(fi, pc + 1, fuel, pending);
+            }
+            self.b.switch_to_block(next);
+        }
+        self.b.ins().jump(miss, &[]);
+        self.b.switch_to_block(miss);
+        let stats = self.field(offset_of!(NativeView, object_stats));
+        self.saturating_add(stats, offset_of!(ObjectStats, native_misses), 1);
+    }
     fn inline_guard(
         &mut self,
         safe: cranelift::prelude::Value,
@@ -540,8 +715,9 @@ impl Lower<'_, '_> {
             self.b
                 .ins()
                 .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, fuel, plan.cost as i64);
-        let tracing = self.field(offset_of!(NativeView, reporting));
-        let unobserved = self.b.ins().icmp_imm_s(IntCC::Equal, tracing, 0);
+        // Frameless bodies have no VM frame for the observer to enter, so trace
+        // observation does not require the fallback. Their work is recorded
+        // through the logical counters on flush.
         let depth = self.field(offset_of!(NativeView, depth));
         let needed = self.b.ins().iadd_imm_s(depth, plan.depth as i64);
         let max = self.field(offset_of!(NativeView, max_depth));
@@ -549,16 +725,13 @@ impl Lower<'_, '_> {
             .b
             .ins()
             .icmp(IntCC::UnsignedLessThanOrEqual, needed, max);
-        let safe = self.b.ins().band(enough, unobserved);
-        let mut safe = self.b.ins().band(safe, room);
+        let mut safe = self.b.ins().band(enough, room);
         let observing = self.program.inspection().is_some_and(|o| o.options.notices);
         let reason = observing.then(|| {
             let one = self.constant(1);
-            let two = self.constant(2);
             let three = self.constant(3);
             let four = self.constant(4);
             let reason = self.b.ins().select(room, four, three);
-            let reason = self.b.ins().select(unobserved, reason, two);
             self.b.ins().select(enough, reason, one)
         });
         let callee = &self.program.functions[plan.function];
@@ -1088,8 +1261,13 @@ pub(super) fn compile_unit(
     program: Arc<Program>,
     function: usize,
     speed: bool,
+    inlining: bool,
 ) -> Result<CraneliftUnit, CompileError> {
-    compile_configured(program, Some(function), CraneliftConfig::tiered(speed))
+    let config = CraneliftConfig {
+        inlining,
+        ..CraneliftConfig::tiered(speed)
+    };
+    compile_configured(program, Some(function), config)
 }
 fn compile_configured(
     program: Arc<Program>,
@@ -1135,6 +1313,10 @@ fn compile_part(
     let flags = config.flags();
     let mut jit = JITBuilder::with_flags(&flags, default_libcall_names())?;
     jit.symbol("caie_native_step", native_step as *const u8)
+        .symbol(
+            "cyallo_native_property_write",
+            native_property_write as *const u8,
+        )
         .symbol("caie_native_flush", native_flush as *const u8)
         .symbol("caie_native_enter", native_enter as *const u8);
     let mut module = JITModule::new(jit);
@@ -1144,6 +1326,7 @@ fn compile_part(
         return Err(CompileError::PointerWidth);
     }
     let step_id = import(&mut module, "caie_native_step", ptr)?;
+    let property_write_id = import(&mut module, "cyallo_native_property_write", ptr)?;
     let flush_id = import(&mut module, "caie_native_flush", ptr)?;
     let enter_id = import(&mut module, "caie_native_enter", ptr)?;
     let mut ctx = module.make_context();
@@ -1155,6 +1338,7 @@ fn compile_part(
     ctx.func.signature.returns = vec![AbiParam::new(types::I64)];
     let id = module.declare_function("caie_entry", Linkage::Local, &ctx.func.signature)?;
     let step = module.declare_func_in_func(step_id, &mut ctx.func);
+    let property_write = module.declare_func_in_func(property_write_id, &mut ctx.func);
     let flush = module.declare_func_in_func(flush_id, &mut ctx.func);
     let enter = module.declare_func_in_func(enter_id, &mut ctx.func);
     let engine = if speed || config.optimization == OptimizationLevel::Speed {
@@ -1207,6 +1391,7 @@ fn compile_part(
             targets: HashMap::new(),
             step,
             flush,
+            property_write,
             signature,
             inline_plans: super::inlining::plans(
                 &program,
@@ -1335,6 +1520,7 @@ fn compile_part(
                 // The successful branch continues to the next caller PC;
                 // this block is the unchanged ordinary-call fallback.
             }
+            l.property_ic(fi, pc, &op, next, count);
             if !effects.may_collect && !effects.may_reenter && l.inline(fi, pc, &op, next, count) {
                 continue;
             }

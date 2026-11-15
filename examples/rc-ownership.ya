@@ -1,12 +1,12 @@
 // Run: cargo run -- run examples/rc-ownership.ya
 // RC owners move; cloning explicitly creates another counted owner.
 
-fn read(value: &@rc i64) -> i64 {
+fn read(value: &rc i64) -> i64 {
     // A pure function can read through a borrowed owner without changing counts.
-    return **value
+    return value.*.*
 }
 
-let original = @rc 42
+let original = rc 42
 let weak = std::rc::downgrade(&original)
 let cloned = std::rc::clone(&original)
 std::io::print("strong: ", std::rc::strong_count(&original))

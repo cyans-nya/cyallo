@@ -29,7 +29,7 @@ struct Lower<'a> {
     function: ir::Function,
     globals: &'a [ir::Local],
     signatures: &'a HashMap<String, Signature>,
-    types: &'a HashMap<String, Type>,
+    types: &'a crate::declarations::TypeEnvironment,
     services: &'a std::sync::Arc<crate::services::Metadata>,
     span: Span,
     options: CompileOptions,
@@ -39,6 +39,18 @@ struct Lower<'a> {
     block_depth: usize,
     drop_scopes: Vec<Vec<(Slot, Type)>>,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallUse {
+    Value,
+    Discard,
+}
+#[derive(Clone, Copy)]
+enum PropertyUse<'a> {
+    Read,
+    Write(&'a Expr),
+    Delete,
+}
+
 struct RangeIteration<'e> {
     start: &'e Expr,
     end: &'e Expr,
@@ -71,8 +83,10 @@ pub fn analyze(
     cyallo_ast::visit::visit_block(
         &mut ast.body,
         &mut |expression| {
-            requires_tracing |= matches!(expression.kind, ExprKind::ManagedNew(..))
-                || matches!(&expression.kind, ExprKind::IntrinsicCall(id, ..) if Intrinsic::from_id(*id) == Some(Intrinsic::RcTryNewIn));
+            requires_tracing |= matches!(
+                expression.kind,
+                ExprKind::ManagedNew(..) | ExprKind::ObjectLiteral(..)
+            ) || matches!(&expression.kind, ExprKind::IntrinsicCall(id, ..) if Intrinsic::from_id(*id) == Some(Intrinsic::RcTryNewIn));
             Ok(())
         },
         &mut |_, _| Ok(()),
@@ -81,15 +95,20 @@ pub fn analyze(
         cyallo_ast::visit::visit_block(
             &mut function.body,
             &mut |expression| {
-                requires_tracing |= matches!(expression.kind, ExprKind::ManagedNew(..))
-                    || matches!(&expression.kind, ExprKind::IntrinsicCall(id, ..) if Intrinsic::from_id(*id) == Some(Intrinsic::RcTryNewIn));
+                requires_tracing |= matches!(
+                    expression.kind,
+                    ExprKind::ManagedNew(..) | ExprKind::ObjectLiteral(..)
+                ) || matches!(&expression.kind, ExprKind::IntrinsicCall(id, ..) if Intrinsic::from_id(*id) == Some(Intrinsic::RcTryNewIn));
                 Ok(())
             },
             &mut |_, _| Ok(()),
         )?;
     }
-    let mut routine_types = crate::composites::resolve(&mut ast)?;
-    let records = std::sync::Arc::new(routine_types.clone());
+    let mut routine_types = crate::declarations::TypeEnvironment::new(
+        crate::composites::resolve(&mut ast)?,
+        ast.native.clone(),
+    );
+    let records = std::sync::Arc::new(routine_types.record_types());
     let services = std::sync::Arc::new(crate::services::prepare(&mut ast)?);
     for t in &services.traits {
         for m in &t.methods {
@@ -122,13 +141,16 @@ pub fn analyze(
     if matches!(options.dialect, Dialect::Modern | Dialect::Simplified) {
         crate::inference::infer(&ast.body, &mut globals, &[], &routine_types, options)?;
     }
+    crate::native_thunk::rewrite(&mut ast, &routine_types, options)?;
     crate::composites::lift(&mut ast, &globals, &routine_types, options)?;
     for function in &mut ast.functions {
         cyallo_ast::visit::visit_block(
             &mut function.body,
             &mut |expression| {
-                requires_tracing |= matches!(expression.kind, ExprKind::ManagedNew(..))
-                    || matches!(&expression.kind, ExprKind::IntrinsicCall(id, ..) if Intrinsic::from_id(*id) == Some(Intrinsic::RcTryNewIn));
+                requires_tracing |= matches!(
+                    expression.kind,
+                    ExprKind::ManagedNew(..) | ExprKind::ObjectLiteral(..)
+                ) || matches!(&expression.kind, ExprKind::IntrinsicCall(id, ..) if Intrinsic::from_id(*id) == Some(Intrinsic::RcTryNewIn));
                 Ok(())
             },
             &mut |_, _| Ok(()),
@@ -305,7 +327,7 @@ fn lower_routine(
     f: &cyallo_ast::Function,
     globals: &[ir::Local],
     signatures: &HashMap<String, Signature>,
-    routine_types: &HashMap<String, Type>,
+    routine_types: &crate::declarations::TypeEnvironment,
     options: CompileOptions,
     services: &std::sync::Arc<crate::services::Metadata>,
     source_names: &HashMap<Box<str>, Box<str>>,
@@ -390,7 +412,7 @@ struct DeferredContext {
     services: std::sync::Arc<crate::services::Metadata>,
     globals: Vec<ir::Local>,
     signatures: HashMap<String, Signature>,
-    routine_types: HashMap<String, Type>,
+    routine_types: crate::declarations::TypeEnvironment,
     options: CompileOptions,
     headers: Vec<ir::Function>,
 }
@@ -739,12 +761,36 @@ pub fn numeric_context(a: &Expr, ta: &Type, b: &Expr, tb: &Type) -> Type {
     }
 }
 pub fn intrinsic_arguments(
-    id: Intrinsic,
+    reference: IntrinsicId,
     type_args: &[Type],
     arguments: &[Expr],
     known: &HashMap<String, Type>,
-    routines: &HashMap<String, Type>,
+    routines: &crate::declarations::TypeEnvironment,
 ) -> Result<Vec<Expr>> {
+    let id = Intrinsic::from_id(reference).ok_or_else(|| {
+        crate::declarations::invalid_declaration(
+            crate::declarations::DeclarationError::InvalidSignature,
+            Span::default(),
+        )
+    })?;
+    if let Some(declaration) = reference.1 {
+        let types = arguments
+            .iter()
+            .map(|argument| crate::inference::expression_type(argument, known, routines))
+            .collect::<Result<Vec<_>>>()?;
+        let parameters = crate::native_contract::function_parameter_types(
+            routines,
+            declaration,
+            type_args,
+            arguments,
+            &types,
+        )?;
+        return arguments
+            .iter()
+            .zip(parameters)
+            .map(|(argument, ty)| contextualize(argument, &ty))
+            .collect();
+    }
     let expected = if id == Intrinsic::LayoutNew {
         Some(Type::numeric(NumberKind::Usize))
     } else if matches!(
@@ -798,6 +844,15 @@ pub fn intrinsic_arguments(
         .collect()
 }
 pub fn contextualize(expression: &Expr, wanted: &Type) -> Result<Expr> {
+    if *wanted == Type::Dynamic {
+        if matches!(expression.kind, ExprKind::Cast(_, Type::Dynamic)) {
+            return Ok(expression.clone());
+        }
+        return Ok(Expr {
+            kind: ExprKind::Cast(Box::new(expression.clone()), Type::Dynamic),
+            span: expression.span,
+        });
+    }
     let mut e = expression.clone();
     if let Some(kind) = wanted.number_kind() {
         let number = match e.kind {
@@ -919,6 +974,30 @@ fn specialized_operator(op: Operator, result: &Type) -> Operator {
     }
 }
 pub fn binary_type(op: cyallo_ast::Operator, a: &Type, b: &Type, span: Span) -> Result<Type> {
+    if matches!(op, Operator::Equal | Operator::NotEqual)
+        && matches!((a, b), (Type::Object(_), Type::Object(_)))
+    {
+        return Ok(Type::Boolean);
+    }
+    if *a == Type::Dynamic || *b == Type::Dynamic {
+        return Ok(
+            if matches!(
+                op,
+                Operator::Equal
+                    | Operator::NotEqual
+                    | Operator::Less
+                    | Operator::LessEqual
+                    | Operator::Greater
+                    | Operator::GreaterEqual
+                    | Operator::And
+                    | Operator::Or
+            ) {
+                Type::Boolean
+            } else {
+                Type::Dynamic
+            },
+        );
+    }
     if matches!(a, Type::Numeric(_)) || matches!(b, Type::Numeric(_)) {
         if a != b {
             return Err(Diagnostic::new(
@@ -996,6 +1075,161 @@ pub fn binary_type(op: cyallo_ast::Operator, a: &Type, b: &Type, span: Span) -> 
     })
 }
 impl Lower<'_> {
+    fn native_call(
+        &mut self,
+        reference: IntrinsicId,
+        type_args: &[Type],
+        args: &[Expr],
+        span: Span,
+        usage: CallUse,
+    ) -> Result<(Reg, Type)> {
+        let known = self
+            .globals
+            .iter()
+            .chain(self.function.locals.iter())
+            .map(|local| (key(&local.name), local.ty.clone()))
+            .collect();
+        let arguments = intrinsic_arguments(reference, type_args, args, &known, self.types)?;
+        let mut registers = Vec::new();
+        let mut operands = Vec::new();
+        for argument in &arguments {
+            let (register, ty) = self.expr(argument)?;
+            registers.push(register);
+            operands.push(ty);
+        }
+        if let Some(declaration) = reference.1 {
+            let contract = crate::native_contract::function(
+                self.types,
+                declaration,
+                type_args,
+                &arguments,
+                &operands,
+                span,
+            )?;
+            self.native_obligations(&contract.obligations, span)?;
+        }
+        let call = crate::intrinsic::resolve_declared(
+            reference, self.types, type_args, &arguments, &operands, span,
+        )?;
+        if call.result == Type::Void && usage == CallUse::Value {
+            return Err(Diagnostic::new(
+                "E110",
+                "procedure cannot be used as an expression",
+                span,
+            ));
+        }
+        match call.lowering {
+            Lowering::AddressLength => {
+                let result = self.reg(Type::Integer);
+                self.emit(Op::Length(result, registers[0]));
+                Ok((result, Type::Integer))
+            }
+            Lowering::RcTryNewIn => self.rc_new_in(
+                registers[0],
+                operands[0].clone(),
+                registers[1],
+                operands[1].clone(),
+                true,
+                span,
+            ),
+            Lowering::Print => {
+                self.emit(Op::Output(registers, ir::TextStyle::Plain));
+                Ok((self.reg(Type::Void), Type::Void))
+            }
+            Lowering::Input => {
+                let Type::Reference { pointee, .. } = &operands[0] else {
+                    unreachable!("checked input signature");
+                };
+                self.emit(Op::Input(registers[0], *pointee.clone()));
+                Ok((self.reg(Type::Void), Type::Void))
+            }
+            Lowering::Storage(op) => self.lookup_op(op, call.result, registers, span),
+            Lowering::Context => {
+                let r = self.reg(call.result.clone());
+                self.emit(Op::Service(
+                    r,
+                    crate::services::Operation::Context,
+                    registers,
+                ));
+                Ok((r, call.result))
+            }
+            Lowering::ServiceKey => {
+                let key = self
+                    .services
+                    .keys
+                    .iter()
+                    .position(|k| k.span == span.start)
+                    .ok_or_else(|| Diagnostic::new("E131", "undeclared service key", span))?;
+                let r = self.reg(call.result.clone());
+                self.emit(Op::ServiceKey(r, key));
+                Ok((r, call.result))
+            }
+            Lowering::Utility(id) => {
+                if matches!(
+                    self.options.dialect,
+                    Dialect::Compatibility | Dialect::Strict
+                ) && !self.options.convenience_builtins
+                {
+                    if !crate::builtins::standard_id(id) {
+                        return Err(Diagnostic::new(
+                            "E112",
+                            "utility requires explicit convenience builtins",
+                            span,
+                        ));
+                    }
+                    if id == Intrinsic::Length && operands != [Type::String] {
+                        return Err(Diagnostic::new("E112", "CAIE LENGTH requires STRING", span));
+                    }
+                }
+                let r = self.reg(call.result.clone());
+                self.emit(Op::Builtin(r, id, registers));
+                Ok((r, call.result))
+            }
+        }
+    }
+
+    fn native_obligations(
+        &self,
+        obligations: &[crate::native_contract::TraitObligation],
+        span: Span,
+    ) -> Result<()> {
+        for obligation in obligations {
+            let ty = obligation.ty.pointee_or_self();
+            let proven = match obligation.kind {
+                crate::native_contract::TraitObligationKind::Allocator => {
+                    self.services.allocator(ty).is_some()
+                }
+                crate::native_contract::TraitObligationKind::UserTrait => {
+                    let name = match &obligation.bound {
+                        Type::Named(name) | Type::Applied(name, _) | Type::TraitObject(name) => {
+                            Some(name.as_ref())
+                        }
+                        _ => None,
+                    };
+                    name.and_then(|name| self.services.trait_id(name))
+                        .is_some_and(|trait_id| {
+                            self.services.implementations.iter().any(|implementation| {
+                                implementation.trait_id == trait_id
+                                    && crate::declarations::equivalent_types(
+                                        &implementation.receiver,
+                                        ty,
+                                    )
+                            })
+                        })
+                }
+            };
+            if !proven {
+                return Err(crate::declarations::invalid_declaration(
+                    crate::declarations::DeclarationError::UnsatisfiedTrait {
+                        ty: obligation.ty.clone(),
+                        bound: obligation.bound.clone(),
+                    },
+                    span,
+                ));
+            }
+        }
+        Ok(())
+    }
     fn concrete_addressable(&self, e: &Expr, known: &HashMap<String, Type>) -> bool {
         match &e.kind {
             ExprKind::Name(_) => true,
@@ -1045,15 +1279,109 @@ impl Lower<'_> {
         }
         .ok_or_else(|| Diagnostic::new("E116", "unknown field or tuple index", span))
     }
+    fn expression_type(&self, expression: &Expr) -> Result<Type> {
+        let known = self
+            .globals
+            .iter()
+            .chain(&self.function.locals)
+            .map(|local| (key(&local.name), local.ty.clone()))
+            .collect();
+        crate::inference::expression_type(expression, &known, self.types)
+    }
+    fn dynamic_op(
+        &mut self,
+        operation: crate::dynamic::Operation,
+        result: Type,
+        args: Vec<Reg>,
+        span: Span,
+    ) -> Result<(Reg, Type)> {
+        let register = self.reg(result.clone());
+        self.span = span;
+        self.emit(Op::Dynamic(register, operation, args));
+        Ok((register, result))
+    }
+    fn object_target(&self, target: &Expr) -> Result<bool> {
+        match &target.kind {
+            ExprKind::Field(base, _) | ExprKind::Index(base, _) => Ok(crate::dynamic::object(
+                self.expression_type(base)?.pointee_or_self(),
+            )),
+            _ => Ok(false),
+        }
+    }
+    fn check_object_write(&self, target: &Expr) -> Result<()> {
+        if let ExprKind::Field(base, _) | ExprKind::Index(base, _) = &target.kind
+            && matches!(
+                self.expression_type(base)?,
+                Type::Reference { mutable: false, .. }
+            )
+        {
+            return Err(cyallo_ast::diagnostic::readonly_object_borrow(target.span));
+        }
+        Ok(())
+    }
+    fn object_operation(&mut self, target: &Expr, usage: PropertyUse<'_>) -> Result<(Reg, Type)> {
+        if !matches!(usage, PropertyUse::Read) {
+            self.check_object_write(target)?;
+        }
+        use crate::dynamic::Operation as D;
+        let (operation, mut args, ty) = match &target.kind {
+            ExprKind::Field(base, name) => {
+                let ty = self.expression_type(target)?;
+                let (base, _) = self.expr(base)?;
+                let op = match usage {
+                    PropertyUse::Read => D::Get(name.clone()),
+                    PropertyUse::Write(_) => D::Set(name.clone()),
+                    PropertyUse::Delete => D::Delete(name.clone()),
+                };
+                (op, vec![base], ty)
+            }
+            ExprKind::Index(base, keys) if keys.len() == 1 => {
+                let (base, _) = self.expr(base)?;
+                let (key, _) = self.expr(&keys[0])?;
+                let op = match usage {
+                    PropertyUse::Read => D::GetKey,
+                    PropertyUse::Write(_) => D::SetKey,
+                    PropertyUse::Delete => D::DeleteKey,
+                };
+                (op, vec![base, key], Type::Dynamic)
+            }
+            _ => return Err(cyallo_ast::diagnostic::object_property_borrow(target.span)),
+        };
+        let result = match usage {
+            PropertyUse::Read => ty.clone(),
+            PropertyUse::Write(value) => {
+                args.push(self.expr_expected(value, &ty)?.0);
+                Type::Void
+            }
+            PropertyUse::Delete => Type::Boolean,
+        };
+        self.dynamic_op(operation, result, args, target.span)
+    }
     fn invoke(
         &mut self,
         callee: &Expr,
         args: &[Expr],
         span: Span,
-        discard: bool,
+        usage: CallUse,
     ) -> Result<(Reg, Type)> {
+        if self
+            .expression_type(callee)
+            .is_ok_and(|ty| ty == Type::Dynamic)
+        {
+            let (callee, _) = self.expr(callee)?;
+            let mut arguments = vec![callee];
+            for argument in args {
+                arguments.push(self.expr_expected(argument, &Type::Dynamic)?.0);
+            }
+            return self.dynamic_op(
+                crate::dynamic::Operation::Invoke,
+                Type::Dynamic,
+                arguments,
+                span,
+            );
+        }
         if let ExprKind::Parenthesized(inner) = &callee.kind {
-            return self.invoke(inner, args, span, discard);
+            return self.invoke(inner, args, span, usage);
         }
         if let ExprKind::ClosureValue(name, captures, _) = &callee.kind
             && captures.is_empty()
@@ -1061,7 +1389,7 @@ impl Lower<'_> {
             // A frozen routine reference carries declaration identity. Resolve
             // through signatures even if a local shadows its source name.
             let sig = self.signatures[&key(name)].clone();
-            if sig.result == Type::Void && !discard {
+            if sig.result == Type::Void && usage == CallUse::Value {
                 return Err(Diagnostic::new(
                     "E110",
                     "procedure cannot be used as an expression",
@@ -1128,7 +1456,7 @@ impl Lower<'_> {
                     },
                     args,
                     span,
-                    discard,
+                    usage,
                 );
             }
         }
@@ -1151,7 +1479,7 @@ impl Lower<'_> {
                     .methods[method]
                     .clone();
                 let id = self.services.implementations[implementation].methods[method];
-                if m.result == Type::Void && !discard {
+                if m.result == Type::Void && usage == CallUse::Value {
                     return Err(Diagnostic::new(
                         "E110",
                         "procedure cannot be used as an expression",
@@ -1194,6 +1522,8 @@ impl Lower<'_> {
                         .iter()
                         .enumerate()
                         .map(|(i, (ty, by_ref))| Param {
+                            arity: ParameterArity::One,
+                            passing: ParameterPassing::Value,
                             receiver: false,
                             name: format!("arg{i}").into(),
                             ty: ty.clone(),
@@ -1211,13 +1541,9 @@ impl Lower<'_> {
                 self.emit(Op::Call((m.result != Type::Void).then_some(r), id, rs));
                 return Ok((r, m.result));
             }
-            if matches!(receiver_ty, Type::Managed { .. })
-                || matches!(
-                    receiver_ty.pointee_or_self(),
-                    Type::Storage(..) | Type::Array(..) | Type::Slice(..) | Type::Managed { .. }
-                )
             {
-                let parameters = crate::lookup::parameter_types(&receiver_ty, name);
+                let parameters =
+                    crate::native_contract::parameter_types(self.types, &receiver_ty, name, span);
                 let known = self
                     .globals
                     .iter()
@@ -1239,56 +1565,77 @@ impl Lower<'_> {
                     .iter()
                     .map(|arg| crate::inference::expression_type(arg, &known, self.types))
                     .collect::<Result<Vec<_>>>()?;
-                let field = args.first().and_then(cyallo_ast::constant_text);
-                let method = crate::lookup::method(&receiver_ty, name, &types, field)
-                    .ok_or_else(|| crate::lookup::error(span))?;
-                let receiver = match method.receiver {
-                    crate::lookup::ReceiverMode::Owner | crate::lookup::ReceiverMode::Move => {
-                        self.expr(base)?.0
-                    }
-                    crate::lookup::ReceiverMode::Value => {
-                        let (register, ty) = self.expr(base)?;
-                        if let Type::Reference { pointee, .. } | Type::Managed { pointee, .. } = ty
-                        {
-                            let loaded = self.reg(*pointee);
-                            self.emit(Op::Load(loaded, register));
-                            loaded
-                        } else {
-                            register
+                if let Some(method) = crate::member::resolve(
+                    self.types,
+                    &receiver_ty,
+                    name,
+                    &arguments,
+                    &types,
+                    span,
+                )? {
+                    self.native_obligations(&method.obligations, span)?;
+                    let receiver = match method.receiver {
+                        crate::lookup::ReceiverMode::Owner | crate::lookup::ReceiverMode::Move => {
+                            self.expr(base)?.0
                         }
-                    }
-                    mode => {
-                        self.projection_address(base, mode == crate::lookup::ReceiverMode::Mutable)?
+                        crate::lookup::ReceiverMode::Value => {
+                            let (register, ty) = self.expr(base)?;
+                            if let Type::Reference { pointee, .. } | Type::Managed { pointee, .. } =
+                                ty
+                            {
+                                let loaded = self.reg(*pointee);
+                                self.emit(Op::Load(loaded, register));
+                                loaded
+                            } else {
+                                register
+                            }
+                        }
+                        mode => {
+                            self.projection_address(
+                                base,
+                                mode == crate::lookup::ReceiverMode::Mutable,
+                            )?
                             .0
+                        }
+                    };
+                    let mut operands = vec![receiver];
+                    for argument in &arguments {
+                        operands.push(self.expr(argument)?.0);
                     }
-                };
-                let mut operands = vec![receiver];
-                for argument in &arguments {
-                    operands.push(self.expr(argument)?.0);
+                    if method.result == Type::Void && usage == CallUse::Value {
+                        return Err(Diagnostic::new(
+                            "E110",
+                            "procedure cannot be used as an expression",
+                            span,
+                        ));
+                    }
+                    let result = match method.body {
+                        crate::member::Body::Storage(operation) => {
+                            self.lookup_op(operation, method.result, operands, span)?
+                        }
+                        crate::member::Body::Service(operation) => {
+                            let r = self.reg(method.result.clone());
+                            self.span = span;
+                            self.emit(Op::Service(r, operation, operands));
+                            (r, method.result)
+                        }
+                    };
+                    if temporary(base)
+                        && crate::ownership::effectful_lifecycle(&receiver_ty)
+                        && matches!(
+                            method.receiver,
+                            crate::lookup::ReceiverMode::Value | crate::lookup::ReceiverMode::Owner
+                        )
+                    {
+                        self.lookup_op(
+                            crate::lookup::Operation::DropValue,
+                            Type::Void,
+                            vec![receiver],
+                            span,
+                        )?;
+                    }
+                    return Ok(result);
                 }
-                if method.result == Type::Void && !discard {
-                    return Err(Diagnostic::new(
-                        "E110",
-                        "procedure cannot be used as an expression",
-                        span,
-                    ));
-                }
-                let result = self.lookup_op(method.operation, method.result, operands, span)?;
-                if temporary(base)
-                    && crate::ownership::effectful_lifecycle(&receiver_ty)
-                    && matches!(
-                        method.receiver,
-                        crate::lookup::ReceiverMode::Value | crate::lookup::ReceiverMode::Owner
-                    )
-                {
-                    self.lookup_op(
-                        crate::lookup::Operation::DropValue,
-                        Type::Void,
-                        vec![receiver],
-                        span,
-                    )?;
-                }
-                return Ok(result);
             }
             if matches!(
                 receiver_ty.pointee_or_self(),
@@ -1322,6 +1669,8 @@ impl Lower<'_> {
                             .iter()
                             .enumerate()
                             .map(|(i, (t, b))| Param {
+                                arity: ParameterArity::One,
+                                passing: ParameterPassing::Value,
                                 receiver: false,
                                 name: format!("arg{i}").into(),
                                 ty: t.clone(),
@@ -1332,7 +1681,7 @@ impl Lower<'_> {
                         result: m.result.clone(),
                         id: 0,
                     };
-                    if m.result == Type::Void && !discard {
+                    if m.result == Type::Void && usage == CallUse::Value {
                         return Err(Diagnostic::new(
                             "E110",
                             "procedure cannot be used as an expression",
@@ -1350,35 +1699,7 @@ impl Lower<'_> {
                     ));
                     return Ok((r, m.result));
                 }
-                let mut rs = vec![receiver];
-                let mut ts = vec![];
-                for a in args {
-                    let (r, t) = self.expr(a)?;
-                    rs.push(r);
-                    ts.push(t);
-                }
-                let (operation, result) =
-                    crate::services::intrinsic(&ty, name, &ts).ok_or_else(|| {
-                        Diagnostic::new(
-                            "E131",
-                            format!(
-                                "invalid service operation `{}` or argument types",
-                                cyallo_ast::source_name(name)
-                            ),
-                            span,
-                        )
-                    })?;
-                if result == Type::Void && !discard {
-                    return Err(Diagnostic::new(
-                        "E110",
-                        "procedure cannot be used as an expression",
-                        span,
-                    ));
-                }
-                let r = self.reg(result.clone());
-                self.span = span;
-                self.emit(Op::Service(r, operation, rs));
-                return Ok((r, result));
+                return Err(crate::lookup::error(span));
             }
         }
         let (mut target, mut ty) = self.expr(callee)?;
@@ -1388,6 +1709,10 @@ impl Lower<'_> {
             self.emit(Op::Load(loaded, target));
             target = loaded;
         }
+        if let Type::NativeCallable(declaration) = ty {
+            let reference = self.types.function_reference(declaration, span)?;
+            return self.native_call(reference, &[], args, span, usage);
+        }
         let (kind, params, result) = crate::composites::callable(&ty)
             .ok_or_else(|| Diagnostic::new("E110", "value is not callable", span))?;
         let sig = Signature {
@@ -1396,6 +1721,8 @@ impl Lower<'_> {
                 .iter()
                 .enumerate()
                 .map(|(i, (ty, by_ref))| Param {
+                    arity: ParameterArity::One,
+                    passing: ParameterPassing::Value,
                     receiver: false,
                     name: format!("arg{i}").into(),
                     ty: ty.clone(),
@@ -1406,7 +1733,7 @@ impl Lower<'_> {
             result: result.clone(),
             id: 0,
         };
-        if sig.result == Type::Void && !discard {
+        if sig.result == Type::Void && usage == CallUse::Value {
             return Err(Diagnostic::new(
                 "E110",
                 "procedure cannot be used as an expression",
@@ -1471,9 +1798,10 @@ impl Lower<'_> {
                     .map(|local| (key(&local.name), local.ty.clone()))
                     .collect();
                 let receiver = crate::inference::expression_type(base, &known, self.types)?;
-                match crate::lookup::method(&receiver, name, &[], None) {
-                    Some(crate::lookup::Method {
-                        operation: crate::lookup::Operation::RangeReverse,
+                match crate::member::resolve(self.types, &receiver, name, &[], &[], iterable.span)?
+                {
+                    Some(crate::member::Resolved {
+                        body: crate::member::Body::Storage(crate::lookup::Operation::RangeReverse),
                         ..
                     }) => {
                         let inner = self.range_iteration(base)?;
@@ -1624,7 +1952,7 @@ impl Lower<'_> {
             if self.cell_target(e)?.is_some() {
                 return Err(Diagnostic::new(
                     "E107",
-                    "Cell contents do not expose a reference or support compound assignment; use *cell = value or cell.replace(value)",
+                    "Cell contents do not expose a reference or support compound assignment; use cell.* = value or cell.replace(value)",
                     e.span,
                 ));
             }
@@ -1813,6 +2141,7 @@ impl Lower<'_> {
     }
     fn require(&self, want: &Type, got: &Type, span: Span) -> Result<()> {
         if crate::memory::same_regions(want, got)
+            || matches!((want,got),(Type::Function(RoutineKind::Procedure,wp,wr),Type::Function(RoutineKind::Function,gp,gr)) if wp.len()==gp.len() && wp.iter().zip(gp).all(|((w,wb),(g,gb))|wb==gb && crate::declarations::equivalent_types(w,g)) && crate::declarations::equivalent_types(wr,gr))
             || matches!((want,got),(Type::Reference{mutable:w,pointee:a,..},Type::Reference{mutable:g,pointee:b,..}) if (!w || *g) && (crate::memory::same_regions(a,b) || matches!(b.as_ref(),Type::Borrowed(inner) if inner==a)))
             || (self.options.dialect != Dialect::Modern
                 && *want == Type::Real
@@ -1836,6 +2165,37 @@ impl Lower<'_> {
         }
     }
     fn expr_expected(&mut self, expression: &Expr, expected: &Type) -> Result<(Reg, Type)> {
+        let actual = self.expression_type(expression).ok();
+        if *expected == Type::Dynamic && actual.as_ref() == Some(&Type::Dynamic) {
+            return self.expr(expression);
+        }
+        if *expected == Type::Dynamic {
+            let actual = actual
+                .ok_or_else(|| cyallo_ast::diagnostic::dynamic_borrow_escape(expression.span))?;
+            if !crate::dynamic::owned(&actual) {
+                return Err(cyallo_ast::diagnostic::dynamic_borrow_escape(
+                    expression.span,
+                ));
+            }
+            let (value, _) = self.expr(expression)?;
+            return self.dynamic_op(
+                crate::dynamic::Operation::Erase,
+                Type::Dynamic,
+                vec![value],
+                expression.span,
+            );
+        }
+        if actual.as_ref() == Some(&Type::Dynamic) && *expected != Type::Dynamic
+            || matches!(expected, Type::Object(_)) && actual.as_ref() != Some(expected)
+        {
+            let (value, _) = self.expr(expression)?;
+            return self.dynamic_op(
+                crate::dynamic::Operation::Check(expected.clone()),
+                expected.clone(),
+                vec![value],
+                expression.span,
+            );
+        }
         if let Type::Reference {
             mutable, pointee, ..
         } = expected
@@ -1933,7 +2293,12 @@ impl Lower<'_> {
         self.emit(Op::Call(Some(allocated), allocate, vec![receiver, layout]));
         let state = self.reg(allocator_ty.clone());
         self.emit(Op::Take(state, address));
-        let owner_ty = crate::memory::managed_type(MemoryKind::Rc, Some(&allocator_ty), value_ty);
+        let owner_ty = crate::memory::managed_type(
+            MemoryKind::Rc,
+            Locality::Local,
+            Some(&allocator_ty),
+            value_ty,
+        );
         let result_ty = if fallible {
             crate::lookup::result_type(owner_ty, crate::memory::error())
         } else {
@@ -1974,9 +2339,10 @@ impl Lower<'_> {
         self.require(input, child_input, span)?;
         let step_type = crate::generator::step(&child_type).unwrap();
         let step = self.reg(step_type);
+        // `yield from` takes a new generator and starts it.
         self.emit(Op::Lookup(
             step,
-            crate::lookup::Operation::GeneratorResume(false),
+            crate::lookup::Operation::GeneratorStart,
             vec![child],
         ));
         let test_pc = self.function.code.len();
@@ -1998,7 +2364,7 @@ impl Lower<'_> {
         self.emit(Op::Yield(reply, value));
         self.emit(Op::Lookup(
             step,
-            crate::lookup::Operation::GeneratorResume(true),
+            crate::lookup::Operation::GeneratorResume(crate::lookup::ResumeInput::Value),
             vec![child, reply],
         ));
         self.emit(Op::Jump(test_pc));
@@ -2022,9 +2388,59 @@ impl Lower<'_> {
         cyallo_ast::with_stack(|| {
             self.span = e.span;
             match &e.kind {
+                ExprKind::TypeDescriptor(descriptor) => self.dynamic_op(
+                    crate::dynamic::Operation::TypeDescriptor(descriptor.clone()),
+                    Type::Storage(StorageKind::TypeDescriptor, Box::new(Type::Void)),
+                    vec![],
+                    e.span,
+                ),
+                ExprKind::DeferredCallable(name) => self.dynamic_op(
+                    crate::dynamic::Operation::DeferredCallable(name.clone()),
+                    Type::Dynamic,
+                    vec![],
+                    e.span,
+                ),
+                ExprKind::ObjectLiteral(kind, fields) => {
+                    let mut names = vec![];
+                    let mut values = vec![];
+                    let mut types = vec![];
+                    for (name, value) in fields {
+                        if names.contains(name) {
+                            return Err(cyallo_ast::diagnostic::duplicate_object_property(
+                                value.span,
+                            ));
+                        }
+                        let (register, ty) = self.expr(value)?;
+                        if !crate::dynamic::owned(&ty) {
+                            return Err(cyallo_ast::diagnostic::dynamic_borrow_escape(value.span));
+                        }
+                        names.push(name.clone());
+                        values.push(register);
+                        types.push((name.clone(), ty));
+                    }
+                    self.dynamic_op(
+                        crate::dynamic::Operation::Object(*kind, names.into_boxed_slice()),
+                        if *kind == ObjectKind::Dynamic {
+                            Type::Dynamic
+                        } else {
+                            Type::Object(types)
+                        },
+                        values,
+                        e.span,
+                    )
+                }
+                ExprKind::DeleteProperty(target) => {
+                    if !self.object_target(target)? {
+                        return Err(cyallo_ast::diagnostic::object_property_borrow(target.span));
+                    }
+                    self.object_operation(target, PropertyUse::Delete)
+                }
                 ExprKind::Yield(value, delegate) => self.yield_expr(value, *delegate, e.span),
                 ExprKind::Invalid(diagnostic) => Err(diagnostic.clone()),
-                ExprKind::ManagedNew(kind, allocator, value) => {
+                ExprKind::ManagedNew(kind, locality, allocator, value) => {
+                    if *locality == Locality::Shared {
+                        return Err(cyallo_ast::diagnostic::shared_managed_unavailable(e.span));
+                    }
                     let allocator = allocator
                         .as_ref()
                         .map(|allocator| self.expr(allocator))
@@ -2034,7 +2450,7 @@ impl Lower<'_> {
                         if *kind != MemoryKind::Rc {
                             return Err(Diagnostic::new(
                                 "E109",
-                                "custom allocation requires @rc",
+                                "custom allocation requires rc",
                                 e.span,
                             ));
                         }
@@ -2042,7 +2458,7 @@ impl Lower<'_> {
                     }
                     self.lookup_op(
                         crate::lookup::Operation::ManagedNew(*kind, false),
-                        crate::memory::managed_type(*kind, None, ty),
+                        crate::memory::managed_type(*kind, *locality, None, ty),
                         vec![value],
                         e.span,
                     )
@@ -2059,114 +2475,21 @@ impl Lower<'_> {
                     e.span,
                 )),
                 ExprKind::IntrinsicCall(id, type_args, args) => {
-                    let intrinsic = Intrinsic::from_id(*id).ok_or_else(|| {
-                        Diagnostic::new("E112", "invalid intrinsic identity", e.span)
-                    })?;
-                    let known = self
-                        .globals
-                        .iter()
-                        .chain(self.function.locals.iter())
-                        .map(|local| (key(&local.name), local.ty.clone()))
-                        .collect();
-                    let arguments =
-                        intrinsic_arguments(intrinsic, type_args, args, &known, self.types)?;
-                    let mut registers = Vec::new();
-                    let mut operands = Vec::new();
-                    for argument in &arguments {
-                        let (register, ty) = self.expr(argument)?;
-                        registers.push(register);
-                        operands.push(ty);
-                    }
-                    let call = crate::intrinsic::resolve_at_call(
-                        intrinsic, type_args, args, &operands, e.span,
-                    )?;
-                    match call.lowering {
-                        Lowering::AddressLength => {
-                            let result = self.reg(Type::Integer);
-                            self.emit(Op::Length(result, registers[0]));
-                            Ok((result, Type::Integer))
-                        }
-                        Lowering::RcTryNewIn => self.rc_new_in(
-                            registers[0],
-                            operands[0].clone(),
-                            registers[1],
-                            operands[1].clone(),
-                            true,
-                            e.span,
-                        ),
-                        Lowering::Print => {
-                            self.emit(Op::Output(registers, ir::TextStyle::Plain));
-                            Ok((self.reg(Type::Void), Type::Void))
-                        }
-                        Lowering::Input => {
-                            let Type::Reference { pointee, .. } = &operands[0] else {
-                                unreachable!("checked input signature");
-                            };
-                            self.emit(Op::Input(registers[0], *pointee.clone()));
-                            Ok((self.reg(Type::Void), Type::Void))
-                        }
-                        Lowering::Storage(op) => self.lookup_op(op, call.result, registers, e.span),
-                        Lowering::Context => {
-                            let r = self.reg(call.result.clone());
-                            self.emit(Op::Service(
-                                r,
-                                crate::services::Operation::Context,
-                                registers,
-                            ));
-                            Ok((r, call.result))
-                        }
-                        Lowering::ServiceKey => {
-                            let key = self
-                                .services
-                                .keys
-                                .iter()
-                                .position(|k| k.span == e.span.start)
-                                .ok_or_else(|| {
-                                    Diagnostic::new("E131", "undeclared service key", e.span)
-                                })?;
-                            let r = self.reg(call.result.clone());
-                            self.emit(Op::ServiceKey(r, key));
-                            Ok((r, call.result))
-                        }
-                        Lowering::Utility(id) => {
-                            if matches!(
-                                self.options.dialect,
-                                Dialect::Compatibility | Dialect::Strict
-                            ) && !self.options.convenience_builtins
-                            {
-                                if !crate::builtins::standard_id(id) {
-                                    return Err(Diagnostic::new(
-                                        "E112",
-                                        "utility requires explicit convenience builtins",
-                                        e.span,
-                                    ));
-                                }
-                                if id == Intrinsic::Length && operands != [Type::String] {
-                                    return Err(Diagnostic::new(
-                                        "E112",
-                                        "CAIE LENGTH requires STRING",
-                                        e.span,
-                                    ));
-                                }
-                            }
-                            let r = self.reg(call.result.clone());
-                            self.emit(Op::Builtin(r, id, registers));
-                            Ok((r, call.result))
-                        }
-                    }
+                    self.native_call(*id, type_args, args, e.span, CallUse::Value)
                 }
                 ExprKind::TypedCollection(..) => Err(Diagnostic::new(
                     "E151",
                     "unresolved collection initializer",
                     e.span,
                 )),
-                ExprKind::Cast(base, wanted) if wanted.number_kind().is_some() => {
+                ExprKind::Cast(base, wanted)
+                    if wanted.number_kind().is_some()
+                        && self.expression_type(base)? != Type::Dynamic =>
+                {
                     let (value, got) = self.expr(base)?;
                     if got.number_kind().is_none() {
-                        return Err(Diagnostic::new(
-                            "E109",
-                            "numeric cast requires a numeric value",
-                            e.span,
+                        return Err(cyallo_ast::diagnostic::numeric_cast_requires_number(
+                            got, e.span,
                         ));
                     }
                     let r = self.reg(wanted.clone());
@@ -2176,6 +2499,13 @@ impl Lower<'_> {
                         vec![value],
                     ));
                     Ok((r, wanted.clone()))
+                }
+                ExprKind::Cast(base, ty)
+                    if *ty == Type::Dynamic
+                        || self.expression_type(base)? == Type::Dynamic
+                        || matches!(ty, Type::Object(_)) =>
+                {
+                    self.expr_expected(base, ty)
                 }
                 ExprKind::Cast(base, Type::TraitObject(name)) => {
                     let (value, ty) = self.expr(base)?;
@@ -2301,6 +2631,9 @@ impl Lower<'_> {
                     self.emit(Op::Aggregate(r, rs));
                     Ok((r, ty))
                 }
+                ExprKind::Field(_, _) | ExprKind::Index(_, _) if self.object_target(e)? => {
+                    self.object_operation(e, PropertyUse::Read)
+                }
                 ExprKind::Field(base, _) | ExprKind::TupleField(base, _) => {
                     if assignable(base) {
                         let (a, t) = self.address(e, false)?;
@@ -2320,7 +2653,28 @@ impl Lower<'_> {
                         Ok((r, ty))
                     }
                 }
-                ExprKind::Invoke(callee, args) => self.invoke(callee, args, e.span, false),
+                ExprKind::Invoke(callee, args) => self.invoke(callee, args, e.span, CallUse::Value),
+                ExprKind::NativeCoerce(value, thunk) => {
+                    self.expr(value)?;
+                    self.expr(thunk)
+                }
+                ExprKind::Name(name)
+                    if self.lookup(name).is_err()
+                        && matches!(
+                            self.types.get(name.as_ref()),
+                            Some(Type::NativeCallable(_))
+                        ) =>
+                {
+                    let Type::NativeCallable(declaration) = self.types[name.as_ref()] else {
+                        unreachable!()
+                    };
+                    self.lookup_op(
+                        crate::lookup::Operation::NativeCallable(declaration),
+                        Type::NativeCallable(declaration),
+                        vec![],
+                        e.span,
+                    )
+                }
                 ExprKind::Name(n)
                     if self.options.dialect == Dialect::Modern
                         && self.lookup(n).is_err()
@@ -2392,6 +2746,9 @@ impl Lower<'_> {
                     Ok((r, t))
                 }
                 ExprKind::Unary(Operator::Borrow | Operator::BorrowMut, a) => {
+                    if self.object_target(a)? {
+                        return Err(cyallo_ast::diagnostic::object_property_borrow(a.span));
+                    }
                     let mutable = matches!(e.kind, ExprKind::Unary(Operator::BorrowMut, _));
                     let (address, pointee) = self.address(a, mutable)?;
                     let ty = Type::Reference {
@@ -2429,6 +2786,18 @@ impl Lower<'_> {
                 }
                 ExprKind::Unary(op, a) => {
                     let (a, t) = self.expr(a)?;
+                    if t == Type::Dynamic {
+                        return self.dynamic_op(
+                            crate::dynamic::Operation::Unary(*op),
+                            if *op == Operator::Not {
+                                Type::Boolean
+                            } else {
+                                Type::Dynamic
+                            },
+                            vec![a],
+                            e.span,
+                        );
+                    }
                     if !(if *op == Operator::Not {
                         t == Type::Boolean
                     } else {
@@ -2442,6 +2811,36 @@ impl Lower<'_> {
                     Ok((r, t))
                 }
                 ExprKind::Binary(op, a, b) => {
+                    if matches!(op, Operator::And | Operator::Or) {
+                        let (left, _) = self.expr_expected(a, &Type::Boolean)?;
+                        let result = self.reg(Type::Boolean);
+                        self.emit(Op::Move(result, left));
+                        let branch = self.emit(Op::Statement);
+                        let rhs = self.function.code.len();
+                        let (right, _) = self.expr_expected(b, &Type::Boolean)?;
+                        self.emit(Op::Move(result, right));
+                        let end = self.function.code.len();
+                        self.function.code[branch].op = if *op == Operator::And {
+                            Op::Branch(left, rhs, end)
+                        } else {
+                            Op::Branch(left, end, rhs)
+                        };
+                        return Ok((result, Type::Boolean));
+                    }
+                    if (self.expression_type(a)? == Type::Dynamic
+                        || self.expression_type(b)? == Type::Dynamic)
+                        && !matches!(op, Operator::And | Operator::Or)
+                    {
+                        let (left, _) = self.expr_expected(a, &Type::Dynamic)?;
+                        let (right, _) = self.expr_expected(b, &Type::Dynamic)?;
+                        let result = binary_type(*op, &Type::Dynamic, &Type::Dynamic, e.span)?;
+                        return self.dynamic_op(
+                            crate::dynamic::Operation::Binary(*op),
+                            result,
+                            vec![left, right],
+                            e.span,
+                        );
+                    }
                     let known = self
                         .globals
                         .iter()
@@ -2525,7 +2924,7 @@ impl Lower<'_> {
                             kind: ExprKind::Name(n.clone()),
                             span: e.span,
                         };
-                        return self.invoke(&callee, args, e.span, false);
+                        return self.invoke(&callee, args, e.span, CallUse::Value);
                     }
                     if let Some(sig) = self.signatures.get(&key(n)).cloned() {
                         if sig.result == Type::Void {
@@ -2599,7 +2998,7 @@ impl Lower<'_> {
         })
     }
     fn condition(&mut self, e: &Expr) -> Result<Reg> {
-        let (r, t) = self.expr(e)?;
+        let (r, t) = self.expr_expected(e, &Type::Boolean)?;
         self.require(&Type::Boolean, &t, e.span)?;
         Ok(r)
     }
@@ -2625,6 +3024,42 @@ impl Lower<'_> {
                 self.emit(Op::Store(addr, v));
             }
             StmtKind::Compound(target, op, value) => {
+                if self.object_target(target)? {
+                    self.check_object_write(target)?;
+                    use crate::dynamic::Operation as D;
+                    let (get, set, args, ty) = match &target.kind {
+                        ExprKind::Field(base, name) => {
+                            let ty = self.expression_type(target)?;
+                            let (base, _) = self.expr(base)?;
+                            (D::Get(name.clone()), D::Set(name.clone()), vec![base], ty)
+                        }
+                        ExprKind::Index(base, keys) if keys.len() == 1 => {
+                            let (base, _) = self.expr(base)?;
+                            let (key, _) = self.expr(&keys[0])?;
+                            (D::GetKey, D::SetKey, vec![base, key], Type::Dynamic)
+                        }
+                        _ => {
+                            return Err(cyallo_ast::diagnostic::object_property_borrow(
+                                target.span,
+                            ));
+                        }
+                    };
+                    let (old, _) = self.dynamic_op(get, ty.clone(), args.clone(), target.span)?;
+                    let (rhs, rty) = self.expr_expected(value, &ty)?;
+                    let result = binary_type(*op, &ty, &rty, s.span)?;
+                    self.require(&ty, &result, s.span)?;
+                    let (value, _) = if ty == Type::Dynamic {
+                        self.dynamic_op(D::Binary(*op), result, vec![old, rhs], s.span)?
+                    } else {
+                        let r = self.reg(result.clone());
+                        self.emit(Op::Binary(r, specialized_operator(*op, &result), old, rhs));
+                        (r, result)
+                    };
+                    let mut args = args;
+                    args.push(value);
+                    self.dynamic_op(set, Type::Void, args, s.span)?;
+                    return Ok(());
+                }
                 let (addr, ty) = self.address(target, true)?;
                 let old = self.reg(ty.clone());
                 self.emit(Op::Load(old, addr));
@@ -2638,8 +3073,10 @@ impl Lower<'_> {
                 self.emit(Op::Store(addr, r));
             }
             StmtKind::Evaluate(e) => {
-                let result = if let ExprKind::Invoke(callee, args) = &e.kind {
-                    Some(self.invoke(callee, args, e.span, true)?)
+                let result = if let ExprKind::IntrinsicCall(reference, types, args) = &e.kind {
+                    Some(self.native_call(*reference, types, args, e.span, CallUse::Discard)?)
+                } else if let ExprKind::Invoke(callee, args) = &e.kind {
+                    Some(self.invoke(callee, args, e.span, CallUse::Discard)?)
                 } else if let ExprKind::Call(n, args) = &e.kind
                     && self.options.dialect == Dialect::Modern
                     && self.lookup(n).is_ok()
@@ -2651,7 +3088,7 @@ impl Lower<'_> {
                         },
                         args,
                         e.span,
-                        true,
+                        CallUse::Discard,
                     )?)
                 } else if let ExprKind::Call(n, args) = &e.kind
                     && let Some(sig) = self.signatures.get(&key(n)).cloned()
@@ -2718,6 +3155,10 @@ impl Lower<'_> {
                 self.emit(Op::Store(a, v));
             }
             StmtKind::Assign(a, e) => {
+                if self.object_target(a)? {
+                    self.object_operation(a, PropertyUse::Write(e))?;
+                    return Ok(());
+                }
                 let known = self
                     .globals
                     .iter()
@@ -2744,8 +3185,38 @@ impl Lower<'_> {
             }
             StmtKind::Output(es) => {
                 if es.len() == 1 {
+                    if let ExprKind::IntrinsicCall(reference, types, args) = &es[0].kind {
+                        let (register, ty) = self.native_call(
+                            *reference,
+                            types,
+                            args,
+                            es[0].span,
+                            CallUse::Discard,
+                        )?;
+                        if ty != Type::Void {
+                            if !matches!(
+                                ty,
+                                Type::Integer
+                                    | Type::Real
+                                    | Type::Numeric(_)
+                                    | Type::String
+                                    | Type::Char
+                                    | Type::Boolean
+                                    | Type::Dynamic
+                                    | Type::Object(_)
+                            ) {
+                                return Err(Diagnostic::new(
+                                    "E109",
+                                    "OUTPUT requires scalar values",
+                                    s.span,
+                                ));
+                            }
+                            self.emit(Op::Output(vec![register], self.output_style()));
+                        }
+                        return Ok(());
+                    }
                     if let ExprKind::Invoke(callee, args) = &es[0].kind {
-                        let (r, t) = self.invoke(callee, args, es[0].span, true)?;
+                        let (r, t) = self.invoke(callee, args, es[0].span, CallUse::Discard)?;
                         if t != Type::Void {
                             if !matches!(
                                 t,
@@ -2755,6 +3226,8 @@ impl Lower<'_> {
                                     | Type::String
                                     | Type::Char
                                     | Type::Boolean
+                                    | Type::Dynamic
+                                    | Type::Object(_)
                             ) {
                                 return Err(Diagnostic::new(
                                     "E109",
@@ -2774,7 +3247,7 @@ impl Lower<'_> {
                             kind: ExprKind::Name(n.clone()),
                             span: es[0].span,
                         };
-                        let (r, t) = self.invoke(&callee, args, es[0].span, true)?;
+                        let (r, t) = self.invoke(&callee, args, es[0].span, CallUse::Discard)?;
                         if t != Type::Void {
                             self.emit(Op::Output(vec![r], self.output_style()));
                         }

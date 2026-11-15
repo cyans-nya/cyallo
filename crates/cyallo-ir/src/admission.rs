@@ -78,14 +78,15 @@ impl Estimate {
                         self.expr(i);
                     }
                 }
-                E::Yield(a, _)
+                E::DeleteProperty(a)
+                | E::Yield(a, _)
                 | E::Parenthesized(a)
                 | E::Unary(_, a)
                 | E::Field(a, _)
                 | E::TupleField(a, _)
                 | E::Cast(a, _)
                 | E::ExtensionField(a, _, _) => self.expr(a),
-                E::Record(_, fs) | E::GenericRecord(_, _, fs) => {
+                E::Record(_, fs) | E::GenericRecord(_, _, fs) | E::ObjectLiteral(_, fs) => {
                     for (_, e) in fs {
                         self.expr(e);
                     }
@@ -102,18 +103,23 @@ impl Estimate {
                         self.expr(e);
                     }
                 }
-                E::ManagedNew(_, allocator, value) => {
+                E::ManagedNew(_, _, allocator, value) => {
                     if let Some(allocator) = allocator {
                         self.expr(allocator);
                     }
                     self.expr(value);
                 }
                 E::Closure(..) => {}
-                E::Binary(_, a, b) => {
+                E::Binary(_, a, b) | E::NativeCoerce(a, b) => {
                     self.expr(a);
                     self.expr(b);
                 }
-                E::Literal(_) | E::Frozen(..) | E::Name(_) | E::Invalid(_) => {}
+                E::TypeDescriptor(_)
+                | E::DeferredCallable(_)
+                | E::Literal(_)
+                | E::Frozen(..)
+                | E::Name(_)
+                | E::Invalid(_) => {}
             }
         })
     }
