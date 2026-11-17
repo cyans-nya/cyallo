@@ -6,13 +6,16 @@ and errors, and explicitly owned runtime state.
 
 ```text
 borrowed UTF-8 source → compact tokens → source-preserving AST
-→ declarations/signatures → per-body fixed-type inference + semantic checks
-→ typed control-flow IR → typed register bytecode
+→ resolved module graph + declaration contracts
+→ per-module/per-body semantic checks → checked module IR
+→ executable linking → typed register bytecode
 → interpreter | native Winch | Cranelift fast | Cranelift speed
 ```
 
 Independent file/declaration parsing, semantic function units, per-function metadata,
-and bytecode translation use bounded parallel jobs. Shared signatures, generic
+and bytecode translation use bounded parallel jobs. Modules retain their own
+checked routines and initialization through executable linking; see
+[module compilation and reuse](modules.md). Shared signatures, generic
 instances, and effects have ordered coordination barriers. See
 [parallel compilation](parallel-compilation.md) and [general lookup plans](lookups.md).
 

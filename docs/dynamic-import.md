@@ -93,6 +93,10 @@ without a P, then resumes once. Heap arguments stay in coroutine-owned,
 relocatable roots; host workers receive code snapshots, types and declarations.
 Cancellation prevents late completions from publishing into a cancelled C.
 
+Checking retains [module products](modules.md) and can reuse their checked IR.
+Publication invokes only newly added module initializers; imported source bodies
+are never merged into the entry AST.
+
 Publication appends code and globals, preserving routine IDs, PCs, frame layouts,
 roots and suspended generators. Native drivers exit before publication and
 continue the extended snapshot in the interpreter. Native compilation of newly

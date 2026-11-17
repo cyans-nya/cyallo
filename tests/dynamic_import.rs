@@ -11,8 +11,9 @@ struct Files(PathBuf);
 impl Files {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "cyallo-import-{}-{}",
+            "cyallo-import-{}-{:?}-{}",
             std::process::id(),
+            std::thread::current().id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -438,7 +439,19 @@ fn import_declarations_can_move_and_shadow_without_changing_compiler_paths() {
             .iter()
             .map(|(path, source)| SourceText { path, source }),
     )
-    .unwrap();
+    .unwrap()
+    .with_bindings(cyallo_ir::bindings::NativeBindings::embedded().map(|path, key| {
+        let path = match path.strip_prefix("std::module::") {
+            Some(rest) => format!(
+                "std::plugins::{}",
+                rest.replace("LoadError", "LoadFailure")
+                    .replace("load", "read_file")
+                    .replace("is_denied", "was_denied")
+            ),
+            None => path.to_string(),
+        };
+        Some((path, key.to_string()))
+    }));
     let program = cyallo::compile_with_core_package(
         r#"
 use std::plugins::read_file as read_plugin

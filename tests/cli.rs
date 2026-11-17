@@ -609,3 +609,25 @@ fn jit_trace_out_writes_the_report_to_a_file_and_keeps_stderr_quiet() {
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("needs --jit-trace"));
 }
+
+#[test]
+fn enum_examples_execute_through_the_cli() {
+    for engine in ["interpreter", "jit", "cranelift", "cranelift_speed"] {
+        for (path, expected) in [
+            ("examples/enums/result.ya", "4\ncannot divide by 0\n"),
+            ("examples/enums/patterns.ya", "positive: 7\nchanged\n2\n"),
+            ("examples/enums/ownership.ya", "first:1:1:true\n"),
+            ("examples/enums/recursive.ya", "5\n"),
+        ] {
+            let result = cli(&["run", path, "--engine", engine, "--gc-stress"])
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{path} ({engine}): {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&result.stdout), expected);
+        }
+    }
+}

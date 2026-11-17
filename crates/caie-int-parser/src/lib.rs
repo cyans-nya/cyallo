@@ -126,7 +126,7 @@ impl Parser<'_> {
                 ast.body.push(self.statement()?);
             }
         }
-        ast.source_names = self.source_names;
+        ast.source_names = self.source_names.into_iter().collect();
         Ok(ast)
     }
     fn ty(&mut self) -> Result<Type, Diagnostic> {

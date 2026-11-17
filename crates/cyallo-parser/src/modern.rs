@@ -80,10 +80,18 @@ impl Parser<'_> {
             self.pos += 1;
             self.expect("[")?;
             let name = self.name()?.to_string();
-            if name == "cyallo_internal" {
+            if name == "cyallo_internal" || name == "since" {
                 self.expect("(")?;
                 if self.token().kind != TokenKind::Text {
-                    return Err(self.error("cyallo_internal requires a string literal ABI key"));
+                    if name == "cyallo_internal" {
+                        return Err(self.error("cyallo_internal requires a string literal ABI key"));
+                    }
+                    return Err(cyallo_ast::diagnostic::invalid_enum_syntax(
+                        cyallo_ast::diagnostic::EnumSyntaxError::AnnotationRequiresString {
+                            name: name.into(),
+                        },
+                        self.token().span,
+                    ));
                 }
                 let value = self
                     .literal_text(self.token_text(), self.token().span)?
@@ -182,7 +190,7 @@ impl Parser<'_> {
         }
         Ok((attributes, annotations))
     }
-    fn condition_expr(&mut self) -> Result<Expr, Diagnostic> {
+    pub(super) fn condition_expr(&mut self) -> Result<Expr, Diagnostic> {
         let old = self.condition;
         self.condition = true;
         let result = self.expr(0);
@@ -280,6 +288,7 @@ impl Parser<'_> {
         let span = self.finish_span(start);
         self.eol()?;
         Ok(Record {
+            opaque: false,
             annotations: vec![],
             type_params,
             name,
@@ -578,6 +587,9 @@ impl Parser<'_> {
             return Ok(Some(StmtKind::ReturnVoid));
         }
         if self.take("if") {
+            if self.take("let") {
+                return self.if_let_statement();
+            }
             let condition = self.condition_expr()?;
             let yes = self.braces()?;
             let after = self.pos;

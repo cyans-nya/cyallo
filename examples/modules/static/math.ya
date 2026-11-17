@@ -1,0 +1,16 @@
+use crate::model::{BASE, Reading, Readable}
+
+// The dependency is a declaration in model, even when files are discovered in
+// another order. This helper remains private to math.
+fn increment(value: i64) -> i64 { return value + 1 }
+pub const OFFSET = increment(BASE)
+
+impl Readable for Reading {
+    fn value(self) -> i64 { return self.number }
+}
+pub fn reading() -> Reading { return Reading { number: OFFSET * 2 } }
+
+// This template and its capturing closure remain owned by math.
+pub fn keep<T>(value: T) -> fn() -> T {
+    return fn() -> T { return value }
+}

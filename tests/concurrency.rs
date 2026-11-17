@@ -107,7 +107,7 @@ fn runtime_failures_and_returned_errors_are_distinct() {
         use std::io::print
         let failed = spawn(proc() -> i64 { let zero = 0; return 1 / zero })
         print(failed.join().is_failed())
-        let ordinary = spawn(proc() -> Result<i64, string> { return std::result::err<i64, string>("ordinary") })
+        let ordinary = spawn(proc() -> Result<i64, string> { return Result::Err("ordinary") })
         print(ordinary.join().completed().unwrap_err())
     "#,
         "true\nordinary\n",
@@ -192,5 +192,55 @@ fn declaration_aliases_and_user_spellings_keep_their_identity() {
         std::io::print(spawn())
     "#,
         "42\n99\n",
+    );
+}
+
+#[test]
+fn enum_payloads_cross_sessions_without_heap_cell_indices() {
+    parity(
+        include_str!("../examples/concurrency/enums.ya"),
+        "42:worker\nfinished\n",
+    );
+    for source in [
+        "enum E { Value: gc i64 }\nlet endpoint = std::channel::bounded<E>(1 as usize)\n",
+        "enum E { Value: record { data: gc i64 } }\nlet endpoint = std::channel::bounded<E>(1 as usize)\n",
+        "enum E { Value: &i64 }\nlet endpoint = std::channel::bounded<E>(1 as usize)\n",
+    ] {
+        assert!(
+            compile(source).is_err(),
+            "accepted local enum transport: {source}"
+        );
+    }
+}
+
+#[test]
+fn standard_status_enums_cross_sessions_with_their_owned_payloads() {
+    parity(
+        r#"
+use std::generator::Step
+use std::channel::{ReceiveError,SendError}
+let steps = std::channel::bounded<Step<string,string>>(1 as usize)
+let sender = steps.0.clone()
+let producer = std::task::spawn(proc() { sender.send(Step::Yielded("yielded")).unwrap() })
+let received = steps.1.recv().unwrap()
+std::io::print(match received { Step::Yielded(text) | Step::Complete(text) => text })
+producer.join().completed()
+let errors = std::channel::bounded<SendError<string>>(1 as usize)
+let sender = errors.0.clone()
+let producer = std::task::spawn(proc() { sender.send(SendError::Full("unsent")).unwrap() })
+std::io::print(match errors.1.recv().unwrap() { SendError::Full(text) | SendError::Closed(text) | SendError::Limit(text) => text })
+producer.join().completed()
+let result = std::task::spawn(proc() -> ReceiveError { return ReceiveError::Closed }).join().completed()
+std::io::print(match result { ReceiveError::Closed => "closed", ReceiveError::Empty => "empty" })
+"#,
+        "yielded\nunsent\nclosed\n",
+    );
+}
+
+#[test]
+fn standard_status_enum_example_executes() {
+    parity(
+        include_str!("../examples/concurrency/status-enums.ya"),
+        "7\ncomplete: finished\nrecovered: second\nempty\nclosed\n",
     );
 }

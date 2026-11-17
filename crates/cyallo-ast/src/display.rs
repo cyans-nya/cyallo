@@ -33,6 +33,9 @@ impl Display for ParameterPassing {
 /// gives declarations internal identities (`$module0$Value$total`,
 /// `$binding3$x`, `$generic$map<…>`); diagnostics show the source spelling.
 pub fn source_name(name: &str) -> &str {
+    if let Some(generic) = name.strip_prefix("$generic$") {
+        return source_name(generic.split('<').next().unwrap_or(generic));
+    }
     let Some(rest) = name.strip_prefix('$') else {
         return name;
     };
@@ -41,7 +44,10 @@ pub fn source_name(name: &str) -> &str {
     let spelled = if head.starts_with("module") {
         // `$module{N}${Kind}${name}[$shadow{V}]`
         parts.nth(1)
-    } else if head.starts_with("binding") || matches!(head, "type" | "property" | "generic") {
+    } else if head.starts_with("binding")
+        || head.starts_with("variant")
+        || matches!(head, "type" | "property")
+    {
         parts.next()
     } else {
         None
@@ -122,7 +128,33 @@ impl Display for Type {
                 list(f, arguments)?;
                 f.write_str(">")
             }
+            Self::Never => f.write_str("!"),
             Self::Dynamic => f.write_str("dynamic"),
+            Self::Enum(value) => {
+                f.write_str(source_name(&value.name))?;
+                if !value.identity.arguments.is_empty() {
+                    f.write_str("<")?;
+                    list(f, &value.identity.arguments)?;
+                    f.write_str(">")?;
+                }
+                Ok(())
+            }
+            Self::EnumRef(identity, name) => {
+                f.write_str(source_name(name))?;
+                if !identity.arguments.is_empty() {
+                    f.write_str("<")?;
+                    list(f, &identity.arguments)?;
+                    f.write_str(">")?;
+                }
+                Ok(())
+            }
+            Self::AnonymousRecord(fields) => {
+                f.write_str("record { ")?;
+                for (name, ty) in fields {
+                    write!(f, "{name}: {ty}, ")?;
+                }
+                f.write_str("}")
+            }
             Self::Object(fields) => {
                 f.write_str("object { ")?;
                 for (name, ty) in fields {
@@ -196,30 +228,13 @@ impl Display for Type {
             Self::TraitObject(name) => write!(f, "dyn {}", source_name(name)),
             Self::Storage(kind, payload) => {
                 let name = match kind {
-                    StorageKind::Cell => "Cell",
-                    StorageKind::Location => "Location",
-                    StorageKind::StoragePath => "StoragePath",
                     StorageKind::Option => "Option",
                     StorageKind::Result => "Result",
-                    StorageKind::Vec => "Vec",
-                    StorageKind::VecDeque => "VecDeque",
                     StorageKind::Range => "Range",
                     StorageKind::ParseError => return f.write_str("ParseError"),
-                    StorageKind::Weak => "Weak",
-                    StorageKind::ArenaCell => "ArenaCell",
-                    StorageKind::Layout => return f.write_str("Layout"),
-                    StorageKind::Allocation => return f.write_str("Allocation"),
                     StorageKind::AllocError => return f.write_str("AllocError"),
-                    StorageKind::Generator => "Generator",
-                    StorageKind::PureGenerator => "Generator",
                     StorageKind::GeneratorStep => "GeneratorStep",
-                    StorageKind::Sender => "Sender",
-                    StorageKind::Receiver => "Receiver",
                     StorageKind::SendError => "SendError",
-                    StorageKind::ReceiveError => return f.write_str("ReceiveError"),
-                    StorageKind::Clock => return f.write_str("Clock"),
-                    StorageKind::Task => "Task",
-                    StorageKind::TaskOutcome => "TaskOutcome",
                     StorageKind::TypeDescriptor => return f.write_str("TypeDescriptor"),
                     StorageKind::ViewError => return f.write_str("ViewError"),
                     StorageKind::LoadError => return f.write_str("LoadError"),
@@ -228,15 +243,21 @@ impl Display for Type {
                 // Multi-parameter constructors store their arguments as a tuple.
                 match (kind, payload.as_ref()) {
                     (
-                        StorageKind::Result
-                        | StorageKind::Generator
-                        | StorageKind::PureGenerator
-                        | StorageKind::GeneratorStep,
+                        StorageKind::Result | StorageKind::GeneratorStep,
                         Self::Tuple(arguments),
                     ) => list(f, arguments)?,
                     (_, payload) => payload.fmt(f)?,
                 }
                 f.write_str(">")
+            }
+            Self::Opaque(name, arguments, _) => {
+                f.write_str(source_name(name))?;
+                if !arguments.is_empty() {
+                    f.write_str("<")?;
+                    list(f, arguments)?;
+                    f.write_str(">")?;
+                }
+                Ok(())
             }
             Self::Symbol => f.write_str("Symbol"),
             Self::Any => f.write_str("Any"),

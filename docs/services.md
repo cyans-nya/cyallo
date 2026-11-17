@@ -29,6 +29,9 @@ Embedders can use `modules::compile_modules` with an explicit set of sources.
 The CLI follows module declarations using `modules::load_path`. Source ranges
 remain available in `Program::source_modules` for diagnostics and the debugger.
 
+The [module compilation contract](modules.md) describes retained module IR,
+initializers, executable linking and the instance-owned checked-module cache.
+
 ## Traits and extension properties
 
 ```text

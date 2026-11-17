@@ -356,7 +356,7 @@ fn repl_abandons_failed_mappers_and_relinks_erased_closures() {
     for source in [
         "fn broken(s: gc Cell<i64>, key: i64) -> std::lookup::StoragePath<i64> { let n = 1 / key; return std::lookup::path(s).target().target() }",
         "let value = gc Cell::new(10)",
-        "let f = std::option::some(std::any::erase(fn() -> i64 { return 42 }))",
+        "let f = Option::Some(std::any::erase(fn() -> i64 { return 42 }))",
         "let result = std::lookup::mapped(value, 0, broken)",
     ] {
         repl.push_line(source).unwrap();

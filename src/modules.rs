@@ -1,5 +1,6 @@
 //! Package linking and lexical extension imports. Imports never execute plugin code.
 use crate::{CompileOptions, Diagnostic, Span};
+use cyallo_ir::module_graph::{ModuleError, module_diagnostic};
 pub use cyallo_modules::SourceModule;
 use std::path::Path;
 #[derive(Debug, Clone)]
@@ -95,34 +96,38 @@ pub fn compile_modules_with_policy(
         &cyallo_ir::core_package::CorePackage::embedded(),
     )
 }
-pub fn compile_modules_with_core(
+fn compile_modules_cached(
     entry: usize,
     sources: &[SourceModule],
     options: CompileOptions,
     deferred: bool,
     policy: &cyallo_ir::import_policy::ImportPolicy,
     core: &cyallo_ir::core_package::CorePackage<'_>,
+    cache: std::sync::Arc<cyallo_ir::module_cache::ModuleCache>,
 ) -> Result<crate::ir::Program, Diagnostic> {
     if entry >= sources.len() {
-        return Err(Diagnostic::new(
-            "E140",
-            "module entry index is invalid",
-            Span::default(),
-        ));
+        return Err(module_diagnostic(ModuleError::InvalidEntry {
+            index: entry,
+            count: sources.len(),
+        }));
     }
     let mut source = String::new();
     let mut offsets = Vec::with_capacity(sources.len());
     for module in sources {
         source.push_str(&format!("// module: {}\n", module.path));
         let offset = u32::try_from(source.len()).map_err(|_| {
-            Diagnostic::new("E140", "module source exceeds span limit", Span::default())
+            module_diagnostic(ModuleError::SourceTooLarge {
+                bytes: source.len(),
+            })
         })?;
         offsets.push(offset);
         source.push_str(&module.source);
         source.push('\n');
     }
     u32::try_from(source.len()).map_err(|_| {
-        Diagnostic::new("E140", "module source exceeds span limit", Span::default())
+        module_diagnostic(ModuleError::SourceTooLarge {
+            bytes: source.len(),
+        })
     })?;
     let core_archive = core
         .append_to(&mut source)
@@ -167,7 +172,7 @@ pub fn compile_modules_with_core(
         asts.push(ast);
     }
     let raw = asts.clone();
-    let ast = crate::namespace::link_with_core(
+    let mut ast = crate::namespace::link_with_core(
         asts,
         &sources.iter().map(|s| s.path.clone()).collect::<Vec<_>>(),
         entry,
@@ -175,8 +180,33 @@ pub fn compile_modules_with_core(
         core,
         core_archive.base,
     )?;
+    ast.source_files = sources
+        .iter()
+        .zip(&offsets)
+        .map(|(m, &offset)| cyallo_ir::module_graph::SourceFile {
+            id: cyallo_ir::module_graph::SourceFileId {
+                path: m.path.clone().into(),
+                trust: cyallo_ast::SourceTrust::User,
+            },
+            span: Span::new(offset, offset + m.source.len() as u32),
+        })
+        .chain(
+            core_archive
+                .ranges
+                .iter()
+                .map(|r| cyallo_ir::module_graph::SourceFile {
+                    id: cyallo_ir::module_graph::SourceFileId {
+                        path: r.path.clone(),
+                        trust: cyallo_ast::SourceTrust::Core,
+                    },
+                    span: r.span,
+                }),
+        )
+        .collect();
+    let source_files = ast.source_files.clone();
     let authorization = ast.native.import_policy.clone();
-    let mut program = crate::compiler::compile_ast(&source, ast, options, deferred)?;
+    let mut program =
+        crate::compiler::compile_resolved_with_cache(&source, ast, options, deferred, cache)?;
     let mut ranges: Vec<_> = sources
         .iter()
         .zip(offsets)
@@ -191,6 +221,7 @@ pub fn compile_modules_with_core(
     }));
     let mut plan = crate::dynamic_modules::CompilePlan::new(
         crate::dynamic_modules::CompileSources {
+            source_files,
             asts: raw,
             paths: sources.iter().map(|s| s.path.clone()).collect(),
             entry,
@@ -235,4 +266,63 @@ pub fn source_archive(sources: &[SourceModule]) -> String {
     // diagnostics can still render the user archive if its suffix cannot fit.
     let _ = cyallo_ir::core_package::CorePackage::embedded().append_to(&mut archive);
     archive
+}
+
+/// Owns reusable checked module artifacts. Sessions own all runtime state.
+#[derive(Debug, Default)]
+pub struct Compiler {
+    cache: std::sync::Arc<cyallo_ir::module_cache::ModuleCache>,
+}
+impl Compiler {
+    pub fn compile(
+        &self,
+        entry: usize,
+        sources: &[SourceModule],
+        options: CompileOptions,
+        deferred: bool,
+    ) -> Result<crate::ir::Program, Diagnostic> {
+        self.compile_with_policy(
+            entry,
+            sources,
+            options,
+            deferred,
+            &cyallo_ir::import_policy::ImportPolicy::default(),
+        )
+    }
+    pub fn compile_with_policy(
+        &self,
+        entry: usize,
+        sources: &[SourceModule],
+        options: CompileOptions,
+        deferred: bool,
+        policy: &cyallo_ir::import_policy::ImportPolicy,
+    ) -> Result<crate::ir::Program, Diagnostic> {
+        compile_modules_cached(
+            entry,
+            sources,
+            options,
+            deferred,
+            policy,
+            &cyallo_ir::core_package::CorePackage::embedded(),
+            self.cache.clone(),
+        )
+    }
+}
+pub fn compile_modules_with_core(
+    entry: usize,
+    sources: &[SourceModule],
+    options: CompileOptions,
+    deferred: bool,
+    policy: &cyallo_ir::import_policy::ImportPolicy,
+    core: &cyallo_ir::core_package::CorePackage<'_>,
+) -> Result<crate::ir::Program, Diagnostic> {
+    compile_modules_cached(
+        entry,
+        sources,
+        options,
+        deferred,
+        policy,
+        core,
+        Default::default(),
+    )
 }

@@ -38,6 +38,8 @@ its run command and comments explaining the behavior.
 | --- | --- |
 | [tour.ya](tour.ya) | Small functions, procedures, arrays, range loops, break/continue, and string utilities |
 | [composites.ya](composites.ya) | Records, tuples, callbacks, returning owned closures, and explicit `&mut` captures |
+| [Data enums](enums/README.md) | Generic variants, real Result errors, exhaustive patterns, guard commit order and borrowed payloads |
+| [SDKs and worlds](sdk/README.md) | `interface mod`, opaque types and their bindings, worlds with `include`/`import`/`export`, the prelude SDK (`prelude::core`); an unbound opaque type is rejected |
 | [postfix-dereference.ya](postfix-dereference.ya) | `value.*`, chained dereferences, mutation through references, tuple fields, and multiplication; prints `21`, `12`, `7` |
 | [generics.ya](generics.ya) | Generic records, inferred/explicit type arguments, an array transform, and specialized closures |
 | [traits.ya](traits.ya) | Concrete method calls, `dyn` dispatch, owned conversion, and aliases to an erased object |

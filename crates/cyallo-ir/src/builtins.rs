@@ -1,11 +1,10 @@
 //! Utility declaration contracts, keyed by semantic identity.
 use crate::{Type, intrinsic::Intrinsic};
 use Intrinsic::*;
+/// Observably pure: foldable, removable when unused and callable from a `fn`.
+/// The answer comes from the intrinsic's contract.
 pub fn pure(id: Intrinsic) -> bool {
-    !matches!(
-        id,
-        Random | Print | Input | FreshSymbol | CellNew | ContextNew | ServiceKeyNew | MappedLookup
-    )
+    id.contract().effects.is_pure()
 }
 pub fn standard(name: &str) -> bool {
     canonical(name).is_some_and(standard_id)
@@ -97,33 +96,25 @@ pub fn result_type(n: Intrinsic, ts: &[Type]) -> Option<Type> {
             _ => None,
         };
     }
+    if let (ArraySum, [collection]) = (n, ts)
+        && let Some(element) = collection.collection_element()
+        && element.number_kind().is_some()
+    {
+        return Some(element.clone());
+    }
+    if let (ArrayLength, [collection]) = (n, ts)
+        && collection.collection_element().is_some()
+    {
+        return Some(Integer);
+    }
     Some(match (n, ts) {
-        (
-            ArraySum,
-            [
-                Array(_, element)
-                | Storage(cyallo_ast::StorageKind::Vec | cyallo_ast::StorageKind::VecDeque, element),
-            ],
-        ) if element.number_kind().is_some() => *element.clone(),
+        (ArraySum, [Array(_, element)]) if element.number_kind().is_some() => *element.clone(),
         (Left | Right, [String, Integer]) | (Mid, [String, Integer, Integer]) => String,
         (StringLength, [String]) => Integer,
-        (
-            ArrayLength,
-            [
-                Array(..)
-                | Storage(cyallo_ast::StorageKind::Vec | cyallo_ast::StorageKind::VecDeque, _),
-            ],
-        ) => Integer,
+        (ArrayLength, [Array(..)]) => Integer,
         (ArrayLength, [Reference { pointee, .. }])
-            if matches!(
-                pointee.as_ref(),
-                Slice(_)
-                    | Array(..)
-                    | Storage(
-                        cyallo_ast::StorageKind::Vec | cyallo_ast::StorageKind::VecDeque,
-                        _
-                    )
-            ) =>
+            if matches!(pointee.as_ref(), Slice(_) | Array(..))
+                || pointee.collection_element().is_some() =>
         {
             Integer
         }

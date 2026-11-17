@@ -1,6 +1,16 @@
+pub use std::prelude;
 pub use std::{array, collections, num, gc, rc, io, cell, lookup, string, mem};
 pub use std::cell::Cell;
 pub use std::collections::{Vec, VecDeque};
 pub use std::option::Option;
 pub use std::result::Result;
 pub use std::generator::Generator;
+
+// Items grouped by the SDK they come from: `use prelude::core::*` brings in
+// Option/Some/None and Result/Ok/Err. Reexports keep the original identities.
+pub mod core {
+    pub use std::option::Option;
+    pub use std::option::Option::{Some, None};
+    pub use std::result::Result;
+    pub use std::result::Result::{Ok, Err};
+}

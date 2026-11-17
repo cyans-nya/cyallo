@@ -13,9 +13,17 @@ type Known = HashMap<String, Type>;
 pub fn rewrite(ast: &mut Ast, env: &TypeEnvironment, options: CompileOptions) -> Result<()> {
     let mut globals = analysis::collect(&ast.body, &[])?;
     inference::infer(&ast.body, &mut globals, &[], env, options)?;
+    rewrite_with_globals(ast, env, options, &globals)
+}
+pub fn rewrite_with_globals(
+    ast: &mut Ast,
+    env: &TypeEnvironment,
+    options: CompileOptions,
+    globals: &[crate::ir::Local],
+) -> Result<()> {
     let known: Known = globals
         .iter()
-        .map(|local| (local.name.to_string(), local.ty.clone()))
+        .map(|l| (l.name.to_string(), l.ty.clone()))
         .collect();
     let mut rewriter = Rewriter { env, options };
     rewriter.block(&mut ast.body, &known, None, None)?;
@@ -120,6 +128,12 @@ impl Rewriter<'_> {
         cyallo_ast::with_stack(|| {
             for statement in body {
                 match &mut statement.kind {
+                    StmtKind::IfLet(..) => {
+                        return Err(crate::patterns::invalid_pattern(
+                            crate::patterns::PatternError::UnresolvedPattern,
+                            statement.span,
+                        ));
+                    }
                     StmtKind::Binding(name, annotation, _, _, value) => {
                         let expected = annotation.as_ref().or_else(|| known.get(name.as_ref()));
                         self.expression(value, expected, known, yielded)?;
@@ -259,7 +273,7 @@ impl Rewriter<'_> {
     }
 
     fn ordinary_method_parameters(&self, receiver: &Type, name: &str) -> Option<Vec<Type>> {
-        if matches!(receiver.pointee_or_self(), Type::Record(_, fields) if fields.iter().any(|(field, _)| field.as_ref() == name))
+        if matches!(receiver.pointee_or_self(), Type::Record(_, fields) | Type::AnonymousRecord(fields) if fields.iter().any(|(field, _)| field.as_ref() == name))
         {
             return None;
         }
@@ -305,6 +319,58 @@ impl Rewriter<'_> {
     ) -> Result<()> {
         cyallo_ast::with_stack(|| {
             match &mut expression.kind {
+                ExprKind::EnumConstruct(_, ty, payload) => {
+                    if let Some(payload) = payload {
+                        let expected = None;
+                        let _ = ty;
+                        self.expression(payload, expected, known, yielded)?;
+                    }
+                }
+                ExprKind::AnonymousRecord(fields) | ExprKind::VariantPayload(fields) => {
+                    let declared = match expected {
+                        Some(Type::AnonymousRecord(fields)) => Some(fields),
+                        _ => None,
+                    };
+                    for (name, value) in fields {
+                        self.expression(
+                            value,
+                            declared.and_then(|fields| {
+                                fields
+                                    .iter()
+                                    .find(|(field, _)| field == name)
+                                    .map(|(_, ty)| ty)
+                            }),
+                            known,
+                            yielded,
+                        )?;
+                    }
+                }
+                ExprKind::Match(value, arms) => {
+                    self.expression(value, None, known, yielded)?;
+                    let ty = crate::patterns::scrutinee_type(value, known, self.env)?;
+                    for arm in arms {
+                        let mut scope = known.clone();
+                        for binding in
+                            crate::patterns::check(&arm.pattern, &ty, self.env)?.bindings()
+                        {
+                            scope.insert(binding.name.to_string(), binding.ty);
+                        }
+                        if let Some(guard) = &mut arm.guard {
+                            self.expression(guard, Some(&Type::Boolean), &scope, yielded)?;
+                        }
+                        match &mut arm.body {
+                            MatchBody::Expression(value) => {
+                                self.expression(value, expected, &scope, yielded)?
+                            }
+                            MatchBody::Block(body, tail) => {
+                                self.block(body, &scope, None, yielded)?;
+                                if let Some(tail) = tail {
+                                    self.expression(tail, expected, &scope, yielded)?;
+                                }
+                            }
+                        }
+                    }
+                }
                 // Already checked adapters must not acquire another adapter.
                 ExprKind::NativeCoerce(..) => return Ok(()),
                 ExprKind::Closure(function, _) => self.function(function, known)?,
@@ -402,7 +468,7 @@ impl Rewriter<'_> {
                     let record = expected.or_else(|| self.env.get(name.as_ref()));
                     for (name, value) in values {
                         let ty = match record {
-                            Some(Type::Record(_, fields)) => fields
+                            Some(Type::Record(_, fields) | Type::AnonymousRecord(fields)) => fields
                                 .iter()
                                 .find(|(field, _)| field == name)
                                 .map(|(_, ty)| ty),
@@ -572,7 +638,9 @@ mod tests {
     use super::*;
 
     fn program(source: &str) -> (Ast, TypeEnvironment) {
-        let mut ast = crate::namespace::single(cyallo_parser::parse(source).unwrap()).unwrap();
+        let mut graph = crate::namespace::single(cyallo_parser::parse(source).unwrap()).unwrap();
+        let mut ast = std::mem::take(&mut graph.entry_mut().source);
+        ast.native = graph.native;
         let mut types = crate::composites::resolve(&mut ast).unwrap();
         let services = crate::services::prepare(&mut ast).unwrap();
         for interface in &services.traits {

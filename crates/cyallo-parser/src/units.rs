@@ -48,6 +48,7 @@ impl<'src> IndexedSource<'src> {
         let mut out = Ast::default();
         for ast in parsed {
             let mut ast = ast?;
+            out.enums.append(&mut ast.enums);
             out.body.append(&mut ast.body);
             out.functions.append(&mut ast.functions);
             out.type_aliases.append(&mut ast.type_aliases);
@@ -58,6 +59,9 @@ impl<'src> IndexedSource<'src> {
             out.implementations.append(&mut ast.implementations);
             out.properties.append(&mut ast.properties);
             out.modules.append(&mut ast.modules);
+            out.worlds.append(&mut ast.worlds);
+            out.interface_implementations
+                .append(&mut ast.interface_implementations);
             out.inherent_implementations
                 .append(&mut ast.inherent_implementations);
         }

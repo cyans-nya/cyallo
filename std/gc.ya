@@ -1,13 +1,9 @@
-#[cyallo_internal("gc_owner_trait")]
 pub trait GcOwner {}
 
-#[cyallo_internal("gc_view_trait")]
 pub trait GcView {}
 
-#[cyallo_internal("gc_clone")]
 pub fn clone<O: GcOwner>(owner: &O) -> O;
 
 impl<T> gc T {
-    #[cyallo_internal("gc_clone_member")]
     pub fn clone(self: &Self) -> Self;
 }

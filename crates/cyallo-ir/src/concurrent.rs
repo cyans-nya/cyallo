@@ -36,6 +36,11 @@ pub enum Operation {
 }
 pub fn transferable(ty: &Type) -> bool {
     match ty {
+        Type::Enum(contract) => contract
+            .variants
+            .iter()
+            .filter_map(|v| v.payload.as_ref())
+            .all(transferable),
         Type::Numeric(_)
         | Type::Integer
         | Type::Real
@@ -45,13 +50,36 @@ pub fn transferable(ty: &Type) -> bool {
         | Type::Void => true,
         Type::Array(_, t) | Type::SparseArray(t) => transferable(t),
         Type::Tuple(ts) => ts.iter().all(transferable),
-        Type::Record(_, fs) => fs.iter().all(|(_, t)| transferable(t)),
-        Type::Storage(K::Sender | K::Receiver | K::Clock, _) => true,
-        Type::Storage(K::Vec | K::VecDeque | K::Option | K::Result | K::SendError, t) => {
-            transferable(t)
-        }
+        Type::Record(_, fs) | Type::AnonymousRecord(fs) => fs.iter().all(|(_, t)| transferable(t)),
+        Type::Opaque(_, arguments, traits) => traits.transferable() && arguments.iter().all(transferable),
+        Type::Storage(
+            K::Option | K::Result | K::GeneratorStep | K::SendError,
+            t,
+        ) => transferable(t),
         _ => false,
     }
+}
+/// The declared result must be an opaque host type applied to exactly `arguments`:
+/// the declaration names the type, the contract still constrains its shape.
+fn opaque_with(declared: &Type, arguments: &[Type]) -> bool {
+    matches!(
+        declared,
+        Type::Opaque(_, applied, _)
+            if applied.len() == arguments.len()
+                && applied
+                    .iter()
+                    .zip(arguments)
+                    .all(|(a, b)| crate::declarations::equivalent_types(a, b))
+    )
+}
+/// A channel constructor returns a sender and a receiver of the element type.
+fn channel_pair(declared: &Type, element: &Type) -> bool {
+    matches!(
+        declared,
+        Type::Tuple(ends)
+            if ends.len() == 2
+                && ends.iter().all(|end| opaque_with(end, std::slice::from_ref(element)))
+    )
 }
 pub fn is_intrinsic(id: Intrinsic) -> bool {
     matches!(
@@ -68,28 +96,30 @@ pub fn resolve(
     args: &[Type],
     span: Span,
 ) -> Result<ResolvedCall, Diagnostic> {
-    let pair = |t: &Type| {
-        Type::Tuple(vec![
-            lookup::storage(K::Sender, t.clone()),
-            lookup::storage(K::Receiver, t.clone()),
-        ])
-    };
+    // The sender/receiver pair is the declared result: the declaration names the
+    // types, the element type only has to be transferable.
     let (op, result) = match (id, types, args) {
-        (Intrinsic::ChannelBounded, [t], [n])
-            if transferable(t) && n.number_kind() == Some(NumberKind::Usize) =>
+        (Intrinsic::ChannelBounded, [t, declared], [n])
+            if transferable(t)
+                && channel_pair(declared, t)
+                && n.number_kind() == Some(NumberKind::Usize) =>
         {
-            (Operation::Bounded, pair(t))
+            (Operation::Bounded, declared.clone())
         }
-        (Intrinsic::ChannelUnbounded, [t], []) if transferable(t) => {
-            (Operation::Unbounded, pair(t))
+        (Intrinsic::ChannelUnbounded, [t, declared], []) if transferable(t) && channel_pair(declared, t) => {
+            (Operation::Unbounded, declared.clone())
         }
-        (Intrinsic::ClockNew, [], []) => (Operation::Clock, lookup::storage(K::Clock, Type::Void)),
-        (Intrinsic::TaskSpawn, [], [callable])
-            if cyallo_ast::callable(callable)
-                .is_some_and(|(_, p, r)| p.is_empty() && transferable(r)) =>
+        // The result is the declared type: the declaration, not a kind, names it.
+        (Intrinsic::ClockNew, [declared], []) if opaque_with(declared, &[]) => {
+            (Operation::Clock, declared.clone())
+        }
+        (Intrinsic::TaskSpawn, [declared], [callable])
+            if cyallo_ast::callable(callable).is_some_and(|(_, p, r)| {
+                p.is_empty() && transferable(r) && opaque_with(declared, std::slice::from_ref(r))
+            }) =>
         {
-            let (_, _, result) = cyallo_ast::callable(callable).unwrap();
-            (Operation::Spawn, lookup::storage(K::Task, result.clone()))
+            // The handle type is the declared result.
+            (Operation::Spawn, declared.clone())
         }
         _ => {
             return Err(cyallo_ast::diagnostic::invalid_concurrent_call(

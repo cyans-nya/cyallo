@@ -121,6 +121,74 @@ pub fn result_type(value: Type, error: Type) -> Type {
         Type::Tuple(vec![value, error]),
     )
 }
+/// The payload of an `Option` type, whichever form the type takes.
+pub fn option_payload(ty: &Type) -> Option<&Type> {
+    use cyallo_ast::EnumEncoding::OptionSome;
+    match ty {
+        Type::Storage(cyallo_ast::StorageKind::Option, t) => Some(t),
+        Type::Enum(contract) => contract
+            .variants
+            .iter()
+            .find(|v| v.encoding == OptionSome)
+            .and_then(|v| v.payload.as_ref()),
+        _ => None,
+    }
+}
+/// The value and error payloads of a `Result` type, whichever form the type takes.
+pub fn result_payload(ty: &Type) -> Option<(&Type, &Type)> {
+    use cyallo_ast::EnumEncoding::{ResultErr, ResultOk};
+    match ty {
+        Type::Storage(cyallo_ast::StorageKind::Result, tuple) => match tuple.as_ref() {
+            Type::Tuple(types) => match types.as_slice() {
+                [value, error] => Some((value, error)),
+                _ => None,
+            },
+            _ => None,
+        },
+        Type::Enum(contract) => {
+            let payload = |role| {
+                contract
+                    .variants
+                    .iter()
+                    .find(|v| v.encoding == role)
+                    .and_then(|v| v.payload.as_ref())
+            };
+            Some((payload(ResultOk)?, payload(ResultErr)?))
+        }
+        _ => None,
+    }
+}
+fn role_payload(ty: &Type, role: cyallo_ast::EnumEncoding) -> Option<&Type> {
+    let Type::Enum(contract) = ty else {
+        return None;
+    };
+    contract
+        .variants
+        .iter()
+        .find(|v| v.encoding == role)
+        .and_then(|v| v.payload.as_ref())
+}
+/// The yielded and completed payloads of a `GeneratorStep` type, in either form.
+pub fn step_payload(ty: &Type) -> Option<(&Type, &Type)> {
+    use cyallo_ast::EnumEncoding::{StepComplete, StepYielded};
+    match ty {
+        Type::Storage(cyallo_ast::StorageKind::GeneratorStep, tuple) => match tuple.as_ref() {
+            Type::Tuple(types) => match types.as_slice() {
+                [yielded, completed] => Some((yielded, completed)),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => Some((role_payload(ty, StepYielded)?, role_payload(ty, StepComplete)?)),
+    }
+}
+/// The unsent value type of a `SendError` type, in either form.
+pub fn send_payload(ty: &Type) -> Option<&Type> {
+    match ty {
+        Type::Storage(cyallo_ast::StorageKind::SendError, t) => Some(t),
+        _ => role_payload(ty, cyallo_ast::EnumEncoding::SendClosed),
+    }
+}
 pub fn inner(ty: &Type, name: cyallo_ast::StorageKind) -> Option<&Type> {
     match ty {
         Type::Storage(n, t) if *n == name => Some(t),
@@ -129,22 +197,45 @@ pub fn inner(ty: &Type, name: cyallo_ast::StorageKind) -> Option<&Type> {
 }
 pub fn constructor(name: Intrinsic, ty: &Type, args: &[Type]) -> Option<(Operation, Type)> {
     let (op, result, valid) = match name {
-        Intrinsic::VecLiteral | Intrinsic::DequeLiteral => (
-            Operation::CollectionLiteral(name == Intrinsic::DequeLiteral),
-            storage(
-                if name == Intrinsic::DequeLiteral {
-                    cyallo_ast::StorageKind::VecDeque
-                } else {
-                    cyallo_ast::StorageKind::Vec
-                },
-                ty.clone(),
+        // The weak type is the declared result; the argument must be an `rc` owner.
+        Intrinsic::RcDowngrade => (
+            Operation::RcDowngrade,
+            ty.clone(),
+            matches!(
+                (ty, args),
+                (
+                    Type::Opaque(_, owner, traits),
+                    [owner_argument]
+                ) if traits.weak()
+                    && matches!(owner.as_slice(), [Type::Managed { kind: cyallo_ast::MemoryKind::Rc, .. }])
+                    && matches!(
+                        owner_argument.pointee_or_self(),
+                        Type::Managed { kind: cyallo_ast::MemoryKind::Rc, .. }
+                    )
             ),
-            args.iter().all(|t| crate::memory::same_regions(t, ty)),
         ),
+        // `Vec::from(range)`: the collection is the declared result.
+        Intrinsic::VecFrom | Intrinsic::DequeFrom => (
+            Operation::CollectionFrom(name == Intrinsic::DequeFrom),
+            ty.clone(),
+            matches!(
+                (ty, args),
+                (Type::Opaque(_, applied, traits), [Type::Storage(cyallo_ast::StorageKind::Range, range)])
+                    if traits.collection()
+                        && traits.double_ended() == (name == Intrinsic::DequeFrom)
+                        && matches!(applied.as_slice(), [element] if crate::memory::same_regions(element, range))
+            ),
+        ),
+        // A cell is the declared result, applied to the type of its contents.
         Intrinsic::CellNew => (
             Operation::CellNew,
-            storage(cyallo_ast::StorageKind::Cell, ty.clone()),
-            matches!(args, [actual] if crate::memory::same_regions(actual, ty)),
+            ty.clone(),
+            matches!(
+                (ty, args),
+                (Type::Opaque(_, applied, traits), [actual])
+                    if traits.deref()
+                        && matches!(applied.as_slice(), [element] if crate::memory::same_regions(actual, element))
+            ),
         ),
         Intrinsic::ArrayEmpty => (
             Operation::Empty,
@@ -158,8 +249,19 @@ pub fn constructor(name: Intrinsic, ty: &Type, args: &[Type]) -> Option<(Operati
         ),
         Intrinsic::MissingPath => (
             Operation::Missing,
-            storage(cyallo_ast::StorageKind::StoragePath, ty.clone()),
-            args.is_empty(),
+            ty.clone(),
+            args.is_empty() && matches!(ty, Type::Opaque(_, applied, traits) if traits.path() && applied.len() == 1),
+        ),
+        // `path(value)`: the declared path type applied to the value's type.
+        Intrinsic::LookupPath => (
+            Operation::StoragePathNew,
+            ty.clone(),
+            matches!(
+                (ty, args),
+                (Type::Opaque(_, applied, traits), [actual])
+                    if traits.path()
+                        && matches!(applied.as_slice(), [element] if crate::memory::same_regions(actual, element))
+            ),
         ),
         Intrinsic::Checked => (Operation::Checked, ty.clone(), args == [Type::Any]),
         _ => return None,
@@ -203,30 +305,19 @@ pub fn call(name: Intrinsic, args: &[Type]) -> Option<(Operation, Type)> {
                     ..
                 },
             ) => return Some((Operation::RcClone, owner.clone())),
-            (
-                Intrinsic::RcDowngrade,
-                Type::Managed {
-                    kind: cyallo_ast::MemoryKind::Rc,
-                    ..
-                },
-            ) => {
-                return Some((
-                    Operation::RcDowngrade,
-                    storage(cyallo_ast::StorageKind::Weak, owner.clone()),
-                ));
-            }
-            (Intrinsic::RcUpgrade, Type::Storage(cyallo_ast::StorageKind::Weak, owner))
-                if matches!(
-                    owner.as_ref(),
-                    Type::Managed {
-                        kind: cyallo_ast::MemoryKind::Rc,
-                        ..
-                    }
-                ) =>
+            (Intrinsic::RcUpgrade, Type::Opaque(_, owner, traits))
+                if traits.weak()
+                    && matches!(
+                        owner.as_slice(),
+                        [Type::Managed {
+                            kind: cyallo_ast::MemoryKind::Rc,
+                            ..
+                        }]
+                    ) =>
             {
                 return Some((
                     Operation::RcUpgrade,
-                    storage(cyallo_ast::StorageKind::Option, *owner.clone()),
+                    storage(cyallo_ast::StorageKind::Option, owner[0].clone()),
                 ));
             }
             (
@@ -249,57 +340,20 @@ pub fn call(name: Intrinsic, args: &[Type]) -> Option<(Operation, Type)> {
         }
     }
     match (name, args) {
-        (Intrinsic::VecLiteral | Intrinsic::DequeLiteral, [first, rest @ ..])
-            if rest.iter().all(|t| crate::memory::same_regions(t, first)) =>
-        {
-            Some((
-                Operation::CollectionLiteral(name == Intrinsic::DequeLiteral),
-                storage(
-                    if name == Intrinsic::DequeLiteral {
-                        cyallo_ast::StorageKind::VecDeque
-                    } else {
-                        cyallo_ast::StorageKind::Vec
-                    },
-                    first.clone(),
-                ),
-            ))
-        }
-        (Intrinsic::VecFrom | Intrinsic::DequeFrom, [Type::Storage(kind, t)])
-            if *kind == cyallo_ast::StorageKind::Range =>
-        {
-            Some((
-                Operation::CollectionFrom(name == Intrinsic::DequeFrom),
-                storage(
-                    if name == Intrinsic::DequeFrom {
-                        cyallo_ast::StorageKind::VecDeque
-                    } else {
-                        cyallo_ast::StorageKind::Vec
-                    },
-                    *t.clone(),
-                ),
-            ))
-        }
-        (Intrinsic::CellNew, [t]) => Some((
-            Operation::CellNew,
-            storage(cyallo_ast::StorageKind::Cell, t.clone()),
-        )),
         (Intrinsic::OptionSome, [t]) => Some((
             Operation::Some,
             storage(cyallo_ast::StorageKind::Option, t.clone()),
         )),
         (Intrinsic::Erase, [_]) => Some((Operation::Erase, Type::Any)),
         (Intrinsic::FreshSymbol, [Type::String]) => Some((Operation::Symbol, Type::Symbol)),
-        (Intrinsic::LookupPath, [t]) => Some((
-            Operation::StoragePathNew,
-            storage(cyallo_ast::StorageKind::StoragePath, t.clone()),
-        )),
         (Intrinsic::MappedLookup, [receiver, key, Type::Function(_, params, result)]) if matches!(params.as_slice(), [(a, false), (b, false)] if crate::memory::same_regions(a, receiver) && crate::memory::same_regions(b, key)) => {
-            inner(result, cyallo_ast::StorageKind::StoragePath).map(|t| {
-                (
+            match result.as_ref() {
+                Type::Opaque(_, applied, traits) if traits.path() && applied.len() == 1 => Some((
                     Operation::Mapped,
-                    storage(cyallo_ast::StorageKind::Option, t.clone()),
-                )
-            })
+                    storage(cyallo_ast::StorageKind::Option, applied[0].clone()),
+                )),
+                _ => None,
+            }
         }
         _ => None,
     }

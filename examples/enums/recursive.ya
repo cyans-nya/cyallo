@@ -1,0 +1,12 @@
+// cargo run -- run examples/enums/recursive.ya --gc-stress
+// Output: "5".
+enum List<T> { End, Node: (T, gc List<T>) }
+proc sum(value: &List<i64>) -> i64 {
+    return match value {
+        List::End => 0,
+        List::Node((number, next)) => number.* + sum(&next.*.*),
+    }
+}
+let end: gc List<i64> = gc List::End
+let list = gc List::Node((3, gc List::Node((2, end))))
+std::io::print(sum(&list.*))

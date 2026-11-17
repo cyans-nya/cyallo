@@ -112,7 +112,11 @@ factory, or explicitly passed capability. Independent instances must work
 independently, including when their scoped numeric IDs happen to be equal.
 
 Never create mutable process-wide counters, registries, or singleton services
-such as `NEXT`, `NEXT_RUNTIME`, or `SERVICE`. Do not use thread-local executor
+such as `NEXT`, `NEXT_RUNTIME`, or `SERVICE`. The one sanctioned process-wide
+resource is the compile worker pool in `cyallo-compile-jobs`: it is capacity only (idle
+threads keyed by `Jobs` width, no identifiers, registry or program state), compile entry
+points have no owner to hold it, and runtimes and sessions share nothing through it. Do not
+extend that exception to anything that holds state. Do not use thread-local executor
 state to discover the current runtime or processor. Carry coroutine identity,
 processor preference, fuel, and wake capabilities explicitly.
 

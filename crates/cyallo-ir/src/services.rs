@@ -14,13 +14,13 @@ pub struct Extension {
     pub receiver: Type,
     pub result: Type,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Trait {
     pub origin: cyallo_ast::TraitOrigin,
     pub name: Box<str>,
     pub methods: Vec<Method>,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Method {
     pub name: Box<str>,
     pub kind: RoutineKind,
@@ -28,7 +28,7 @@ pub struct Method {
     pub result: Type,
     pub receiver: Receiver,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Receiver {
     Value,
     Shared,
@@ -98,19 +98,84 @@ pub enum Operation {
     Available,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceDeclarationError {
+    DuplicateTrait,
+    MissingReceiver,
+    DuplicateMethod,
+    UnknownTrait,
+    DuplicateImplementation,
+    IncompleteImplementation,
+    MissingMethod,
+    SignatureMismatch,
+    ServiceInterface,
+    KeyInterface,
+    KeyLabel,
+    UndeclaredTrait { name: Box<str> },
+}
+impl std::fmt::Display for ServiceDeclarationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateTrait => f.write_str("duplicate trait"),
+            Self::MissingReceiver => f.write_str("trait methods require a self receiver"),
+            Self::DuplicateMethod => f.write_str("duplicate trait method"),
+            Self::UnknownTrait => f.write_str("unknown trait"),
+            Self::DuplicateImplementation => f.write_str("duplicate trait implementation"),
+            Self::IncompleteImplementation => {
+                f.write_str("implementation must define every trait method exactly once")
+            }
+            Self::MissingMethod => f.write_str("missing or duplicate trait method"),
+            Self::SignatureMismatch => {
+                f.write_str("trait implementation signature differs from declaration")
+            }
+            Self::ServiceInterface => f.write_str("service types require a dyn trait interface"),
+            Self::KeyInterface => f.write_str("service key requires a dyn trait type"),
+            Self::KeyLabel => {
+                f.write_str("ServiceKey requires a compile-time string diagnostic label")
+            }
+            Self::UndeclaredTrait { name } => {
+                write!(f, "unknown trait `{}`", cyallo_ast::source_name(name))
+            }
+        }
+    }
+}
+impl std::error::Error for ServiceDeclarationError {}
+fn invalid_service_declaration(
+    error: ServiceDeclarationError,
+    span: cyallo_ast::Span,
+) -> cyallo_ast::Diagnostic {
+    let code = match error {
+        ServiceDeclarationError::ServiceInterface
+        | ServiceDeclarationError::KeyInterface
+        | ServiceDeclarationError::KeyLabel => "E131",
+        _ => "E130",
+    };
+    cyallo_ast::Diagnostic::new(code, error.to_string(), span)
+}
+
 pub fn prepare(ast: &mut cyallo_ast::Ast) -> Result<Metadata, cyallo_ast::Diagnostic> {
-    use cyallo_ast::*;
     let mut out = Metadata::default();
+    prepare_into(ast, &mut out, 0)?;
+    Ok(out)
+}
+fn prepare_into(
+    ast: &mut cyallo_ast::Ast,
+    out: &mut Metadata,
+    module: usize,
+) -> Result<(), cyallo_ast::Diagnostic> {
+    use cyallo_ast::*;
     for t in &ast.traits {
         if out.trait_id(&t.name).is_some() {
-            return Err(Diagnostic::new("E130", "duplicate trait", t.span));
+            return Err(invalid_service_declaration(
+                ServiceDeclarationError::DuplicateTrait,
+                t.span,
+            ));
         }
         let mut methods = vec![];
         for f in &t.methods {
             let Some(receiver) = f.params.first().filter(|p| p.receiver) else {
-                return Err(Diagnostic::new(
-                    "E130",
-                    "trait methods require a self receiver",
+                return Err(invalid_service_declaration(
+                    ServiceDeclarationError::MissingReceiver,
                     f.span,
                 ));
             };
@@ -118,7 +183,10 @@ pub fn prepare(ast: &mut cyallo_ast::Ast) -> Result<Metadata, cyallo_ast::Diagno
                 .iter()
                 .any(|m: &Method| m.name.eq_identifier(&f.name))
             {
-                return Err(Diagnostic::new("E130", "duplicate trait method", f.span));
+                return Err(invalid_service_declaration(
+                    ServiceDeclarationError::DuplicateMethod,
+                    f.span,
+                ));
             }
             methods.push(Method {
                 name: f.name.clone(),
@@ -138,24 +206,22 @@ pub fn prepare(ast: &mut cyallo_ast::Ast) -> Result<Metadata, cyallo_ast::Diagno
         });
     }
     for (index, implementation) in ast.implementations.drain(..).enumerate() {
-        let trait_id = out
-            .trait_id(&implementation.trait_name)
-            .ok_or_else(|| Diagnostic::new("E130", "unknown trait", implementation.span))?;
+        let trait_id = out.trait_id(&implementation.trait_name).ok_or_else(|| {
+            invalid_service_declaration(ServiceDeclarationError::UnknownTrait, implementation.span)
+        })?;
         if out
             .implementations
             .iter()
             .any(|i| i.trait_id == trait_id && i.receiver == implementation.receiver)
         {
-            return Err(Diagnostic::new(
-                "E130",
-                "duplicate trait implementation",
+            return Err(invalid_service_declaration(
+                ServiceDeclarationError::DuplicateImplementation,
                 implementation.span,
             ));
         }
         if implementation.methods.len() != out.traits[trait_id].methods.len() {
-            return Err(Diagnostic::new(
-                "E130",
-                "implementation must define every trait method exactly once",
+            return Err(invalid_service_declaration(
+                ServiceDeclarationError::IncompleteImplementation,
                 implementation.span,
             ));
         }
@@ -167,9 +233,8 @@ pub fn prepare(ast: &mut cyallo_ast::Ast) -> Result<Metadata, cyallo_ast::Diagno
                 .filter(|f| f.name.eq_identifier(&declared.name))
                 .collect();
             if found.len() != 1 {
-                return Err(Diagnostic::new(
-                    "E130",
-                    "missing or duplicate trait method",
+                return Err(invalid_service_declaration(
+                    ServiceDeclarationError::MissingMethod,
                     implementation.span,
                 ));
             }
@@ -187,14 +252,13 @@ pub fn prepare(ast: &mut cyallo_ast::Ast) -> Result<Metadata, cyallo_ast::Diagno
                     .first()
                     .is_none_or(|p| !p.receiver || receiver(&p.ty) != declared.receiver)
             {
-                return Err(Diagnostic::new(
-                    "E130",
-                    "trait implementation signature differs from declaration",
+                return Err(invalid_service_declaration(
+                    ServiceDeclarationError::SignatureMismatch,
                     f.span,
                 ));
             }
             f.origin = cyallo_ast::RoutineOrigin::Implementation;
-            f.name = format!("$impl{index}${}", declared.name).into();
+            f.name = format!("$impl{module}${index}${}", declared.name).into();
             methods.push(ast.functions.len() + 1);
             ast.functions.push(f);
         }
@@ -215,17 +279,15 @@ pub fn prepare(ast: &mut cyallo_ast::Ast) -> Result<Metadata, cyallo_ast::Diagno
     fn validate(t: &Type, metadata: &Metadata, span: cyallo_ast::Span) -> Result<(), Diagnostic> {
         match t {
             Type::TraitObject(name) if metadata.trait_id(name).is_none() => {
-                return Err(Diagnostic::new(
-                    "E130",
-                    format!("unknown trait `{}`", cyallo_ast::source_name(name)),
+                return Err(invalid_service_declaration(
+                    ServiceDeclarationError::UndeclaredTrait { name: name.clone() },
                     span,
                 ));
             }
             Type::ServiceKey(inner) | Type::ServiceRef(inner) => {
                 if !matches!(inner.as_ref(), Type::TraitObject(_)) {
-                    return Err(Diagnostic::new(
-                        "E131",
-                        "service types require a dyn trait interface",
+                    return Err(invalid_service_declaration(
+                        ServiceDeclarationError::ServiceInterface,
                         span,
                     ));
                 }
@@ -234,12 +296,17 @@ pub fn prepare(ast: &mut cyallo_ast::Ast) -> Result<Metadata, cyallo_ast::Diagno
             Type::Array(_, t) | Type::SparseArray(t) | Type::Borrowed(t) | Type::Storage(_, t) => {
                 validate(t, metadata, span)?
             }
+            Type::Opaque(_, ts, _) => {
+                for t in ts {
+                    validate(t, metadata, span)?;
+                }
+            }
             Type::Tuple(ts) => {
                 for t in ts {
                     validate(t, metadata, span)?;
                 }
             }
-            Type::Record(_, fs) => {
+            Type::Record(_, fs) | Type::AnonymousRecord(fs) => {
                 for (_, t) in fs {
                     validate(t, metadata, span)?;
                 }
@@ -257,19 +324,19 @@ pub fn prepare(ast: &mut cyallo_ast::Ast) -> Result<Metadata, cyallo_ast::Diagno
     for t in &out.traits {
         for m in &t.methods {
             for (ty, _) in &m.params {
-                validate(ty, &out, cyallo_ast::Span::default())?;
+                validate(ty, out, cyallo_ast::Span::default())?;
             }
-            validate(&m.result, &out, cyallo_ast::Span::default())?;
+            validate(&m.result, out, cyallo_ast::Span::default())?;
         }
     }
     for f in &ast.functions {
         for p in &f.params {
-            validate(&p.ty, &out, p.span)?;
+            validate(&p.ty, out, p.span)?;
         }
-        validate(&f.result, &out, f.span)?;
+        validate(&f.result, out, f.span)?;
     }
     cyallo_ast::visit::visit_block(&mut ast.body, &mut |_| Ok(()), &mut |t, span| {
-        validate(t, &out, span)
+        validate(t, out, span)
     })?;
     fn scan(body: &mut [Stmt], out: &mut Metadata) -> Result<(), Diagnostic> {
         cyallo_ast::visit::visit_block(
@@ -283,9 +350,8 @@ pub fn prepare(ast: &mut cyallo_ast::Ast) -> Result<Metadata, cyallo_ast::Diagno
                         == Some(crate::intrinsic::Intrinsic::ServiceKeyNew)
                 {
                     let [ty @ Type::TraitObject(_)] = types.as_slice() else {
-                        return Err(Diagnostic::new(
-                            "E131",
-                            "service key requires a dyn trait type",
+                        return Err(invalid_service_declaration(
+                            ServiceDeclarationError::KeyInterface,
                             e.span,
                         ));
                     };
@@ -294,11 +360,7 @@ pub fn prepare(ast: &mut cyallo_ast::Ast) -> Result<Metadata, cyallo_ast::Diagno
                         .filter(|_| args.len() == 1)
                         .and_then(cyallo_ast::constant_text)
                         .ok_or_else(|| {
-                            Diagnostic::new(
-                                "E131",
-                                "ServiceKey requires a compile-time string diagnostic label",
-                                e.span,
-                            )
+                            invalid_service_declaration(ServiceDeclarationError::KeyLabel, e.span)
                         })?;
                     if !out.keys.iter().any(|key| key.span == e.span.start) {
                         out.keys.push(Key {
@@ -313,9 +375,39 @@ pub fn prepare(ast: &mut cyallo_ast::Ast) -> Result<Metadata, cyallo_ast::Diagno
             &mut |_, _| Ok(()),
         )
     }
-    scan(&mut ast.body, &mut out)?;
+    scan(&mut ast.body, out)?;
     for f in &mut ast.functions {
-        scan(&mut f.body, &mut out)?;
+        scan(&mut f.body, out)?;
     }
-    Ok(out)
+    Ok(())
+}
+
+/// Trait contracts are shared declarations; implementations and method bodies
+/// remain in their defining module. Return method symbols for final relocation.
+pub type MethodTargets = Vec<Vec<Box<str>>>;
+pub fn prepare_modules(
+    asts: &mut [cyallo_ast::Ast],
+) -> Result<(Metadata, MethodTargets), cyallo_ast::Diagnostic> {
+    let mut declarations = cyallo_ast::Ast {
+        traits: asts.iter().flat_map(|a| a.traits.iter().cloned()).collect(),
+        ..Default::default()
+    };
+    let mut metadata = prepare(&mut declarations)?;
+    let mut targets = vec![];
+    for (module, ast) in asts.iter_mut().enumerate() {
+        let traits = std::mem::take(&mut ast.traits);
+        let start = metadata.implementations.len();
+        let result = prepare_into(ast, &mut metadata, module);
+        ast.traits = traits;
+        result?;
+        for imp in &metadata.implementations[start..] {
+            targets.push(
+                imp.methods
+                    .iter()
+                    .map(|&id| ast.functions[id - 1].name.clone())
+                    .collect(),
+            );
+        }
+    }
+    Ok((metadata, targets))
 }

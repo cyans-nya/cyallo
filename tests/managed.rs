@@ -140,9 +140,12 @@ fn recursive_rc_nodes_release_when_backedges_are_weak() {
     parity(
         r#"
 record Node { next: Cell<Option<rc Node>>, previous: Cell<Option<std::rc::Weak<Node>>> }
-let first = rc Node { next: Cell::new(std::option::none<rc Node>()), previous: Cell::new(std::option::none<std::rc::Weak<Node>>()) }
-let second = rc Node { next: Cell::new(std::option::none<rc Node>()), previous: Cell::new(std::option::some(first.downgrade())) }
-first.next.* = std::option::some(std::rc::clone(&second))
+let first_next: Option<rc Node> = Option::None
+let first_previous: Option<std::rc::Weak<Node>> = Option::None
+let second_next: Option<rc Node> = Option::None
+let first = rc Node { next: Cell::new(first_next), previous: Cell::new(first_previous) }
+let second = rc Node { next: Cell::new(second_next), previous: Cell::new(Option::Some(first.downgrade())) }
+first.next.* = Option::Some(std::rc::clone(&second))
 let first_weak = first.downgrade()
 let second_weak = second.downgrade()
 std::mem::drop(second)
@@ -183,7 +186,7 @@ fn fallible_allocation_returns_errors_and_drops_the_payload() {
 record Denied {{}}
 impl Allocator for Denied {{
     proc allocate(self: &mut Self, layout: Layout) -> Result<Allocation, AllocError> {{
-        return std::result::err<Allocation, AllocError>(AllocError::new("denied"))
+        return Result::Err(AllocError::new("denied"))
     }}
     proc deallocate(self: &mut Self, allocation: Allocation) {{ std::mem::deallocate(allocation) }}
 }}
@@ -240,7 +243,7 @@ record Pool { free: Vec<Allocation>, system: gc Cell<i64> }
 impl Allocator for Pool {
     proc allocate(self: &mut Self, layout: Layout) -> Result<Allocation, AllocError> {
         if self.free.len() > 0 {
-            return std::result::ok<Allocation, AllocError>(self.free.pop().unwrap())
+            return Result::Ok(self.free.pop().unwrap())
         }
         self.system.*.* = self.system.*.* + 1
         return std::mem::allocate(layout)

@@ -18,6 +18,7 @@ cargo run -- run examples/concurrency/ownership/local-managed.ya --gc-stress
 | [Result input](generators/resume-result.ya) | An ordinary Result is supplied to the suspended yield | `request`, `complete: 42`, `request`, `error: unavailable`, `complete: -1` |
 | [Delegation](generators/delegation.ya) | A pure, capture-free child factory; owned `yield from`; forwarded input and completion | `yielded: 7`, `complete: 42` |
 | [Buffered channel](channels/buffered.ya) | Bounded messages, typed full/closed errors, recovery of an unsent value | `true`, `42`, `true`, `99` |
+| [Enum payloads](enums.ya) | A structural enum payload crosses a channel, and a task returns a unit variant | `42:worker`, `finished` |
 | [Rendezvous](channels/rendezvous.ya) | A capturing procedure sends to its caller over a zero-capacity channel; joining returns its result | `42`, `7` |
 | [MPMC](channels/mpmc.ya) | Two producers and two competing consumers use a bounded channel | `21` |
 | [Clock](scheduling/clock.ya) | An ordinary procedure parks for a timer | `before`, `after` |

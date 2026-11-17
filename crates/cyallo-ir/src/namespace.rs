@@ -1,9 +1,11 @@
 //! Lexical, case-sensitive resolution shared by single-source and module builds.
+mod patterns;
 use crate::declarations::{
     self, DeclarationError, DeclarationKind, SourceTrust, invalid_declaration,
 };
 use crate::internal::{InternalSemantic, NativeType};
 use crate::intrinsic::Intrinsic;
+use crate::module_graph::{BindingKind, ModuleBinding, ModuleId, ResolvedModule, ResolvedProgram};
 use cyallo_ast::*;
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,6 +16,7 @@ enum Kind {
     Type,
     Value,
     Property,
+    World,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SymbolOrigin {
@@ -39,6 +42,7 @@ struct Placement {
     boundary: ModuleBoundary,
 }
 struct Node {
+    interface: bool,
     parent: Option<usize>,
     package: usize,
     id: DeclarationId,
@@ -55,8 +59,10 @@ struct Local {
 }
 struct Resolver {
     aliases: HashMap<Box<str>, (usize, Type)>,
-    source_names: HashMap<Box<str>, Box<str>>,
+    source_names: std::collections::BTreeMap<Box<str>, Box<str>>,
     nodes: Vec<Node>,
+    variant_ids: std::collections::HashSet<DeclarationId>,
+    unit_variants: std::collections::HashSet<DeclarationId>,
     next_binding: usize,
     next_declaration: u32,
     prelude: Option<usize>,
@@ -64,7 +70,24 @@ struct Resolver {
     associated: HashMap<DeclarationId, HashMap<String, Vec<Symbol>>>,
     associated_functions: Vec<(usize, NativeFunctionDeclaration)>,
     permissions: Option<crate::import_policy::ResolvedPolicy>,
-    requesting_modules: HashMap<u32, DeclarationId>,
+    requesting_modules: std::collections::BTreeMap<u32, DeclarationId>,
+    opaque: std::collections::HashSet<DeclarationId>,
+    /// Declared type-parameter count of each provider-bound opaque host type.
+    opaque_arity: HashMap<DeclarationId, usize>,
+    bound_opaque: HashMap<DeclarationId, Span>,
+    implemented_interfaces: Vec<usize>,
+    worlds: Vec<crate::module_graph::ResolvedWorld>,
+    associated_owners: HashMap<DeclarationId, Box<str>>,
+    bindings: crate::bindings::NativeBindings,
+    applied_bindings: std::collections::BTreeSet<Box<str>>,
+    interface_methods: Vec<InterfaceMethod>,
+}
+/// A method declared inside an `interface mod`: contract only.
+struct InterfaceMethod {
+    module: usize,
+    owner: String,
+    public: bool,
+    function: Function,
 }
 fn error(message: impl Into<String>, span: Span) -> Diagnostic {
     Diagnostic::new("E140", message, span)
@@ -88,6 +111,9 @@ impl Resolver {
         if self.nodes.iter().any(|n| n.path == path) {
             return Err(error("duplicate module", Span::default()));
         }
+        if trust == SourceTrust::Core {
+            self.apply_bindings(&path, &mut ast)?;
+        }
         let index = self.nodes.len();
         let id = self.declaration_id();
         let declarations = std::mem::take(&mut ast.modules);
@@ -99,6 +125,7 @@ impl Resolver {
                 .map_or(index, |parent| self.nodes[parent].package)
         };
         self.nodes.push(Node {
+            interface: false,
             parent: placement.parent,
             package,
             id,
@@ -161,6 +188,7 @@ impl Resolver {
                     declaration.span,
                 ));
             }
+            self.nodes[child].interface = declaration.interface;
             let child_id = self.nodes[child].id;
             self.nodes[index]
                 .names
@@ -183,6 +211,82 @@ impl Resolver {
                 });
         }
         Ok(index)
+    }
+    /// Give each declaration its provider binding as the private annotation the rest
+    /// of the pipeline reads. Only the provider's own source is touched.
+    fn apply_bindings(&mut self, module: &str, ast: &mut Ast) -> Result<()> {
+        if self.bindings.is_empty() {
+            return Ok(());
+        }
+        fn attach(
+            this: &mut Resolver,
+            path: String,
+            annotations: &mut Vec<DeclarationAnnotation>,
+            span: Span,
+        ) -> Result<()> {
+            let Some(key) = this.bindings.get(&path) else {
+                return Ok(());
+            };
+            if annotations.iter().any(|a| a.name.as_ref() == "cyallo_internal") {
+                return Err(invalid_declaration(
+                    DeclarationError::BindingConflict(path.into()),
+                    span,
+                ));
+            }
+            annotations.push(DeclarationAnnotation {
+                name: "cyallo_internal".into(),
+                value: key.into(),
+                span,
+            });
+            this.applied_bindings.insert(path.into());
+            Ok(())
+        }
+        for function in &mut ast.functions {
+            let path = format!("{module}::{}", function.name);
+            attach(self, path, &mut function.annotations, function.span)?;
+        }
+        for record in &mut ast.records {
+            let path = format!("{module}::{}", record.name);
+            attach(self, path, &mut record.annotations, record.span)?;
+        }
+        for declaration in &mut ast.enums {
+            let path = format!("{module}::{}", declaration.name);
+            attach(self, path.clone(), &mut declaration.annotations, declaration.span)?;
+            for variant in &mut declaration.variants {
+                let path = format!("{path}::{}", variant.name);
+                attach(self, path, &mut variant.annotations, variant.span)?;
+            }
+        }
+        for declaration in &mut ast.traits {
+            let path = format!("{module}::{}", declaration.name);
+            attach(self, path, &mut declaration.annotations, declaration.span)?;
+        }
+        for implementation in &mut ast.inherent_implementations {
+            // A nominal receiver is named; others (`[]T`, `rc T`, `gc T`) use their
+            // spelling, so an impl block is addressed by what it extends.
+            let owner = match &implementation.receiver {
+                Type::Named(owner) | Type::Applied(owner, _) => owner.to_string(),
+                other => other.to_string(),
+            };
+            for method in &mut implementation.methods {
+                let path = format!("{module}::{owner}::{}", method.function.name);
+                let span = method.function.span;
+                attach(self, path, &mut method.function.annotations, span)?;
+            }
+        }
+        Ok(())
+    }
+    /// Every provider binding must have found its declaration.
+    fn check_bindings_applied(&self) -> Result<()> {
+        for (path, _) in self.bindings.iter() {
+            if !self.applied_bindings.contains(path) {
+                return Err(invalid_declaration(
+                    DeclarationError::UnusedBinding(path.into()),
+                    Span::default(),
+                ));
+            }
+        }
+        Ok(())
     }
     fn declarations(&mut self, start: usize) -> Result<()> {
         let mut canonical = HashMap::new();
@@ -209,6 +313,16 @@ impl Resolver {
                         .contains(&format!("$type${}", alias.name).into_boxed_str()),
                 )
             }));
+            definitions.extend(node.ast.enums.iter().map(|e| {
+                (
+                    e.name.clone(),
+                    Kind::Type,
+                    node.ast
+                        .exports
+                        .iter()
+                        .any(|n| n.as_ref() == format!("$type${}", e.name)),
+                )
+            }));
             definitions.extend(node.ast.records.iter().map(|r| {
                 (
                     r.name.clone(),
@@ -217,6 +331,16 @@ impl Resolver {
                         .exports
                         .iter()
                         .any(|e| e.as_ref() == format!("$type${}", r.name)),
+                )
+            }));
+            definitions.extend(node.ast.worlds.iter().map(|w| {
+                (
+                    w.name.clone(),
+                    Kind::World,
+                    node.ast
+                        .exports
+                        .iter()
+                        .any(|e| e.as_ref() == format!("$world${}", w.name)),
                 )
             }));
             definitions.extend(node.ast.traits.iter().map(|t| {
@@ -261,6 +385,13 @@ impl Resolver {
                         .map(|r| (&r.annotations[..], DeclarationKind::Record, r.span))
                         .or_else(|| {
                             node.ast
+                                .enums
+                                .iter()
+                                .find(|e| e.name == name)
+                                .map(|e| (&e.annotations[..], DeclarationKind::Enum, e.span))
+                        })
+                        .or_else(|| {
+                            node.ast
                                 .traits
                                 .iter()
                                 .find(|t| t.name == name)
@@ -270,12 +401,15 @@ impl Resolver {
                 }
                 .unwrap_or((&[], DeclarationKind::Function, Span::default()));
                 let semantic = declarations::bind(annotations, node.trust, declaration_kind)?;
+                // An engine-known canonical declaration exists once. Opaque host types
+                // have no engine identity: many declare the same traits.
                 if let Some(
                     semantic @ (InternalSemantic::Type(_)
                     | InternalSemantic::TypeFamily(_)
                     | InternalSemantic::Trait(_)
                     | InternalSemantic::AllocatorTrait),
                 ) = semantic
+                    && !matches!(semantic, InternalSemantic::Type(NativeType::Opaque(_)))
                     && let Some(previous) = canonical.insert(semantic, span)
                 {
                     return Err(
@@ -285,6 +419,9 @@ impl Resolver {
                 }
                 if let Some(record) = node.ast.records.iter().find(|r| r.name == name) {
                     let expected = match semantic {
+                        Some(InternalSemantic::Type(NativeType::Opaque(_))) => {
+                            Some(record.type_params.len())
+                        }
                         Some(InternalSemantic::Type(t)) => Some(declarations::type_arity(t)),
                         Some(InternalSemantic::TypeFamily(f)) => {
                             Some(declarations::family_arity(f))
@@ -328,7 +465,7 @@ impl Resolver {
                                 function.span,
                             ));
                         }
-                        (None, FunctionBodyKind::Declaration) => {
+                        (None, FunctionBodyKind::Declaration) if !node.interface => {
                             return Err(invalid_declaration(
                                 DeclarationError::BodyRequired,
                                 function.span,
@@ -339,6 +476,14 @@ impl Resolver {
                 }
                 let id = DeclarationId(next_declaration);
                 next_declaration += 1;
+                if kind == Kind::Type && node.ast.records.iter().any(|r| r.name == name && r.opaque) {
+                    self.opaque.insert(id);
+                }
+                if let Some(InternalSemantic::Type(NativeType::Opaque(_))) = semantic
+                    && let Some(record) = node.ast.records.iter().find(|r| r.name == name)
+                {
+                    self.opaque_arity.insert(id, record.type_params.len());
+                }
                 let entries = node.names.entry(name.to_string()).or_default();
                 if entries.iter().any(|s| s.kind == kind) {
                     return Err(error(
@@ -415,19 +560,750 @@ impl Resolver {
             }
         }
         self.next_declaration = next_declaration;
+        self.enum_declarations(start)?;
         self.associated_declarations(start)?;
+        self.interface_implementations(start)?;
+        self.world_declarations(start)?;
+        Ok(())
+    }
+    /// Bind each interface's opaque records to the implementing module's types.
+    /// An opaque record is bound exactly once; inside the linked program the
+    /// binding is the type, so it reuses the type-alias path.
+    fn interface_implementations(&mut self, start: usize) -> Result<()> {
+        for module in start..self.nodes.len() {
+            let implementations =
+                std::mem::take(&mut self.nodes[module].ast.interface_implementations);
+            for implementation in implementations {
+                let diagnostic = |error| invalid_declaration(error, implementation.span);
+                let interface = self
+                    .path(module, &implementation.interface, Some(Kind::Module))
+                    .and_then(|symbol| self.nodes.iter().position(|n| n.path == symbol.target.as_ref()))
+                    .ok_or_else(|| {
+                        diagnostic(DeclarationError::UnresolvedInterface(
+                            implementation.interface.clone(),
+                        ))
+                    })?;
+                if !self.nodes[interface].interface {
+                    return Err(diagnostic(DeclarationError::NotInterfaceModule(
+                        implementation.interface.clone(),
+                    )));
+                }
+                let _implementer = self
+                    .path(module, &implementation.module, Some(Kind::Module))
+                    .and_then(|symbol| self.nodes.iter().position(|n| n.path == symbol.target.as_ref()))
+                    .ok_or_else(|| {
+                        diagnostic(DeclarationError::UnresolvedImplementer(
+                            implementation.module.clone(),
+                        ))
+                    })?;
+                if !self.implemented_interfaces.contains(&interface) {
+                    self.implemented_interfaces.push(interface);
+                }
+                for (name, ty) in implementation.bindings {
+                    let not_opaque = || {
+                        diagnostic(DeclarationError::NotOpaqueType {
+                            interface: implementation.interface.clone(),
+                            name: name.clone(),
+                        })
+                    };
+                    let record = self.nodes[interface]
+                        .ast
+                        .records
+                        .iter()
+                        .find(|r| r.name == name && r.opaque)
+                        .ok_or_else(not_opaque)?;
+                    if !record.type_params.is_empty() {
+                        return Err(diagnostic(DeclarationError::GenericOpaqueBinding(name)));
+                    }
+                    let symbol = self.nodes[interface]
+                        .names
+                        .get(name.as_ref())
+                        .and_then(|symbols| symbols.iter().find(|s| s.kind == Kind::Type))
+                        .cloned()
+                        .ok_or_else(not_opaque)?;
+                    if let Some(previous) = self.bound_opaque.insert(symbol.id, implementation.span) {
+                        return Err(diagnostic(DeclarationError::DuplicateOpaqueBinding(name))
+                            .with_related(previous, "first binding"));
+                    }
+                    self.aliases.insert(symbol.target, (module, ty));
+                }
+            }
+        }
+        // Every opaque type of an implemented interface needs a binding, and every
+        // binding must name a resolvable, acyclic type in its implementer.
+        for &interface in &self.implemented_interfaces {
+            for record in self.nodes[interface].ast.records.iter().filter(|r| r.opaque) {
+                let symbol = self.nodes[interface].names[record.name.as_ref()]
+                    .iter()
+                    .find(|s| s.kind == Kind::Type)
+                    .expect("declared opaque record");
+                if !self.bound_opaque.contains_key(&symbol.id) {
+                    return Err(invalid_declaration(
+                        DeclarationError::MissingOpaqueBinding {
+                            interface: self.nodes[interface].path.clone().into(),
+                            name: record.name.clone(),
+                        },
+                        record.span,
+                    ));
+                }
+                let mut resolved = Type::Named(symbol.target.clone());
+                self.ty_resolved_target(&mut resolved, record.span)?;
+            }
+        }
+        Ok(())
+    }
+    /// A module path relative to a package root, or the full path outside it.
+    fn relative_path(&self, path: &str, package: usize) -> String {
+        let root = self.nodes[package].path.as_str();
+        match path.strip_prefix(root) {
+            Some("") => String::new(),
+            Some(rest) if rest.starts_with("::") => rest[2..].to_owned(),
+            _ => path.to_owned(),
+        }
+    }
+    /// Stable spelling of a resolved target: declaring module path plus source name,
+    /// relative to `package` when the module belongs to it. Independent of
+    /// declaration numbering and of how the declaration was reached.
+    fn canonical_target(&self, target: &str, package: usize) -> String {
+        let Some(rest) = target.strip_prefix("$module") else {
+            return target.to_owned();
+        };
+        let mut parts = rest.split('$');
+        let (Some(index), Some(_kind), Some(name)) = (
+            parts.next().and_then(|n| n.parse::<usize>().ok()),
+            parts.next(),
+            parts.next(),
+        ) else {
+            return target.to_owned();
+        };
+        let Some(node) = self.nodes.get(index) else {
+            return target.to_owned();
+        };
+        let module = if node.package == package {
+            self.relative_path(&node.path, package)
+        } else {
+            node.path.clone()
+        };
+        if module.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{module}::{name}")
+        }
+    }
+    fn canonical_type(&self, ty: &Type, package: usize) -> String {
+        let mut ty = ty.clone();
+        cyallo_ast::visit::visit_type(&mut ty, &mut |ty| match ty {
+            Type::Named(name)
+            | Type::TraitObject(name)
+            | Type::RecordRef(name)
+            | Type::Record(name, _)
+            | Type::Applied(name, _) => *name = self.canonical_target(name, package).into(),
+            _ => {}
+        });
+        ty.to_string()
+    }
+    /// Signature text without parameter names, bodies, annotations or spans.
+    fn canonical_signature(&self, function: &Function, package: usize) -> String {
+        let generics = function.type_params.join(",");
+        let constraints: Vec<_> = function
+            .constraints
+            .iter()
+            .map(|constraint| {
+                let bounds: Vec<_> = constraint
+                    .bounds
+                    .iter()
+                    .map(|bound| self.canonical_type(bound, package))
+                    .collect();
+                format!("{}:{}", constraint.parameter, bounds.join("+"))
+            })
+            .collect();
+        let parameters: Vec<_> = function
+            .params
+            .iter()
+            .map(|p| {
+                format!(
+                    "{:?}/{:?}{} {}",
+                    p.passing,
+                    p.arity,
+                    if p.receiver { "/self" } else { "" },
+                    self.canonical_type(&p.ty, package)
+                )
+            })
+            .collect();
+        format!(
+            "{:?}<{generics}>[{}]({}) -> {}",
+            function.kind,
+            constraints.join(";"),
+            parameters.join(", "),
+            self.canonical_type(&function.result, package)
+        )
+    }
+    /// Public items of one `interface mod`, for digests.
+    fn interface_items(&self, index: usize, ast: &Ast) -> Result<Vec<crate::sdk::InterfaceItem>> {
+        use crate::sdk::{InterfaceItem, ItemKind, SdkError, sdk_diagnostic, since};
+        let node = &self.nodes[index];
+        let package = node.package;
+        let module = self.relative_path(&node.path, package);
+        let path = |name: &str| {
+            if module.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{module}::{name}")
+            }
+        };
+        let source = |target: &str| -> String {
+            self.source_names
+                .get(target)
+                .map(|name| name.to_string())
+                .unwrap_or_else(|| target.to_owned())
+        };
+        let exported = |name: &str, namespace: &str| {
+            ast.exports
+                .iter()
+                .any(|e| e.as_ref() == format!("{namespace}{name}"))
+        };
+        let version = |annotations: &[DeclarationAnnotation], span: Span| {
+            since(annotations).map_err(|e: SdkError| sdk_diagnostic(e, span))
+        };
+        let mut items = vec![];
+        for function in &ast.functions {
+            let name = source(&function.name);
+            if !exported(&name, "") {
+                continue;
+            }
+            items.push(InterfaceItem::new(
+                &path(&name),
+                ItemKind::Function,
+                version(&function.annotations, function.span)?,
+                self.canonical_signature(function, package),
+            )
+            .bindable(
+                function.body_kind == FunctionBodyKind::Declaration,
+                Some(function.params.len()),
+            ));
+        }
+        for record in &ast.records {
+            let name = source(&record.name);
+            if !exported(&name, "$type$") {
+                continue;
+            }
+            let fields: Vec<_> = record
+                .fields
+                .iter()
+                .map(|(field, ty)| format!("{field}: {}", self.canonical_type(ty, package)))
+                .collect();
+            let (kind, text) = if record.opaque {
+                (ItemKind::OpaqueRecord, format!("opaque<{}>", record.type_params.len()))
+            } else {
+                (
+                    ItemKind::Record,
+                    format!("<{}>{{{}}}", record.type_params.join(","), fields.join(", ")),
+                )
+            };
+            items.push(InterfaceItem::new(
+                &path(&name),
+                kind,
+                version(&record.annotations, record.span)?,
+                text,
+            )
+            .bindable(record.opaque, None));
+        }
+        for declaration in &ast.enums {
+            let name = source(&declaration.name);
+            if !exported(&name, "$type$") {
+                continue;
+            }
+            let mut variants = vec![];
+            for variant in &declaration.variants {
+                let payload = variant
+                    .payload
+                    .as_ref()
+                    .map_or(String::new(), |ty| self.canonical_type(ty, package));
+                let introduced = version(&variant.annotations, variant.span)?
+                    .map_or(String::new(), |v| format!("@{v}"));
+                variants.push(format!("{}{introduced}: {payload}", variant.name));
+            }
+            items.push(InterfaceItem::new(
+                &path(&name),
+                ItemKind::Enum,
+                version(&declaration.annotations, declaration.span)?,
+                format!(
+                    "<{}>{}{{{}}}",
+                    declaration.type_params.join(","),
+                    if declaration.open { " open" } else { "" },
+                    variants.join(", ")
+                ),
+            ));
+        }
+        for trait_ in &ast.traits {
+            let name = source(&trait_.name);
+            if !exported(&name, "$type$") {
+                continue;
+            }
+            let methods: Vec<_> = trait_
+                .methods
+                .iter()
+                .map(|m| format!("{}: {}", source(&m.name), self.canonical_signature(m, package)))
+                .collect();
+            items.push(InterfaceItem::new(
+                &path(&name),
+                ItemKind::Trait,
+                version(&trait_.annotations, trait_.span)?,
+                format!("<{}>{{{}}}", trait_.type_params.join(","), methods.join("; ")),
+            ));
+        }
+        for alias in &ast.type_aliases {
+            if !exported(&alias.name, "$type$") {
+                continue;
+            }
+            items.push(InterfaceItem::new(
+                &path(&alias.name),
+                ItemKind::Alias,
+                None,
+                self.canonical_type(&alias.ty, package),
+            ));
+        }
+        for method in self.interface_methods.iter().filter(|m| m.module == index && m.public) {
+            let name = source(&method.function.name);
+            items.push(InterfaceItem::new(
+                &format!("{}::{name}", method.owner),
+                ItemKind::Method,
+                version(&method.function.annotations, method.function.span)?,
+                self.canonical_signature(&method.function, package),
+            )
+            .bindable(
+                method.function.body_kind == FunctionBodyKind::Declaration,
+                Some(method.function.params.len()),
+            ));
+        }
+        Ok(items)
+    }
+    /// Resolve worlds: expand `include`, find imported modules, check member lists
+    /// against the real signatures, and resolve exported signatures.
+    fn world_declarations(&mut self, start: usize) -> Result<()> {
+        use crate::module_graph::{ResolvedWorld, ResolvedWorldExport, ResolvedWorldImport};
+        struct Pending {
+            module: usize,
+            world: World,
+            id: DeclarationId,
+        }
+        let mut pending: Vec<Pending> = vec![];
+        for module in start..self.nodes.len() {
+            for world in std::mem::take(&mut self.nodes[module].ast.worlds) {
+                let id = self.nodes[module].names[world.name.as_ref()]
+                    .iter()
+                    .find(|s| s.kind == Kind::World)
+                    .expect("declared world")
+                    .id;
+                pending.push(Pending { module, world, id });
+            }
+        }
+        let mut done: HashMap<DeclarationId, usize> = self
+            .worlds
+            .iter()
+            .enumerate()
+            .map(|(index, world)| (world.id, index))
+            .collect();
+        fn resolve(
+            this: &mut Resolver,
+            pending: &[Pending],
+            index: usize,
+            done: &mut HashMap<DeclarationId, usize>,
+            stack: &mut Vec<DeclarationId>,
+        ) -> Result<usize> {
+            let Pending { module, world, id } = &pending[index];
+            let (module, id) = (*module, *id);
+            if let Some(&resolved) = done.get(&id) {
+                return Ok(resolved);
+            }
+            let fail = |error: DeclarationError, span: Span| invalid_declaration(error, span);
+            if stack.contains(&id) {
+                return Err(fail(
+                    DeclarationError::CyclicWorldInclude(world.name.clone()),
+                    world.span,
+                ));
+            }
+            stack.push(id);
+            let mut resolved = ResolvedWorld {
+                id,
+                module: ModuleId(this.nodes[module].id),
+                path: format!("{}::{}", this.nodes[module].path, world.name).into(),
+                includes: vec![],
+                imports: vec![],
+                exports: vec![],
+                digest: crate::sdk::Digest([0; 32]),
+            };
+            let add_import = |resolved: &mut ResolvedWorld,
+                              import: ResolvedWorldImport,
+                              span: Span|
+             -> Result<()> {
+                if let Some(existing) = resolved.imports.iter().find(|i| i.field == import.field) {
+                    if existing.origin == import.origin
+                        && existing.module == import.module
+                        && import.origin != id
+                    {
+                        return Ok(());
+                    }
+                    return Err(fail(
+                        DeclarationError::DuplicateWorldField(import.field.clone()),
+                        span,
+                    ));
+                }
+                resolved.imports.push(import);
+                Ok(())
+            };
+            let add_export = |resolved: &mut ResolvedWorld,
+                              export: ResolvedWorldExport,
+                              span: Span|
+             -> Result<()> {
+                if let Some(existing) = resolved.exports.iter().find(|e| e.name == export.name) {
+                    if existing.origin == export.origin && export.origin != id {
+                        return Ok(());
+                    }
+                    return Err(fail(
+                        DeclarationError::DuplicateWorldExport(export.name.clone()),
+                        span,
+                    ));
+                }
+                resolved.exports.push(export);
+                Ok(())
+            };
+            for item in &world.items {
+                match item {
+                    WorldItem::Include { path, span } => {
+                        let symbol = this
+                            .path(module, path, Some(Kind::World))
+                            .ok_or_else(|| fail(DeclarationError::UnresolvedWorld(path.clone()), *span))?;
+                        let included = match pending.iter().position(|p| p.id == symbol.id) {
+                            Some(position) => resolve(this, pending, position, done, stack)?,
+                            None => *done.get(&symbol.id).ok_or_else(|| {
+                                fail(DeclarationError::UnresolvedWorld(path.clone()), *span)
+                            })?,
+                        };
+                        let included = if included < this.worlds.len() {
+                            this.worlds[included].clone()
+                        } else {
+                            // Resolved earlier in this batch and not yet published.
+                            unreachable!("included world is published before use")
+                        };
+                        resolved.includes.push(included.id);
+                        for import in included.imports {
+                            add_import(&mut resolved, import, *span)?;
+                        }
+                        for export in included.exports {
+                            add_export(&mut resolved, export, *span)?;
+                        }
+                    }
+                    WorldItem::Import {
+                        path,
+                        alias,
+                        members,
+                        span,
+                    } => {
+                        let symbol = this
+                            .path(module, path, Some(Kind::Module))
+                            .ok_or_else(|| {
+                                fail(DeclarationError::UnresolvedWorldImport(path.clone()), *span)
+                            })?;
+                        this.check_import(module, &symbol, *span)?;
+                        let target = this
+                            .nodes
+                            .iter()
+                            .position(|n| n.path == symbol.target.as_ref())
+                            .ok_or_else(|| {
+                                fail(DeclarationError::UnresolvedWorldImport(path.clone()), *span)
+                            })?;
+                        let field = alias
+                            .clone()
+                            .unwrap_or_else(|| path.rsplit("::").next().unwrap_or(path).into());
+                        let mut listed = None;
+                        let mut signatures = vec![];
+                        if let Some(members) = members {
+                            let mut names = vec![];
+                            for member in members {
+                                signatures.push(
+                                    this.check_world_member(module, target, member, path)?.into(),
+                                );
+                                names.push(member.name.clone());
+                            }
+                            listed = Some(names);
+                        }
+                        add_import(
+                            &mut resolved,
+                            ResolvedWorldImport {
+                                origin: id,
+                                field,
+                                module: ModuleId(this.nodes[target].id),
+                                path: symbol.target.clone(),
+                                members: listed,
+                                member_signatures: signatures,
+                            },
+                            *span,
+                        )?;
+                    }
+                    WorldItem::Export { function } => {
+                        let mut signature = function.clone();
+                        for parameter in &mut signature.params {
+                            this.ty(module, &mut parameter.ty, &function.type_params, function.span)?;
+                        }
+                        this.ty(module, &mut signature.result, &function.type_params, function.span)?;
+                        add_export(
+                            &mut resolved,
+                            ResolvedWorldExport {
+                                origin: id,
+                                name: function.name.clone(),
+                                signature,
+                            },
+                            function.span,
+                        )?;
+                    }
+                }
+            }
+            stack.pop();
+            let package = this.nodes[module].package;
+            let mut lines: Vec<String> = resolved
+                .imports
+                .iter()
+                .map(|import| {
+                    let mut signatures: Vec<_> =
+                        import.member_signatures.iter().map(|s| s.as_ref()).collect();
+                    signatures.sort_unstable();
+                    format!(
+                        "import {} {} {}",
+                        import.field,
+                        this.relative_path(&import.path, package),
+                        if import.members.is_some() { signatures.join(" | ") } else { "*".into() }
+                    )
+                })
+                .chain(resolved.exports.iter().map(|export| {
+                    format!(
+                        "export {} {}",
+                        export.name,
+                        this.canonical_signature(&export.signature, package)
+                    )
+                }))
+                .collect();
+            lines.sort();
+            resolved.digest = crate::sdk::Digest::of(&lines.join("\n"));
+            this.worlds.push(resolved);
+            let position = this.worlds.len() - 1;
+            done.insert(id, position);
+            Ok(position)
+        }
+        for index in 0..pending.len() {
+            resolve(self, &pending, index, &mut done, &mut vec![])?;
+        }
+        Ok(())
+    }
+    /// A world import's member must be a public routine of the module with exactly
+    /// the declared signature: a world may narrow a module, never change it.
+    fn check_world_member(
+        &self,
+        from: usize,
+        target: usize,
+        member: &Function,
+        path: &str,
+    ) -> Result<String> {
+        let mismatch = || {
+            invalid_declaration(
+                DeclarationError::WorldMemberMismatch {
+                    module: path.into(),
+                    name: member.name.clone(),
+                },
+                member.span,
+            )
+        };
+        let missing = || {
+            invalid_declaration(
+                DeclarationError::WorldMemberMissing {
+                    module: path.into(),
+                    name: member.name.clone(),
+                },
+                member.span,
+            )
+        };
+        self.nodes[target]
+            .names
+            .get(member.name.as_ref())
+            .and_then(|symbols| symbols.iter().find(|s| s.kind == Kind::Value))
+            .filter(|symbol| self.accessible(from, symbol))
+            .ok_or_else(missing)?;
+        let actual = self.nodes[target]
+            .ast
+            .functions
+            .iter()
+            .find(|f| f.name == member.name)
+            .ok_or_else(missing)?;
+        if actual.kind != member.kind
+            || actual.params.len() != member.params.len()
+            || actual.type_params.len() != member.type_params.len()
+        {
+            return Err(mismatch());
+        }
+        let resolved = |module: usize, function: &Function| -> Result<Function> {
+            let mut function = function.clone();
+            for parameter in &mut function.params {
+                self.ty(module, &mut parameter.ty, &function.type_params, function.span)?;
+            }
+            self.ty(module, &mut function.result, &function.type_params, function.span)?;
+            Ok(function)
+        };
+        // Generic parameters keep positional meaning: rename to the target's names
+        // so `fn f<T>(x: T)` and `fn f<U>(x: U)` agree.
+        let mut renamed = member.clone();
+        for (from_name, to_name) in member.type_params.iter().zip(&actual.type_params) {
+            let (from_name, to_name) = (from_name.clone(), to_name.clone());
+            let rename = |ty: &mut Type| {
+                cyallo_ast::visit::visit_type(ty, &mut |ty| {
+                    if matches!(ty, Type::Named(n) if *n == from_name) {
+                        *ty = Type::Named(to_name.clone());
+                    }
+                })
+            };
+            for parameter in &mut renamed.params {
+                rename(&mut parameter.ty);
+            }
+            rename(&mut renamed.result);
+        }
+        renamed.type_params = actual.type_params.clone();
+        let package = self.nodes[target].package;
+        let wanted = self.canonical_signature(&resolved(from, &renamed)?, package);
+        let found = self.canonical_signature(&resolved(target, actual)?, package);
+        if wanted != found {
+            return Err(mismatch());
+        }
+        Ok(found)
+    }
+    /// Resolve a type already named by a resolved target, to validate alias chains.
+    fn ty_resolved_target(&self, ty: &mut Type, span: Span) -> Result<()> {
+        let Type::Named(target) = ty else {
+            return Ok(());
+        };
+        let mut seen = vec![];
+        let mut target = target.clone();
+        while let Some((owner, alias)) = self.aliases.get(&target) {
+            if seen.contains(&target) {
+                return Err(cyallo_ast::diagnostic::cyclic_type_alias(span));
+            }
+            seen.push(target.clone());
+            let mut alias = alias.clone();
+            self.ty(*owner, &mut alias, &[], span)?;
+            match alias {
+                Type::Named(next) => target = next,
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+    fn enum_declarations(&mut self, start: usize) -> Result<()> {
+        for module in start..self.nodes.len() {
+            let mut declarations = std::mem::take(&mut self.nodes[module].ast.enums);
+            for declaration in &mut declarations {
+                let owner = self
+                    .path(module, &declaration.name, Some(Kind::Type))
+                    .expect("declared enum");
+                declaration.resolved = Some(ResolvedEnum {
+                    declaration: EnumId(owner.id),
+                    package: self.nodes[self.nodes[module].package].id,
+                    arguments: vec![],
+                });
+                let mut seen = std::collections::HashSet::new();
+                for variant in &mut declaration.variants {
+                    if !seen.insert(variant.name.clone()) {
+                        return Err(crate::enums::invalid_enum(
+                            crate::enums::EnumError::DuplicateVariant {
+                                name: variant.name.clone(),
+                            },
+                            variant.span,
+                        ));
+                    }
+                    let role = declarations::bind(
+                        &variant.annotations,
+                        self.nodes[module].trust,
+                        DeclarationKind::Variant,
+                    )?;
+                    // Variants of the `core` enums have reserved ids, so values built
+                    // by any program or runtime agree on them.
+                    let id = match role {
+                        Some(InternalSemantic::Variant(encoding)) => encoding.reserved(),
+                        _ => None,
+                    }
+                    .map_or_else(|| self.declaration_id(), |variant| variant.0);
+                    let target: Box<str> =
+                        format!("$variant{}${}", owner.id.0, variant.name).into();
+                    self.source_names
+                        .insert(target.clone(), variant.name.clone());
+                    self.variant_ids.insert(id);
+                    if variant.payload.is_none() {
+                        self.unit_variants.insert(id);
+                    }
+                    self.associated
+                        .entry(owner.id)
+                        .or_default()
+                        .entry(variant.name.to_string())
+                        .or_default()
+                        .push(Symbol {
+                            id,
+                            native: None,
+                            origin: owner.origin,
+                            target: target.clone(),
+                            kind: Kind::Value,
+                            owner: module,
+                            defining_module: module,
+                            public: owner.public,
+                            intrinsic: None,
+                        });
+                    let encoding = match declarations::bind(
+                        &variant.annotations,
+                        self.nodes[module].trust,
+                        DeclarationKind::Variant,
+                    )? {
+                        Some(InternalSemantic::Variant(encoding)) => encoding,
+                        _ => EnumEncoding::General,
+                    };
+                    if encoding != EnumEncoding::General
+                        && !matches!(
+                            owner.native,
+                            Some(InternalSemantic::Type(NativeType::Storage(
+                                StorageKind::Option
+                                    | StorageKind::Result
+                                    | StorageKind::GeneratorStep
+                                    | StorageKind::SendError
+                            )))
+                        )
+                        && !matches!(
+                            encoding,
+                            EnumEncoding::ReceiveClosed | EnumEncoding::ReceiveEmpty
+                        )
+                    {
+                        return Err(crate::enums::invalid_enum(
+                            crate::enums::EnumError::NativeContract {
+                                name: declaration.name.clone(),
+                            },
+                            variant.span,
+                        ));
+                    }
+                    variant.resolved = Some(ResolvedVariant {
+                        encoding,
+                        declaration: VariantId(id),
+                        symbol: target,
+                    });
+                }
+            }
+            self.nodes[module].ast.enums = declarations;
+        }
         Ok(())
     }
     fn associated_declarations(&mut self, start: usize) -> Result<()> {
         for module in start..self.nodes.len() {
             let implementations = self.nodes[module].ast.inherent_implementations.clone();
-            for implementation in implementations {
+            for (implementation_index, implementation) in implementations.into_iter().enumerate() {
                 let owner_name = match &implementation.receiver {
                     Type::Named(n) | Type::Applied(n, _) => Some(n.as_ref()),
                     _ => None,
                 };
                 let owner = owner_name.and_then(|name| self.path(module, name, Some(Kind::Type)));
-                for method in implementation.methods {
+                for (method_index, method) in implementation.methods.into_iter().enumerate() {
                     if method
                         .function
                         .params
@@ -447,10 +1323,13 @@ impl Resolver {
                     let id = self.declaration_id();
                     let mut function = method.function;
                     let name = function.name.clone();
-                    // Source positions remain stable when independent packages
-                    // append nodes; allocation-order IDs do not.
-                    let target: Box<str> =
-                        format!("$associated{}${name}", function.span.start).into();
+                    // A method belongs to its module and declaration position,
+                    // independently of archive offsets and appended packages.
+                    let target: Box<str> = format!(
+                        "$associated{}${implementation_index}${method_index}${name}",
+                        self.nodes[module].path
+                    )
+                    .into();
                     function.name = target.clone();
                     for parameter in &mut function.params {
                         cyallo_ast::visit::visit_type(&mut parameter.ty, &mut |ty| {
@@ -468,6 +1347,7 @@ impl Resolver {
                     parameters.extend(function.type_params);
                     function.type_params = parameters;
                     self.source_names.insert(target.clone(), name.clone());
+                    self.associated_owners.insert(id, owner.target.clone());
                     self.associated
                         .entry(owner.id)
                         .or_default()
@@ -609,6 +1489,16 @@ impl Resolver {
                     return None;
                 }
             } else {
+                let mut seen = std::collections::HashSet::new();
+                while let Some((owner, ty)) = self.aliases.get(&symbol.target) {
+                    if !seen.insert(symbol.id) {
+                        return None;
+                    }
+                    let (Type::Named(name) | Type::Applied(name, _)) = ty else {
+                        return None;
+                    };
+                    symbol = self.path(*owner, name, Some(Kind::Type))?;
+                }
                 let symbols = self.associated.get(&symbol.id)?.get(part)?;
                 symbol = select(symbols, if position == parts.len() { kind } else { None })?;
                 if !self.accessible(from, &symbol) {
@@ -648,7 +1538,19 @@ impl Resolver {
                     continue;
                 };
                 self.check_import(*module, &target, import.span)?;
-                let entries = if import.glob {
+                let entries = if import.glob && target.kind == Kind::Type {
+                    self.associated
+                        .get(&target.id)
+                        .into_iter()
+                        .flat_map(|entries| entries.iter())
+                        .flat_map(|(name, symbols)| {
+                            symbols
+                                .iter()
+                                .filter(|s| self.variant_ids.contains(&s.id))
+                                .map(move |s| (name.clone(), s.clone()))
+                        })
+                        .collect()
+                } else if import.glob {
                     if target.kind != Kind::Module {
                         return Err(error("glob import requires a module", import.span));
                     }
@@ -776,7 +1678,18 @@ impl Resolver {
                     *ty = alias;
                     return Ok(());
                 }
-                if let Some((_, InternalSemantic::Type(id))) = self.native_target(&target) {
+                if let Some((declaration, InternalSemantic::Type(NativeType::Opaque(traits)))) =
+                    self.native_target(&target)
+                {
+                    let expected = self.opaque_arity.get(&declaration).copied().unwrap_or(0);
+                    if expected != 0 {
+                        return Err(invalid_declaration(
+                            DeclarationError::GenericArity { expected, actual: 0 },
+                            span,
+                        ));
+                    }
+                    *ty = Type::Opaque(target, vec![], traits);
+                } else if let Some((_, InternalSemantic::Type(id))) = self.native_target(&target) {
                     *ty = match id {
                         NativeType::Any => Type::Any,
                         NativeType::Symbol => Type::Symbol,
@@ -787,11 +1700,7 @@ impl Resolver {
                             | StorageKind::ViewError
                             | StorageKind::LoadError
                             | StorageKind::ParseError
-                            | StorageKind::Layout
-                            | StorageKind::Allocation
-                            | StorageKind::AllocError
-                            | StorageKind::ReceiveError
-                            | StorageKind::Clock),
+                            | StorageKind::AllocError),
                         ) => Type::Storage(kind, Box::new(Type::Void)),
                         _ => return Err(error("generic type requires element arguments", span)),
                     };
@@ -800,41 +1709,23 @@ impl Resolver {
                 }
             }
             Type::Applied(n, arguments) => {
-                let target = self.symbol(module, n, Kind::Type, span)?;
-                if matches!(
-                    self.native_target(&target),
-                    Some((
-                        _,
-                        InternalSemantic::Type(NativeType::Storage(StorageKind::Weak))
-                    ))
-                ) {
-                    let lifetime = if matches!(arguments.first(), Some(Type::Lifetime(_))) {
-                        let Type::Lifetime(lifetime) = arguments.remove(0) else {
-                            unreachable!()
-                        };
-                        Some(lifetime)
-                    } else {
-                        None
-                    };
-                    if arguments.len() != 1 {
-                        return Err(error(
-                            "Weak requires a pointee type and an optional allocator lifetime",
-                            span,
-                        ));
+                // A weak reference may start with an allocator lifetime, which is not
+                // a type: take it out before the arguments are resolved.
+                let weak_lifetime = {
+                    let target = self.symbol(module, n, Kind::Type, span)?;
+                    match self.native_target(&target) {
+                        Some((_, InternalSemantic::Type(NativeType::Opaque(traits))))
+                            if traits.weak()
+                                && matches!(arguments.first(), Some(Type::Lifetime(_))) =>
+                        {
+                            let Type::Lifetime(lifetime) = arguments.remove(0) else {
+                                unreachable!()
+                            };
+                            Some(lifetime)
+                        }
+                        _ => None,
                     }
-                    let mut pointee = arguments.remove(0);
-                    self.ty_alias(module, &mut pointee, params, span, seen)?;
-                    *ty = Type::Storage(
-                        StorageKind::Weak,
-                        Box::new(Type::Managed {
-                            kind: MemoryKind::Rc,
-                            locality: Locality::Local,
-                            lifetime,
-                            pointee: Box::new(pointee),
-                        }),
-                    );
-                    return Ok(());
-                }
+                };
                 for t in arguments.iter_mut() {
                     self.ty_alias(module, t, params, span, seen)?;
                 }
@@ -843,6 +1734,43 @@ impl Resolver {
                     self.native_target(&target)
                 {
                     *ty = Type::Dependent(declaration, std::mem::take(arguments));
+                } else if let Some((declaration, InternalSemantic::Type(NativeType::Opaque(traits)))) =
+                    self.native_target(&target)
+                {
+                    let expected = self.opaque_arity.get(&declaration).copied().unwrap_or(0);
+                    if traits.weak() {
+                        // `Weak<'a, T>`: the owner is the `rc` of the pointee in the optional
+                        // allocator region. The language builds it; the type is the provider's.
+                        let lifetime = weak_lifetime;
+                        if arguments.len() != 1 {
+                            return Err(error(
+                                "a weak reference requires a pointee type and an optional allocator lifetime",
+                                span,
+                            ));
+                        }
+                        let pointee = arguments.remove(0);
+                        *ty = Type::Opaque(
+                            target,
+                            vec![Type::Managed {
+                                kind: MemoryKind::Rc,
+                                locality: Locality::Local,
+                                lifetime,
+                                pointee: Box::new(pointee),
+                            }],
+                            traits,
+                        );
+                        return Ok(());
+                    }
+                    if arguments.len() != expected {
+                        return Err(invalid_declaration(
+                            DeclarationError::GenericArity {
+                                expected,
+                                actual: arguments.len(),
+                            },
+                            span,
+                        ));
+                    }
+                    *ty = Type::Opaque(target, std::mem::take(arguments), traits);
                 } else if let Some((_, InternalSemantic::Type(id))) = self.native_target(&target) {
                     let expected = declarations::type_arity(id);
                     if arguments.len() != expected {
@@ -862,15 +1790,6 @@ impl Resolver {
                     *ty = match id {
                         NativeType::ServiceKey => Type::ServiceKey(inner),
                         NativeType::ServiceRef => Type::ServiceRef(inner),
-                        NativeType::Storage(StorageKind::Weak) => Type::Storage(
-                            StorageKind::Weak,
-                            Box::new(Type::Managed {
-                                kind: MemoryKind::Rc,
-                                locality: Locality::Local,
-                                lifetime: None,
-                                pointee: inner,
-                            }),
-                        ),
                         NativeType::Storage(kind) => Type::Storage(kind, inner),
                         _ => return Err(error("type does not accept element arguments", span)),
                     };
@@ -885,6 +1804,11 @@ impl Resolver {
             | Type::ServiceKey(t)
             | Type::ServiceRef(t)
             | Type::Storage(_, t) => self.ty_alias(module, t, params, span, seen)?,
+            Type::Opaque(_, arguments, _) => {
+                for argument in arguments {
+                    self.ty_alias(module, argument, params, span, seen)?;
+                }
+            }
             Type::Managed {
                 locality: Locality::Shared,
                 ..
@@ -908,7 +1832,7 @@ impl Resolver {
                 }
                 self.ty_alias(module, r, params, span, seen)?;
             }
-            Type::Record(_, fs) | Type::Object(fs) => {
+            Type::Record(_, fs) | Type::AnonymousRecord(fs) | Type::Object(fs) => {
                 let mut names = std::collections::HashSet::new();
                 for (name, _) in fs.iter() {
                     if !names.insert(name) {
@@ -954,31 +1878,111 @@ impl Resolver {
             if let Some(symbol) = &constructor {
                 self.check_import(module, symbol, e.span)?;
             }
+            // A collection type written as a literal head (`Vec[..]`, `Vec<T>[..]`) is
+            // known by its provider-declared `collection` trait; the literal carries the
+            // declared type, applied to its element type by the operation.
             let constructor = constructor.and_then(|symbol| match symbol.native {
-                Some(InternalSemantic::Type(NativeType::Storage(StorageKind::Vec))) => {
-                    Some(Intrinsic::VecLiteral)
-                }
-                Some(InternalSemantic::Type(NativeType::Storage(StorageKind::VecDeque))) => {
-                    Some(Intrinsic::DequeLiteral)
+                Some(InternalSemantic::Type(NativeType::Opaque(traits))) if traits.collection() => {
+                    Some((
+                        if traits.double_ended() {
+                            Intrinsic::DequeLiteral
+                        } else {
+                            Intrinsic::VecLiteral
+                        },
+                        Type::Opaque(symbol.target.clone(), vec![], traits),
+                    ))
                 }
                 _ => None,
             });
-            if let Some(id) = constructor {
+            if let Some((id, head)) = constructor {
                 match &mut e.kind {
                     ExprKind::Index(_, args) => {
-                        e.kind = ExprKind::IntrinsicCall(id.id(), vec![], std::mem::take(args))
+                        e.kind = ExprKind::IntrinsicCall(id.id(), vec![head], std::mem::take(args))
                     }
                     ExprKind::TypedCollection(_, types, args) => {
-                        e.kind = ExprKind::IntrinsicCall(
-                            id.id(),
-                            std::mem::take(types),
-                            std::mem::take(args),
-                        )
+                        let mut all = vec![head];
+                        all.append(types);
+                        e.kind = ExprKind::IntrinsicCall(id.id(), all, std::mem::take(args))
                     }
                     _ => {}
                 }
             }
+            let brace = match &mut e.kind {
+                ExprKind::Record(name, fields) => self
+                    .path(module, name, Some(Kind::Value))
+                    .filter(|s| self.variant_ids.contains(&s.id))
+                    .map(|s| (s, vec![], std::mem::take(fields))),
+                ExprKind::GenericRecord(name, types, fields) => self
+                    .path(module, name, Some(Kind::Value))
+                    .filter(|s| self.variant_ids.contains(&s.id))
+                    .map(|s| (s, std::mem::take(types), std::mem::take(fields))),
+                _ => None,
+            };
+            if let Some((symbol, mut types, mut fields)) = brace {
+                self.check_import(module, &symbol, e.span)?;
+                for ty in &mut types {
+                    self.ty(module, ty, params, e.span)?;
+                }
+                for (_, value) in &mut fields {
+                    self.expr(module, value, scopes, params)?;
+                }
+                let payload = Expr {
+                    span: e.span,
+                    kind: ExprKind::VariantPayload(fields),
+                };
+                e.kind = if types.is_empty() {
+                    ExprKind::Call(symbol.target, vec![payload])
+                } else {
+                    ExprKind::GenericCall(symbol.target, types, vec![payload])
+                };
+                return Ok(());
+            }
             match &mut e.kind {
+                ExprKind::AnonymousRecord(fields) | ExprKind::VariantPayload(fields) => {
+                    for (_, value) in fields {
+                        self.expr(module, value, scopes, params)?;
+                    }
+                }
+                ExprKind::Match(value, arms) => {
+                    self.expr(module, value, scopes, params)?;
+                    for arm in arms {
+                        arm.package = Some(self.nodes[self.nodes[module].package].id);
+                        let mut bindings = HashMap::new();
+                        self.pattern(module, &mut arm.pattern, &mut bindings)?;
+                        scopes.push(bindings);
+                        if let Some(guard) = &mut arm.guard {
+                            self.expr(module, guard, scopes, params)?;
+                        }
+                        match &mut arm.body {
+                            MatchBody::Expression(value) => {
+                                self.expr(module, value, scopes, params)?
+                            }
+                            MatchBody::Block(body, tail) => {
+                                // Keep block locals visible to its tail expression.
+                                if let Some(value) = tail.take() {
+                                    body.push(Stmt {
+                                        span: value.span,
+                                        kind: StmtKind::Evaluate(*value),
+                                    });
+                                    self.block(module, body, scopes, params, false)?;
+                                    let StmtKind::Evaluate(value) = body.pop().unwrap().kind else {
+                                        unreachable!()
+                                    };
+                                    *tail = Some(Box::new(value));
+                                } else {
+                                    self.block(module, body, scopes, params, false)?;
+                                }
+                            }
+                        }
+                        scopes.pop();
+                    }
+                }
+                ExprKind::EnumConstruct(_, ty, payload) => {
+                    self.ty(module, ty, params, e.span)?;
+                    if let Some(payload) = payload {
+                        self.expr(module, payload, scopes, params)?;
+                    }
+                }
                 ExprKind::ObjectLiteral(_, fields) => {
                     for (_, value) in fields {
                         self.expr(module, value, scopes, params)?;
@@ -1019,6 +2023,10 @@ impl Resolver {
                         local.target
                     } else if let Some(symbol) = self.path(module, n, Some(Kind::Value)) {
                         self.check_import(module, &symbol, e.span)?;
+                        if self.unit_variants.contains(&symbol.id) {
+                            e.kind = ExprKind::Call(symbol.target, vec![]);
+                            return Ok(());
+                        }
                         symbol.target
                     } else {
                         e.kind = ExprKind::Invalid(Diagnostic::new(
@@ -1037,6 +2045,12 @@ impl Resolver {
                     };
                     if let Some(symbol) = &symbol {
                         self.check_import(module, symbol, e.span)?;
+                        if self.unit_variants.contains(&symbol.id) {
+                            return Err(crate::enums::invalid_enum(
+                                crate::enums::EnumError::UnitVariantCalled { name: n.clone() },
+                                e.span,
+                            ));
+                        }
                     }
                     for a in args.iter_mut() {
                         self.expr(module, a, scopes, params)?;
@@ -1093,6 +2107,12 @@ impl Resolver {
                         if symbol.native.is_some() {
                             return Err(invalid_declaration(
                                 DeclarationError::OpaqueConstruction,
+                                e.span,
+                            ));
+                        }
+                        if self.opaque.contains(&symbol.id) {
+                            return Err(invalid_declaration(
+                                DeclarationError::OpaqueRecordConstruction,
                                 e.span,
                             ));
                         }
@@ -1168,7 +2188,47 @@ impl Resolver {
         cyallo_ast::with_stack(|| {
             scopes.push(HashMap::new());
             for s in body {
+                if let StmtKind::IfLet(pattern, value, yes, no) = &mut s.kind {
+                    let value = std::mem::replace(
+                        value,
+                        Expr {
+                            kind: ExprKind::Tuple(vec![]),
+                            span: s.span,
+                        },
+                    );
+                    s.kind = StmtKind::Evaluate(Expr {
+                        span: s.span,
+                        kind: ExprKind::Match(
+                            Box::new(value),
+                            vec![
+                                MatchArm {
+                                    package: None,
+                                    pattern: pattern.clone(),
+                                    guard: None,
+                                    body: MatchBody::Block(std::mem::take(yes), None),
+                                    span: s.span,
+                                },
+                                MatchArm {
+                                    package: None,
+                                    pattern: Pattern {
+                                        kind: PatternKind::Wildcard,
+                                        span: s.span,
+                                    },
+                                    guard: None,
+                                    body: MatchBody::Block(std::mem::take(no), None),
+                                    span: s.span,
+                                },
+                            ],
+                        ),
+                    });
+                }
                 match &mut s.kind {
+                    StmtKind::IfLet(..) => {
+                        return Err(crate::patterns::invalid_pattern(
+                            crate::patterns::PatternError::UnresolvedPattern,
+                            s.span,
+                        ));
+                    }
                     StmtKind::Binding(name, ty, _, mutable, value) => {
                         if let Some(t) = ty {
                             self.ty(module, t, params, s.span)?;
@@ -1352,23 +2412,51 @@ impl Resolver {
         scopes.push(parameters);
         self.block(module, &mut f.body, &mut scopes, &type_params, false)
     }
-    fn finish(mut self, entry: usize) -> Result<Ast> {
+    fn finish(mut self, entry: usize) -> Result<ResolvedProgram> {
         self.declarations(entry)?;
         self.imports()?;
+        let entry_package = self.nodes[entry].package;
         let mut linked = Ast::default();
+        let mut associated: Vec<Vec<Function>> = (0..self.nodes.len()).map(|_| vec![]).collect();
+        let mut modules = vec![];
+        let mut digest_items: Vec<crate::sdk::InterfaceItem> = vec![];
         for (module, mut declaration) in std::mem::take(&mut self.associated_functions) {
             self.function(module, &mut declaration.function, &[], &[])?;
+            if self.nodes[module].interface {
+                let pkg = self.nodes[module].package;
+                let owner = self
+                    .associated_owners
+                    .get(&declaration.id)
+                    .map(|target| self.canonical_target(target, pkg))
+                    .unwrap_or_default();
+                self.interface_methods.push(InterfaceMethod {
+                    module,
+                    owner,
+                    public: true,
+                    function: declaration.function,
+                });
+                continue;
+            }
             if declaration.function.body_kind == FunctionBodyKind::Source
-                && declaration.function.annotations.is_empty()
+                && declarations::internal_annotation(&declaration.function.annotations).is_none()
             {
-                linked.functions.push(declaration.function);
+                associated[module].push(declaration.function);
             } else {
                 linked.native.functions.push(declaration);
             }
         }
-        let mut constants = Vec::new();
         for index in 0..self.nodes.len() {
+            self.next_binding = 0;
             let mut ast = std::mem::take(&mut self.nodes[index].ast);
+            for declaration in &mut ast.enums {
+                declaration.name =
+                    self.symbol(index, &declaration.name, Kind::Type, declaration.span)?;
+                for variant in &mut declaration.variants {
+                    if let Some(ty) = &mut variant.payload {
+                        self.ty(index, ty, &declaration.type_params, variant.span)?;
+                    }
+                }
+            }
             for record in &mut ast.records {
                 let symbol = self.path(index, &record.name, Some(Kind::Type)).unwrap();
                 record.name = symbol.target;
@@ -1427,6 +2515,31 @@ impl Resolver {
                     {
                         continue;
                     }
+                    if self.nodes[index].interface {
+                        let mut function = method.function.clone();
+                        for param in &mut function.params {
+                            cyallo_ast::visit::visit_type(&mut param.ty, &mut |ty| {
+                                if *ty == Type::SelfType {
+                                    *ty = implementation.receiver.clone();
+                                }
+                            });
+                        }
+                        cyallo_ast::visit::visit_type(&mut function.result, &mut |ty| {
+                            if *ty == Type::SelfType {
+                                *ty = implementation.receiver.clone();
+                            }
+                        });
+                        self.function(index, &mut function, &[], &implementation.type_params)?;
+                        let pkg = self.nodes[index].package;
+                        let owner = self.canonical_type(&receiver, pkg);
+                        self.interface_methods.push(InterfaceMethod {
+                            module: index,
+                            owner,
+                            public: method.public,
+                            function,
+                        });
+                        continue;
+                    }
                     let semantic = declarations::bind(
                         &method.function.annotations,
                         self.nodes[index].trust,
@@ -1442,13 +2555,13 @@ impl Resolver {
                     for param in &mut function.params {
                         cyallo_ast::visit::visit_type(&mut param.ty, &mut |ty| {
                             if *ty == Type::SelfType {
-                                *ty = receiver.clone();
+                                *ty = implementation.receiver.clone();
                             }
                         });
                     }
                     cyallo_ast::visit::visit_type(&mut function.result, &mut |ty| {
                         if *ty == Type::SelfType {
-                            *ty = receiver.clone();
+                            *ty = implementation.receiver.clone();
                         }
                     });
                     self.function(index, &mut function, &[], &implementation.type_params)?;
@@ -1464,7 +2577,7 @@ impl Resolver {
                 }
             }
             ast.functions.retain(|function| {
-                if function.annotations.is_empty() {
+                if declarations::internal_annotation(&function.annotations).is_none() {
                     true
                 } else {
                     let id = self.native_target(&function.name).unwrap().0;
@@ -1483,7 +2596,9 @@ impl Resolver {
                             id,
                             name: record.name.clone(),
                             parameters: record.type_params.clone(),
-                            annotation: record.annotations[0].clone(),
+                            annotation: declarations::internal_annotation(&record.annotations)
+                                .expect("bound native type")
+                                .clone(),
                         });
                         false
                     }
@@ -1518,72 +2633,84 @@ impl Resolver {
                 ));
             }
             self.block(index, &mut ast.body, &mut Vec::new(), &[], true)?;
-            if index == entry {
-                linked.body.append(&mut ast.body);
-            } else {
-                constants.append(&mut ast.body);
+            ast.functions.append(&mut associated[index]);
+            for declaration in &ast.enums {
+                ast.functions
+                    .extend(crate::enums::constructors(declaration)?);
             }
-            linked.functions.append(&mut ast.functions);
-            linked.records.append(&mut ast.records);
-            linked.traits.append(&mut ast.traits);
-            linked.implementations.append(&mut ast.implementations);
-            linked.properties.append(&mut ast.properties);
+            ast.enums.retain(|declaration| {
+                if let Some((id, InternalSemantic::Type(NativeType::Storage(storage)))) =
+                    self.native_target(&declaration.name)
+                {
+                    linked.native.enums.push(NativeEnumDeclaration {
+                        storage,
+                        declaration: declaration.clone(),
+                    });
+                    linked.native.types.push(NativeTypeDeclaration {
+                        id,
+                        name: declaration.name.clone(),
+                        parameters: declaration.type_params.clone(),
+                        annotation: declaration
+                            .annotations
+                            .iter()
+                            .find(|a| a.name.as_ref() == "cyallo_internal")
+                            .unwrap()
+                            .clone(),
+                    });
+                    false
+                } else {
+                    true
+                }
+            });
+            ast.inherent_implementations.clear();
+            declarations::validate_source_ast(&ast)?;
+            let nodes = &self.nodes;
+            let node = &nodes[index];
+            let mut bindings: Vec<_> = node
+                .names
+                .iter()
+                .flat_map(|(name, symbols)| {
+                    symbols.iter().map(move |symbol| ModuleBinding {
+                        name: name.clone().into(),
+                        declaration: symbol.id,
+                        defining_module: ModuleId(nodes[symbol.defining_module].id),
+                        target: symbol.target.clone(),
+                        kind: match symbol.kind {
+                            Kind::Value => BindingKind::Value,
+                            Kind::Type => BindingKind::Type,
+                            Kind::Module => BindingKind::Module,
+                            Kind::Property => BindingKind::Property,
+                            Kind::World => BindingKind::World,
+                        },
+                        public: symbol.public,
+                    })
+                })
+                .collect();
+            bindings.sort_by(|a, b| a.name.cmp(&b.name).then(a.target.cmp(&b.target)));
+            if node.interface && node.package == entry_package {
+                digest_items.extend(self.interface_items(index, &ast)?);
+            }
+            modules.push(ResolvedModule {
+                id: ModuleId(node.id),
+                path: node.path.clone().into(),
+                source: ast,
+                bindings,
+            });
         }
-        declarations::validate_source_ast(&linked)?;
+        let interface = crate::sdk::InterfaceDigests {
+            items: digest_items,
+            worlds: self
+                .worlds
+                .iter()
+                .filter(|w| self.nodes.iter().any(|n| n.id == w.module.0 && n.package == entry_package))
+                .map(|w| crate::sdk::WorldDigest {
+                    path: self.relative_path(&w.path, entry_package).into(),
+                    digest: w.digest,
+                })
+                .collect(),
+        }
+        .sorted();
         declarations::validate_native_declarations(&linked.native)?;
-        // Topologically order imported constants without executing module code.
-        let names: HashMap<_, _> = constants
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| match &s.kind {
-                StmtKind::Binding(n, ..) | StmtKind::Constant(n, _) => Some((n.clone(), i)),
-                _ => None,
-            })
-            .collect();
-        let mut dependencies = vec![Vec::new(); constants.len()];
-        for (i, s) in constants.iter_mut().enumerate() {
-            cyallo_ast::visit::visit_block(
-                std::slice::from_mut(s),
-                &mut |e| {
-                    if let ExprKind::Name(n) = &e.kind
-                        && let Some(j) = names.get(n)
-                    {
-                        dependencies[i].push(*j);
-                    }
-                    Ok(())
-                },
-                &mut |_, _| Ok(()),
-            )?;
-        }
-        fn order(
-            i: usize,
-            deps: &[Vec<usize>],
-            marks: &mut [u8],
-            out: &mut Vec<usize>,
-            body: &[Stmt],
-        ) -> Result<()> {
-            if marks[i] == 2 {
-                return Ok(());
-            }
-            if marks[i] == 1 {
-                return Err(error("cyclic constant initialization", body[i].span));
-            }
-            marks[i] = 1;
-            for j in &deps[i] {
-                order(*j, deps, marks, out, body)?;
-            }
-            marks[i] = 2;
-            out.push(i);
-            Ok(())
-        }
-        let mut marks = vec![0; constants.len()];
-        let mut sorted = Vec::new();
-        for i in 0..constants.len() {
-            order(i, &dependencies, &mut marks, &mut sorted, &constants)?;
-        }
-        let mut body: Vec<_> = sorted.into_iter().map(|i| constants[i].clone()).collect();
-        body.append(&mut linked.body);
-        linked.body = body;
         linked.source_names = std::mem::take(&mut self.source_names);
         linked.resolved_modules = self
             .nodes
@@ -1595,13 +2722,13 @@ impl Resolver {
                     .flat_map(|(name, symbols)| {
                         symbols
                             .iter()
-                            .filter(|symbol| symbol.kind != Kind::Property && symbol.public)
+                            .filter(|symbol| !matches!(symbol.kind, Kind::Property | Kind::World) && symbol.public)
                             .map(|symbol| ResolvedExport {
                                 kind: match symbol.kind {
                                     Kind::Value => ExportKind::Value,
                                     Kind::Module => ExportKind::Module,
                                     Kind::Type => ExportKind::Type,
-                                    Kind::Property => unreachable!(),
+                                    Kind::Property | Kind::World => unreachable!(),
                                 },
                                 name: name.clone().into(),
                                 target: symbol.target.clone(),
@@ -1640,10 +2767,23 @@ impl Resolver {
                 requesters: self.requesting_modules,
             });
         }
-        Ok(linked)
+        let graph = ResolvedProgram {
+            interface,
+            worlds: std::mem::take(&mut self.worlds),
+            source_files: vec![],
+            modules,
+            entry: ModuleId(self.nodes[entry].id),
+            native: linked.native,
+            source_names: linked.source_names,
+            exports: linked.resolved_modules,
+        };
+        graph
+            .constant_order()
+            .map_err(crate::module_graph::module_diagnostic)?;
+        Ok(graph)
     }
 }
-pub fn link(asts: Vec<Ast>, paths: &[String], entry: usize) -> Result<Ast> {
+pub fn link(asts: Vec<Ast>, paths: &[String], entry: usize) -> Result<ResolvedProgram> {
     link_with_policy(
         asts,
         paths,
@@ -1656,7 +2796,7 @@ pub fn link_with_policy(
     paths: &[String],
     entry: usize,
     policy: &crate::import_policy::ImportPolicy,
-) -> Result<Ast> {
+) -> Result<ResolvedProgram> {
     link_with_core(
         asts,
         paths,
@@ -1673,7 +2813,7 @@ pub fn link_with_core(
     policy: &crate::import_policy::ImportPolicy,
     package: &crate::core_package::CorePackage<'_>,
     core_offset: u32,
-) -> Result<Ast> {
+) -> Result<ResolvedProgram> {
     let mut files: Vec<_> = asts.into_iter().map(Some).collect();
     let root = files[entry]
         .take()
@@ -1681,16 +2821,27 @@ pub fn link_with_core(
     let dir = Path::new(&paths[entry]).parent().unwrap_or(Path::new(""));
     let mut resolver = Resolver {
         aliases: HashMap::new(),
-        source_names: HashMap::new(),
+        source_names: Default::default(),
         nodes: Vec::new(),
+        variant_ids: Default::default(),
+        unit_variants: Default::default(),
         next_binding: 0,
-        next_declaration: 0,
+        next_declaration: cyallo_ast::RESERVED_DECLARATIONS,
         prelude: None,
         packages: HashMap::new(),
         associated: HashMap::new(),
         associated_functions: vec![],
         permissions: None,
-        requesting_modules: HashMap::new(),
+        requesting_modules: Default::default(),
+        opaque: Default::default(),
+        opaque_arity: HashMap::new(),
+        bound_opaque: HashMap::new(),
+        implemented_interfaces: vec![],
+        worlds: vec![],
+        associated_owners: HashMap::new(),
+        bindings: package.bindings().clone(),
+        applied_bindings: Default::default(),
+        interface_methods: vec![],
     };
     // Only bytes furnished by the sealed core source provider receive Core
     // provenance. User-controlled filenames and module labels confer no trust.
@@ -1721,6 +2872,7 @@ pub fn link_with_core(
     // Allocate core identities before user declarations, so appending REPL
     // definitions cannot change the identity of a saved native function item.
     resolver.declarations(0)?;
+    resolver.check_bindings_applied()?;
     let user = resolver.add(
         "crate".into(),
         root,
@@ -1740,6 +2892,6 @@ pub fn link_with_core(
         })?);
     resolver.finish(user)
 }
-pub fn single(ast: Ast) -> Result<Ast> {
+pub fn single(ast: Ast) -> Result<ResolvedProgram> {
     link(vec![ast], &["main.ya".into()], 0)
 }

@@ -99,8 +99,11 @@ fn analyze_selected(
                     }
                 }
                 Op::Lookup(destination, op, arguments) => {
-                    effect.may_allocate = true;
-                    effect.may_fail = true;
+                    // The operation's contract; operations without a single origin
+                    // carry the conservative contract (allocates and fails).
+                    let contract = op.contract().effects;
+                    effect.may_allocate |= contract.allocates;
+                    effect.may_fail |= contract.may_fail || contract.allocates;
                     if matches!(
                         op,
                         crate::lookup::Operation::Concurrent(_)
@@ -218,7 +221,8 @@ fn analyze_selected(
                         record_store(fi, addresses[*a], f, effect);
                     }
                 }
-                Op::Field(r, a, _) => {
+                Op::EnumPayload(r, a, _, crate::enums::Projection::Address, _)
+                | Op::Field(r, a, _) => {
                     addresses[*r] = addresses[*a];
                     effect.may_fail = true;
                 }
@@ -292,17 +296,23 @@ fn analyze_selected(
                 }
                 Op::ArrayLiteral(..)
                 | Op::Frozen(..)
+                | Op::EnumConstruct(..)
                 | Op::Aggregate(..)
                 | Op::FunctionValue(..)
                 | Op::LiteralString(..) => effect.may_allocate = true,
                 Op::Unary(..) | Op::Binary(..) => effect.may_fail = true,
                 Op::Builtin(r, name, _) => {
-                    effect.may_fail = true;
-                    effect.may_allocate |= matches!(
-                        f.registers[*r],
-                        Type::String | Type::Array(..) | Type::SparseArray(_)
-                    );
-                    if !crate::builtins::pure(*name) {
+                    // The intrinsic's contract states what it can do. Allocation can
+                    // exhaust resources, so it still counts as a possible failure.
+                    let contract = name.contract().effects;
+                    effect.may_fail |= contract.may_fail || contract.allocates;
+                    effect.may_allocate |= contract.allocates
+                        || matches!(
+                            f.registers[*r],
+                            Type::String | Type::Array(..) | Type::SparseArray(_)
+                        );
+                    effect.io |= contract.io;
+                    if !contract.is_pure() {
                         effect.nondeterministic = true;
                         violation = Some(format!("pure fn cannot call effectful builtin `{name}`"));
                     }

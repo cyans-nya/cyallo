@@ -93,7 +93,7 @@ impl NumberKind {
         }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Number {
     pub kind: NumberKind,
     pub bits: u64,

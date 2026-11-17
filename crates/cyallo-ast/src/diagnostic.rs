@@ -2,7 +2,7 @@
 //! presentation codes. Call sites carry semantic errors, not code literals.
 use crate::{Diagnostic, NumberError, Span};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ManagedSyntaxError {
     LegacySigil(crate::MemoryKind),
     UnknownLocality(Box<str>),
@@ -32,7 +32,7 @@ pub fn invalid_managed_syntax(error: ManagedSyntaxError, span: Span) -> Diagnost
     Diagnostic::new("E178", error.to_string(), span)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ManagedLocalityError {
     SharedRuntimeUnavailable,
 }
@@ -50,7 +50,7 @@ pub fn shared_managed_unavailable(span: Span) -> Diagnostic {
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DereferenceSyntaxError {
     PrefixRemoved,
 }
@@ -75,7 +75,7 @@ pub fn numeric_conversion_failed(error: NumberError, span: Span) -> Diagnostic {
     Diagnostic::new("E109", error.to_string(), span)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GeneratorDiagnostic {
     FactorySignatureRequired,
     CaptureInPureFactory,
@@ -116,7 +116,7 @@ pub fn borrowed_generator_yield(span: Span) -> Diagnostic {
     generator_failure(GeneratorDiagnostic::BorrowedYield, span)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConcurrentCallError {
     pub declaration: &'static str,
     pub types: Vec<crate::Type>,
@@ -156,7 +156,7 @@ pub fn invalid_concurrent_call(
     Diagnostic::new("E170", error.to_string(), span)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SpawnCaptureError {
     UnknownCallable,
     LocalCapture(crate::Type),
@@ -181,7 +181,7 @@ pub fn local_capture_cannot_spawn(ty: crate::Type, span: Span) -> Diagnostic {
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ObjectSyntaxError {
     CyclicAlias,
     AliasDepth,
@@ -218,7 +218,7 @@ pub fn readonly_object_borrow(span: crate::Span) -> crate::Diagnostic {
     crate::Diagnostic::new("E181", ObjectSyntaxError::ReadonlyBorrow.to_string(), span)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DynamicBorrowEscape;
 impl std::fmt::Display for DynamicBorrowEscape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -234,7 +234,7 @@ pub fn type_alias_depth(span: crate::Span) -> crate::Diagnostic {
     crate::Diagnostic::new("E181", ObjectSyntaxError::AliasDepth.to_string(), span)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NumericCastError {
     NonNumeric(crate::Type),
 }
@@ -254,4 +254,40 @@ pub fn numeric_cast_requires_number(actual: crate::Type, span: crate::Span) -> c
         NumericCastError::NonNumeric(actual).to_string(),
         span,
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum EnumSyntaxError {
+    ExpectedFieldSeparator,
+    ExpectedArmSeparator,
+    ExpectedIfBlock,
+    AnnotationRequiresString { name: Box<str> },
+    DuplicateVariant { name: Box<str> },
+    DuplicateField { name: Box<str> },
+    VariantRoutineAttributes,
+    ExpectedPattern,
+}
+impl std::fmt::Display for EnumSyntaxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExpectedFieldSeparator => {
+                f.write_str("expected comma or newline between record fields")
+            }
+            Self::ExpectedArmSeparator => f.write_str("expected comma or newline after match arm"),
+            Self::ExpectedIfBlock => f.write_str("expected if block"),
+            Self::AnnotationRequiresString { name } => {
+                write!(f, "{name} requires a string literal")
+            }
+            Self::DuplicateVariant { name } => write!(f, "duplicate enum variant `{name}`"),
+            Self::DuplicateField { name } => write!(f, "duplicate record field `{name}`"),
+            Self::VariantRoutineAttributes => {
+                f.write_str("routine compilation attributes cannot annotate enum variants")
+            }
+            Self::ExpectedPattern => f.write_str("expected a pattern"),
+        }
+    }
+}
+impl std::error::Error for EnumSyntaxError {}
+pub fn invalid_enum_syntax(error: EnumSyntaxError, span: Span) -> Diagnostic {
+    Diagnostic::new("E183", error.to_string(), span)
 }

@@ -1,0 +1,19 @@
+// cargo run -- run examples/enums/result.ya --engine interpreter
+// Output: 4, then "cannot divide by 0" (one line each).
+use std::result::Result::{Ok, Err}
+
+type DivideError = record { divisor: i64, message: string }
+fn divide(value: i64, divisor: i64) -> Result<i64, DivideError> {
+    if divisor == 0 {
+        return Err { divisor: divisor, message: "cannot divide by " }
+    }
+    return Ok(value / divisor)
+}
+
+let outcomes = [divide(12, 3), divide(12, 0)]
+for index in 0..=1 {
+    match &outcomes[index] {
+        Ok(value) => std::io::print(value.*),
+        Err { divisor, message } => std::io::print(message.*, divisor.*),
+    }
+}

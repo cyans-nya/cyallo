@@ -1,0 +1,9 @@
+// Rejected: `Logger` is an opaque type of `host_api` that no binding supplies.
+pub interface mod host_api {
+    pub opaque record Context;
+    pub opaque record Logger;
+}
+mod host { pub record ContextImpl { dir: string } }
+impl interface host_api for host {
+    type Context = crate::host::ContextImpl
+}

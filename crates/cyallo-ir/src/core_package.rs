@@ -22,6 +22,7 @@ pub struct SourceText<'a> {
 pub struct CorePackage<'a> {
     root: &'a str,
     sources: Vec<SourceText<'a>>,
+    bindings: crate::bindings::NativeBindings,
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +173,7 @@ impl CorePackage<'static> {
                     source: source.source,
                 })
                 .collect(),
+            bindings: crate::bindings::NativeBindings::embedded(),
         }
     }
 }
@@ -203,7 +205,19 @@ impl<'a> CorePackage<'a> {
         if !paths.contains_key(root) {
             return Err(CoreSourceError::MissingRoot { root: root.into() });
         }
-        Ok(Self { root, sources })
+        Ok(Self {
+            root,
+            sources,
+            bindings: Default::default(),
+        })
+    }
+    /// The provider's implementation bindings for this package's declarations.
+    pub fn with_bindings(mut self, bindings: crate::bindings::NativeBindings) -> Self {
+        self.bindings = bindings;
+        self
+    }
+    pub fn bindings(&self) -> &crate::bindings::NativeBindings {
+        &self.bindings
     }
 
     pub fn root(&self) -> &'a str {

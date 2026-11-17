@@ -1,18 +1,11 @@
-#[cyallo_internal("result_struct")]
-pub record Result<T, E> {}
-
-#[cyallo_internal("result_ok")]
-pub fn ok<T, E>(value: T) -> Result<T, E>;
-#[cyallo_internal("result_err")]
-pub fn err<T, E>(error: E) -> Result<T, E>;
+pub enum Result<T, E> {
+    Ok: T,
+    Err: E,
+}
 
 impl<T, E> Result<T, E> {
-    #[cyallo_internal("result_is_ok")]
     pub fn is_ok(self: &Self) -> bool;
-    #[cyallo_internal("result_is_err")]
     pub fn is_err(self: &Self) -> bool;
-    #[cyallo_internal("result_unwrap")]
     pub fn unwrap(self) -> T;
-    #[cyallo_internal("result_unwrap_err")]
     pub fn unwrap_err(self) -> E;
 }

@@ -1,0 +1,19 @@
+// cargo run -- run examples/enums/ownership.ya --engine cranelift_speed --gc-stress
+// Output: "first:1:1:true".
+enum Resource { Pair: (rc string, rc string), Empty }
+proc probe(calls: &mut i64) -> bool { calls.* += 1; return false }
+proc choose(value: Resource, calls: &mut i64) -> rc string {
+    return match value {
+        Resource::Pair((first, _)) if probe(calls) => first,
+        Resource::Pair((first, _)) => first,
+        Resource::Empty => rc "empty",
+    }
+}
+let first = rc "first"
+let second = rc "second"
+let weak_second = second.downgrade()
+let mut calls = 0
+let chosen = choose(Resource::Pair((first, second)), &mut calls)
+std::io::print(chosen.*, ":", chosen.strong_count(), ":", calls, ":", weak_second.upgrade().is_none())
+std::mem::drop(chosen)
+std::mem::drop(weak_second)

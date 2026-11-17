@@ -8,7 +8,7 @@ use crate::{
     dynamic_modules::CompiledLoad,
     ir::{Program, Reg},
 };
-use cyallo_ast::{StorageKind, Type};
+use cyallo_ast::Type;
 use cyallo_modules::{LoadError, PublicationError};
 use std::sync::Arc;
 
@@ -17,7 +17,7 @@ pub(super) struct CachedNamespace {
     pub value: super::gc::RootId,
 }
 fn failure(error: LoadError) -> Value {
-    Value::Result(Err(Box::new(Value::LoadError(Arc::new(error)))))
+    Value::result(Err(Box::new(Value::LoadError(Arc::new(error)))))
 }
 
 impl Session {
@@ -30,12 +30,9 @@ impl Session {
         let Value::String(path) = path else {
             return Err(expected(ValueKind::String));
         };
-        let Type::Storage(StorageKind::Result, tuple) = result else {
+        if cyallo_ir::lookup::result_payload(result).is_none() {
             return Err(expected(ValueKind::Result));
-        };
-        let Type::Tuple(_) = tuple.as_ref() else {
-            return Err(expected(ValueKind::Result));
-        };
+        }
         let admitted = (|| {
             let loader = self
                 .program
@@ -101,7 +98,7 @@ impl Session {
         if let Some(cached) = self.module_namespaces.get(&imported.key) {
             self.set(
                 destination,
-                Value::Result(Ok(Box::new(cached.scope.value_copy(cached.value)))),
+                Value::result(Ok(Box::new(cached.scope.value_copy(cached.value)))),
             );
             return Ok(());
         }
@@ -124,6 +121,7 @@ impl Session {
             self.context.gc.enabled = true;
             self.collector.reserve(self.heap.len());
             self.free_cells.clear();
+            self.parked_children.clear();
             self.cell_owners.clear();
             self.register_globals();
             for frame in &mut self.frames {
@@ -263,7 +261,7 @@ mod tests {
             .iter()
             .position(|local| local.display_name.as_deref() == Some("result"))
             .unwrap();
-        let Value::Result(Err(error)) = session.read(session.globals[index]).unwrap() else {
+        let Ok(Err(error)) = session.read(session.globals[index]).unwrap().into_result() else {
             panic!("import result")
         };
         assert!(

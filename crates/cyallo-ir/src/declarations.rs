@@ -17,6 +17,8 @@ use std::{
 pub use cyallo_ast::SourceTrust;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeclarationKind {
+    Enum,
+    Variant,
     Module,
     Record,
     Trait,
@@ -26,6 +28,8 @@ pub enum DeclarationKind {
 impl fmt::Display for DeclarationKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::Enum => "enum",
+            Self::Variant => "enum variant",
             Self::Module => "module",
             Self::Record => "record",
             Self::Trait => "trait",
@@ -48,6 +52,38 @@ pub enum DeclarationError {
     },
     OpaqueFields,
     OpaqueConstruction,
+    /// A source `opaque record` has no fields; only its implementer can make values.
+    OpaqueRecordConstruction,
+    UnresolvedInterface(Box<str>),
+    NotInterfaceModule(Box<str>),
+    UnresolvedImplementer(Box<str>),
+    NotOpaqueType {
+        interface: Box<str>,
+        name: Box<str>,
+    },
+    DuplicateOpaqueBinding(Box<str>),
+    MissingOpaqueBinding {
+        interface: Box<str>,
+        name: Box<str>,
+    },
+    GenericOpaqueBinding(Box<str>),
+    UnresolvedWorld(Box<str>),
+    UnresolvedWorldImport(Box<str>),
+    CyclicWorldInclude(Box<str>),
+    DuplicateWorldField(Box<str>),
+    DuplicateWorldExport(Box<str>),
+    /// A declaration has both a source annotation and a provider binding.
+    BindingConflict(Box<str>),
+    /// A provider binding names a declaration the package does not contain.
+    UnusedBinding(Box<str>),
+    WorldMemberMissing {
+        module: Box<str>,
+        name: Box<str>,
+    },
+    WorldMemberMismatch {
+        module: Box<str>,
+        name: Box<str>,
+    },
     BodyRequired,
     NativeBodyForbidden,
     DuplicateCanonical,
@@ -79,7 +115,7 @@ pub enum DeclarationError {
     NativePredicateMethods,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NativeOperandMode {
     Read,
     Transfer,
@@ -161,6 +197,58 @@ impl fmt::Display for DeclarationError {
             Self::OpaqueConstruction => {
                 f.write_str("native storage cannot be fabricated with a record literal")
             }
+            Self::OpaqueRecordConstruction => {
+                f.write_str("an opaque record cannot be constructed with a record literal")
+            }
+            Self::UnresolvedInterface(path) => {
+                write!(f, "unresolved interface module `{path}`")
+            }
+            Self::NotInterfaceModule(path) => {
+                write!(f, "`{path}` is not an `interface mod`")
+            }
+            Self::UnresolvedImplementer(path) => {
+                write!(f, "unresolved implementing module `{path}`")
+            }
+            Self::NotOpaqueType { interface, name } => {
+                write!(f, "`{name}` is not an opaque record of interface `{interface}`")
+            }
+            Self::DuplicateOpaqueBinding(name) => {
+                write!(f, "opaque type `{name}` is already bound by another implementation")
+            }
+            Self::MissingOpaqueBinding { interface, name } => write!(
+                f,
+                "implementations of interface `{interface}` leave opaque type `{name}` unbound"
+            ),
+            Self::GenericOpaqueBinding(name) => write!(
+                f,
+                "generic opaque type `{name}` cannot be bound by an `impl interface` yet"
+            ),
+            Self::BindingConflict(path) => write!(
+                f,
+                "`{path}` has both a source annotation and a provider binding"
+            ),
+            Self::UnusedBinding(path) => {
+                write!(f, "the provider binds `{path}`, which the package does not declare")
+            }
+            Self::UnresolvedWorld(path) => write!(f, "unresolved world `{path}`"),
+            Self::UnresolvedWorldImport(path) => {
+                write!(f, "world import `{path}` does not name a module")
+            }
+            Self::CyclicWorldInclude(name) => write!(f, "world `{name}` includes itself"),
+            Self::DuplicateWorldField(name) => write!(
+                f,
+                "two imports are named `{name}`; give one an alias with `import path as name`"
+            ),
+            Self::DuplicateWorldExport(name) => {
+                write!(f, "world export `{name}` is declared more than once")
+            }
+            Self::WorldMemberMissing { module, name } => {
+                write!(f, "module `{module}` has no accessible routine `{name}`")
+            }
+            Self::WorldMemberMismatch { module, name } => write!(
+                f,
+                "the signature of `{name}` in the world differs from the one in `{module}`"
+            ),
             Self::BodyRequired => f.write_str("source callable requires an implementation body"),
             Self::NativeBodyForbidden => {
                 f.write_str("native callable requires a bodyless declaration")
@@ -235,6 +323,10 @@ pub fn bind(
     trust: SourceTrust,
     kind: DeclarationKind,
 ) -> Result<Option<InternalSemantic>, Diagnostic> {
+    let annotations: Vec<_> = annotations
+        .iter()
+        .filter(|a| a.name.as_ref() == "cyallo_internal")
+        .collect();
     let Some(annotation) = annotations.first() else {
         return Ok(None);
     };
@@ -259,7 +351,17 @@ pub fn bind(
     })?;
     let valid = matches!(
         (kind, semantic),
-        (DeclarationKind::Module, InternalSemantic::Prelude)
+        (DeclarationKind::Variant, InternalSemantic::Variant(_))
+            | (
+                DeclarationKind::Enum,
+                InternalSemantic::Type(NativeType::Storage(
+                    StorageKind::Option
+                        | StorageKind::Result
+                        | StorageKind::GeneratorStep
+                        | StorageKind::SendError
+                ))
+            )
+            | (DeclarationKind::Module, InternalSemantic::Prelude)
             | (
                 DeclarationKind::Record,
                 InternalSemantic::Type(_) | InternalSemantic::TypeFamily(_)
@@ -274,7 +376,20 @@ pub fn bind(
                 InternalSemantic::Member(_) | InternalSemantic::Function(_)
             )
     );
-    if !valid {
+    if !valid
+        || matches!(
+            (kind, semantic),
+            (
+                DeclarationKind::Record,
+                InternalSemantic::Type(NativeType::Storage(
+                    StorageKind::Option
+                        | StorageKind::Result
+                        | StorageKind::GeneratorStep
+                        | StorageKind::SendError
+                ))
+            )
+        )
+    {
         return Err(invalid_declaration(
             DeclarationError::WrongKind { kind },
             annotation.span,
@@ -285,24 +400,21 @@ pub fn bind(
 pub fn type_arity(ty: NativeType) -> usize {
     use NativeType::*;
     match ty {
-        Storage(StorageKind::Generator | StorageKind::PureGenerator) => 3,
         Storage(StorageKind::Result | StorageKind::GeneratorStep) => 2,
         Storage(
-            StorageKind::Layout
-            | StorageKind::Allocation
-            | StorageKind::AllocError
+            StorageKind::AllocError
             | StorageKind::TypeDescriptor
             | StorageKind::ViewError
             | StorageKind::LoadError
-            | StorageKind::ParseError
-            | StorageKind::ReceiveError
-            | StorageKind::Clock,
+            | StorageKind::ParseError,
         )
         | Any
         | Symbol
         | Context
         | Registration => 0,
         Storage(_) | ServiceKey | ServiceRef => 1,
+        // Declared arity, checked against the declaration itself.
+        Opaque(_) => 0,
     }
 }
 pub fn family_arity(family: NativeTypeFamily) -> usize {
@@ -332,63 +444,7 @@ fn operand_mode(semantic: InternalSemantic, index: usize) -> Option<NativeOperan
                 Read
             }
         }
-        InternalSemantic::Member(member) => {
-            use MemberIntrinsic::*;
-            match member {
-                GeneratorStart | GeneratorResume | GeneratorNext | GeneratorClose
-                | CollectionPushBack | CollectionPushFront | CollectionPopBack
-                | CollectionPopFront => {
-                    if index == 0 {
-                        MutableAddress
-                    } else {
-                        Transfer
-                    }
-                }
-                MutableSlice if index == 0 => MutableAddress,
-                Slice | CollectionLength if index == 0 => SharedAddress,
-                GeneratorYielded | GeneratorCompleted | ResultUnwrap | ResultUnwrapErr
-                | OptionUnwrap | OptionOrFail | StoragePathField | StoragePathElement
-                | StoragePathTarget | SendErrorValue | TaskJoin | TaskCompleted => {
-                    if index == 0 {
-                        Transfer
-                    } else {
-                        Read
-                    }
-                }
-                CellReplace if index == 0 => SharedAddress,
-                CellReplace | LocationStore | ContextOnDispose => {
-                    if index == 1 {
-                        Transfer
-                    } else {
-                        Read
-                    }
-                }
-                ContextProvide | ContextInject => {
-                    if index == 2 {
-                        Transfer
-                    } else {
-                        Read
-                    }
-                }
-                GeneratorIsComplete | GeneratorIsYielded | LayoutSize | LayoutAlign | RcClone
-                | RcDowngrade | RcUpgrade | RcStrongCount | RcWeakCount | GcClone | ResultIsOk
-                | ResultIsErr | Slice | MutableSlice | CollectionLength | RangeReverse
-                | LocationLoad | OptionIsSome | OptionIsNone | ChannelClone | ChannelClose
-                | ChannelIsClosed | ChannelSend | ChannelTrySend | ChannelReceive
-                | ChannelTryReceive | SendErrorClosed | SendErrorFull | SendErrorLimit
-                | LoadErrorNotFound | LoadErrorDenied | LoadErrorCheck | ViewErrorMessage
-                | LoadErrorMessage | ReceiveErrorClosed | ReceiveErrorEmpty | ClockClone
-                | ClockSleep | TaskCancel | TaskIsFinished | TaskIsCompleted | TaskIsFailed
-                | TaskIsCancelled | TaskIsStopped | ContextExtend | ContextIsolate
-                | ContextService | ContextAvailable | ContextDispose | RegistrationDispose => {
-                    if matches!(member, ChannelSend | ChannelTrySend) && index == 1 {
-                        Transfer
-                    } else {
-                        Read
-                    }
-                }
-            }
-        }
+        InternalSemantic::Member(member) => member.contract().operands.mode(index),
         _ => return None,
     })
 }
@@ -398,6 +454,11 @@ fn potentially_owning(ty: &Type, nonowning_parameter: &impl Fn(&str) -> bool) ->
         return false;
     }
     match ty {
+        Type::Enum(contract) => contract
+            .variants
+            .iter()
+            .filter_map(|v| v.payload.as_ref())
+            .any(|ty| potentially_owning(ty, nonowning_parameter)),
         Type::Named(name) => !nonowning_parameter(name),
         Type::RecordRef(_)
         | Type::Any
@@ -417,26 +478,16 @@ fn potentially_owning(ty: &Type, nonowning_parameter: &impl Fn(&str) -> bool) ->
         } => true,
         Type::Storage(
             StorageKind::Range
-            | StorageKind::Layout
             | StorageKind::AllocError
             | StorageKind::TypeDescriptor
             | StorageKind::ViewError
             | StorageKind::LoadError
-            | StorageKind::ParseError
-            | StorageKind::ReceiveError,
+            | StorageKind::ParseError,
             _,
         ) => false,
-        Type::Storage(
-            StorageKind::Allocation
-            | StorageKind::Weak
-            | StorageKind::Generator
-            | StorageKind::PureGenerator
-            | StorageKind::Sender
-            | StorageKind::Receiver
-            | StorageKind::Clock
-            | StorageKind::Task,
-            _,
-        ) => true,
+        Type::Opaque(_, arguments, traits) => {
+            traits.resource() || arguments.iter().any(|ty| potentially_owning(ty, nonowning_parameter))
+        }
         Type::Storage(_, inner)
         | Type::Array(_, inner)
         | Type::SparseArray(inner)
@@ -445,7 +496,7 @@ fn potentially_owning(ty: &Type, nonowning_parameter: &impl Fn(&str) -> bool) ->
         Type::Tuple(types) => types
             .iter()
             .any(|ty| potentially_owning(ty, nonowning_parameter)),
-        Type::Record(_, fields) => fields
+        Type::Record(_, fields) | Type::AnonymousRecord(fields) => fields
             .iter()
             .any(|(_, ty)| potentially_owning(ty, nonowning_parameter)),
         _ => false,
@@ -518,12 +569,22 @@ pub fn validate_native_ownership(
     validate_operand_modes(semantic, params, span, |_| false)
 }
 
+pub fn internal_annotation(
+    annotations: &[DeclarationAnnotation],
+) -> Option<&DeclarationAnnotation> {
+    annotations
+        .iter()
+        .find(|a| a.name.as_ref() == "cyallo_internal")
+}
 fn semantic_of(function: &Function) -> Result<InternalSemantic, Diagnostic> {
-    let semantic = function
+    let mut annotations = function
         .annotations
-        .first()
-        .and_then(|annotation| internal::from_key(&annotation.value));
-    if function.annotations.len() != 1 {
+        .iter()
+        .filter(|a| a.name.as_ref() == "cyallo_internal");
+    let semantic = annotations
+        .next()
+        .and_then(|a| internal::from_key(&a.value));
+    if annotations.next().is_some() {
         return Err(invalid_declaration(
             DeclarationError::InvalidSignature,
             function.span,
@@ -557,7 +618,7 @@ fn validate_native_header(
                     .traits
                     .iter()
                     .find(|(_, declaration)| declaration.name == *name)
-                    .and_then(|(_, declaration)| declaration.annotations.first())
+                    .and_then(|(_, declaration)| internal_annotation(&declaration.annotations))
                     .and_then(|annotation| internal::from_key(&annotation.value))
                     .is_some_and(|semantic| {
                         matches!(
@@ -586,6 +647,7 @@ fn validate_native_header(
 
 /// Rejects malformed trusted contracts before any call can specialize them.
 pub fn validate_native_declarations(native: &NativeDeclarations) -> Result<(), Diagnostic> {
+    crate::enums::validate_native_enums(native)?;
     for declaration in &native.functions {
         validate_native_header(&declaration.function, native)?;
     }
@@ -593,9 +655,7 @@ pub fn validate_native_declarations(native: &NativeDeclarations) -> Result<(), D
         validate_native_header(&declaration.function, native)?;
     }
     for (_, declaration) in &native.traits {
-        match declaration
-            .annotations
-            .first()
+        match internal_annotation(&declaration.annotations)
             .and_then(|annotation| internal::from_key(&annotation.value))
         {
             Some(InternalSemantic::AllocatorTrait) => validate_allocator_trait(declaration)?,
@@ -643,13 +703,12 @@ pub fn allocator_contract(declaration: &Trait) -> Result<(), AllocatorContractEr
     let [allocate, deallocate] = declaration.methods.as_slice() else {
         return Err(AllocatorContractError::MethodCount);
     };
-    let storage = |kind| Type::Storage(kind, Box::new(Type::Void));
     let common = |function: &Function| {
         function.kind == RoutineKind::Procedure
             && !function.generator
             && function.body_kind == FunctionBodyKind::Declaration
             && function.body.is_empty()
-            && function.annotations.is_empty()
+            && internal_annotation(&function.annotations).is_none()
             && function.type_params.is_empty()
             && function.constraints.is_empty()
             && function.type_packs.is_empty()
@@ -663,21 +722,19 @@ pub fn allocator_contract(declaration: &Trait) -> Result<(), AllocatorContractEr
             && !function.params[1].receiver
             && matches!(&function.params[0].ty, Type::Reference {mutable: true, pointee, ..} if pointee.as_ref() == &Type::SelfType)
     };
-    let allocated = Type::Storage(
-        StorageKind::Result,
-        Box::new(Type::Tuple(vec![
-            storage(StorageKind::Allocation),
-            storage(StorageKind::AllocError),
-        ])),
-    );
+    // The protocol is stated by roles, not names: `allocate` takes a layout and
+    // returns `Result<allocation, AllocError>`; `deallocate` takes an allocation.
+    let role = |ty: &Type, wanted: fn(&cyallo_ast::OpaqueTraits) -> bool| {
+        matches!(ty, Type::Opaque(_, args, traits) if args.is_empty() && wanted(traits))
+    };
     if !common(allocate)
-        || !equivalent_types(&allocate.params[1].ty, &storage(StorageKind::Layout))
-        || !equivalent_types(&allocate.result, &allocated)
+        || !role(&allocate.params[1].ty, |t| t.layout())
+        || !crate::memory::allocator_result_allocation(&allocate.result)
     {
         return Err(AllocatorContractError::AllocateShape);
     }
     if !common(deallocate)
-        || !equivalent_types(&deallocate.params[1].ty, &storage(StorageKind::Allocation))
+        || !role(&deallocate.params[1].ty, |t| t.allocation())
         || !equivalent_types(&deallocate.result, &Type::Void)
     {
         return Err(AllocatorContractError::DeallocateShape);
@@ -685,7 +742,7 @@ pub fn allocator_contract(declaration: &Trait) -> Result<(), AllocatorContractEr
     Ok(())
 }
 
-fn unsupported_source(feature: SourceFeature, span: Span) -> Diagnostic {
+pub(crate) fn unsupported_source(feature: SourceFeature, span: Span) -> Diagnostic {
     invalid_declaration(DeclarationError::UnsupportedSourceFeature(feature), span)
 }
 
@@ -763,6 +820,16 @@ fn validate_source_block(body: &[Stmt]) -> Result<(), Diagnostic> {
 /// Checks the ordinary AST after trusted native declarations have been retained
 /// separately in Ast.native, and before generics or services erase metadata.
 pub fn validate_source_ast(ast: &Ast) -> Result<(), Diagnostic> {
+    for alias in &ast.type_aliases {
+        validate_source_type(&alias.ty, alias.span)?;
+    }
+    for declaration in &ast.enums {
+        for variant in &declaration.variants {
+            if let Some(payload) = &variant.payload {
+                validate_source_type(payload, variant.span)?;
+            }
+        }
+    }
     validate_source_block(&ast.body)?;
     for function in &ast.functions {
         validate_source_function(function)?;
@@ -824,7 +891,34 @@ pub struct TypeEnvironment {
     pub native: Arc<NativeDeclarations>,
 }
 impl TypeEnvironment {
-    pub fn new(mut types: HashMap<String, Type>, native: NativeDeclarations) -> Self {
+    /// The provider's weak-reference type: the declaration whose binding carries the
+    /// `weak` trait. The language needs it to type `downgrade`; it asks for the
+    /// trait, not for a name.
+    pub fn weak_type(&self) -> Option<(Box<str>, cyallo_ast::OpaqueTraits)> {
+        self.native.types.iter().find_map(|declaration| {
+            match crate::internal::from_key(&declaration.annotation.value)? {
+                InternalSemantic::Type(NativeType::Opaque(traits)) if traits.weak() => {
+                    Some((declaration.name.clone(), traits))
+                }
+                _ => None,
+            }
+        })
+    }
+    pub fn new(mut types: HashMap<String, Type>, mut native: NativeDeclarations) -> Self {
+        normalize_native_signatures(&mut native);
+        for declaration in &native.enums {
+            let arguments = declaration
+                .declaration
+                .type_params
+                .iter()
+                .cloned()
+                .map(Type::Named)
+                .collect::<Vec<_>>();
+            let ty = crate::enums::native_type(declaration.storage, arguments);
+            if let Some(contract) = crate::enums::contract(&ty, &native) {
+                types.insert(contract.name.to_string(), Type::Enum(std::sync::Arc::new(contract)));
+            }
+        }
         for declaration in &native.functions {
             types.insert(
                 declaration.function.name.to_string(),
@@ -850,7 +944,9 @@ impl TypeEnvironment {
             .iter()
             .find(|entry| entry.id == declaration)
             .ok_or_else(|| invalid_declaration(DeclarationError::InvalidSignature, span))?;
-        match internal::from_key(&function.function.annotations[0].value) {
+        match internal_annotation(&function.function.annotations)
+            .and_then(|a| internal::from_key(&a.value))
+        {
             Some(InternalSemantic::Function(id)) => Ok(id.id().declared(declaration)),
             _ => Err(invalid_declaration(
                 DeclarationError::InvalidSignature,
@@ -872,6 +968,39 @@ impl DerefMut for TypeEnvironment {
     }
 }
 
+/// Declared signatures spell the core enums with their markers; resolve them to the
+/// declared enums, as source annotations are, so a signature compares with the
+/// types it is applied to. Type parameters stay as `Named` arguments of the template.
+fn normalize_native_signatures(native: &mut NativeDeclarations) {
+    let templates: Vec<_> = native
+        .enums
+        .iter()
+        .map(|e| (e.storage, e.declaration.clone()))
+        .collect();
+    let normalize = |ty: &mut Type| {
+        cyallo_ast::visit::visit_type(ty, &mut |ty| {
+            if let Type::Storage(kind, inner) = ty
+                && let Some((_, declaration)) = templates.iter().find(|(k, _)| k == kind)
+                && let Some(contract) = crate::enums::contract_for(declaration, *kind, inner)
+            {
+                *ty = Type::Enum(std::sync::Arc::new(contract));
+            }
+        })
+    };
+    for declaration in &mut native.functions {
+        for parameter in &mut declaration.function.params {
+            normalize(&mut parameter.ty);
+        }
+        normalize(&mut declaration.function.result);
+    }
+    for declaration in &mut native.methods {
+        for parameter in &mut declaration.function.params {
+            normalize(&mut parameter.ty);
+        }
+        normalize(&mut declaration.function.result);
+        normalize(&mut declaration.receiver);
+    }
+}
 pub fn equivalent_types(left: &Type, right: &Type) -> bool {
     fn canonical(ty: &Type) -> Type {
         let mut ty = ty.clone();

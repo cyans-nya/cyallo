@@ -258,7 +258,7 @@ impl Session {
         self.publish_generator_roots();
         self.set(
             result,
-            Value::GeneratorStep(cyallo_values::GeneratorStep::Yielded(Box::new(yielded))),
+            Value::step(cyallo_values::GeneratorStep::Yielded(Box::new(yielded))),
         );
         Ok(())
     }
@@ -278,7 +278,7 @@ impl Session {
         self.generators.entries.remove(&id);
         self.set(
             result,
-            Value::GeneratorStep(cyallo_values::GeneratorStep::Complete(Box::new(
+            Value::step(cyallo_values::GeneratorStep::Complete(Box::new(
                 roots.value_copy(returned),
             ))),
         );

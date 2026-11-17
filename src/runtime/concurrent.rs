@@ -386,13 +386,15 @@ impl Session {
                     .collect::<RunResult<_>>()?,
                 length,
             ),
-            Value::Optional(v) => {
-                Payload::Optional(v.map(|v| self.detached(*v).map(Box::new)).transpose()?)
+            Value::Enum(variant, payload) => Payload::Enum(
+                variant,
+                payload
+                    .map(|v| self.detached(*v).map(Box::new))
+                    .transpose()?,
+            ),
+            Value::EnumStorage(..) | Value::NativeEnumStorage(..) => {
+                self.detached(self.snapshot(&value))?
             }
-            Value::Result(v) => Payload::Result(match v {
-                Ok(v) => Ok(Box::new(self.detached(*v)?)),
-                Err(v) => Err(Box::new(self.detached(*v)?)),
-            }),
             Value::Concurrent(handle) => Payload::Resource(OwnedHandle::new(handle)),
             // Managed graphs, borrows, erased local pointers and saved generators
             // require their own checked sharing contract. Never copy their IDs.
@@ -490,19 +492,19 @@ impl Session {
                     Value::Address(id) => &self.heap[*id].value,
                     v => v,
                 };
-                let Value::SendError(error) = error else {
+                let Some((kind, value)) = error.as_send_error() else {
                     return Err(ConcurrencyError::InvalidOperand.into());
                 };
                 match operation {
-                    Operation::SendErrorValue => *error.value.clone(),
+                    Operation::SendErrorValue => value.clone(),
                     Operation::SendErrorClosed => {
-                        Value::Boolean(error.kind == cyallo_channel::SendFailure::Closed)
+                        Value::Boolean(kind == cyallo_channel::SendFailure::Closed)
                     }
                     Operation::SendErrorFull => {
-                        Value::Boolean(error.kind == cyallo_channel::SendFailure::Full)
+                        Value::Boolean(kind == cyallo_channel::SendFailure::Full)
                     }
                     Operation::SendErrorLimit => {
-                        Value::Boolean(error.kind == cyallo_channel::SendFailure::Limit)
+                        Value::Boolean(kind == cyallo_channel::SendFailure::Limit)
                     }
                     _ => unreachable!(),
                 }
@@ -512,15 +514,15 @@ impl Session {
                     Value::Address(id) => &self.heap[*id].value,
                     v => v,
                 };
-                let Value::ReceiveError(error) = error else {
+                let Value::Enum(variant, _) = error else {
                     return Err(ConcurrencyError::InvalidOperand.into());
                 };
                 Value::Boolean(
-                    *error
+                    *variant
                         == if operation == Operation::ReceiveErrorClosed {
-                            cyallo_channel::ReceiveError::Closed
+                            cyallo_ast::VariantId::RECEIVE_CLOSED
                         } else {
-                            cyallo_channel::ReceiveError::Empty
+                            cyallo_ast::VariantId::RECEIVE_EMPTY
                         },
                 )
             }
@@ -644,6 +646,9 @@ impl Session {
 }
 fn attached(value: Payload) -> Value {
     match value {
+        Payload::Enum(variant, payload) => {
+            Value::Enum(variant, payload.map(|v| Box::new(attached(*v))))
+        }
         Payload::Unit => Value::ArraySnapshot(vec![]),
         Payload::Number(n) => Value::from_number(n),
         Payload::Boolean(n) => Value::Boolean(n),
@@ -654,11 +659,6 @@ fn attached(value: Payload) -> Value {
             values.into_iter().map(|(i, v)| (i, attached(v))).collect(),
             length,
         ),
-        Payload::Optional(v) => Value::Optional(v.map(|v| Box::new(attached(*v)))),
-        Payload::Result(v) => Value::Result(match v {
-            Ok(v) => Ok(Box::new(attached(*v))),
-            Err(v) => Err(Box::new(attached(*v))),
-        }),
         Payload::Resource(handle) => Value::Concurrent(handle.into_handle()),
         Payload::Function(f, captures) => {
             Value::Function(f, captures.into_iter().map(attached).collect())
@@ -667,18 +667,24 @@ fn attached(value: Payload) -> Value {
     }
 }
 fn send_result(result: Result<(), cyallo_channel::SendError<Payload>>) -> Value {
-    Value::Result(match result {
+    Value::result(match result {
         Ok(()) => Ok(Box::new(Value::ArraySnapshot(vec![]))),
-        Err(error) => Err(Box::new(Value::SendError(cyallo_channel::SendError {
-            kind: error.kind,
-            value: Box::new(attached(error.value)),
-        }))),
+        Err(error) => Err(Box::new(Value::send_error(
+            error.kind,
+            Box::new(attached(error.value)),
+        ))),
     })
 }
 fn receive_result(result: Result<Payload, cyallo_channel::ReceiveError>) -> Value {
-    Value::Result(match result {
+    Value::result(match result {
         Ok(value) => Ok(Box::new(attached(value))),
-        Err(error) => Err(Box::new(Value::ReceiveError(error))),
+        Err(error) => Err(Box::new(Value::Enum(
+            match error {
+                cyallo_channel::ReceiveError::Closed => cyallo_ast::VariantId::RECEIVE_CLOSED,
+                cyallo_channel::ReceiveError::Empty => cyallo_ast::VariantId::RECEIVE_EMPTY,
+            },
+            None,
+        ))),
     })
 }
 

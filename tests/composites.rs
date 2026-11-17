@@ -208,3 +208,45 @@ fn recursive_record_layouts_require_indirection_on_every_cycle() {
         compile(source).unwrap_or_else(|errors| panic!("{source}: {errors:?}"));
     }
 }
+
+#[test]
+fn structural_records_canonicalize_fields_and_preserve_evaluation_order() {
+    output(
+        r#"
+type Row = record { x: i64, y: string }
+fn make() -> Row { return record { y: "saved", x: 2 } }
+proc next(n: &mut i64) -> i64 { n.* += 1; return n.* }
+let mut count = 0
+let mut ordered = record { z: next(&mut count), a: next(&mut count) }
+let equivalent: record { a: i64, z: i64 } = ordered
+let mut row = make()
+row.x += equivalent.a
+let cloned = std::mem::clone(&row)
+row.x = 99
+std::io::print(equivalent.z, equivalent.a, ":", cloned.x, cloned.y, make().y)
+"#,
+        "12:4savedsaved\n",
+    );
+}
+
+#[test]
+fn structural_records_reject_nominal_coercions_and_incompatible_fields() {
+    for source in [
+        "record P { x: i64 }\nlet value: P = record { x: 1 }\n",
+        "record P { x: i64 }\nlet value: record { x: i64 } = P { x: 1 }\n",
+        "let value: record { x: i64 } = record { x: true }\n",
+        "let value: record { x: i64 } = record { x: 1, y: 2 }\n",
+        "fn bad() -> record { f: proc() } { let mut x = 0; return record { f: proc[&mut x]() { x += 1 } } }\n",
+    ] {
+        assert!(compile(source).is_err(), "accepted {source}");
+    }
+}
+
+#[test]
+fn borrowing_temporary_structural_records_checks_their_owned_fields() {
+    output(
+        "let value = &record { x: 3 }\nstd::io::print(value.*.x)\n",
+        "3\n",
+    );
+    assert!(compile("let owner = rc 3\nlet borrowed = &record { owner: owner }\nstd::io::print(owner.*, borrowed.*.owner.*)\n").is_err());
+}

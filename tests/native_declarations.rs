@@ -5,6 +5,7 @@ use cyallo::{
     import_policy::{ImportPolicy, ImportScope, ModuleAccess, ScopeMatch},
     modules::{SourceModule, compile_modules_with_policy},
 };
+use cyallo_ir::bindings::NativeBindings;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -67,6 +68,9 @@ fn standard_sources() -> Vec<(String, String)> {
 }
 
 fn package(sources: &[(String, String)]) -> CorePackage<'_> {
+    package_with(sources, NativeBindings::embedded())
+}
+fn package_with(sources: &[(String, String)], bindings: NativeBindings) -> CorePackage<'_> {
     CorePackage::from_trusted_sources(
         "std.ya",
         sources
@@ -74,6 +78,12 @@ fn package(sources: &[(String, String)]) -> CorePackage<'_> {
             .map(|(path, source)| SourceText { path, source }),
     )
     .unwrap()
+    .with_bindings(bindings)
+}
+/// The embedded table with some entries' paths rewritten, as a provider does when it
+/// moves or renames declarations in its source.
+fn renamed(f: impl Fn(&str) -> String) -> NativeBindings {
+    NativeBindings::embedded().map(|path, key| Some((f(path), key.to_string())))
 }
 
 #[test]
@@ -102,7 +112,19 @@ fn native_types_functions_members_and_modules_can_move_without_compiler_changes(
     "#,
         CompileOptions::default(),
         &ImportPolicy::default(),
-        &package(&sources),
+        &package_with(
+            &sources,
+            renamed(|path| match path.strip_prefix("std::task::") {
+                Some(rest) => format!(
+                    "std::workers::{}",
+                    rest.replace("TaskOutcome", "Completion")
+                        .replace("Task", "Work")
+                        .replace("spawn", "launch")
+                        .replace("join", "collect")
+                ),
+                None => path.to_string(),
+            }),
+        ),
     )
     .unwrap();
     execute(program, "42\n");
@@ -115,18 +137,18 @@ fn source_contract_is_checked_and_source_body_needs_no_annotation() {
         .iter_mut()
         .find(|(path, _)| path == "std/task.ya")
         .unwrap();
-    task.1 = task
-        .1
-        .replace("#[cyallo_internal(\"task_spawn\")]", "")
-        .replace(
-            "pub proc spawn<T: Transferable>(body: proc() -> T) -> Task<T>;",
-            "pub proc spawn() -> i64 { return 73 }",
-        );
+    task.1 = task.1.replace(
+        "pub proc spawn<T: Transferable>(body: proc() -> T) -> Task<T>;",
+        "pub proc spawn() -> i64 { return 73 }",
+    );
+    // Removing the provider's binding makes the declaration ordinary source.
+    let unbound = NativeBindings::embedded()
+        .map(|path, key| (path != "std::task::spawn").then(|| (path.to_string(), key.to_string())));
     let program = cyallo::compile_with_core_package(
         "std::io::print(std::task::spawn())",
         Default::default(),
         &ImportPolicy::default(),
-        &package(&sources),
+        &package_with(&sources, unbound),
     )
     .unwrap();
     execute(program, "73\n");
@@ -235,17 +257,13 @@ fn source_archive_preserves_core_paths_and_utf8_spans() {
         .unwrap()
         .1
         .insert_str(0, "// 猫\n");
-    sources
-        .iter_mut()
-        .find(|(path, _)| path == "std/task.ya")
-        .unwrap()
-        .1 = sources
-        .iter()
-        .find(|(path, _)| path == "std/task.ya")
-        .unwrap()
-        .1
-        .replace("task_struct", "unknown_representation");
-    let core = package(&sources);
+    let core = package_with(
+        &sources,
+        NativeBindings::embedded().map(|path, key| {
+            let key = if path == "std::task::Task" { "unknown_representation" } else { key };
+            Some((path.to_string(), key.to_string()))
+        }),
+    );
     let user = "// λ\nstd::io::print(1)";
     let error = cyallo::compile_with_core_package(
         user,
@@ -267,8 +285,10 @@ fn source_archive_preserves_core_paths_and_utf8_spans() {
     let (path, text, local) =
         cyallo::modules::diagnostic_context(&archive, &ranges, &error).unwrap();
     assert_eq!(path, "std/task.ya");
+    // A provider binding has no annotation text of its own, so the diagnostic points
+    // at the bound declaration, still in the right file and at UTF-8-correct offsets.
     assert!(
-        text[local.span.start as usize..local.span.end as usize].contains("unknown_representation")
+        text[local.span.start as usize..local.span.end as usize].contains("record Task<T>")
     );
 }
 
@@ -397,4 +417,146 @@ fn erased_resources_are_owned_and_checked_casts_transfer_them() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn standard_enum_variant_names_are_owned_by_source_declarations() {
+    let mut sources = standard_sources();
+    for (path, source) in &mut sources {
+        if path == "std/option.ya" {
+            *source = source
+                .replace("Some: T", "Present: T")
+                .replace("    None,", "    Absent,");
+        }
+        if path == "std/result.ya" {
+            *source = source
+                .replace("Ok: T", "Success: T")
+                .replace("Err: E", "Failure: E");
+        }
+        // The prelude reexports variants by name, so renaming them is a source
+        // edit there too.
+        if path == "std/prelude.ya" {
+            *source = source
+                .replace("{Some, None}", "{Present, Absent}")
+                .replace("{Ok, Err}", "{Success, Failure}");
+        }
+    }
+    let table = renamed(|path| {
+        path.replace("::Option::Some", "::Option::Present")
+            .replace("::Option::None", "::Option::Absent")
+            .replace("::Result::Ok", "::Result::Success")
+            .replace("::Result::Err", "::Result::Failure")
+    });
+    let program=cyallo::compile_with_core_package(r#"
+use std::option::Option::{Present, Absent}
+use std::result::Result::{Success, Failure}
+let present = Present(8)
+let absent: Option<i64> = Absent
+let result: Result<i64,string> = Failure("message")
+std::io::print(match present { Present(n) => n, Absent => 0 }, match absent { Present(n) => n, Absent => 9 })
+std::io::print(match result { Success(n) => "unexpected", Failure(text) => text })
+std::io::print(match std::num::parse<i64>("42") { Success(n) => n, Failure(_) => 0 })
+"#,CompileOptions::default(),&ImportPolicy::default(),&package_with(&sources, table)).unwrap();
+    execute(program, "89\nmessage\n42\n");
+}
+
+#[test]
+fn malformed_native_enum_payloads_and_roles_are_rejected() {
+    for replacement in ["Some: bool", "#[since(\"1.0\")]\n    Some: bool"] {
+        let mut sources = standard_sources();
+        for (path, source) in &mut sources {
+            if path == "std/option.ya" {
+                *source = source.replace("Some: T", replacement);
+            }
+        }
+        let error = cyallo::compile_with_core_package(
+            "",
+            CompileOptions::default(),
+            &ImportPolicy::default(),
+            &package(&sources),
+        )
+        .expect_err("invalid native enum accepted");
+        assert_eq!(error.code, "E184");
+    }
+    let sources = standard_sources();
+    let swapped = NativeBindings::embedded().map(|path, key| {
+        let key = if path == "std::option::Option::None" { "result_err_variant" } else { key };
+        Some((path.to_string(), key.to_string()))
+    });
+    assert_eq!(
+        cyallo::compile_with_core_package(
+            "",
+            CompileOptions::default(),
+            &ImportPolicy::default(),
+            &package_with(&sources, swapped)
+        )
+        .expect_err("wrong native variant role accepted")
+        .code,
+        "E184"
+    );
+}
+
+#[test]
+fn foreign_open_enums_require_a_wildcard_and_own_package_remains_exhaustive() {
+    let mut sources = standard_sources();
+    for (path, source) in &mut sources {
+        if path == "std/option.ya" {
+            source.push_str("\npub open enum Future { Ready: i64, #[since(\"1.1\")] Later }\n");
+        }
+    }
+    let source = "use std::option::Future\nlet value = Future::Ready(3)\nlet result = match value { Future::Ready(n) => n, Future::Later => 0 }\n";
+    let error = cyallo::compile_with_core_package(
+        source,
+        CompileOptions::default(),
+        &ImportPolicy::default(),
+        &package(&sources),
+    )
+    .expect_err("foreign open enum accepted without wildcard");
+    assert_eq!(error.code, "E185");
+    assert!(error.message.contains("wildcard"));
+    let source = "use std::option::Future\nlet value = Future::Ready(3)\nstd::io::print(match value { Future::Ready(n) => n, _ => 0 })\n";
+    execute(
+        cyallo::compile_with_core_package(
+            source,
+            CompileOptions::default(),
+            &ImportPolicy::default(),
+            &package(&sources),
+        )
+        .unwrap(),
+        "3\n",
+    );
+    execute(cyallo::compile("mod own { pub open enum Future { Ready: i64, Later } }\nlet value = own::Future::Ready(3)\nstd::io::print(match value { own::Future::Ready(n) => n, own::Future::Later => 0 })\n").unwrap(),"3\n");
+}
+
+#[test]
+fn version_annotations_do_not_replace_private_semantic_annotations() {
+    let mut sources = standard_sources();
+    for (path, source) in &mut sources {
+        if path == "std/option.ya" {
+            // A version annotation on a bound declaration does not replace its binding.
+            *source = source.replace("pub fn ", "#[since(\"1.1\")]\npub fn ");
+        }
+    }
+    let program=cyallo::compile_with_core_package("#[since(\"1.0\")]\nfn source_value() -> i64 { return 3 }\nlet value = Option::Some(source_value())\nstd::io::print(value.is_some(), value.unwrap())\n",CompileOptions::default(),&ImportPolicy::default(),&package(&sources)).unwrap();
+    execute(program, "true3\n");
+}
+
+#[test]
+fn option_and_result_native_identities_require_actual_enum_declarations() {
+    let mut sources = standard_sources();
+    for (path, source) in &mut sources {
+        if path == "std/option.ya" {
+            let start = source.find("pub enum Option<T> {").unwrap();
+            let end = start + source[start..].find("\n}").unwrap() + 2;
+            source.replace_range(start..end, "pub record Option<T> {}");
+        }
+    }
+    let error = cyallo::compile_with_core_package(
+        "",
+        CompileOptions::default(),
+        &ImportPolicy::default(),
+        &package(&sources),
+    )
+    .expect_err("an opaque record must not implement the enum ABI");
+    assert!(error.message.contains("record"));
 }

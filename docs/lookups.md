@@ -25,7 +25,7 @@ validates dependencies and applies the recipe to the current receiver.
 | `StoragePath<Cell<T>>.target()` | Read the cell contents |
 | `std::lookup::missing<T>()` | Negative `StoragePath<T>` |
 | `std::lookup::mapped(receiver, key, mapper)` | Resolve the current `Option<T>` |
-| `std::option::some(value)` / `std::option::none<T>()` | Construct optional values |
+| `Option::Some(value)` / `Option::None` | Construct optional values (the enum constructors) |
 | `std::any::erase(value)` / `std::any::checked<T>(value)` | Owned erasure / exact-type recovery |
 
 A retained `Location<T>` refers to a field, not a movable collection element.

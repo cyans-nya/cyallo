@@ -1,0 +1,21 @@
+// cargo run -- run examples/concurrency/enums.ya --gc-stress
+// Output: "42:worker", "finished" (one line each).
+use std::channel::bounded
+use std::task::spawn
+
+enum Event { Message: record { number: i64, text: string }, Finished }
+let endpoints = bounded<Event>(1 as usize)
+let sender = endpoints.0.clone()
+let worker = spawn(proc() -> Event {
+    sender.send(Event::Message { number: 42, text: "worker" }).unwrap()
+    return Event::Finished
+})
+let message = endpoints.1.recv().unwrap()
+match message {
+    Event::Message { number, text } => std::io::print(number, ":", text),
+    Event::Finished => {},
+}
+std::io::print(match worker.join().completed() {
+    Event::Message { .. } => "message",
+    Event::Finished => "finished",
+})

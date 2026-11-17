@@ -1,2 +1,1 @@
-#[cyallo_internal("random_uniform")]
 pub proc uniform(limit: i64) -> f64;

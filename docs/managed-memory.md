@@ -84,7 +84,7 @@ the supplied value in the cell. There is no implicit clone or default replacemen
 An optional owner can be extracted by replacing it with an empty option:
 
 ```text
-let cell = Cell::new(std::option::some(Vec[1,2]))
+let cell = Cell::new(Option::Some(Vec[1,2]))
 let inner = cell.replace(std::option::none<Vec<i64>>()).unwrap()
 std::io::print(inner[0], ":", inner[1])
 ```
@@ -136,7 +136,7 @@ use `rc<'a> T` and `std::rc::Weak<'a, T>`.
 | `std::mem::allocate(layout)` | Fallible aligned backing allocation |
 | `std::mem::deallocate(allocation)` | Consume and release backing allocation |
 | `std::mem::AllocError::new(message)` | Construct an allocation error |
-| `std::result::ok<T,E>(value)`, `std::result::err<T,E>(error)` | Construct a typed result |
+| `Result::Ok(value)`, `Result::Err(error)` | Construct a typed result (the enum constructors; no separate functions) |
 
 An allocation is an opaque owned token; source code has no raw pointer or unsafe
 operation. Allocators can move tokens into a pool and return them on later calls.

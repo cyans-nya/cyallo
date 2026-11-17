@@ -3,13 +3,13 @@
 use crate::*;
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SpanEndpoint {
     Start,
     End,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SpanShiftError {
     InvalidRange {
         span: Span,
@@ -86,6 +86,17 @@ pub fn shift_ast(ast: &mut Ast, offset: u32) -> Result<(), Diagnostic> {
     shift_ast_checked(ast, offset).map_err(invalid_span_shift)
 }
 
+/// Visit every coordinate, including declaration attributes, nested closures,
+/// native headers, and related diagnostics. Source-map clients use this to
+/// retain file-relative identities independently of archive placement.
+pub fn visit_spans(ast: &mut Ast, mut visit: impl FnMut(&mut Span)) {
+    walk_ast(ast, &mut |span| {
+        visit(span);
+        Ok(())
+    })
+    .expect("infallible span visitor");
+}
+
 /// Relocates primary and related diagnostic spans; leaves all unchanged on error.
 pub fn shift_diagnostic(diagnostic: &mut Diagnostic, offset: u32) -> Result<(), Diagnostic> {
     walk_diagnostic(diagnostic, &mut |span| shifted(*span, offset).map(|_| ()))
@@ -156,6 +167,30 @@ fn walk_trait(trait_: &mut Trait, visit: &mut impl FnMut(&mut Span) -> VisitResu
     }
     Ok(())
 }
+fn walk_pattern(
+    pattern: &mut Pattern,
+    visit: &mut impl FnMut(&mut Span) -> VisitResult,
+) -> VisitResult {
+    crate::with_stack(|| {
+        visit(&mut pattern.span)?;
+        match &mut pattern.kind {
+            PatternKind::Variant(_, Some(payload))
+            | PatternKind::ResolvedVariant(_, Some(payload)) => walk_pattern(payload, visit)?,
+            PatternKind::Tuple(patterns) | PatternKind::Or(patterns) => {
+                for pattern in patterns {
+                    walk_pattern(pattern, visit)?;
+                }
+            }
+            PatternKind::Record(fields, _) => {
+                for (_, pattern) in fields {
+                    walk_pattern(pattern, visit)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })
+}
 fn walk_expr(
     expression: &mut Expr,
     visit: &mut impl FnMut(&mut Span) -> VisitResult,
@@ -163,6 +198,30 @@ fn walk_expr(
     crate::with_stack(|| {
         visit(&mut expression.span)?;
         match &mut expression.kind {
+            ExprKind::EnumConstruct(_, _, payload) => {
+                if let Some(payload) = payload {
+                    walk_expr(payload, visit)?;
+                }
+            }
+            ExprKind::Match(value, arms) => {
+                walk_expr(value, visit)?;
+                for arm in arms {
+                    visit(&mut arm.span)?;
+                    walk_pattern(&mut arm.pattern, visit)?;
+                    if let Some(guard) = &mut arm.guard {
+                        walk_expr(guard, visit)?;
+                    }
+                    match &mut arm.body {
+                        MatchBody::Expression(value) => walk_expr(value, visit)?,
+                        MatchBody::Block(body, tail) => {
+                            walk_block(body, visit)?;
+                            if let Some(tail) = tail {
+                                walk_expr(tail, visit)?;
+                            }
+                        }
+                    }
+                }
+            }
             ExprKind::Invalid(diagnostic) => walk_diagnostic(diagnostic, visit)?,
             ExprKind::ManagedNew(_, _, allocator, value) => {
                 if let Some(allocator) = allocator {
@@ -181,7 +240,9 @@ fn walk_expr(
                     walk_expr(value, visit)?;
                 }
             }
-            ExprKind::Record(_, fields)
+            ExprKind::AnonymousRecord(fields)
+            | ExprKind::VariantPayload(fields)
+            | ExprKind::Record(_, fields)
             | ExprKind::GenericRecord(_, _, fields)
             | ExprKind::ObjectLiteral(_, fields) => {
                 for (_, value) in fields {
@@ -235,6 +296,12 @@ fn walk_block(body: &mut [Stmt], visit: &mut impl FnMut(&mut Span) -> VisitResul
                         walk_expr(value, visit)?;
                     }
                 }
+                StmtKind::IfLet(pattern, condition, a, b) => {
+                    walk_pattern(pattern, visit)?;
+                    walk_expr(condition, visit)?;
+                    walk_block(a, visit)?;
+                    walk_block(b, visit)?;
+                }
                 StmtKind::If(condition, a, b) => {
                     walk_expr(condition, visit)?;
                     walk_block(a, visit)?;
@@ -278,6 +345,14 @@ fn walk_block(body: &mut [Stmt], visit: &mut impl FnMut(&mut Span) -> VisitResul
 }
 fn walk_ast(ast: &mut Ast, visit: &mut impl FnMut(&mut Span) -> VisitResult) -> VisitResult {
     crate::with_stack(|| {
+        for declaration in &mut ast.enums {
+            visit(&mut declaration.span)?;
+            walk_annotations(&mut declaration.annotations, visit)?;
+            for variant in &mut declaration.variants {
+                visit(&mut variant.span)?;
+                walk_annotations(&mut variant.annotations, visit)?;
+            }
+        }
         walk_block(&mut ast.body, visit)?;
         for function in &mut ast.functions {
             walk_function(function, visit)?;
@@ -310,11 +385,38 @@ fn walk_ast(ast: &mut Ast, visit: &mut impl FnMut(&mut Span) -> VisitResult) -> 
         for import in &mut ast.imports {
             visit(&mut import.span)?;
         }
+        for world in &mut ast.worlds {
+            visit(&mut world.span)?;
+            walk_annotations(&mut world.annotations, visit)?;
+            for item in &mut world.items {
+                match item {
+                    WorldItem::Include { span, .. } => visit(span)?,
+                    WorldItem::Import { span, members, .. } => {
+                        visit(span)?;
+                        for function in members.iter_mut().flatten() {
+                            walk_function(function, visit)?;
+                        }
+                    }
+                    WorldItem::Export { function } => walk_function(function, visit)?,
+                }
+            }
+        }
+        for implementation in &mut ast.interface_implementations {
+            visit(&mut implementation.span)?;
+        }
         for module in &mut ast.modules {
             visit(&mut module.span)?;
             walk_annotations(&mut module.annotations, visit)?;
             if let Some(body) = &mut module.body {
                 walk_ast(body, visit)?;
+            }
+        }
+        for native in &mut ast.native.enums {
+            visit(&mut native.declaration.span)?;
+            walk_annotations(&mut native.declaration.annotations, visit)?;
+            for variant in &mut native.declaration.variants {
+                visit(&mut variant.span)?;
+                walk_annotations(&mut variant.annotations, visit)?;
             }
         }
         for declaration in &mut ast.native.types {
@@ -412,6 +514,7 @@ mod tests {
     }
     fn record() -> Record {
         Record {
+            opaque: false,
             annotations: vec![annotation()],
             type_params: vec![],
             name: "R".into(),
@@ -467,6 +570,7 @@ mod tests {
         let mut child = Ast::default();
         child.functions.push(function());
         ast.modules.push(ModuleDeclaration {
+            interface: false,
             boundary: Default::default(),
             annotations: vec![annotation()],
             name: "child".into(),

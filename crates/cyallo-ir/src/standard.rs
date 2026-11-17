@@ -34,8 +34,24 @@ mod tests {
         }
     }
 
-    fn check_native_function(function: &cyallo_ast::Function, path: &str) {
+    /// `std/mem/manual.ya` declares module `std::mem::manual`; `std.ya` is `std`.
+    fn module_path(file: &str) -> String {
+        file.trim_end_matches(".ya").replace('/', "::")
+    }
+    fn bound(item: &str) -> bool {
+        crate::bindings::NativeBindings::embedded().get(item).is_some()
+    }
+    fn check_native_function(function: &cyallo_ast::Function, path: &str, owner: Option<&str>) {
         check_annotations(&function.annotations, path);
+        // A provider binding stands in for the source annotation.
+        let item = match owner {
+            Some(owner) => format!("{}::{owner}::{}", module_path(path), function.name),
+            None => format!("{}::{}", module_path(path), function.name),
+        };
+        if bound(&item) {
+            assert!(function.annotations.is_empty(), "{path}: {item} is both annotated and bound");
+            return;
+        }
         assert_eq!(
             function.body_kind,
             cyallo_ast::FunctionBodyKind::Declaration,
@@ -65,15 +81,27 @@ mod tests {
             for record in &ast.records {
                 check_annotations(&record.annotations, source.path);
             }
+            // Every binding's key is a known private ABI key.
+            for (item, key) in crate::bindings::NativeBindings::embedded().iter() {
+                assert!(crate::internal::from_key(key).is_some(), "{item}: unknown key {key}");
+            }
             for trait_ in &ast.traits {
                 check_annotations(&trait_.annotations, source.path);
             }
             for function in &ast.functions {
-                check_native_function(function, source.path);
+                check_native_function(function, source.path, None);
             }
             for implementation in &ast.inherent_implementations {
+                // Same addressing as the linker: a nominal receiver by name, any other
+                // receiver (`[]T`, `rc T`) by its spelling.
+                let owner = match &implementation.receiver {
+                    cyallo_ast::Type::Named(name) | cyallo_ast::Type::Applied(name, _) => {
+                        name.to_string()
+                    }
+                    other => other.to_string(),
+                };
                 for function in &implementation.methods {
-                    check_native_function(&function.function, source.path);
+                    check_native_function(&function.function, source.path, Some(&owner));
                 }
             }
         }

@@ -1,0 +1,43 @@
+// SDKs and worlds: a contract (interface mod), its implementation (impl interface),
+// and the world that fixes what an extension may import and must export.
+
+mod fs_impl {
+    pub fn read_to_string(path: string) -> string { return path }
+}
+
+// 1. The SDK: contract items only. `opaque` types have no fields; whoever
+//    implements the interface chooses the representation.
+pub interface mod host_api {
+    pub opaque record Context;
+    pub opaque record Logger;
+    impl Context {
+        pub fn data_dir(self: &Self) -> string;
+    }
+    pub proc log(message: string);
+}
+
+// 2. The implementation binds each opaque type exactly once.
+mod host {
+    pub record ContextImpl { dir: string }
+    pub record LoggerImpl { level: i64 }
+}
+impl interface host_api for host {
+    type Context = crate::host::ContextImpl
+    type Logger = crate::host::LoggerImpl
+}
+
+// 3. Worlds: what a component may import (optionally only listed members, with
+//    their exact signatures) and what it must export. `include` composes worlds.
+pub world Base {
+    import fs_impl as files {
+        fn read_to_string(path: string) -> string;
+    }
+}
+pub world Extension {
+    include Base
+    import host_api
+    export proc activate(ctx: i64) -> i64;
+}
+
+let ctx = crate::host::ContextImpl { dir: "data" }
+std::io::print(ctx.dir)

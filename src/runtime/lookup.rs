@@ -107,11 +107,24 @@ impl Session {
     }
     fn lookup_fingerprint(&self, value: &Value, out: &mut Guard) -> RunResult<()> {
         match value {
-            Value::Generator(id) => out.push(Atom::Tag(48, *id as u64)),
-            Value::GeneratorStep(step) => {
-                out.push(Atom::Tag(49, u64::from(step.is_complete())));
-                self.lookup_fingerprint(step.value(), out)?;
+            Value::Enum(variant, payload) => {
+                out.push(Atom::Tag(50, variant.0.0 as u64));
+                out.push(Atom::Tag(51, u64::from(payload.is_some())));
+                if let Some(payload) = payload {
+                    self.lookup_fingerprint(payload, out)?;
+                }
             }
+            Value::NativeEnum(variant, payload) => {
+                out.push(Atom::Tag(50, variant.declaration.0.0 as u64));
+                out.push(Atom::Tag(51, u64::from(payload.is_some())));
+                if let Some(payload) = payload {
+                    self.lookup_fingerprint(payload, out)?;
+                }
+            }
+            Value::EnumStorage(..) | Value::NativeEnumStorage(..) => {
+                self.lookup_fingerprint(&self.snapshot(value), out)?
+            }
+            Value::Generator(id) => out.push(Atom::Tag(48, *id as u64)),
             Value::Layout { size, align } => {
                 out.push(Atom::Tag(44, *size as u64));
                 out.push(Atom::Tag(45, *align as u64));
@@ -134,15 +147,6 @@ impl Session {
                 out.push(Atom::Tag(39, self.heap[*owner].identity));
                 out.push(Atom::Tag(40, *offset as u64));
                 out.push(Atom::Tag(41, *length as u64));
-            }
-            Value::Result(result) => {
-                out.push(Atom::Tag(37, u64::from(result.is_ok())));
-                self.lookup_fingerprint(
-                    match result {
-                        Ok(v) | Err(v) => v,
-                    },
-                    out,
-                )?;
             }
             Value::ParseError(message) => {
                 out.push(Atom::Tag(38, 0));
@@ -199,12 +203,6 @@ impl Session {
                     self.lookup_fingerprint(v, out)?
                 }
             }
-            Value::Optional(v) => {
-                out.push(Atom::Tag(15, u64::from(v.is_some())));
-                if let Some(v) = v {
-                    self.lookup_fingerprint(v, out)?
-                }
-            }
             Value::Erased(t, v) => {
                 out.push(Atom::Type(t.clone()));
                 self.lookup_fingerprint(v, out)?
@@ -218,7 +216,6 @@ impl Session {
             }
             Value::Concurrent(_)
             | Value::TaskOutcome(_)
-            | Value::SendError(_)
             | Value::NativeCallable(_)
             | Value::TypeDescriptor(_)
             | Value::DeferredCallable(_)
@@ -227,7 +224,6 @@ impl Session {
             | Value::Dynamic(..)
             | Value::ViewError(_)
             | Value::LoadError(_)
-            | Value::ReceiveError(_)
             | Value::Address(_)
             | Value::Array(_)
             | Value::SparseArray(..)
@@ -263,7 +259,7 @@ impl Session {
     }
     fn apply_lookup(&mut self, receiver: Value, path: Option<&[usize]>) -> RunResult<Value> {
         let Some(path) = path else {
-            return Ok(Value::Optional(None));
+            return Ok(Value::option(None));
         };
         enum Cursor {
             Value(Value),
@@ -316,7 +312,7 @@ impl Session {
             }
             Cursor::Value(value) => value,
         };
-        Ok(Value::Optional(Some(Box::new(self.clone_value(value)?))))
+        Ok(Value::option(Some(Box::new(self.clone_value(value)?))))
     }
     pub(super) fn finish_lookup(&mut self, value: Value) -> RunResult<Value> {
         let pending = self.lookups.pending.pop().expect("mapper continuation");
@@ -463,7 +459,7 @@ impl Session {
                 Value::Uninitialized
             }
             Operation::GeneratorIsComplete | Operation::GeneratorIsYielded => {
-                let Value::GeneratorStep(step) = &values[0] else {
+                let Some(step) = values[0].as_step() else {
                     return Err(expected(ValueKind::GeneratorStep));
                 };
                 Value::Boolean(
@@ -471,7 +467,7 @@ impl Session {
                 )
             }
             Operation::GeneratorYielded | Operation::GeneratorCompleted => {
-                let Value::GeneratorStep(step) = values[0].clone() else {
+                let Some(step) = values[0].as_step() else {
                     return Err(expected(ValueKind::GeneratorStep));
                 };
                 match (step, operation) {
@@ -479,7 +475,7 @@ impl Session {
                     | (
                         cyallo_values::GeneratorStep::Complete(value),
                         Operation::GeneratorCompleted,
-                    ) => *value,
+                    ) => value.clone(),
                     _ => return Err(UnwrapError::StepVariant.into()),
                 }
             }
@@ -492,7 +488,7 @@ impl Session {
                     .map_err(|_| AllocatorError::InvalidSize)?;
                 let align = usize::try_from(integer(values[1].clone())?)
                     .map_err(|_| AllocatorError::InvalidAlignment)?;
-                Value::Result(
+                Value::result(
                     std::alloc::Layout::from_size_align(size, align)
                         .map(|_| Box::new(Value::Layout { size, align }))
                         .map_err(|_| Box::new(Value::AllocError("invalid layout".into()))),
@@ -515,7 +511,7 @@ impl Session {
                 let Value::Layout { size, align } = values[0] else {
                     return Err(expected(ValueKind::Layout));
                 };
-                Value::Result(
+                Value::result(
                     self.allocate_backing(size, align)
                         .map(|id| Box::new(Value::Allocation(id)))
                         .map_err(|error| Box::new(Value::AllocError(error.to_string().into()))),
@@ -534,7 +530,7 @@ impl Session {
                 };
                 Value::AllocError(message.clone())
             }
-            Operation::ResultNew(ok) => Value::Result(if ok {
+            Operation::ResultNew(ok) => Value::result(if ok {
                 Ok(Box::new(values[0].clone()))
             } else {
                 Err(Box::new(values[0].clone()))
@@ -545,13 +541,10 @@ impl Session {
                 fallible,
             } => {
                 let owner_ty = if fallible {
-                    let Type::Storage(cyallo_ast::StorageKind::Result, inner) = &ty else {
+                    let Some((value, _)) = cyallo_ir::lookup::result_payload(&ty) else {
                         return Err(AllocatorError::ResultNotAllocation.into());
                     };
-                    let Type::Tuple(types) = inner.as_ref() else {
-                        return Err(AllocatorError::ResultNotAllocation.into());
-                    };
-                    &types[0]
+                    value
                 } else {
                     &ty
                 };
@@ -613,25 +606,25 @@ impl Session {
             },
             Operation::Parse(kind) => {
                 let source = text(&values[0])?;
-                Value::Result(
+                Value::result(
                     cyallo_ast::Number::parse(kind, source)
                         .map(|number| Box::new(Value::from_number(number)))
                         .map_err(|message| Box::new(Value::ParseError(message.to_string().into()))),
                 )
             }
             Operation::IsOk | Operation::IsErr => {
-                let Value::Result(result) = &values[0] else {
+                let Some(result) = values[0].as_result() else {
                     return Err(expected(ValueKind::Result));
                 };
                 Value::Boolean(result.is_ok() != matches!(operation, Operation::IsErr))
             }
             Operation::UnwrapOk | Operation::UnwrapErr => {
-                let Value::Result(result) = &values[0] else {
+                let Some(result) = values[0].as_result() else {
                     return Err(expected(ValueKind::Result));
                 };
                 match (result, operation) {
                     (Ok(value), Operation::UnwrapOk) | (Err(value), Operation::UnwrapErr) => {
-                        *value.clone()
+                        value.clone()
                     }
                     (Err(error), _) => {
                         return Err(UnwrapError::Err(error.to_string().into()).into());
@@ -712,7 +705,7 @@ impl Session {
                 let Value::Address(id) = values[0] else {
                     return Err(expected(ValueKind::Address));
                 };
-                let Type::Storage(_, element) = self.heap[id].ty.clone() else {
+                let Some(element) = self.heap[id].ty.collection_element().cloned() else {
                     return Err(Invariant::InvalidCollectionType.into());
                 };
                 let roots = self.root_scope();
@@ -751,7 +744,7 @@ impl Session {
                     _ => return Err(Invariant::InvalidCollectionType.into()),
                 };
                 self.bump_cell_version(id)?;
-                Value::Optional(
+                Value::option(
                     child
                         .map(|id| self.take_cell(id).map(Box::new))
                         .transpose()?,
@@ -765,9 +758,9 @@ impl Session {
                     .ok_or(IdentitySpace::Symbol)?;
                 Value::Symbol(id)
             }
-            Operation::Some => Value::Optional(Some(Box::new(values[0].clone()))),
+            Operation::Some => Value::option(Some(Box::new(values[0].clone()))),
             Operation::Empty => Value::ArraySnapshot(Vec::new()),
-            Operation::None => Value::Optional(None),
+            Operation::None => Value::option(None),
             Operation::Erase => Value::Erased(
                 self.program.functions[function].registers[args[0]].clone(),
                 Box::new(values[0].clone()),
@@ -785,16 +778,16 @@ impl Session {
                 *v
             }
             Operation::IsSome | Operation::IsNone => {
-                let Value::Optional(v) = &values[0] else {
+                let Some(v) = values[0].as_option() else {
                     return Err(expected(ValueKind::Option));
                 };
                 Value::Boolean(v.is_some() != matches!(operation, Operation::IsNone))
             }
             Operation::Unwrap => {
-                let Value::Optional(v) = &values[0] else {
+                let Some(v) = values[0].as_option() else {
                     return Err(expected(ValueKind::Option));
                 };
-                *v.clone().ok_or_else(|| match values.get(1) {
+                v.cloned().ok_or_else(|| match values.get(1) {
                     Some(message) => UnwrapError::Expect(message.to_string().into()),
                     None => UnwrapError::NoneValue,
                 })?

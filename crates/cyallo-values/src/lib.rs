@@ -1,34 +1,7 @@
 //! Tagged values and relocatable Session cell indices. No NaN boxing.
 use cyallo_ast::Literal;
+pub use cyallo_concurrent_values::GeneratorStep;
 use std::collections::BTreeMap;
-#[derive(Debug, Clone, PartialEq)]
-pub enum GeneratorStep<T> {
-    Yielded(T),
-    Complete(T),
-}
-impl<T> GeneratorStep<T> {
-    pub fn value(&self) -> &T {
-        match self {
-            Self::Yielded(value) | Self::Complete(value) => value,
-        }
-    }
-    pub fn value_mut(&mut self) -> &mut T {
-        match self {
-            Self::Yielded(value) | Self::Complete(value) => value,
-        }
-    }
-    pub fn is_complete(&self) -> bool {
-        matches!(self, Self::Complete(_))
-    }
-}
-impl<T: std::fmt::Display> std::fmt::Display for GeneratorStep<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Yielded(value) => write!(f, "Yielded({value})"),
-            Self::Complete(value) => write!(f, "Complete({value})"),
-        }
-    }
-}
 /// A range of integers. `reversed` iterates from the end towards the start.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RangeValue {
@@ -39,6 +12,10 @@ pub struct RangeValue {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
+    NativeEnum(cyallo_ast::EnumVariant,Option<Box<Value>>),
+    NativeEnumStorage(cyallo_ast::EnumVariant, Option<usize>),
+    Enum(cyallo_ast::VariantId, Option<Box<Value>>),
+    EnumStorage(cyallo_ast::VariantId, Option<usize>),
     TypeDescriptor(cyallo_ast::ExportedType),
     DeferredCallable(Box<str>),
     Dynamic(cyallo_ast::Type, Box<Value>),
@@ -51,11 +28,8 @@ pub enum Value {
     NativeCallable(cyallo_ast::DeclarationId),
     Concurrent(cyallo_concurrent_values::Handle),
     TaskOutcome(cyallo_concurrent_values::TaskOutcome<Box<Value>>),
-    SendError(cyallo_concurrent_values::SendError<Box<Value>>),
     LoadError(std::sync::Arc<cyallo_modules::LoadError>),
-    ReceiveError(cyallo_concurrent_values::ReceiveError),
     Generator(usize),
-    GeneratorStep(GeneratorStep<Box<Value>>),
     Layout {
         size: usize,
         align: usize,
@@ -92,8 +66,6 @@ pub enum Value {
     Rc(usize),
     Weak(usize),
     Symbol(u64),
-    Optional(Option<Box<Value>>),
-    Result(Result<Box<Value>, Box<Value>>),
     ParseError(std::sync::Arc<str>),
     Erased(cyallo_ast::Type, Box<Value>),
     StoragePath(Box<Value>, Vec<usize>),
@@ -124,9 +96,153 @@ impl Value {
         }
     }
 }
+/// Constructors and views for the `core` `Option` and `Result` enums, whose variants
+/// have reserved ids.
+impl Value {
+    pub fn some(value: Value) -> Self {
+        Self::Enum(cyallo_ast::VariantId::OPTION_SOME, Some(Box::new(value)))
+    }
+    pub fn none() -> Self {
+        Self::Enum(cyallo_ast::VariantId::OPTION_NONE, None)
+    }
+    pub fn option(value: Option<Box<Value>>) -> Self {
+        match value {
+            Some(value) => Self::Enum(cyallo_ast::VariantId::OPTION_SOME, Some(value)),
+            None => Self::none(),
+        }
+    }
+    pub fn result(value: Result<Box<Value>, Box<Value>>) -> Self {
+        match value {
+            Ok(value) => Self::Enum(cyallo_ast::VariantId::RESULT_OK, Some(value)),
+            Err(error) => Self::Enum(cyallo_ast::VariantId::RESULT_ERR, Some(error)),
+        }
+    }
+    pub fn ok(value: Value) -> Self {
+        Self::result(Ok(Box::new(value)))
+    }
+    pub fn err(error: Value) -> Self {
+        Self::result(Err(Box::new(error)))
+    }
+    /// `Some(payload)` for `Option::Some`, `None` for `Option::None`; the outer
+    /// `None` means the value is not an option.
+    pub fn as_option(&self) -> Option<Option<&Value>> {
+        match self {
+            Self::Enum(variant, Some(value)) if *variant == cyallo_ast::VariantId::OPTION_SOME => {
+                Some(Some(value))
+            }
+            Self::Enum(variant, None) if *variant == cyallo_ast::VariantId::OPTION_NONE => {
+                Some(None)
+            }
+            _ => None,
+        }
+    }
+    pub fn as_result(&self) -> Option<Result<&Value, &Value>> {
+        match self {
+            Self::Enum(variant, Some(value)) if *variant == cyallo_ast::VariantId::RESULT_OK => {
+                Some(Ok(value))
+            }
+            Self::Enum(variant, Some(value)) if *variant == cyallo_ast::VariantId::RESULT_ERR => {
+                Some(Err(value))
+            }
+            _ => None,
+        }
+    }
+    pub fn step(step: GeneratorStep<Box<Value>>) -> Self {
+        match step {
+            GeneratorStep::Yielded(value) => {
+                Self::Enum(cyallo_ast::VariantId::STEP_YIELDED, Some(value))
+            }
+            GeneratorStep::Complete(value) => {
+                Self::Enum(cyallo_ast::VariantId::STEP_COMPLETE, Some(value))
+            }
+        }
+    }
+    pub fn as_step(&self) -> Option<GeneratorStep<&Value>> {
+        match self {
+            Self::Enum(variant, Some(value)) if *variant == cyallo_ast::VariantId::STEP_YIELDED => {
+                Some(GeneratorStep::Yielded(value))
+            }
+            Self::Enum(variant, Some(value)) if *variant == cyallo_ast::VariantId::STEP_COMPLETE => {
+                Some(GeneratorStep::Complete(value))
+            }
+            _ => None,
+        }
+    }
+    pub fn send_error(kind: cyallo_concurrent_values::SendFailure, value: Box<Value>) -> Self {
+        use cyallo_concurrent_values::SendFailure::*;
+        Self::Enum(
+            match kind {
+                Closed => cyallo_ast::VariantId::SEND_CLOSED,
+                Full => cyallo_ast::VariantId::SEND_FULL,
+                Limit => cyallo_ast::VariantId::SEND_LIMIT,
+            },
+            Some(value),
+        )
+    }
+    pub fn as_send_error(&self) -> Option<(cyallo_concurrent_values::SendFailure, &Value)> {
+        use cyallo_concurrent_values::SendFailure::*;
+        let Self::Enum(variant, Some(value)) = self else {
+            return None;
+        };
+        let kind = match *variant {
+            v if v == cyallo_ast::VariantId::SEND_CLOSED => Closed,
+            v if v == cyallo_ast::VariantId::SEND_FULL => Full,
+            v if v == cyallo_ast::VariantId::SEND_LIMIT => Limit,
+            _ => return None,
+        };
+        Some((kind, value))
+    }
+    pub fn into_option(self) -> Result<Option<Box<Value>>, Value> {
+        match self {
+            Self::Enum(variant, payload) if variant == cyallo_ast::VariantId::OPTION_SOME && payload.is_some() => Ok(payload),
+            Self::Enum(variant, None) if variant == cyallo_ast::VariantId::OPTION_NONE => Ok(None),
+            other => Err(other),
+        }
+    }
+    pub fn into_result(self) -> Result<Result<Box<Value>, Box<Value>>, Value> {
+        match self {
+            Self::Enum(variant, Some(value)) if variant == cyallo_ast::VariantId::RESULT_OK => Ok(Ok(value)),
+            Self::Enum(variant, Some(value)) if variant == cyallo_ast::VariantId::RESULT_ERR => Ok(Err(value)),
+            other => Err(other),
+        }
+    }
+}
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Enum(variant, Some(v)) if *variant == cyallo_ast::VariantId::OPTION_SOME => {
+                write!(f, "{v}")
+            }
+            Self::Enum(variant, None) if *variant == cyallo_ast::VariantId::OPTION_NONE => {
+                write!(f, "<none>")
+            }
+            Self::Enum(variant, Some(v)) if *variant == cyallo_ast::VariantId::RESULT_OK => {
+                write!(f, "Ok({v})")
+            }
+            Self::Enum(variant, Some(v)) if *variant == cyallo_ast::VariantId::RESULT_ERR => {
+                write!(f, "Err({v})")
+            }
+            Self::Enum(variant, Some(v)) if *variant == cyallo_ast::VariantId::STEP_YIELDED => {
+                write!(f, "Yielded({v})")
+            }
+            Self::Enum(variant, Some(v)) if *variant == cyallo_ast::VariantId::STEP_COMPLETE => {
+                write!(f, "Complete({v})")
+            }
+            Self::Enum(_, Some(v)) if self.as_send_error().is_some() => {
+                write!(f, "SendError({}, {v})", self.as_send_error().unwrap().0)
+            }
+            Self::Enum(variant, payload) => {
+                write!(f, "<variant {}", variant.0.0)?;
+                if let Some(payload) = payload {
+                    write!(f, ": {payload}")?;
+                }
+                f.write_str(">")
+            }
+            Self::NativeEnum(variant,payload)=>{write!(f,"<variant {}",variant.declaration.0.0)?;if let Some(payload)=payload{write!(f,": {payload}")?;}f.write_str(">")},
+            Self::NativeEnumStorage(variant, _) => {
+                write!(f, "<stored variant {}>", variant.declaration.0.0)
+            }
+            Self::EnumStorage(variant, _) => write!(f, "<stored variant {}>", variant.0.0),
             Self::NativeCallable(_) => f.write_str("<native callable>"),
             Self::Concurrent(handle) => write!(f, "{handle:?}"),
             Self::TypeDescriptor(descriptor) => write!(f, "type {}", descriptor.name),
@@ -145,11 +261,8 @@ impl std::fmt::Display for Value {
                 cyallo_concurrent_values::TaskOutcome::Cancelled => f.write_str("Cancelled"),
                 cyallo_concurrent_values::TaskOutcome::Stopped => f.write_str("Stopped"),
             },
-            Self::SendError(error) => write!(f, "SendError({}, {})", error.kind, error.value),
             Self::LoadError(error) => error.fmt(f),
-            Self::ReceiveError(error) => error.fmt(f),
             Self::Generator(id) => write!(f, "<generator {id}>"),
-            Self::GeneratorStep(step) => write!(f, "{step}"),
             Self::Layout { size, align } => write!(f, "Layout({size}, {align})"),
             Self::Allocation(id) => write!(f, "<allocation {id}>"),
             Self::AllocError(message) => write!(f, "{message}"),
@@ -180,10 +293,6 @@ impl std::fmt::Display for Value {
             Self::Rc(v) => write!(f, "<rc owner {v}>"),
             Self::Weak(v) => write!(f, "<weak owner {v}>"),
             Self::Symbol(v) => write!(f, "<symbol {v}>"),
-            Self::Optional(Some(v)) => write!(f, "{v}"),
-            Self::Optional(None) => write!(f, "<none>"),
-            Self::Result(Ok(value)) => write!(f, "Ok({value})"),
-            Self::Result(Err(error)) => write!(f, "Err({error})"),
             Self::ParseError(message) => write!(f, "{message}"),
             Self::Erased(_, v) => write!(f, "{v}"),
             Self::StoragePath(..) | Self::MissingStoragePath => write!(f, "<storage path>"),

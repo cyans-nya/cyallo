@@ -1,39 +1,24 @@
-#[cyallo_internal("context_struct")]
 pub record Context {}
-#[cyallo_internal("registration_struct")]
 pub record Registration {}
-#[cyallo_internal("service_key_struct")]
 pub record ServiceKey<T> {}
-#[cyallo_internal("service_ref_struct")]
 pub record ServiceRef<T> {}
 
 impl Context {
-    #[cyallo_internal("context_new")]
     pub proc new() -> Context;
-    #[cyallo_internal("context_extend")]
     pub proc extend(self: &Self) -> Context;
-    #[cyallo_internal("context_isolate")]
     pub proc isolate<T>(self: &Self, read key: ServiceKey<T>) -> Context;
-    #[cyallo_internal("context_service")]
     pub proc service<T>(self: &Self, read key: ServiceKey<T>) -> ServiceRef<T>;
-    #[cyallo_internal("context_provide")]
     pub proc provide<T>(self: &Self, read key: ServiceKey<T>, value: T) -> Registration;
-    #[cyallo_internal("context_available")]
     pub proc available<T>(self: &Self, read key: ServiceKey<T>) -> bool;
-    #[cyallo_internal("context_dispose")]
     pub proc dispose(self: &Self);
-    #[cyallo_internal("context_inject")]
     pub proc inject<T>(self: &Self, read key: ServiceKey<T>, callback: proc(Context));
-    #[cyallo_internal("context_on_dispose")]
     pub proc on_dispose(self: &Self, callback: proc());
 }
 
 impl<T> ServiceKey<T> {
-    #[cyallo_internal("service_key_new")]
     pub proc new(read label: string) -> ServiceKey<T>;
 }
 
 impl Registration {
-    #[cyallo_internal("registration_dispose")]
     pub proc dispose(self: &Self);
 }

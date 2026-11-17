@@ -1,0 +1,3 @@
+pub const BASE = 20
+pub record Reading { number: i64 }
+pub trait Readable { fn value(self) -> i64 }

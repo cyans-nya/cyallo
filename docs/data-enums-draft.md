@@ -1,11 +1,12 @@
 # Data enums and anonymous records — design draft
 
-Status: proposal, 2026-11-16. Nothing here is implemented. Cyallo has no enum
-declarations, no `match` and no anonymous record types today: `Option` and `Result`
-are intrinsic records, and statuses and failures such as `TaskOutcome`,
-`SendError`, `ViewError` and `LoadError` are opaque records queried through
-predicates (`is_failed()`, `is_full()`). Syntax is illustrative. Computing types at
-compile time and runtime builds on this draft; see
+Status: design target, updated 2026-11-17. User enums, anonymous records,
+matching and standard `Option`/`Result` execute on the `data-enums` branch; see the
+[implementation tracker](data-enums-implementation.md) and
+[work log](data-enums-work-log.md) for verified behavior. Other standard statuses
+and failures, including `TaskOutcome`, `SendError`, `ViewError` and `LoadError`,
+still use their existing opaque declarations and await migration. Computing types
+at compile time and runtime builds on this draft; see
 [types as values](types-as-values-draft.md).
 
 ## Problem

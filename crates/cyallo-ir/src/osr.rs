@@ -120,8 +120,10 @@ impl ResumeMetadata {
 }
 pub fn uses_defs(op: &Op) -> (Vec<Reg>, Option<Reg>) {
     match op {
+        Op::EnumConstruct(r, _, payload) => (payload.iter().copied().collect(), Some(*r)),
+        Op::EnumTest(r, value, _) | Op::EnumPayload(r, value, _, _, _) => (vec![*value], Some(*r)),
         Op::Yield(destination, value) => (vec![*value], Some(*destination)),
-        Op::Statement | Op::Nop | Op::Jump(_) => (vec![], None),
+        Op::Unreachable | Op::Statement | Op::Nop | Op::Jump(_) => (vec![], None),
         Op::Drop(a) => (vec![*a], None),
         Op::Literal(r, _)
         | Op::LiteralString(r, _)
@@ -198,7 +200,7 @@ fn live_inputs(function: &Function) -> Vec<LiveBlock> {
                     leaders.insert(pc + 1);
                 }
             }
-            Op::Return(_) if pc + 1 < n => {
+            Op::Return(_) | Op::Unreachable if pc + 1 < n => {
                 leaders.insert(pc + 1);
             }
             _ => {}
@@ -225,7 +227,7 @@ fn live_inputs(function: &Function) -> Vec<LiveBlock> {
             }
         };
         match function.code[last].op {
-            Op::Return(_) => {}
+            Op::Return(_) | Op::Unreachable => {}
             Op::Jump(target) => add(target),
             Op::Branch(_, yes, no) => {
                 add(yes);

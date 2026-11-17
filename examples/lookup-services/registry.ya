@@ -43,7 +43,8 @@ proc ensure_entry(ctx: gc Directory, key: string) -> gc Cell<gc Binding> {
         if keys[i] == key { return entries[i] }
         i += 1
     }
-    let binding = gc Cell::new(gc Binding { generation: 0, current: std::option::none<Any>() })
+    let empty: Option<Any> = Option::None
+    let binding = gc Cell::new(gc Binding { generation: 0, current: empty })
     entries.push(binding)
     ctx.entries.* = gc entries
     keys.push(key)
@@ -53,13 +54,14 @@ proc ensure_entry(ctx: gc Directory, key: string) -> gc Cell<gc Binding> {
 pub proc provide<T>(ctx: gc Directory, key: Key<T>, value: T) -> Lease {
     let binding = ensure_entry(ctx, std::mem::clone(&key.id))
     let generation = binding.*.*.generation + 1
-    binding.*.* = gc Binding { generation: generation, current: std::option::some(std::any::erase(value)) }
+    binding.*.* = gc Binding { generation: generation, current: Option::Some(std::any::erase(value)) }
     return Lease { binding: binding, generation: generation }
 }
 pub proc dispose(lease: &Lease) {
     let binding = lease.binding.*.*
     if binding.generation == lease.generation {
-        lease.binding.*.* = gc Binding { generation: binding.generation, current: std::option::none<Any>() }
+        let empty: Option<Any> = Option::None
+        lease.binding.*.* = gc Binding { generation: binding.generation, current: empty }
     }
 }
 pub proc available<T>(handle: &ServiceHandle<T>) -> bool {

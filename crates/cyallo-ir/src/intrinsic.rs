@@ -117,26 +117,6 @@ intrinsics! {
     ArraySum,
 }
 impl Intrinsic {
-    /// Ownership is part of each intrinsic declaration's parameter contract.
-    pub fn consumes_argument(self, _index: usize) -> bool {
-        matches!(
-            self,
-            Self::TaskSpawn
-                | Self::CellNew
-                | Self::Allocate
-                | Self::Deallocate
-                | Self::ResultOk
-                | Self::ResultErr
-                | Self::RcTryNewIn
-                | Self::VecLiteral
-                | Self::DequeLiteral
-                | Self::OptionSome
-                | Self::Erase
-                | Self::Checked
-                | Self::LookupPath
-                | Self::DropValue
-        )
-    }
     pub fn cast(kind: NumberKind) -> Self {
         use NumberKind::*;
         match kind {
@@ -205,7 +185,7 @@ pub fn resolve_at_call(
 ) -> Result<ResolvedCall, cyallo_ast::Diagnostic> {
     use cyallo_ast::{ExprKind, Literal, Operator, StorageKind, Type};
     if id == Intrinsic::FieldLocation
-        && type_args.is_empty()
+        && let [declared] = type_args
         && let [owner, Type::String] = types
     {
         let owner = match owner {
@@ -223,10 +203,11 @@ pub fn resolve_at_call(
                 .iter()
                 .enumerate()
                 .find(|(_, (name, _))| name.as_ref() == field)
+            && matches!(declared, Type::Opaque(_, applied, _) if matches!(applied.as_slice(), [element] if crate::declarations::equivalent_types(element, ty)))
         {
             return Ok(ResolvedCall {
                 intrinsic: id,
-                result: crate::lookup::storage(StorageKind::Location, ty.clone()),
+                result: declared.clone(),
                 lowering: Lowering::Storage(crate::lookup::Operation::Field(index)),
             });
         }
@@ -391,14 +372,7 @@ pub fn resolve(
     if type_args.is_empty()
         && id == Intrinsic::ArrayLength
         && let [Type::Reference { pointee, .. }] = arguments
-        && matches!(
-            pointee.as_ref(),
-            Type::Array(..)
-                | Type::Storage(
-                    cyallo_ast::StorageKind::Vec | cyallo_ast::StorageKind::VecDeque,
-                    _
-                )
-        )
+        && (matches!(pointee.as_ref(), Type::Array(..)) || pointee.collection_element().is_some())
     {
         return Ok(ResolvedCall {
             intrinsic: id,
@@ -441,6 +415,35 @@ pub fn resolve(
         }
         return Err(invalid());
     }
+    // A collection literal: the head names the declared collection type, an optional
+    // second type argument fixes the element type, otherwise the operands decide.
+    if matches!(id, Intrinsic::VecLiteral | Intrinsic::DequeLiteral) {
+        let (head, explicit) = match type_args {
+            [head] => (head, None),
+            [head, element] => (head, Some(element)),
+            _ => return Err(invalid()),
+        };
+        let element = explicit.or(arguments.first()).ok_or_else(invalid)?.clone();
+        return match head {
+            Type::Opaque(target, applied, traits)
+                if applied.is_empty()
+                    && traits.collection()
+                    && traits.double_ended() == (id == Intrinsic::DequeLiteral)
+                    && arguments
+                        .iter()
+                        .all(|argument| crate::memory::same_regions(argument, &element)) =>
+            {
+                Ok(ResolvedCall {
+                    intrinsic: id,
+                    result: Type::Opaque(target.clone(), vec![element], *traits),
+                    lowering: Lowering::Storage(crate::lookup::Operation::CollectionLiteral(
+                        id == Intrinsic::DequeLiteral,
+                    )),
+                })
+            }
+            _ => Err(invalid()),
+        };
+    }
     let storage = if type_args.is_empty() {
         crate::lookup::call(id, arguments)
     } else if let [ty] = type_args {
@@ -480,7 +483,7 @@ pub fn resolve_declared(
 ) -> Result<ResolvedCall, cyallo_ast::Diagnostic> {
     use crate::declarations::{DeclarationError, invalid_declaration};
     use crate::internal::InternalSemantic;
-    use cyallo_ast::{StorageKind as K, Type};
+    use cyallo_ast::Type;
     let id = Intrinsic::from_id(reference)
         .ok_or_else(|| invalid_declaration(DeclarationError::InvalidSignature, span))?;
     let Some(declaration) = reference.1 else {
@@ -495,22 +498,37 @@ pub fn resolve_declared(
             span,
         ));
     }
-    let inner = |kind| crate::lookup::inner(&contract.result, kind).cloned();
-    let result_arguments = || match &contract.result {
-        Type::Storage(K::Result, tuple) => match tuple.as_ref() {
-            Type::Tuple(types) => Some(types.clone()),
-            _ => None,
-        },
-        _ => None,
+    let result_arguments = || {
+        crate::lookup::result_payload(&contract.result)
+            .map(|(value, error)| vec![value.clone(), error.clone()])
     };
     let specialization = match id {
         Intrinsic::ResultOk | Intrinsic::ResultErr => result_arguments(),
         Intrinsic::ObjectView | Intrinsic::Parse => result_arguments()
             .and_then(|types| types.first().cloned())
             .map(|ty| vec![ty]),
-        Intrinsic::OptionNone => inner(K::Option).map(|ty| vec![ty]),
+        Intrinsic::OptionNone => crate::lookup::option_payload(&contract.result).map(|ty| vec![ty.clone()]),
         Intrinsic::Checked => Some(vec![contract.result.clone()]),
-        Intrinsic::MissingPath => inner(K::StoragePath).map(|ty| vec![ty]),
+        // A host constructor must declare an opaque host type as its result; any other
+        // declared result is an invalid signature for the operation.
+        Intrinsic::LayoutNew | Intrinsic::Allocate => Some(vec![contract.result.clone()]),
+        Intrinsic::VecFrom | Intrinsic::DequeFrom => match &contract.result {
+            Type::Opaque(..) => Some(vec![contract.result.clone()]),
+            _ => None,
+        },
+        Intrinsic::ClockNew | Intrinsic::TaskSpawn | Intrinsic::RcDowngrade => match &contract.result {
+            Type::Opaque(..) => Some(vec![contract.result.clone()]),
+            _ => None,
+        },
+        // Constructors of opaque host types take the declared type; the operation
+        // validates its shape.
+        Intrinsic::MissingPath
+        | Intrinsic::CellNew
+        | Intrinsic::LookupPath
+        | Intrinsic::FieldLocation => match &contract.result {
+            Type::Opaque(..) => Some(vec![contract.result.clone()]),
+            _ => None,
+        },
         Intrinsic::ArrayEmpty => match &contract.result {
             Type::Array(_, element) => Some(vec![*element.clone()]),
             _ => None,
@@ -520,11 +538,12 @@ pub fn resolve_declared(
             _ => None,
         },
         Intrinsic::ChannelBounded | Intrinsic::ChannelUnbounded => match &contract.result {
-            Type::Tuple(types) => types
-                .first()
-                .and_then(|ty| crate::lookup::inner(ty, K::Sender))
-                .cloned()
-                .map(|ty| vec![ty]),
+            Type::Tuple(types) => match types.first() {
+                Some(Type::Opaque(_, arguments, _)) if arguments.len() == 1 => {
+                    Some(vec![arguments[0].clone(), contract.result.clone()])
+                }
+                _ => None,
+            },
             _ => None,
         },
         _ => Some(vec![]),

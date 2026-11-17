@@ -63,6 +63,7 @@ pub(crate) fn specialize_calls(
             plan.core_base,
         )
         .map_err(E::CallCheck)?;
+        linked.source_files = plan.source_files.clone();
         let span = request.span;
         let name: Box<str> = format!("$dynamicCall{}", plan.next_factory).into();
         plan.next_factory += 1;
@@ -107,7 +108,7 @@ pub(crate) fn specialize_calls(
                 expression(ExprKind::Call(target.clone(), args), span)
             }
         };
-        linked.functions.push(function(
+        linked.entry_mut().source.functions.push(function(
             name.clone(),
             params.clone(),
             Type::Dynamic,
@@ -120,22 +121,28 @@ pub(crate) fn specialize_calls(
             }],
             span,
         ));
-        cyallo_ir::generics::specialize(&mut linked, plan.options).map_err(E::CallCheck)?;
+        {
+            let native = linked.native.clone();
+            linked.with_sources(|asts| {
+                cyallo_ir::generics::specialize_modules(asts, &native, plan.options)
+            })
+        }
+        .map_err(E::CallCheck)?;
         let mut env = TypeEnvironment::new(
-            cyallo_ir::composites::resolve(&mut linked).map_err(E::CallCheck)?,
+            {
+                let native = linked.native.clone();
+                linked
+                    .with_sources(|asts| cyallo_ir::composites::resolve_modules(asts, &native))
+                    .map_err(E::CallCheck)?
+            },
             linked.native.clone(),
         );
         env.extend(
             linked
-                .functions
-                .iter()
+                .functions()
                 .map(|f| (f.name.to_string(), cyallo_ir::composites::function_type(f))),
         );
-        let wrapper = linked
-            .functions
-            .iter_mut()
-            .find(|f| f.name == name)
-            .unwrap();
+        let wrapper = linked.functions_mut().find(|f| f.name == name).unwrap();
         let StmtKind::Return(erased) = &wrapper.body[0].kind else {
             unreachable!()
         };
@@ -212,8 +219,14 @@ pub(crate) fn specialize_calls(
                 span,
             }]
         };
-        let compiled = compiler::compile_ast(&plan.archive, linked, plan.options, true)
-            .map_err(E::CallCheck)?;
+        let compiled = compiler::compile_resolved_with_cache(
+            &plan.archive,
+            linked,
+            plan.options,
+            true,
+            program.module_cache.clone(),
+        )
+        .map_err(E::CallCheck)?;
         let (mut extension, initializer, function) =
             publication::publish(&program, compiled, &name).map_err(compile_error)?;
         let adapter = Adapter {

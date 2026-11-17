@@ -566,6 +566,7 @@ pub enum ValueKind {
 pub enum Invariant {
     Expected(ValueKind),
     UnknownRecordLayout,
+    EnumShapeMismatch,
     UnknownRecordField,
     UnknownFunction,
     UnsupportedIntrinsic(cyallo_ir::intrinsic::Intrinsic),
@@ -588,6 +589,9 @@ impl fmt::Display for Invariant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Expected(kind) => write!(f, "expected a {kind:?} value"),
+            Self::EnumShapeMismatch => {
+                f.write_str("enum variant or payload does not match its checked layout")
+            }
             Self::UnknownRecordLayout => f.write_str("unknown record layout"),
             Self::UnknownRecordField => f.write_str("unknown record field"),
             Self::UnknownFunction => f.write_str("unknown function"),

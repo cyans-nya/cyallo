@@ -20,7 +20,7 @@ This tracker records verified language behavior. The runtime contract lives in
 - Explicit clock capabilities and millisecond sleeps from ordinary procedures.
   Source procedures require no `async`/`await` coloring.
 - Independent worker Sessions with detached owned payload transport. Primitive,
-  array, record, option/result, and supported capability values cross Sessions
+  array, record, enum, option/result, and supported capability values cross Sessions
   without transmitting heap cell indices. Logical endpoint ownership is distinct
   from cloned internal Value storage.
 - Local managed objects and borrows are rejected as channel elements, task
@@ -47,7 +47,9 @@ This tracker records verified language behavior. The runtime contract lives in
   TLS, global runtime service, or process-wide identity counter.
 - Runtime `.ya` loads through `std::module::load(path)` suspend through the
   bounded host pool, inherit scoped standard-module permissions, and publish
-  append-only code at a VM safe point. Readonly namespaces use general object
+  append-only code at a VM safe point. Checked module products retain their own
+  routines and initializers through linking and publication; see
+  [module compilation](modules.md). Readonly namespaces use general object
   properties/calls and retain identity through optional structural views.
   Imported procedures use the caller's local heap. Independent one-P coroutine
   loads and suspended generators are covered in `tests/dynamic_import.rs`;

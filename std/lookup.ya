@@ -2,39 +2,25 @@ use std::num::Integer;
 use std::option::Option;
 use std::gc::GcView;
 
-#[cyallo_internal("storage_path_struct")]
 pub record StoragePath<T> {}
-#[cyallo_internal("location_struct")]
 pub record Location<T> {}
 
-#[cyallo_internal("field_type")]
 pub record Field<Owner, Key> {}
-#[cyallo_internal("element_type")]
 pub record Element<Collection> {}
-#[cyallo_internal("target_type")]
 pub record Target<Owner> {}
 
-#[cyallo_internal("field_location")]
 pub fn field<O: GcView>(read owner: O, read field: string) -> Location<Field<owner, field>>;
-#[cyallo_internal("lookup_path")]
 pub fn path<T>(value: T) -> StoragePath<T>;
-#[cyallo_internal("lookup_missing")]
 pub fn missing<T>() -> StoragePath<T>;
-#[cyallo_internal("lookup_mapped")]
 pub proc mapped<R, K, T>(read receiver: R, read key: K, read mapper: proc(R, K) -> StoragePath<T>) -> Option<T>;
 
 impl<T> StoragePath<T> {
-    #[cyallo_internal("storage_path_field")]
     pub fn field(self, read field: string) -> StoragePath<Field<T, field>>;
-    #[cyallo_internal("storage_path_element")]
     pub fn element<I: Integer>(self, index: I) -> StoragePath<Element<T>>;
-    #[cyallo_internal("storage_path_target")]
     pub fn target(self) -> StoragePath<Target<T>>;
 }
 
 impl<T> Location<T> {
-    #[cyallo_internal("location_load")]
     pub proc load(self: &Self) -> T;
-    #[cyallo_internal("location_store")]
     pub proc store(self: &Self, value: T);
 }

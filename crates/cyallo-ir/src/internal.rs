@@ -10,6 +10,9 @@ use cyallo_ast::StorageKind;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NativeType {
     Storage(StorageKind),
+    /// An opaque host type; its declaration supplies identity and arity, the
+    /// provider's key supplies its traits (`opaque:transfer,effectful,clone`).
+    Opaque(cyallo_ast::OpaqueTraits),
     Any,
     Symbol,
     Context,
@@ -66,8 +69,16 @@ impl std::fmt::Display for NativeTypeFamily {
 
 /// Member identities are independent of the source member's name and owner path.
 /// The resolved declaration supplies receiver mode, parameters and result type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MemberIntrinsic {
+macro_rules! members {
+    ($($variant:ident),* $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum MemberIntrinsic { $($variant),* }
+        impl MemberIntrinsic {
+            pub const ALL: &'static [Self] = &[$(Self::$variant),*];
+        }
+    };
+}
+members! {
     GeneratorStart,
     GeneratorResume,
     GeneratorNext,
@@ -148,6 +159,7 @@ pub enum MemberIntrinsic {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InternalSemantic {
     Type(NativeType),
+    Variant(cyallo_ast::EnumEncoding),
     Trait(NativeTrait),
     TypeFamily(NativeTypeFamily),
     Function(Intrinsic),
@@ -156,10 +168,43 @@ pub enum InternalSemantic {
     AllocatorTrait,
 }
 
+/// `opaque` or `opaque:flag,flag`: a host type with no engine-known identity. Flags:
+/// `copy`, `transfer`, `effectful`, `clone`, `resource`, `indirect`, `generator`, `weak`, `deref`, `target`, `path`, `layout`, `allocation`, `collection`, `double_ended`.
+fn opaque_key(key: &str) -> Option<cyallo_ast::OpaqueTraits> {
+    let flags = match key {
+        "opaque" => "",
+        _ => key.strip_prefix("opaque:")?,
+    };
+    let mut traits = cyallo_ast::OpaqueTraits::default();
+    for flag in flags.split(',').filter(|f| !f.is_empty()) {
+        match flag {
+            "copy" => traits = traits.with_copyable(true),
+            "transfer" => traits = traits.with_transferable(true),
+            "effectful" => traits = traits.with_effectful(true),
+            "clone" => traits = traits.with_cloneable(true),
+            "resource" => traits = traits.with_resource(true),
+            "indirect" => traits = traits.with_indirect(true),
+            "generator" => traits = traits.with_generator(true),
+            "weak" => traits = traits.with_weak(true),
+            "deref" => traits = traits.with_deref(true),
+            "target" => traits = traits.with_target(true),
+            "path" => traits = traits.with_path(true),
+            "layout" => traits = traits.with_layout(true),
+            "allocation" => traits = traits.with_allocation(true),
+            "collection" => traits = traits.with_collection(true),
+            "double_ended" => traits = traits.with_double_ended(true),
+            _ => return None,
+        }
+    }
+    Some(traits)
+}
 macro_rules! abi_keys {
     ($($key:literal => $semantic:expr),* $(,)?) => {
         /// Accepts a private ABI key; retains no caller storage.
         pub fn from_key(key: &str) -> Option<InternalSemantic> {
+            if let Some(traits) = opaque_key(key) {
+                return Some(Type(N::Opaque(traits)));
+            }
             match key {
                 $($key => Some($semantic),)*
                 _ => None,
@@ -223,29 +268,24 @@ abi_keys! {
     "registration_struct" => Type(N::Registration),
     "service_key_struct" => Type(N::ServiceKey),
     "service_ref_struct" => Type(N::ServiceRef),
-    "cell_struct" => Type(N::Storage(S::Cell)),
-    "location_struct" => Type(N::Storage(S::Location)),
-    "storage_path_struct" => Type(N::Storage(S::StoragePath)),
+    "step_yielded_variant" => InternalSemantic::Variant(cyallo_ast::EnumEncoding::StepYielded),
+    "step_complete_variant" => InternalSemantic::Variant(cyallo_ast::EnumEncoding::StepComplete),
+    "send_closed_variant" => InternalSemantic::Variant(cyallo_ast::EnumEncoding::SendClosed),
+    "send_full_variant" => InternalSemantic::Variant(cyallo_ast::EnumEncoding::SendFull),
+    "send_limit_variant" => InternalSemantic::Variant(cyallo_ast::EnumEncoding::SendLimit),
+    "receive_closed_variant" => InternalSemantic::Variant(cyallo_ast::EnumEncoding::ReceiveClosed),
+    "receive_empty_variant" => InternalSemantic::Variant(cyallo_ast::EnumEncoding::ReceiveEmpty),
+    "option_some_variant" => InternalSemantic::Variant(cyallo_ast::EnumEncoding::OptionSome),
+    "option_none_variant" => InternalSemantic::Variant(cyallo_ast::EnumEncoding::OptionNone),
+    "result_ok_variant" => InternalSemantic::Variant(cyallo_ast::EnumEncoding::ResultOk),
+    "result_err_variant" => InternalSemantic::Variant(cyallo_ast::EnumEncoding::ResultErr),
     "option_struct" => Type(N::Storage(S::Option)),
     "result_struct" => Type(N::Storage(S::Result)),
-    "vec_struct" => Type(N::Storage(S::Vec)),
-    "vec_deque_struct" => Type(N::Storage(S::VecDeque)),
     "range_struct" => Type(N::Storage(S::Range)),
     "parse_error_struct" => Type(N::Storage(S::ParseError)),
-    "weak_struct" => Type(N::Storage(S::Weak)),
-    "arena_cell_struct" => Type(N::Storage(S::ArenaCell)),
-    "layout_struct" => Type(N::Storage(S::Layout)),
-    "allocation_struct" => Type(N::Storage(S::Allocation)),
     "alloc_error_struct" => Type(N::Storage(S::AllocError)),
-    "generator_struct" => Type(N::Storage(S::Generator)),
     "generator_step_struct" => Type(N::Storage(S::GeneratorStep)),
-    "sender_struct" => Type(N::Storage(S::Sender)),
-    "receiver_struct" => Type(N::Storage(S::Receiver)),
     "send_error_struct" => Type(N::Storage(S::SendError)),
-    "receive_error_struct" => Type(N::Storage(S::ReceiveError)),
-    "clock_struct" => Type(N::Storage(S::Clock)),
-    "task_struct" => Type(N::Storage(S::Task)),
-    "task_outcome_struct" => Type(N::Storage(S::TaskOutcome)),
     "channel_bounded" => Function(Intrinsic::ChannelBounded),
     "channel_unbounded" => Function(Intrinsic::ChannelUnbounded),
     "clock_new" => Function(Intrinsic::ClockNew),

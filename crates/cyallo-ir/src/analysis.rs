@@ -1,3 +1,4 @@
+mod patterns;
 use crate::intrinsic::{Intrinsic, Lowering};
 use crate::ir::{self, Op, Reg, Slot};
 use cyallo_ast::IdentifierEq as _;
@@ -26,6 +27,7 @@ fn temporary(expression: &Expr) -> bool {
     }
 }
 struct Lower<'a> {
+    guard_aliases: HashMap<String, (Reg, Type)>,
     function: ir::Function,
     globals: &'a [ir::Local],
     signatures: &'a HashMap<String, Signature>,
@@ -206,6 +208,7 @@ pub fn analyze(
     }
     let mut functions = vec![];
     let mut main = Lower {
+        guard_aliases: HashMap::new(),
         function: ir::Function {
             generator: None,
             symbol: "<main>".into(),
@@ -330,7 +333,7 @@ fn lower_routine(
     routine_types: &crate::declarations::TypeEnvironment,
     options: CompileOptions,
     services: &std::sync::Arc<crate::services::Metadata>,
-    source_names: &HashMap<Box<str>, Box<str>>,
+    source_names: &std::collections::BTreeMap<Box<str>, Box<str>>,
 ) -> Result<ir::Function> {
     if f.generator && crate::generator::parts(&f.result).is_none() {
         return Err(cyallo_ast::diagnostic::generator_factory_signature_required(f.span));
@@ -359,6 +362,7 @@ fn lower_routine(
         Default::default()
     };
     let mut lower = Lower {
+        guard_aliases: HashMap::new(),
         function: ir::Function {
             generator: f.generator.then(|| crate::generator::factory_type(f)),
             symbol: f.name.clone(),
@@ -408,7 +412,7 @@ fn lower_routine(
 }
 #[derive(Debug)]
 struct DeferredContext {
-    source_names: HashMap<Box<str>, Box<str>>,
+    source_names: std::collections::BTreeMap<Box<str>, Box<str>>,
     services: std::sync::Arc<crate::services::Metadata>,
     globals: Vec<ir::Local>,
     signatures: HashMap<String, Signature>,
@@ -608,9 +612,18 @@ fn conservative_calls(function: &mut ir::Function) {
         }
     }
 }
-fn returns(body: &[Stmt]) -> bool {
+pub(crate) fn returns(body: &[Stmt]) -> bool {
     body.iter().any(|s| match &s.kind {
         StmtKind::Return(_) => true,
+        StmtKind::Evaluate(Expr {
+            kind: ExprKind::Match(_, arms),
+            ..
+        }) => {
+            !arms.is_empty()
+                && arms
+                    .iter()
+                    .all(|arm| matches!(&arm.body,MatchBody::Block(body,None) if returns(body)))
+        }
         StmtKind::If(_, a, b) => returns(a) && returns(b),
         StmtKind::Case(_, arms, b) => {
             !arms.is_empty() && arms.iter().all(|(_, b)| returns(b)) && returns(b)
@@ -711,6 +724,12 @@ pub fn collect(body: &[Stmt], params: &[Param]) -> Result<Vec<ir::Local>> {
                 });
             }
             match &s.kind {
+                StmtKind::IfLet(..) => {
+                    return Err(crate::patterns::invalid_pattern(
+                        crate::patterns::PatternError::UnresolvedPattern,
+                        s.span,
+                    ));
+                }
                 StmtKind::If(_, a, b) => {
                     walk(a, locals, seen)?;
                     walk(b, locals, seen)?;
@@ -731,6 +750,21 @@ pub fn collect(body: &[Stmt], params: &[Param]) -> Result<Vec<ir::Local>> {
         Ok(())
     }
     walk(body, &mut locals, &mut seen)?;
+    let mut copy = body.to_vec();
+    cyallo_ast::visit::visit_block(
+        &mut copy,
+        &mut |expr| {
+            if let ExprKind::Match(_, arms) = &expr.kind {
+                for arm in arms {
+                    if let MatchBody::Block(body, _) = &arm.body {
+                        walk(body, &mut locals, &mut seen)?;
+                    }
+                }
+            }
+            Ok(())
+        },
+        &mut |_, _| Ok(()),
+    )?;
     Ok(locals)
 }
 fn numeric(t: &Type) -> bool {
@@ -793,10 +827,10 @@ pub fn intrinsic_arguments(
     }
     let expected = if id == Intrinsic::LayoutNew {
         Some(Type::numeric(NumberKind::Usize))
-    } else if matches!(
-        id,
-        Intrinsic::VecLiteral | Intrinsic::DequeLiteral | Intrinsic::CellNew
-    ) {
+    } else if matches!(id, Intrinsic::VecLiteral | Intrinsic::DequeLiteral) {
+        // The first type argument is the collection head, the second the element.
+        type_args.get(1).cloned()
+    } else if id == Intrinsic::CellNew {
         type_args.first().cloned()
     } else if matches!(
         id,
@@ -919,8 +953,9 @@ pub fn contextualize(expression: &Expr, wanted: &Type) -> Result<Expr> {
             *value = contextualize(value, element)?;
         }
     }
-    if let Type::Storage(kind, element) = wanted
-        && matches!(*kind, StorageKind::Vec | StorageKind::VecDeque)
+    if let Type::Opaque(target, applied, traits) = wanted
+        && traits.collection()
+        && let [element] = applied.as_slice()
         && let ExprKind::IntrinsicCall(id, types, values) = &mut e.kind
         && matches!(
             Intrinsic::from_id(*id),
@@ -930,7 +965,7 @@ pub fn contextualize(expression: &Expr, wanted: &Type) -> Result<Expr> {
         for value in values.iter_mut() {
             *value = contextualize(value, element)?;
         }
-        *types = vec![*element.clone()];
+        *types = vec![Type::Opaque(target.clone(), vec![], *traits), element.clone()];
     }
     Ok(e)
 }
@@ -950,6 +985,11 @@ fn assignable(e: &Expr) -> bool {
 /// fixed arrays built from them. Identity-bearing values are excluded.
 fn comparable(ty: &Type) -> bool {
     match ty {
+        Type::Enum(contract) => contract
+            .variants
+            .iter()
+            .filter_map(|v| v.payload.as_ref())
+            .all(comparable),
         Type::Integer
         | Type::Real
         | Type::Numeric(_)
@@ -958,7 +998,9 @@ fn comparable(ty: &Type) -> bool {
         | Type::String
         | Type::Symbol => true,
         Type::Tuple(items) => items.iter().all(comparable),
-        Type::Record(_, fields) => fields.iter().all(|(_, ty)| comparable(ty)),
+        Type::Record(_, fields) | Type::AnonymousRecord(fields) => {
+            fields.iter().all(|(_, ty)| comparable(ty))
+        }
         Type::Array(_, element) => comparable(element),
         _ => false,
     }
@@ -1239,7 +1281,7 @@ impl Lower<'_> {
             | ExprKind::Index(a, _) => self.concrete_addressable(a, known),
             ExprKind::ExtensionField(a, n, _) => {
                 self.concrete_addressable(a, known)
-                    && matches!(crate::inference::expression_type(a,known,self.types),Ok(Type::Record(_,fs)) if fs.iter().any(|(f,_)|f.eq_identifier(n)))
+                    && matches!(crate::inference::expression_type(a,known,self.types),Ok(Type::Record(_,fs) | Type::AnonymousRecord(fs)) if fs.iter().any(|(f,_)|f.eq_identifier(n)))
             }
             _ => false,
         }
@@ -1251,6 +1293,30 @@ impl Lower<'_> {
         rs: Vec<Reg>,
         span: Span,
     ) -> Result<(Reg, Type)> {
+        let encoding = match op {
+            crate::lookup::Operation::Some => Some(EnumEncoding::OptionSome),
+            crate::lookup::Operation::None => Some(EnumEncoding::OptionNone),
+            crate::lookup::Operation::ResultNew(true) => Some(EnumEncoding::ResultOk),
+            crate::lookup::Operation::ResultNew(false) => Some(EnumEncoding::ResultErr),
+            _ => None,
+        };
+        if let Some(encoding) = encoding
+            && let Some(contract) = crate::enums::contract(&ty, &self.types.native)
+        {
+            let variant = contract
+                .variants
+                .iter()
+                .find(|v| v.encoding == encoding)
+                .expect("validated native enum variant");
+            let r = self.reg(ty.clone());
+            self.span = span;
+            self.emit(Op::EnumConstruct(
+                r,
+                variant.operation(),
+                rs.first().copied(),
+            ));
+            return Ok((r, ty));
+        }
         if rs
             .iter()
             .any(|r| crate::composites::borrowed(&self.function.registers[*r]))
@@ -1269,7 +1335,7 @@ impl Lower<'_> {
     fn field_type(&self, t: &Type, field: &ExprKind, span: Span) -> Result<(usize, Type)> {
         let t = crate::composites::type_view(t, self.types);
         match (&t, field) {
-            (Type::Record(_, fs), ExprKind::Field(_, n)) => fs
+            (Type::Record(_, fs) | Type::AnonymousRecord(fs), ExprKind::Field(_, n)) => fs
                 .iter()
                 .enumerate()
                 .find(|(_, (name, _))| name.eq_identifier(n))
@@ -1468,7 +1534,7 @@ impl Lower<'_> {
                 .map(|l| (key(&l.name), l.ty.clone()))
                 .collect();
             let receiver_ty = crate::inference::expression_type(base, &known, self.types)?;
-            let actual_field = matches!(&receiver_ty,Type::Record(_,fs) if fs.iter().any(|(n,_)|n.eq_identifier(name)));
+            let actual_field = matches!(&receiver_ty,Type::Record(_,fs) | Type::AnonymousRecord(fs) if fs.iter().any(|(n,_)|n.eq_identifier(name)));
             if !actual_field
                 && let Some((implementation, method)) = self
                     .services
@@ -1941,7 +2007,9 @@ impl Lower<'_> {
             .collect();
         Ok(
             match crate::inference::expression_type(base, &known, self.types)? {
-                Type::Storage(StorageKind::Cell, inner) => Some((base, *inner)),
+                Type::Opaque(_, mut arguments, traits) if traits.deref() && arguments.len() == 1 => {
+                    Some((base, arguments.remove(0)))
+                }
                 _ => None,
             },
         )
@@ -1999,7 +2067,7 @@ impl Lower<'_> {
                         .chain(self.function.locals.iter())
                         .map(|l| (key(&l.name), l.ty.clone()))
                         .collect();
-                    if let Type::Record(_, fields) =
+                    if let Type::Record(_, fields) | Type::AnonymousRecord(fields) =
                         crate::inference::expression_type(base, &known, self.types)?
                         && fields.iter().any(|(n, _)| n.eq_identifier(name))
                     {
@@ -2028,6 +2096,9 @@ impl Lower<'_> {
                 }
                 ExprKind::Parenthesized(inner) => self.address(inner, write),
                 ExprKind::Name(n) => {
+                    if let Some((address, ty)) = self.guard_aliases.get(n.as_ref()) {
+                        return Ok((*address, ty.clone()));
+                    }
                     let (s, l) = self.lookup(n)?;
                     if write && l.constant {
                         return Err(Diagnostic::new("E107", "cannot modify a constant", e.span));
@@ -2065,10 +2136,9 @@ impl Lower<'_> {
                     let (dimensions, element) = match t {
                         Type::Array(bounds, element) => (bounds.len(), element),
                         Type::SparseArray(element) | Type::Slice(element) => (1, element),
-                        Type::Storage(
-                            cyallo_ast::StorageKind::Vec | cyallo_ast::StorageKind::VecDeque,
-                            element,
-                        ) => (1, element),
+                        collection if collection.collection_element().is_some() => {
+                            (1, Box::new(collection.collection_element().unwrap().clone()))
+                        }
                         _ => {
                             return Err(Diagnostic::new(
                                 "E108",
@@ -2108,6 +2178,7 @@ impl Lower<'_> {
                             | ExprKind::Frozen(..)
                             | ExprKind::ArrayLiteral(_)
                             | ExprKind::Record(..)
+                            | ExprKind::AnonymousRecord(_)
                             | ExprKind::Tuple(_)
                     ) =>
                 {
@@ -2140,6 +2211,9 @@ impl Lower<'_> {
         })
     }
     fn require(&self, want: &Type, got: &Type, span: Span) -> Result<()> {
+        if *got == Type::Never {
+            return Ok(());
+        }
         if crate::memory::same_regions(want, got)
             || matches!((want,got),(Type::Function(RoutineKind::Procedure,wp,wr),Type::Function(RoutineKind::Function,gp,gr)) if wp.len()==gp.len() && wp.iter().zip(gp).all(|((w,wb),(g,gb))|wb==gb && crate::declarations::equivalent_types(w,g)) && crate::declarations::equivalent_types(wr,gr))
             || matches!((want,got),(Type::Reference{mutable:w,pointee:a,..},Type::Reference{mutable:g,pointee:b,..}) if (!w || *g) && (crate::memory::same_regions(a,b) || matches!(b.as_ref(),Type::Borrowed(inner) if inner==a)))
@@ -2165,6 +2239,24 @@ impl Lower<'_> {
         }
     }
     fn expr_expected(&mut self, expression: &Expr, expected: &Type) -> Result<(Reg, Type)> {
+        if let ExprKind::VariantPayload(fields) = &expression.kind {
+            let kind = match expected {
+                Type::Record(name, _) => ExprKind::Record(name.clone(), fields.clone()),
+                Type::AnonymousRecord(_) => ExprKind::AnonymousRecord(fields.clone()),
+                _ => {
+                    return Err(crate::patterns::invalid_pattern(
+                        crate::patterns::PatternError::ExpectedRecord {
+                            actual: expected.clone(),
+                        },
+                        expression.span,
+                    ));
+                }
+            };
+            return self.expr(&Expr {
+                kind,
+                span: expression.span,
+            });
+        }
         let actual = self.expression_type(expression).ok();
         if *expected == Type::Dynamic && actual.as_ref() == Some(&Type::Dynamic) {
             return self.expr(expression);
@@ -2209,7 +2301,8 @@ impl Lower<'_> {
                 ..
             } = &actual
                 && (!*mutable || *writable)
-                && matches!(pointee.as_ref(), Type::Array(_, t) | Type::Storage(StorageKind::Vec, t) if t == element)
+                && (matches!(pointee.as_ref(), Type::Array(_, t) if t == element)
+                    || (!pointee.is_double_ended() && pointee.collection_element() == Some(element)))
             {
                 return self.lookup_op(
                     crate::lookup::Operation::Slice(*mutable),
@@ -2249,6 +2342,7 @@ impl Lower<'_> {
                     span,
                 )
             })?;
+        let trait_id = implementation.trait_id;
         let allocate = implementation.methods[0];
         let deallocate = implementation.methods[1];
         let index = self.function.locals.len();
@@ -2280,16 +2374,16 @@ impl Lower<'_> {
         } else {
             self.emit(Op::Move(receiver, address));
         }
+        // The layout and result types are the allocator trait's declared ones.
+        let declared = &self.services.traits[trait_id].methods[0];
+        let (layout_type, allocated_type) = (declared.params[0].0.clone(), declared.result.clone());
         let (layout, _) = self.lookup_op(
             crate::lookup::Operation::LayoutForRc,
-            crate::memory::layout(),
+            layout_type,
             vec![],
             span,
         )?;
-        let allocated = self.reg(crate::lookup::result_type(
-            crate::memory::allocation(),
-            crate::memory::error(),
-        ));
+        let allocated = self.reg(allocated_type);
         self.emit(Op::Call(Some(allocated), allocate, vec![receiver, layout]));
         let state = self.reg(allocator_ty.clone());
         self.emit(Op::Take(state, address));
@@ -2388,6 +2482,81 @@ impl Lower<'_> {
         cyallo_ast::with_stack(|| {
             self.span = e.span;
             match &e.kind {
+                ExprKind::EnumConstruct(variant, ty, payload) => {
+                    let Some(contract) = crate::enums::contract(ty, &self.types.native) else {
+                        return Err(crate::enums::invalid_enum(
+                            crate::enums::EnumError::UnresolvedDeclaration {
+                                name: ty.to_string().into(),
+                            },
+                            e.span,
+                        ));
+                    };
+                    let declared = contract
+                        .variants
+                        .iter()
+                        .find(|v| v.declaration == *variant)
+                        .ok_or_else(|| {
+                            crate::enums::invalid_enum(
+                                crate::enums::EnumError::WrongVariant {
+                                    name: format!("{:?}", variant).into(),
+                                    enumeration: contract.name.clone(),
+                                },
+                                e.span,
+                            )
+                        })?;
+                    let payload = match (&declared.payload, payload) {
+                        (Some(expected), Some(payload)) => {
+                            let (reg, actual) = self.expr_expected(payload, expected)?;
+                            self.require(expected, &actual, e.span)?;
+                            Some(reg)
+                        }
+                        (None, None) => None,
+                        (Some(_), None) => {
+                            return Err(crate::enums::invalid_enum(
+                                crate::enums::EnumError::MissingPayload {
+                                    name: declared.name.clone(),
+                                },
+                                e.span,
+                            ));
+                        }
+                        (None, Some(_)) => {
+                            return Err(crate::enums::invalid_enum(
+                                crate::enums::EnumError::UnexpectedPayload {
+                                    name: declared.name.clone(),
+                                },
+                                e.span,
+                            ));
+                        }
+                    };
+                    let reg = self.reg(ty.clone());
+                    self.emit(Op::EnumConstruct(reg, declared.operation(), payload));
+                    Ok((reg, ty.clone()))
+                }
+                ExprKind::VariantPayload(_) => Err(crate::patterns::invalid_pattern(
+                    crate::patterns::PatternError::UnresolvedPattern,
+                    e.span,
+                )),
+                ExprKind::AnonymousRecord(fields) => {
+                    let mut values = Vec::with_capacity(fields.len());
+                    for (name, value) in fields {
+                        let (reg, ty) = self.expr(value)?;
+                        values.push((name.clone(), reg, ty));
+                    }
+                    values.sort_by(|(a, ..), (b, ..)| a.cmp(b));
+                    let ty = Type::AnonymousRecord(
+                        values
+                            .iter()
+                            .map(|(name, _, ty)| (name.clone(), ty.clone()))
+                            .collect(),
+                    );
+                    let reg = self.reg(ty.clone());
+                    self.emit(Op::Aggregate(
+                        reg,
+                        values.into_iter().map(|(_, reg, _)| reg).collect(),
+                    ));
+                    Ok((reg, ty))
+                }
+                ExprKind::Match(value, arms) => self.match_expression(value, arms, e.span),
                 ExprKind::TypeDescriptor(descriptor) => self.dynamic_op(
                     crate::dynamic::Operation::TypeDescriptor(descriptor.clone()),
                     Type::Storage(StorageKind::TypeDescriptor, Box::new(Type::Void)),
@@ -2546,7 +2715,7 @@ impl Lower<'_> {
                         .chain(self.function.locals.iter())
                         .map(|l| (key(&l.name), l.ty.clone()))
                         .collect();
-                    if let Type::Record(_, fields) =
+                    if let Type::Record(_, fields) | Type::AnonymousRecord(fields) =
                         crate::inference::expression_type(base, &known, self.types)?
                         && fields.iter().any(|(n, _)| n.eq_identifier(name))
                     {
@@ -3006,6 +3175,12 @@ impl Lower<'_> {
         self.span = s.span;
         self.emit(Op::Statement);
         match &s.kind {
+            StmtKind::IfLet(..) => {
+                return Err(crate::patterns::invalid_pattern(
+                    crate::patterns::PatternError::UnresolvedPattern,
+                    s.span,
+                ));
+            }
             StmtKind::Binding(n, _, _, _, e) => {
                 let (slot, local) = self.lookup(n)?;
                 let (v, t) = self.expr_expected(e, &local.ty)?;
@@ -3611,3 +3786,8 @@ fn resolve_compatibility_calls(ast: &mut Ast) -> Result<()> {
     }
     Ok(())
 }
+
+mod modules;
+pub use modules::{
+    CheckedModule, CheckedProgram, ModuleBuild, analyze_modules, analyze_modules_cached,
+};

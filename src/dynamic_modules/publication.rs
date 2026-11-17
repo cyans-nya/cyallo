@@ -1,5 +1,5 @@
 //! Validates an extension and freezes existing code/identity mappings.
-use crate::ir::{self, Op, Routine, Slot};
+use crate::ir::{self, Op, Routine};
 use cyallo_ast::Type;
 use cyallo_modules::{LoadError, PublicationError as P};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
@@ -117,12 +117,11 @@ pub(super) fn publish(
     let factory = *routines
         .get(factory_name)
         .ok_or(fail(P::MissingExistingRoutine))?;
-    let source = &compiled.functions[0];
-    let mut initializer = source
+    let mut initializer = functions[0]
         .checked()
-        .map_err(|diagnostic| LoadError::Check {
+        .map_err(|d| LoadError::Check {
             path: PathBuf::new(),
-            diagnostic: diagnostic.clone(),
+            diagnostic: d.clone(),
         })?
         .clone();
     initializer.symbol = format!("$dynamicImportInit{}", functions.len()).into();
@@ -130,37 +129,22 @@ pub(super) fn publish(
     initializer.locals.clear();
     initializer.local_storage = Box::default();
     initializer.params.clear();
+    initializer.registers.clear();
     initializer.code.clear();
     initializer.result = Type::Void;
-    let mut include = false;
-    for instruction in &source.code {
-        if matches!(instruction.op, Op::Statement) {
-            include = source.locals.iter().enumerate().any(|(index, local)| {
-                globals[index] >= old_globals && local.span == instruction.span
+    for unit in compiled.modules() {
+        if unit
+            .globals
+            .iter()
+            .any(|&index| globals[index] >= old_globals)
+            && let Some(id) = unit.initializer
+        {
+            initializer.code.push(ir::Instruction {
+                op: Op::Call(None, remap[id], vec![]),
+                span: cyallo_ast::Span::default(),
             });
         }
-        if include {
-            let mut instruction = instruction.clone();
-            match &mut instruction.op {
-                Op::Return(_) => {
-                    include = false;
-                    continue;
-                }
-                Op::Jump(_) | Op::Branch(..) | Op::FrameLoad(..) | Op::FrameStore(..) => {
-                    return Err(fail(P::InvalidInitializer));
-                }
-                Op::Address(_, slot) => {
-                    *slot = Slot {
-                        global: true,
-                        index: slot.index,
-                    };
-                }
-                _ => {}
-            }
-            initializer.code.push(instruction);
-        }
     }
-    map(&mut initializer);
     initializer.code.push(ir::Instruction {
         op: Op::Return(None),
         span: initializer.span,
@@ -192,6 +176,21 @@ pub(super) fn publish(
     }
     services.keys = keys;
     extension.services = Arc::new(services);
+    extension.module_units = compiled
+        .module_units
+        .iter()
+        .map(|unit| {
+            let mut unit = unit.as_ref().clone();
+            unit.globals = unit.globals.iter().map(|&i| globals[i]).collect();
+            unit.initializer = unit.initializer.map(|id| remap[id]);
+            unit.routines = unit
+                .routines
+                .iter()
+                .map(|(id, _)| (remap[*id], functions[remap[*id]].clone()))
+                .collect();
+            Arc::new(unit)
+        })
+        .collect();
     extension.records = compiled.records;
     extension.requires_tracing |= compiled.requires_tracing;
     extension.source = compiled.source;

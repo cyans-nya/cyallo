@@ -112,17 +112,15 @@ impl Session {
                         pending.extend(self.generator_owned_values(*id)?);
                     }
                 }
-                Value::GeneratorStep(
-                    cyallo_values::GeneratorStep::Yielded(value)
-                    | cyallo_values::GeneratorStep::Complete(value),
-                ) => pending.push(value),
                 Value::TaskOutcome(cyallo_concurrent_values::TaskOutcome::Completed(value)) => {
                     pending.push(value)
                 }
-                Value::SendError(error) => pending.push(&error.value),
-                Value::Optional(Some(value))
-                | Value::Result(Ok(value))
-                | Value::Result(Err(value))
+                Value::EnumStorage(_, Some(id)) | Value::NativeEnumStorage(_, Some(id)) => {
+                    if seen.insert(*id) {
+                        pending.push(&self.heap[*id].value);
+                    }
+                }
+                Value::Enum(_, Some(value))
                 | Value::Cell(value) => pending.push(value),
                 _ => {}
             }
@@ -413,7 +411,7 @@ impl Session {
         mode: ViewMode,
     ) -> RunResult<()> {
         let value = if matches!(mode, ViewMode::Result) {
-            Value::Result(
+            Value::result(
                 result
                     .map(Box::new)
                     .map_err(|e| Box::new(Value::ViewError(std::sync::Arc::new(e)))),
@@ -611,17 +609,14 @@ impl Session {
                 values[0].clone()
             }
             Operation::View => {
-                let Type::Storage(cyallo_ast::StorageKind::Result, tuple) = &result else {
-                    unreachable!()
-                };
-                let Type::Tuple(parts) = tuple.as_ref() else {
+                let Some((value, _)) = cyallo_ir::lookup::result_payload(&result) else {
                     unreachable!()
                 };
                 return self.begin_view(
                     destination,
                     values[0].clone(),
                     types[0].clone(),
-                    parts[0].clone(),
+                    value.clone(),
                     ViewMode::Result,
                 );
             }

@@ -1,4 +1,2 @@
-#[cyallo_internal("char_code")]
 pub fn code(value: char) -> i64;
-#[cyallo_internal("char_from_code")]
 pub fn from_code(value: i64) -> char;

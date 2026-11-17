@@ -52,6 +52,11 @@ impl Estimate {
         cyallo_ast::with_stack(|| {
             self.nodes += 1;
             match &e.kind {
+                E::EnumConstruct(_, _, payload) => {
+                    if let Some(payload) = payload {
+                        self.expr(payload);
+                    }
+                }
                 E::Call(name, args)
                 | E::TypedCollection(name, _, args)
                 | E::GenericCall(name, _, args) => {
@@ -86,7 +91,11 @@ impl Estimate {
                 | E::TupleField(a, _)
                 | E::Cast(a, _)
                 | E::ExtensionField(a, _, _) => self.expr(a),
-                E::Record(_, fs) | E::GenericRecord(_, _, fs) | E::ObjectLiteral(_, fs) => {
+                E::AnonymousRecord(fs)
+                | E::VariantPayload(fs)
+                | E::Record(_, fs)
+                | E::GenericRecord(_, _, fs)
+                | E::ObjectLiteral(_, fs) => {
                     for (_, e) in fs {
                         self.expr(e);
                     }
@@ -108,6 +117,23 @@ impl Estimate {
                         self.expr(allocator);
                     }
                     self.expr(value);
+                }
+                E::Match(value, arms) => {
+                    self.expr(value);
+                    for arm in arms {
+                        if let Some(guard) = &arm.guard {
+                            self.expr(guard);
+                        }
+                        match &arm.body {
+                            cyallo_ast::MatchBody::Expression(value) => self.expr(value),
+                            cyallo_ast::MatchBody::Block(body, tail) => {
+                                self.block(body);
+                                if let Some(tail) = tail {
+                                    self.expr(tail);
+                                }
+                            }
+                        }
+                    }
                 }
                 E::Closure(..) => {}
                 E::Binary(_, a, b) | E::NativeCoerce(a, b) => {
@@ -147,7 +173,7 @@ impl Estimate {
                         self.expr(iterable);
                         self.block(body);
                     }
-                    S::If(c, a, b) => {
+                    S::If(c, a, b) | S::IfLet(_, c, a, b) => {
                         self.expr(c);
                         self.block(a);
                         self.block(b);

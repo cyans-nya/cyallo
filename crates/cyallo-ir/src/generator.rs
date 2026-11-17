@@ -2,24 +2,24 @@
 use cyallo_ast::{Function, RoutineKind, StorageKind, Type};
 
 pub fn parts(ty: &Type) -> Option<(&Type, &Type, &Type)> {
-    let Type::Storage(StorageKind::Generator | StorageKind::PureGenerator, inner) = ty else {
-        return None;
-    };
-    let Type::Tuple(types) = inner.as_ref() else {
+    // A generator is any opaque type its provider declared with the `generator`
+    // trait; the language knows the trait, not a name.
+    let Type::Opaque(_, types, traits) = ty else {
         return None;
     };
     let [yielded, resumed, returned] = types.as_slice() else {
         return None;
     };
-    Some((yielded, resumed, returned))
+    traits.generator().then_some((yielded, resumed, returned))
 }
 pub fn factory_type(function: &Function) -> Type {
     let mut ty = function.result.clone();
     if function.generator
         && function.kind == RoutineKind::Function
-        && let Type::Storage(kind @ StorageKind::Generator, _) = &mut ty
+        && let Type::Opaque(_, _, traits) = &mut ty
+        && traits.generator()
     {
-        *kind = StorageKind::PureGenerator;
+        *traits = traits.with_pure(true);
     }
     ty
 }
@@ -44,15 +44,23 @@ pub fn unit(ty: &Type) -> bool {
 }
 pub fn borrowed(ty: &Type) -> bool {
     match ty {
+        Type::Enum(contract) => contract
+            .variants
+            .iter()
+            .filter_map(|v| v.payload.as_ref())
+            .any(borrowed),
         Type::Reference { .. } | Type::Borrowed(_) | Type::Slice(_) => true,
         Type::Managed {
             lifetime: Some(_), ..
         } => true,
         Type::Tuple(ts) => ts.iter().any(borrowed),
-        Type::Record(_, fields) => fields.iter().any(|(_, ty)| borrowed(ty)),
+        Type::Record(_, fields) | Type::AnonymousRecord(fields) => {
+            fields.iter().any(|(_, ty)| borrowed(ty))
+        }
         Type::Storage(_, inner) | Type::Array(_, inner) | Type::SparseArray(inner) => {
             borrowed(inner)
         }
+        Type::Opaque(_, ts, _) => ts.iter().any(borrowed),
         _ => false,
     }
 }

@@ -13,8 +13,38 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum GeneratorStep<T> {
+    Yielded(T),
+    Complete(T),
+}
+impl<T> GeneratorStep<T> {
+    pub fn value(&self) -> &T {
+        match self {
+            Self::Yielded(value) | Self::Complete(value) => value,
+        }
+    }
+    pub fn value_mut(&mut self) -> &mut T {
+        match self {
+            Self::Yielded(value) | Self::Complete(value) => value,
+        }
+    }
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete(_))
+    }
+}
+impl<T: std::fmt::Display> std::fmt::Display for GeneratorStep<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Yielded(value) => write!(f, "Yielded({value})"),
+            Self::Complete(value) => write!(f, "Complete({value})"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Payload {
+    Enum(cyallo_ast::VariantId, Option<Box<Payload>>),
     Unit,
     Number(cyallo_ast::Number),
     Boolean(bool),
@@ -23,8 +53,6 @@ pub enum Payload {
     Array(Vec<Payload>),
     Sparse(BTreeMap<u32, Payload>, u64),
     Function(usize, Vec<Payload>),
-    Optional(Option<Box<Payload>>),
-    Result(Result<Box<Payload>, Box<Payload>>),
     Erased(cyallo_ast::Type, Box<Payload>),
     Resource(OwnedHandle),
 }

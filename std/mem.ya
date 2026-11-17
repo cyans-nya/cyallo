@@ -2,41 +2,28 @@ use std::result::Result;
 
 pub mod manual;
 
-#[cyallo_internal("layout_struct")]
 pub record Layout {}
-#[cyallo_internal("allocation_struct")]
 pub record Allocation {}
-#[cyallo_internal("alloc_error_struct")]
 pub record AllocError {}
 
-#[cyallo_internal("cloneable_trait")]
 pub trait Cloneable {}
 
-#[cyallo_internal("allocator_trait")]
 pub trait Allocator {
     proc allocate(self: &mut Self, layout: Layout) -> Result<Allocation, AllocError>;
     proc deallocate(self: &mut Self, allocation: Allocation);
 }
 
 impl Layout {
-    #[cyallo_internal("layout_new")]
     pub fn new(size: usize, alignment: usize) -> Result<Layout, AllocError>;
-    #[cyallo_internal("layout_size")]
     pub fn size(self: &Self) -> usize;
-    #[cyallo_internal("layout_align")]
     pub fn align(self: &Self) -> usize;
 }
 
 impl AllocError {
-    #[cyallo_internal("alloc_error_new")]
     pub fn new(read message: string) -> AllocError;
 }
 
-#[cyallo_internal("allocate")]
 pub proc allocate(layout: Layout) -> Result<Allocation, AllocError>;
-#[cyallo_internal("deallocate")]
 pub proc deallocate(allocation: Allocation);
-#[cyallo_internal("drop_value")]
 pub proc drop<T>(value: T);
-#[cyallo_internal("clone_value")]
 pub proc clone<T: Cloneable>(value: &T) -> T;

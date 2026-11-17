@@ -196,7 +196,7 @@ impl Session {
             borrowed,
             fallible,
         } = request;
-        let Value::Result(allocated) = allocated else {
+        let Ok(allocated) = allocated.into_result() else {
             return Err(AllocatorError::InvalidResultType.into());
         };
         let allocation = match allocated {
@@ -208,7 +208,7 @@ impl Session {
                 self.drop_value(value)?;
                 self.drop_value(allocator)?;
                 return if fallible {
-                    Ok(Value::Result(Err(error)))
+                    Ok(Value::result(Err(error)))
                 } else {
                     Err(AllocatorError::Rejected(error.to_string().into()).into())
                 };
@@ -247,7 +247,7 @@ impl Session {
         });
         let owner = self.new_rc_handle(block, false);
         Ok(if fallible {
-            Value::Result(Ok(Box::new(owner)))
+            Value::result(Ok(Box::new(owner)))
         } else {
             owner
         })
@@ -327,21 +327,15 @@ impl Session {
                     cyallo_concurrent_values::TaskOutcome::Stopped
                 }
             }),
-            Value::SendError(error) => Value::SendError(cyallo_concurrent_values::SendError {
-                kind: error.kind,
-                value: Box::new(self.clone_value(*error.value)?),
-            }),
             Value::Allocation(_) => return Err(OwnershipError::MoveOnlyAllocation.into()),
             Value::Generator(_) => return Err(OwnershipError::MoveOnlyGenerator.into()),
-            Value::GeneratorStep(step) => Value::GeneratorStep(match step {
-                cyallo_values::GeneratorStep::Yielded(value) => {
-                    cyallo_values::GeneratorStep::Yielded(Box::new(self.clone_value(*value)?))
-                }
-                cyallo_values::GeneratorStep::Complete(value) => {
-                    cyallo_values::GeneratorStep::Complete(Box::new(self.clone_value(*value)?))
-                }
-            }),
             value @ (Value::Rc(_) | Value::Weak(_)) => self.rc_clone(&value, false, false)?,
+            Value::Enum(variant, payload) => Value::Enum(
+                variant,
+                payload
+                    .map(|v| self.clone_value(*v).map(Box::new))
+                    .transpose()?,
+            ),
             Value::Cell(value) => Value::Cell(Box::new(self.clone_value(*value)?)),
             Value::ArraySnapshot(values) => Value::ArraySnapshot(self.clone_values(values)?),
             Value::SparseSnapshot(values, length) => {
@@ -349,15 +343,6 @@ impl Session {
                 let values = self.clone_values(values)?;
                 Value::SparseSnapshot(indices.into_iter().zip(values).collect(), length)
             }
-            Value::Optional(value) => Value::Optional(
-                value
-                    .map(|value| self.clone_value(*value).map(Box::new))
-                    .transpose()?,
-            ),
-            Value::Result(value) => Value::Result(match value {
-                Ok(value) => Ok(Box::new(self.clone_value(*value)?)),
-                Err(value) => Err(Box::new(self.clone_value(*value)?)),
-            }),
             Value::Function(function, captures) => {
                 Value::Function(function, self.clone_values(captures)?)
             }
@@ -483,7 +468,7 @@ impl Session {
             .as_mut()
             .ok_or(OwnershipError::ReleasedAllocation)?;
         if upgrade && control.strong == 0 {
-            return Ok(Value::Optional(None));
+            return Ok(Value::option(None));
         }
         if weak {
             control.weak = control
@@ -498,7 +483,7 @@ impl Session {
         }
         let result = self.new_rc_handle(block, weak);
         Ok(if upgrade {
-            Value::Optional(Some(Box::new(result)))
+            Value::option(Some(Box::new(result)))
         } else {
             result
         })
@@ -552,11 +537,13 @@ impl Session {
     }
     pub(super) fn drop_value(&mut self, value: Value) -> RunResult<()> {
         match value {
+            Value::EnumStorage(_, Some(cell)) | Value::NativeEnumStorage(_, Some(cell)) => {
+                self.drop_cell(cell)?
+            }
             Value::Concurrent(handle) => handle.release(),
             Value::TaskOutcome(cyallo_concurrent_values::TaskOutcome::Completed(value)) => {
                 self.drop_value(*value)?
             }
-            Value::SendError(error) => self.drop_value(*error.value)?,
             Value::Generator(id) => self.close_generator(id)?,
             Value::Rc(index) | Value::Weak(index) => self.release_rc(index)?,
             Value::Allocation(index) => self.deallocate_backing(index),
@@ -585,13 +572,8 @@ impl Session {
                     self.drop_value(value)?;
                 }
             }
-            Value::GeneratorStep(
-                cyallo_values::GeneratorStep::Yielded(value)
-                | cyallo_values::GeneratorStep::Complete(value),
-            )
             | Value::Cell(value)
-            | Value::Optional(Some(value))
-            | Value::Result(Ok(value) | Err(value))
+            | Value::Enum(_, Some(value))
             | Value::Dynamic(_, value)
             | Value::Erased(_, value)
             | Value::StoragePath(value, _) => self.drop_value(*value)?,
@@ -602,7 +584,7 @@ impl Session {
     pub(super) fn drop_cell(&mut self, cell: usize) -> RunResult<()> {
         if matches!(
             self.heap[cell].ty,
-            Type::Array(..) | Type::Record(..) | Type::Tuple(..)
+            Type::Array(..) | Type::Record(..) | Type::AnonymousRecord(..) | Type::Tuple(..)
         ) && let Value::Array(children) = self.heap[cell].value.clone()
         {
             for child in children {
@@ -624,10 +606,19 @@ impl Session {
     }
     fn clear_moved_cell(&mut self, cell: usize) {
         match self.heap[cell].value.clone() {
+            Value::EnumStorage(_, payload) | Value::NativeEnumStorage(_, payload) => {
+                if let Some(child) = payload {
+                    self.clear_moved_cell(child);
+                }
+                self.heap[cell].value = Value::Uninitialized;
+            }
             Value::Array(cells)
                 if matches!(
                     self.heap[cell].ty,
-                    Type::Array(..) | Type::Record(..) | Type::Tuple(..)
+                    Type::Array(..)
+                        | Type::Record(..)
+                        | Type::AnonymousRecord(..)
+                        | Type::Tuple(..)
                 ) =>
             {
                 for child in cells {

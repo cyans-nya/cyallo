@@ -92,8 +92,9 @@ std::mem::drop(old)
 std::io::print(first_weak.upgrade().is_none())
 cell.* = rc 3
 std::io::print(second_weak.upgrade().is_none())
-let optional = Cell::new(std::option::some(Vec[4,5]))
-let values = optional.replace(std::option::none<Vec<i64>>()).unwrap()
+let optional = Cell::new(Option::Some(Vec[4,5]))
+let nothing: Option<Vec<i64>> = Option::None
+let values = optional.replace(nothing).unwrap()
 std::io::print(values[0], ":", values[1])
 std::mem::drop(cell)
 std::mem::drop(first_weak)

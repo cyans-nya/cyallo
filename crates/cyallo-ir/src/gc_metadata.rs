@@ -24,18 +24,22 @@ pub struct GcMetadata {
 fn owned(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::String
+        Type::Enum(..)
+            | Type::EnumRef(..)
+            | Type::String
             | Type::Reference { .. }
             | Type::Managed { .. }
             | Type::Slice(..)
             | Type::Array(..)
             | Type::SparseArray(..)
             | Type::Record(..)
+            | Type::AnonymousRecord(..)
             | Type::RecordRef(_)
             | Type::Tuple(..)
             | Type::Function(..)
             | Type::Borrowed(..)
             | Type::Storage(..)
+            | Type::Opaque(..)
             | Type::Dynamic
             | Type::Object(_)
             | Type::Any
@@ -59,7 +63,8 @@ impl GcMetadata {
             if let Op::Address(r, _)
             | Op::ManagedAddress(r, _)
             | Op::Index(r, ..)
-            | Op::Field(r, ..) = inst.op
+            | Op::Field(r, ..)
+            | Op::EnumPayload(r, _, _, crate::enums::Projection::Address, _) = inst.op
             {
                 registers[r] = ReferenceKind::Location;
             }
@@ -86,16 +91,24 @@ impl GcMetadata {
             .map(|inst| {
                 let may_collect = match &inst.op {
                     Op::Service(_, crate::services::Operation::Reference, _) => false,
+                    // The operation's contract, not the generic builtin rule: a scalar
+                    // cast or length cannot collect even though it runs in a helper.
+                    Op::Lookup(_, operation, _) => {
+                        operation.contract().safepoint != crate::contract::Safepoint::Never
+                    }
+                    Op::Builtin(_, intrinsic, _) => {
+                        intrinsic.contract().safepoint != crate::contract::Safepoint::Never
+                    }
                     Op::Dynamic(..)
-                    | Op::Lookup(..)
                     | Op::Call(..)
                     | Op::TraitCall(..)
                     | Op::TraitBox(..)
                     | Op::Service(..)
                     | Op::Invoke(..)
-                    | Op::Builtin(..)
                     | Op::ArrayLiteral(..)
                     | Op::Frozen(..)
+                    | Op::EnumPayload(..)
+                    | Op::EnumConstruct(..)
                     | Op::Aggregate(..)
                     | Op::FunctionValue(..)
                     | Op::Input(..) => true,
@@ -112,23 +125,31 @@ impl GcMetadata {
                     }
                     _ => false,
                 };
+                // A lookup whose contract never collects or re-enters is not a
+                // re-entry point either.
+                let non_reentrant_lookup = matches!(
+                    &inst.op,
+                    Op::Lookup(_, operation, _)
+                        if operation.contract().safepoint == crate::contract::Safepoint::Never
+                );
                 SafepointEffects {
                     may_collect,
-                    may_reenter: may_collect
-                        || matches!(inst.op, Op::Drop(_) | Op::Return(_))
-                        || !matches!(
-                            inst.op,
-                            Op::Service(_, crate::services::Operation::Reference, _)
-                        ) && matches!(
-                            inst.op,
-                            Op::Lookup(..)
-                                | Op::Call(..)
-                                | Op::TraitCall(..)
-                                | Op::Service(..)
-                                | Op::Invoke(..)
-                                | Op::Input(..)
-                                | Op::FrameInput(..)
-                        ),
+                    may_reenter: !non_reentrant_lookup
+                        && (may_collect
+                            || matches!(inst.op, Op::Drop(_) | Op::Return(_))
+                            || !matches!(
+                                inst.op,
+                                Op::Service(_, crate::services::Operation::Reference, _)
+                            ) && matches!(
+                                inst.op,
+                                Op::Lookup(..)
+                                    | Op::Call(..)
+                                    | Op::TraitCall(..)
+                                    | Op::Service(..)
+                                    | Op::Invoke(..)
+                                    | Op::Input(..)
+                                    | Op::FrameInput(..)
+                            )),
                 }
             })
             .collect();
@@ -136,5 +157,54 @@ impl GcMetadata {
             registers: registers.into_boxed_slice(),
             instructions,
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{intrinsic::Intrinsic, ir::Instruction};
+    use cyallo_ast::{RoutineAttributes, RoutineKind, RoutineOrigin, Span};
+    fn function(code: Vec<Op>, registers: Vec<Type>) -> Function {
+        Function {
+            generator: None,
+            symbol: "f".into(),
+            origin: RoutineOrigin::default(),
+            attributes: RoutineAttributes::default(),
+            analysis_error: None,
+            resume: Default::default(),
+            gc: Default::default(),
+            kind: RoutineKind::Function,
+            span: Span::default(),
+            pure: false,
+            effects: Default::default(),
+            name: "f".into(),
+            locals: vec![],
+            local_storage: Box::new([]),
+            params: vec![],
+            result: Type::Void,
+            registers,
+            code: code
+                .into_iter()
+                .map(|op| Instruction { op, span: Span::default() })
+                .collect(),
+        }
+    }
+    #[test]
+    fn builtin_safepoints_follow_the_intrinsic_contract() {
+        let registers = vec![Type::Integer, Type::Integer, Type::String, Type::String];
+        let f = function(
+            vec![
+                Op::Builtin(0, Intrinsic::CastI64, vec![1]),
+                Op::Builtin(0, Intrinsic::Length, vec![2]),
+                Op::Builtin(3, Intrinsic::Upper, vec![2]),
+            ],
+            registers,
+        );
+        let gc = GcMetadata::build(&f);
+        // Scalar conversions and lengths cannot collect or re-enter.
+        assert_eq!(gc.instructions[0], SafepointEffects::default());
+        assert_eq!(gc.instructions[1], SafepointEffects::default());
+        // A builtin that allocates a string keeps the conservative safepoint.
+        assert!(gc.instructions[2].may_collect && gc.instructions[2].may_reenter);
     }
 }

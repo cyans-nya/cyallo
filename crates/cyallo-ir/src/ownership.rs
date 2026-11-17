@@ -1,6 +1,7 @@
 //! Ownership and loan checking over resolved, typed source expressions.
 //! Local aliases are allowed. Calls enforce aliasing XOR mutability; storage
 //! growth additionally requires that no live view can be invalidated.
+mod matching;
 use crate::{inference::expression_type, intrinsic::Intrinsic, lookup};
 use cyallo_ast::*;
 use std::collections::{HashMap, HashSet};
@@ -69,6 +70,8 @@ enum Use {
 }
 type Result<T> = std::result::Result<T, Diagnostic>;
 struct Checker<'a> {
+    guard_bindings: HashSet<String>,
+    guard_places: Vec<Place>,
     moves: HashSet<(u32, u32)>,
     types: HashMap<String, Type>,
     routines: &'a crate::declarations::TypeEnvironment,
@@ -77,6 +80,10 @@ struct Checker<'a> {
     last_use: HashMap<String, u32>,
 }
 pub fn copy(ty: &Type) -> bool {
+    // A declared-copyable opaque type is copy when its arguments are.
+    if let Type::Opaque(_, arguments, traits) = ty {
+        return traits.copyable() && arguments.iter().all(copy);
+    }
     matches!(
         ty,
         Type::Numeric(_)
@@ -89,7 +96,6 @@ pub fn copy(ty: &Type) -> bool {
             | Type::Void
             | Type::Object(_)
             | Type::NativeCallable(_)
-            | Type::Storage(StorageKind::Layout, _)
             | Type::Managed {
                 kind: MemoryKind::Gc,
                 ..
@@ -98,6 +104,11 @@ pub fn copy(ty: &Type) -> bool {
 }
 fn carries_borrows(ty: &Type) -> bool {
     match ty {
+        Type::Enum(contract) => contract
+            .variants
+            .iter()
+            .filter_map(|v| v.payload.as_ref())
+            .any(carries_borrows),
         Type::Reference { .. }
         | Type::Borrowed(_)
         | Type::Any
@@ -110,30 +121,30 @@ fn carries_borrows(ty: &Type) -> bool {
         | Type::SparseArray(inner)
         | Type::Slice(inner)
         | Type::Storage(_, inner) => carries_borrows(inner),
+        Type::Opaque(_, arguments, _) => arguments.iter().any(carries_borrows),
         Type::Tuple(types) => types.iter().any(carries_borrows),
-        Type::Record(_, fields) => fields.iter().any(|(_, ty)| carries_borrows(ty)),
+        Type::Record(_, fields) | Type::AnonymousRecord(fields) => {
+            fields.iter().any(|(_, ty)| carries_borrows(ty))
+        }
         _ => false,
     }
 }
 pub fn effectful_lifecycle(ty: &Type) -> bool {
     match ty {
+        Type::Enum(contract) => contract
+            .variants
+            .iter()
+            .filter_map(|v| v.payload.as_ref())
+            .any(effectful_lifecycle),
         Type::Reference { .. } | Type::Borrowed(_) => false,
         Type::Managed {
             kind: MemoryKind::Rc,
             ..
         } => true,
         Type::Managed { pointee, .. } => effectful_lifecycle(pointee),
-        Type::Storage(
-            StorageKind::Weak
-            | StorageKind::ArenaCell
-            | StorageKind::Allocation
-            | StorageKind::Generator
-            | StorageKind::Sender
-            | StorageKind::Receiver
-            | StorageKind::Clock
-            | StorageKind::Task,
-            _,
-        ) => true,
+        Type::Opaque(_, arguments, traits) => {
+            traits.effectful() || arguments.iter().any(effectful_lifecycle)
+        }
         Type::Dynamic
         | Type::Any
         | Type::Context
@@ -145,20 +156,28 @@ pub fn effectful_lifecycle(ty: &Type) -> bool {
         | Type::Slice(inner)
         | Type::Storage(_, inner) => effectful_lifecycle(inner),
         Type::Tuple(types) => types.iter().any(effectful_lifecycle),
-        Type::Record(_, fields) => fields.iter().any(|(_, ty)| effectful_lifecycle(ty)),
+        Type::Record(_, fields) | Type::AnonymousRecord(fields) => {
+            fields.iter().any(|(_, ty)| effectful_lifecycle(ty))
+        }
         _ => false,
     }
 }
 pub fn needs_drop(ty: &Type) -> bool {
     effectful_lifecycle(ty)
         || match ty {
+            Type::Enum(contract) => contract
+                .variants
+                .iter()
+                .filter_map(|v| v.payload.as_ref())
+                .any(needs_drop),
             Type::Function(..) => true,
-            Type::Storage(StorageKind::Generator | StorageKind::PureGenerator, _) => true,
             Type::Storage(_, inner) | Type::Array(_, inner) | Type::SparseArray(inner) => {
                 needs_drop(inner)
             }
             Type::Tuple(ts) => ts.iter().any(needs_drop),
-            Type::Record(_, fs) => fs.iter().any(|(_, t)| needs_drop(t)),
+            Type::Record(_, fs) | Type::AnonymousRecord(fs) => {
+                fs.iter().any(|(_, t)| needs_drop(t))
+            }
             _ => false,
         }
 }
@@ -194,6 +213,8 @@ pub fn check(
         .map(|local| (local.name.to_string(), local.ty.clone()))
         .collect();
     let mut checker = Checker {
+        guard_bindings: HashSet::new(),
+        guard_places: vec![],
         moves: HashSet::new(),
         types,
         routines,
@@ -284,7 +305,9 @@ impl Checker<'_> {
             }
             ExprKind::Field(base, name) | ExprKind::ExtensionField(base, name, _) => {
                 let mut place = self.place(base)?;
-                if let Type::Record(_, fields) = self.ty(base)?.pointee_or_self() {
+                if let Type::Record(_, fields) | Type::AnonymousRecord(fields) =
+                    self.ty(base)?.pointee_or_self()
+                {
                     let index = fields
                         .iter()
                         .position(|(field, _)| field == name)
@@ -315,6 +338,7 @@ impl Checker<'_> {
             | ExprKind::Frozen(..)
             | ExprKind::ArrayLiteral(_)
             | ExprKind::Record(..)
+            | ExprKind::AnonymousRecord(_)
             | ExprKind::Tuple(_) => Ok(Place {
                 root: format!(
                     "temporary:{}:{}",
@@ -330,6 +354,18 @@ impl Checker<'_> {
         }
     }
     fn boundary(&self, values: &[ValueInfo], span: Span) -> Result<()> {
+        if values.iter().flat_map(|v| &v.loans).any(|loan| {
+            loan.mutable
+                && self
+                    .guard_places
+                    .iter()
+                    .any(|guard| guard.overlaps(&loan.place))
+        }) {
+            return Err(crate::patterns::invalid_pattern(
+                crate::patterns::PatternError::GuardMutation,
+                span,
+            ));
+        }
         for (index, value) in values.iter().enumerate() {
             for other in &values[index + 1..] {
                 for a in &value.loans {
@@ -426,6 +462,17 @@ impl Checker<'_> {
             }
             let mut result = ValueInfo::default();
             match &expression.kind {
+                ExprKind::EnumConstruct(_, _, payload) => {
+                    if let Some(payload) = payload {
+                        result.extend(self.expression(payload, Use::Move)?);
+                    }
+                }
+                ExprKind::AnonymousRecord(fields) | ExprKind::VariantPayload(fields) => {
+                    for (_, value) in fields {
+                        result.extend(self.expression(value, Use::Move)?);
+                    }
+                }
+                ExprKind::Match(value, arms) => result = self.matching(value, arms, usage)?,
                 ExprKind::NativeCoerce(value, thunk) => {
                     self.expression(value, Use::Read)?;
                     result = self.expression(thunk, usage)?;
@@ -465,6 +512,7 @@ impl Checker<'_> {
                             external: false,
                             projections: vec![],
                         };
+                        self.guard_move(name, &place, expression.span)?;
                         for (alias, binding) in &self.bindings {
                             if self.loan_live(alias, expression.span.end)
                                 && binding
@@ -486,8 +534,25 @@ impl Checker<'_> {
                     }
                 }
                 ExprKind::Unary(operator @ (Operator::Borrow | Operator::BorrowMut), inner) => {
+                    if matches!(
+                        inner.kind,
+                        ExprKind::Record(..)
+                            | ExprKind::AnonymousRecord(_)
+                            | ExprKind::Tuple(_)
+                            | ExprKind::ArrayLiteral(_)
+                    ) {
+                        self.expression(inner, Use::Move)?;
+                    }
                     let place = self.place(inner)?;
-                    let view = matches!(&inner.kind, ExprKind::Index(base,_) if matches!(self.ty(base)?.pointee_or_self(), Type::Storage(StorageKind::Vec,_) | Type::Slice(_)));
+                    if *operator == Operator::BorrowMut
+                        && self.guard_places.iter().any(|guard| guard.overlaps(&place))
+                    {
+                        return Err(crate::patterns::invalid_pattern(
+                            crate::patterns::PatternError::GuardMutation,
+                            expression.span,
+                        ));
+                    }
+                    let view = matches!(&inner.kind, ExprKind::Index(base,_) if matches!(self.ty(base)?.pointee_or_self(), Type::Slice(_)));
                     result.loans.push(Loan {
                         place,
                         mutable: *operator == Operator::BorrowMut,
@@ -787,6 +852,12 @@ impl Checker<'_> {
             let mut declared = vec![];
             for statement in body {
                 match &statement.kind {
+                    StmtKind::IfLet(..) => {
+                        return Err(crate::patterns::invalid_pattern(
+                            crate::patterns::PatternError::UnresolvedPattern,
+                            statement.span,
+                        ));
+                    }
                     StmtKind::Binding(name, _, _, _, value) | StmtKind::Constant(name, value) => {
                         let span = value.span;
                         let mut value = self.expression(value, Use::Move)?;

@@ -3,7 +3,9 @@ use cyallo_ast::IdentifierEq as _;
 use cyallo_ast::Operator;
 mod concurrent;
 pub(crate) mod dynamic;
+pub(crate) mod enums;
 mod error;
+use enums::{enum_payload, enum_test, enum_value};
 pub mod gc;
 mod generator;
 mod lookup;
@@ -126,6 +128,9 @@ pub struct Session {
     native_dirty: Vec<usize>,
     // No-GC calls recycle frame-owned cells without moving global cell IDs.
     free_cells: Vec<usize>,
+    /// Payload cells of enum values that were overwritten, by parent cell, kept so the
+    /// next write reuses them instead of taking new cells (non-GC mode).
+    parked_children: std::collections::HashMap<usize, Vec<usize>>,
     cell_owners: Vec<Option<u64>>,
     transaction_reused_cells: Vec<usize>,
     track_reused_cells: bool,
@@ -181,6 +186,7 @@ impl Session {
             native_view: Box::default(),
             native_dirty: vec![],
             free_cells: vec![],
+            parked_children: Default::default(),
             cell_owners: vec![],
             transaction_reused_cells: vec![],
             track_reused_cells: false,
@@ -407,6 +413,7 @@ impl Session {
             self.context.gc.enabled = true;
             self.collector.reserve(self.heap.len());
             self.free_cells.clear();
+            self.parked_children.clear();
             self.cell_owners.clear();
             self.register_globals();
             for frame in &mut self.frames {
@@ -438,6 +445,7 @@ impl Session {
                         self.heap.truncate(heap_len);
                         self.native_cells.truncate(heap_len);
                         self.cell_owners.truncate(heap_len);
+                        self.parked_children.clear();
                     }
                     self.release_cells(reused);
                     return Err(Diagnostic::new(
@@ -461,6 +469,7 @@ impl Session {
                             self.heap.truncate(heap_len);
                             self.native_cells.truncate(heap_len);
                             self.cell_owners.truncate(heap_len);
+                            self.parked_children.clear();
                         }
                         self.release_cells(reused);
                         return Err(RuntimeFailure::new(message, local.span).diagnostic());
@@ -712,7 +721,7 @@ impl Session {
         self.fail(RuntimeError::DeferredCheck(diagnostic), span);
     }
     fn alloc(&mut self, ty: &Type) -> RunResult<usize> {
-        if let Type::RecordRef(identity) = ty {
+        if let Type::RecordRef(identity) | Type::EnumRef(_, identity) = ty {
             let record = self
                 .program
                 .records
@@ -804,7 +813,7 @@ impl Session {
             return Ok(roots.cell_id(parent));
         }
         let fields: Vec<_> = match ty {
-            Type::Record(_, fs) => fs.iter().map(|(_, t)| t).collect(),
+            Type::Record(_, fs) | Type::AnonymousRecord(fs) => fs.iter().map(|(_, t)| t).collect(),
             Type::Tuple(ts) => ts.iter().collect(),
             _ => return Ok(id),
         };
@@ -851,6 +860,29 @@ impl Session {
         let result = self.alloc(ty);
         self.allocation_owner = previous_owner;
         result
+    }
+    /// Remembers the payload cell of the enum in `parent` before it is overwritten.
+    fn park_enum_child(&mut self, parent: usize) {
+        if self.gc_config.enabled {
+            return;
+        }
+        if let Value::EnumStorage(_, Some(child)) | Value::NativeEnumStorage(_, Some(child)) =
+            self.heap[parent].value
+        {
+            self.parked_children.entry(parent).or_default().push(child);
+        }
+    }
+    /// A payload cell for `parent`: a parked one of the same type, else a new cell.
+    fn child_cell(&mut self, parent: usize, ty: &Type) -> RunResult<usize> {
+        if let Some(parked) = self.parked_children.get_mut(&parent)
+            && let Some(position) = parked.iter().position(|c| self.heap[*c].ty == *ty)
+        {
+            let child = parked.swap_remove(position);
+            self.heap[child].value = Value::Uninitialized;
+            self.heap[child].parent = None;
+            return Ok(child);
+        }
+        self.alloc(ty)
     }
     fn release_cells(&mut self, cells: Vec<usize>) {
         if self.gc_config.enabled || cells.is_empty() {
@@ -1042,6 +1074,14 @@ impl Session {
     }
     fn snapshot(&self, value: &Value) -> Value {
         match value {
+            Value::NativeEnumStorage(variant, payload) => enum_value(
+                *variant,
+                payload.map(|id| Box::new(self.snapshot(&self.heap[id].value))),
+            ),
+            Value::EnumStorage(variant, payload) => Value::Enum(
+                *variant,
+                payload.map(|id| Box::new(self.snapshot(&self.heap[id].value))),
+            ),
             Value::Deque(ids) => Value::ArraySnapshot(
                 ids.iter()
                     .map(|id| self.snapshot(&self.heap[*id].value))
@@ -1095,12 +1135,8 @@ impl Session {
     }
     fn store_inner(&mut self, id: usize, value: Value) -> RunResult<()> {
         self.bump_cell_version(id)?;
-        if let Type::Storage(kind, element) = self.heap[id].ty.clone()
-            && matches!(
-                kind,
-                cyallo_ast::StorageKind::Vec | cyallo_ast::StorageKind::VecDeque
-            )
-        {
+        if let Some(element) = self.heap[id].ty.collection_element().cloned() {
+            let double_ended = self.heap[id].ty.is_double_ended();
             let roots = self.root_scope();
             let target = roots.cell(id);
             let source = roots.value(value);
@@ -1108,7 +1144,7 @@ impl Session {
                 self.drop_cell(id)?;
             }
             let len = roots.array_len(source).ok_or(expected(ValueKind::Array))?;
-            self.heap[roots.cell_id(target)].value = if kind == cyallo_ast::StorageKind::Vec {
+            self.heap[roots.cell_id(target)].value = if !double_ended {
                 Value::Array(Vec::new())
             } else {
                 Value::Deque(VecDeque::new())
@@ -1132,11 +1168,63 @@ impl Session {
             }
             return Ok(());
         }
+        if !self.gc_config.enabled
+            && matches!(self.heap[id].ty, Type::Enum(_))
+            && matches!(self.heap[id].value, Value::NativeEnumStorage(_, Some(_)))
+        {
+            self.park_enum_child(id);
+        }
+        // The core enums (`Option`, `Result`, ...) are small values kept inline in their
+        // cell. Other enums store their payload in a child cell per write.
+        if matches!(&self.heap[id].ty, Type::Enum(contract) if !cyallo_ir::enums::is_core(contract))
+            && let Type::Enum(contract) = self.heap[id].ty.clone()
+        {
+            let roots = self.root_scope();
+            let target = roots.cell(id);
+            let source = roots.value(value);
+            let Value::Enum(variant, payload) = roots.value_copy(source) else {
+                return Err(Invariant::EnumShapeMismatch.into());
+            };
+            let declared = contract
+                .variants
+                .iter()
+                .find(|v| v.declaration == variant)
+                .ok_or(Invariant::EnumShapeMismatch)?;
+            if declared.payload.is_some() != payload.is_some() {
+                return Err(Invariant::EnumShapeMismatch.into());
+            }
+            self.park_enum_child(roots.cell_id(target));
+            self.drop_cell(roots.cell_id(target))?;
+            let child = if let Some(ty) = &declared.payload {
+                let child = self.child_cell(roots.cell_id(target), ty)?;
+                let child = roots.cell(child);
+                let Value::Enum(_, Some(payload)) = roots.value_copy(source) else {
+                    unreachable!()
+                };
+                self.store(roots.cell_id(child), *payload)?;
+                self.attach_child(roots.cell_id(child), roots.cell_id(target));
+                Some(roots.cell_id(child))
+            } else {
+                None
+            };
+            self.heap[roots.cell_id(target)].value = Value::EnumStorage(variant, child);
+            if self.native_enabled {
+                self.native_cells.set(
+                    roots.cell_id(target),
+                    NativeSlot::from_value(&self.heap[roots.cell_id(target)].value),
+                );
+            }
+            return Ok(());
+        }
         // Scalar/string writes cannot collect. Avoid root registration on the
         // common numeric path, including interpreter-only execution.
         if !matches!(
             self.heap[id].ty,
-            Type::Array(..) | Type::SparseArray(..) | Type::Record(..) | Type::Tuple(..)
+            Type::Array(..)
+                | Type::SparseArray(..)
+                | Type::Record(..)
+                | Type::AnonymousRecord(..)
+                | Type::Tuple(..)
         ) {
             if cyallo_ir::ownership::effectful_lifecycle(&self.heap[id].ty) {
                 self.drop_cell(id)?;
@@ -1233,7 +1321,17 @@ impl Session {
             }
             &Op::Yield(input, value) => self.yield_generator(input, value)?,
             &Op::Frozen(r, ref value) => self.set(r, Value::from(value.as_ref())),
-            &Op::Lookup(r, operation, ref args) => self.execute_lookup(r, operation, args)?,
+            &Op::Lookup(r, operation, ref args) => {
+                let cells = self.next_cell_identity;
+                self.execute_lookup(r, operation, args)?;
+                // A contract that promises no safepoint promises no heap allocation:
+                // collection only starts at an allocation.
+                debug_assert!(
+                    operation.contract().safepoint != cyallo_ir::contract::Safepoint::Never
+                        || self.next_cell_identity == cells,
+                    "lookup {operation:?} allocated a cell despite a non-collecting contract"
+                );
+            }
             &Op::ServiceKey(r, key) => self.set(r, Value::ServiceKey(key)),
             &Op::Service(r, operation, ref args) => self.execute_service(r, operation, args)?,
             &Op::TraitCall(result, target, method, ref args) => self.trait_call(
@@ -1258,6 +1356,62 @@ impl Session {
                 self.store(roots.cell_id(root), roots.value_copy(source))?;
                 self.set(r, Value::TraitObject(roots.cell_id(root), implementation));
             }
+
+            &Op::EnumConstruct(r, variant, payload) => {
+                let payload = payload.map(|r| Box::new(self.register(r)));
+                self.set(r, enum_value(variant, payload));
+            }
+            &Op::EnumTest(r, base, variant) => {
+                let value = self.register(base);
+                let value = match value {
+                    Value::Address(id) => self.heap[id].value.clone(),
+                    v => v,
+                };
+                self.set(r, Value::Boolean(enum_test(&value, variant)?));
+            }
+            Op::EnumPayload(r, base, variant, mode, ty) => {
+                let value = self.register(*base);
+                let parent = if let Value::Address(id) = value {
+                    Some(id)
+                } else {
+                    None
+                };
+                let stored = parent
+                    .map(|id| self.heap[id].value.clone())
+                    .unwrap_or(value);
+                if !enum_test(&stored, *variant)? {
+                    return Err(Invariant::EnumShapeMismatch.into());
+                }
+                let payload = match (stored, mode) {
+                    (
+                        Value::EnumStorage(_, Some(id)) | Value::NativeEnumStorage(_, Some(id)),
+                        cyallo_ir::enums::Projection::Address,
+                    ) => Value::Address(id),
+                    (
+                        Value::EnumStorage(_, Some(id)) | Value::NativeEnumStorage(_, Some(id)),
+                        cyallo_ir::enums::Projection::Value,
+                    ) => self.read(id)?,
+                    (value, mode) => {
+                        let payload = enum_payload(value)?;
+                        if *mode == cyallo_ir::enums::Projection::Address {
+                            let roots = self.root_scope();
+                            let source = roots.value(payload);
+                            let parent = roots.cell(parent.ok_or(Invariant::EnumShapeMismatch)?);
+                            let child = self.child_cell(roots.cell_id(parent), ty)?;
+                            let child = roots.cell(child);
+                            self.store(roots.cell_id(child), roots.value_copy(source))?;
+                            self.attach_child(roots.cell_id(child), roots.cell_id(parent));
+                            self.heap[roots.cell_id(parent)].value =
+                                Value::NativeEnumStorage(*variant, Some(roots.cell_id(child)));
+                            Value::Address(roots.cell_id(child))
+                        } else {
+                            payload
+                        }
+                    }
+                };
+                self.set(*r, payload);
+            }
+            &Op::Unreachable => return Err(Invariant::EnumShapeMismatch.into()),
             &Op::Statement | &Op::Nop => {}
             &Op::Aggregate(r, ref regs) => {
                 let values = regs.iter().map(|&r| self.register(r)).collect();
@@ -1438,13 +1592,7 @@ impl Session {
                     return Ok(());
                 }
 
-                if matches!(
-                    self.heap[id].ty,
-                    Type::Storage(
-                        cyallo_ast::StorageKind::Vec | cyallo_ast::StorageKind::VecDeque,
-                        _
-                    )
-                ) {
+                if self.heap[id].ty.collection_element().is_some() {
                     let requested = integer(self.register(indices[0]))?;
                     let (length, child) = match &self.heap[id].value {
                         Value::Array(cells) => (
@@ -1558,7 +1706,7 @@ impl Session {
                 let namespace = frame.namespace;
                 if let Some(key) = namespace
                     && let Some(root) = returned_value
-                    && let Value::Result(Ok(value)) = returned.value_copy(root)
+                    && let Ok(Ok(value)) = returned.value_copy(root).into_result()
                 {
                     let scope = self.root_scope();
                     let value = scope.value(*value);
@@ -1701,10 +1849,7 @@ impl Session {
 }
 fn remap_functions(value: &mut Value, remap: &[usize]) {
     match value {
-        Value::GeneratorStep(
-            cyallo_values::GeneratorStep::Yielded(v) | cyallo_values::GeneratorStep::Complete(v),
-        )
-        | Value::Optional(Some(v))
+        | Value::Enum(_, Some(v))
         | Value::Dynamic(_, v)
         | Value::Erased(_, v)
         | Value::StoragePath(v, _) => remap_functions(v, remap),
@@ -1729,10 +1874,7 @@ fn remap_functions(value: &mut Value, remap: &[usize]) {
 }
 fn remap_service_keys(value: &mut Value, remap: &[usize]) {
     match value {
-        Value::GeneratorStep(
-            cyallo_values::GeneratorStep::Yielded(v) | cyallo_values::GeneratorStep::Complete(v),
-        )
-        | Value::Optional(Some(v))
+        | Value::Enum(_, Some(v))
         | Value::Dynamic(_, v)
         | Value::Erased(_, v)
         | Value::StoragePath(v, _) => remap_service_keys(v, remap),

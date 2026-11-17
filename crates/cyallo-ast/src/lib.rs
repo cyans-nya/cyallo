@@ -2,7 +2,9 @@
 pub use oxc_span::{GetSpan, GetSpanMut, SPAN, Span};
 pub mod diagnostic;
 mod display;
+mod enums;
 pub use display::source_name;
+pub use enums::*;
 mod number;
 pub use number::{Number, NumberError, NumberKind};
 mod operator;
@@ -20,30 +22,13 @@ pub struct DeclarationId(pub u32);
 /// Canonical builtin type constructors, assigned by type resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StorageKind {
-    Cell,
-    Location,
-    StoragePath,
     Option,
     Result,
-    Vec,
-    VecDeque,
     Range,
     ParseError,
-    Weak,
-    ArenaCell,
-    Layout,
-    Allocation,
     AllocError,
-    Generator,
-    PureGenerator,
     GeneratorStep,
-    Sender,
-    Receiver,
     SendError,
-    ReceiveError,
-    Clock,
-    Task,
-    TaskOutcome,
     LoadError,
     ViewError,
     TypeDescriptor,
@@ -69,7 +54,7 @@ impl IdentifierEq for str {
         self == other
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Diagnostic {
     pub code: &'static str,
     pub message: String,
@@ -100,8 +85,48 @@ impl std::fmt::Display for Diagnostic {
     }
 }
 impl std::error::Error for Diagnostic {}
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What the compiler may rely on for an opaque host type, declared by its provider
+/// (see `docs/sdk-registration.md`). These are properties, not identities. Stored as a
+/// bitset so `Type`, and every IR instruction that embeds one, stays small.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct OpaqueTraits(u16);
+macro_rules! opaque_traits {
+    ($($bit:literal $name:ident $with:ident $doc:literal;)*) => {
+        impl OpaqueTraits {
+            $(
+                #[doc = $doc]
+                pub const fn $name(self) -> bool {
+                    self.0 & (1 << $bit) != 0
+                }
+                pub const fn $with(self, on: bool) -> Self {
+                    if on { Self(self.0 | (1 << $bit)) } else { Self(self.0 & !(1 << $bit)) }
+                }
+            )*
+        }
+    };
+}
+opaque_traits! {
+    0 copyable with_copyable "Duplicating the value is a plain copy with no ownership effect.";
+    1 transferable with_transferable "The value can move between tasks and sessions.";
+    2 effectful with_effectful "Creating, cloning or dropping the value has an observable effect.";
+    3 cloneable with_cloneable "The value can be cloned (`clone_value`); handles to unique resources cannot.";
+    4 resource with_resource "The value is itself an owned resource, whatever its type arguments are.";
+    5 indirect with_indirect "The type arguments live behind an indirection, so a recursive type may name itself through it.";
+    6 generator with_generator "The language drives values with `yield`/`resume`; arguments are (yield, resume, return).";
+    7 pure with_pure "Set by the compiler, never declared: a generator made by a pure `fn`.";
+    8 weak with_weak "A weak reference to an `rc` owner; written `Weak<'a, T>` the language builds the owner.";
+    9 deref with_deref "`.*` yields the single argument (a cell reads and writes its contents).";
+    10 target with_target "`Target<Owner>` of this type is its single argument.";
+    11 path with_path "A guarded storage path: a relative lookup plan over its single argument.";
+    12 layout with_layout "The allocator protocol's size-and-alignment request.";
+    13 allocation with_allocation "The allocator protocol's block of memory, returned by `allocate`.";
+    14 collection with_collection "An indexable sequence of its single argument: `v[i]`, `len`, slices, `for`.";
+    15 double_ended with_double_ended "A collection that also grows and shrinks at the front.";
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
+    /// No value can be produced (for example, an exhaustive empty match).
+    Never,
     /// An unresolved generic native function value, retaining declaration identity.
     NativeCallable(DeclarationId),
     /// A value operand named by a native declaration's result contract.
@@ -123,6 +148,11 @@ pub enum Type {
     Record(Box<str>, Vec<(Box<str>, Type)>),
     /// A resolved nominal backedge through an indirection in a recursive layout.
     RecordRef(Box<str>),
+    Enum(std::sync::Arc<EnumType>),
+    /// Boxed so the largest `Type` variant stays small: `Type` is embedded in every
+    /// IR instruction and runtime value.
+    EnumRef(Box<EnumIdentity>, Box<str>),
+    AnonymousRecord(Vec<(Box<str>, Type)>),
     Tuple(Vec<Type>),
     Function(RoutineKind, Vec<(Type, bool)>, Box<Type>),
     Borrowed(Box<Type>),
@@ -145,6 +175,9 @@ pub enum Type {
     TraitObject(Box<str>),
     /// General managed storage/lookup wrappers, independent of services.
     Storage(StorageKind, Box<Type>),
+    /// An opaque host type known only by its declaration: its resolved target,
+    /// type arguments and the traits its provider declared. No kind, no name check.
+    Opaque(Box<str>, Vec<Type>, OpaqueTraits),
     Symbol,
     Any,
     Dynamic,
@@ -152,6 +185,20 @@ pub enum Type {
     Void,
 }
 impl Type {
+    /// The element type of an opaque collection (a type its provider declared with
+    /// the `collection` trait), if this is one.
+    pub fn collection_element(&self) -> Option<&Type> {
+        match self {
+            Self::Opaque(_, arguments, traits) if traits.collection() && arguments.len() == 1 => {
+                arguments.first()
+            }
+            _ => None,
+        }
+    }
+    /// Like [`Self::collection_element`] for a collection that grows at the front too.
+    pub fn is_double_ended(&self) -> bool {
+        matches!(self, Self::Opaque(_, _, traits) if traits.collection() && traits.double_ended())
+    }
     pub fn pointee_or_self(&self) -> &Self {
         match self {
             Self::Reference { pointee, .. } | Self::Managed { pointee, .. } => pointee,
@@ -183,6 +230,21 @@ pub enum Literal {
     Char(char),
     String(Box<str>),
 }
+/// Structural identity: a real hashes by its bit pattern, so equal text gives an
+/// equal hash and distinct values (including `-0.0` and NaN payloads) stay distinct.
+impl std::hash::Hash for Literal {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Number(n) => n.hash(state),
+            Self::Integer(n) => n.hash(state),
+            Self::Real(n) => n.to_bits().hash(state),
+            Self::Boolean(b) => b.hash(state),
+            Self::Char(c) => c.hash(state),
+            Self::String(s) => s.hash(state),
+        }
+    }
+}
 impl Literal {
     pub fn number(n: Number) -> Self {
         match n.kind {
@@ -192,7 +254,7 @@ impl Literal {
         }
     }
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct Expr {
     pub kind: ExprKind,
     pub span: Span,
@@ -209,6 +271,24 @@ pub enum ConstantValue {
     String(std::sync::Arc<str>),
     Array(Vec<ConstantValue>),
     Sparse(std::collections::BTreeMap<u32, ConstantValue>, u64),
+}
+impl std::hash::Hash for ConstantValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Number(n) => n.hash(state),
+            Self::Integer(n) => n.hash(state),
+            Self::Real(n) => n.to_bits().hash(state),
+            Self::Boolean(b) => b.hash(state),
+            Self::Char(c) => c.hash(state),
+            Self::String(s) => s.hash(state),
+            Self::Array(values) => values.hash(state),
+            Self::Sparse(values, length) => {
+                values.hash(state);
+                length.hash(state);
+            }
+        }
+    }
 }
 impl ConstantValue {
     pub fn allocation_size(&self) -> usize {
@@ -227,12 +307,12 @@ impl ConstantValue {
         128usize.saturating_add(extra)
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ObjectKind {
     Typed,
     Dynamic,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub enum ExprKind {
     /// Evaluate a native function value, then materialize its checked ordinary
     /// callable adapter. The first expression's effects must be preserved.
@@ -247,6 +327,11 @@ pub enum ExprKind {
     TypeDescriptor(ExportedType),
     DeferredCallable(Box<str>),
     ObjectLiteral(ObjectKind, Vec<(Box<str>, Expr)>),
+    AnonymousRecord(Vec<(Box<str>, Expr)>),
+    /// Record fields supplied by resolved variant brace construction.
+    VariantPayload(Vec<(Box<str>, Expr)>),
+    Match(Box<Expr>, Vec<MatchArm>),
+    EnumConstruct(VariantId, Type, Option<Box<Expr>>),
     DeleteProperty(Box<Expr>),
     ArrayLiteral(Vec<Expr>),
     Tuple(Vec<Expr>),
@@ -267,12 +352,12 @@ pub enum ExprKind {
     Unary(Operator, Box<Expr>),
     Binary(Operator, Box<Expr>, Box<Expr>),
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct Stmt {
     pub kind: StmtKind,
     pub span: Span,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub enum StmtKind {
     /// Name, annotation, compile-time constant, mutable, initializer.
     Binding(Box<str>, Option<Type>, bool, bool, Expr),
@@ -287,6 +372,7 @@ pub enum StmtKind {
     Output(Vec<Expr>),
     Input(Expr),
     If(Expr, Vec<Stmt>, Vec<Stmt>),
+    IfLet(Pattern, Expr, Vec<Stmt>, Vec<Stmt>),
     While(Expr, Vec<Stmt>),
     Repeat(Vec<Stmt>, Expr),
     /// CAIE `FOR name <- first TO last [STEP step]`: inclusive, signed step.
@@ -297,7 +383,7 @@ pub enum StmtKind {
     Call(Box<str>, Vec<Expr>),
     Return(Expr),
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct Param {
     pub arity: ParameterArity,
     pub passing: ParameterPassing,
@@ -307,12 +393,12 @@ pub struct Param {
     pub by_ref: bool,
     pub span: Span,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct ReferenceCapture {
     pub name: Box<str>,
     pub mutable: bool,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct Function {
     pub annotations: Vec<DeclarationAnnotation>,
     pub body_kind: FunctionBodyKind,
@@ -330,55 +416,56 @@ pub struct Function {
     pub body: Vec<Stmt>,
     pub span: Span,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FunctionBodyKind {
     Source,
     Declaration,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DeclarationAnnotation {
     pub name: Box<str>,
     pub value: Box<str>,
     pub span: Span,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct GenericConstraint {
     pub parameter: Box<str>,
     pub bounds: Vec<Type>,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum ParameterArity {
     #[default]
     One,
     Variadic,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum ParameterPassing {
     #[default]
     Value,
     /// A native call reads a VM descriptor without taking its language owner.
     Read,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum RoutineOrigin {
     #[default]
     Source,
     Closure,
     Implementation,
+    EnumConstructor,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RoutineKind {
     Function,
     Procedure,
 }
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum HeatHint {
     #[default]
     Auto,
     Hot,
     Cold,
 }
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum CompileHint {
     #[default]
     Auto,
@@ -387,7 +474,7 @@ pub enum CompileHint {
     AlwaysEager,
     AlwaysLazy,
 }
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum InlineHint {
     #[default]
     Auto,
@@ -395,7 +482,7 @@ pub enum InlineHint {
     Never,
     Always,
 }
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct RoutineAttributes {
     pub heat: HeatHint,
     pub compilation: CompileHint,
@@ -409,12 +496,13 @@ impl RoutineAttributes {
         self.heat_span.is_none() && self.compilation_span.is_none() && self.inline_span.is_none()
     }
 }
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Hash)]
 pub struct Ast {
+    pub enums: Vec<EnumDeclaration>,
     pub type_aliases: Vec<TypeAlias>,
     pub resolved_modules: Vec<ResolvedModuleExports>,
     pub native: NativeDeclarations,
-    pub source_names: std::collections::HashMap<Box<str>, Box<str>>,
+    pub source_names: std::collections::BTreeMap<Box<str>, Box<str>>,
     pub body: Vec<Stmt>,
     pub functions: Vec<Function>,
     pub records: Vec<Record>,
@@ -425,30 +513,65 @@ pub struct Ast {
     pub properties: Vec<Property>,
     pub modules: Vec<ModuleDeclaration>,
     pub inherent_implementations: Vec<InherentImplementation>,
+    pub worlds: Vec<World>,
+    pub interface_implementations: Vec<InterfaceImplementation>,
 }
-#[derive(Debug, Clone)]
+/// A named contract between an instantiating and an instantiated component.
+#[derive(Debug, Clone, Hash)]
+pub struct World {
+    pub annotations: Vec<DeclarationAnnotation>,
+    pub name: Box<str>,
+    pub public: bool,
+    pub items: Vec<WorldItem>,
+    pub span: Span,
+}
+#[derive(Debug, Clone, Hash)]
+pub enum WorldItem {
+    /// Compose another world's imports and exports.
+    Include { path: Box<str>, span: Span },
+    /// A module the instantiating side provides. `members` lists the exact
+    /// subset of its declarations the component may use; `None` imports it whole.
+    Import {
+        path: Box<str>,
+        alias: Option<Box<str>>,
+        members: Option<Vec<Function>>,
+        span: Span,
+    },
+    /// A routine the instantiated component must provide.
+    Export { function: Function },
+}
+/// `impl interface P for M { type T = U; }`: M implements interface module P and
+/// binds P's opaque types.
+#[derive(Debug, Clone, Hash)]
+pub struct InterfaceImplementation {
+    pub interface: Box<str>,
+    pub module: Box<str>,
+    pub bindings: Vec<(Box<str>, Type)>,
+    pub span: Span,
+}
+#[derive(Debug, Clone, Hash)]
 pub struct TypeAlias {
     pub name: Box<str>,
     pub ty: Type,
     pub span: Span,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct ResolvedModuleExports {
     pub path: Box<str>,
     pub values: Vec<ResolvedExport>,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExportKind {
     Value,
     Module,
     Type,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExportedType {
     pub name: Box<str>,
     pub identity: Box<str>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct ResolvedExport {
     pub kind: ExportKind,
     pub name: Box<str>,
@@ -456,14 +579,16 @@ pub struct ResolvedExport {
 }
 /// A loader may install an independently resolved package under a private node.
 /// This changes lexical ancestry only; it never grants core provenance.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum ModuleBoundary {
     #[default]
     Lexical,
     Package,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct ModuleDeclaration {
+    /// Declared with `interface mod`: its declarations are contract, not implementation.
+    pub interface: bool,
     pub boundary: ModuleBoundary,
     pub annotations: Vec<DeclarationAnnotation>,
     pub name: Box<str>,
@@ -471,7 +596,7 @@ pub struct ModuleDeclaration {
     pub body: Option<Box<Ast>>,
     pub span: Span,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct Import {
     pub path: Box<str>,
     pub alias: Option<Box<str>>,
@@ -479,12 +604,12 @@ pub struct Import {
     pub public: bool,
     pub glob: bool,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TraitOrigin {
     Source,
     Allocator,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct Trait {
     pub type_params: Vec<Box<str>>,
     pub annotations: Vec<DeclarationAnnotation>,
@@ -493,29 +618,30 @@ pub struct Trait {
     pub methods: Vec<Function>,
     pub span: Span,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct Implementation {
     pub trait_name: Box<str>,
     pub receiver: Type,
     pub methods: Vec<Function>,
     pub span: Span,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct InherentImplementation {
     pub type_params: Vec<Box<str>>,
     pub receiver: Type,
     pub methods: Vec<InherentMethod>,
     pub span: Span,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct InherentMethod {
     pub public: bool,
     pub function: Function,
 }
 /// Trusted native headers retained by the compilation after namespace linking.
 /// Source trust is checked by the loader/linker before populating this table.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Hash)]
 pub struct NativeDeclarations {
+    pub enums: Vec<NativeEnumDeclaration>,
     pub import_policy: Option<NativeImportPolicy>,
     pub types: Vec<NativeTypeDeclaration>,
     pub functions: Vec<NativeFunctionDeclaration>,
@@ -523,20 +649,20 @@ pub struct NativeDeclarations {
     pub traits: Vec<(DeclarationId, Trait)>,
     pub families: Vec<(DeclarationId, Record)>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct NativeTypeDeclaration {
     pub id: DeclarationId,
     pub name: Box<str>,
     pub parameters: Vec<Box<str>>,
     pub annotation: DeclarationAnnotation,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct NativeFunctionDeclaration {
     pub id: DeclarationId,
     pub module: Option<DeclarationId>,
     pub function: Function,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct NativeMethodDeclaration {
     pub id: DeclarationId,
     pub module: Option<DeclarationId>,
@@ -546,37 +672,40 @@ pub struct NativeMethodDeclaration {
     pub function: Function,
     pub public: bool,
 }
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Hash)]
 pub struct NativeImportPolicy {
     pub modules: Vec<NativeModuleIdentity>,
     pub access: Vec<NativeModuleAccess>,
-    pub requesters: std::collections::HashMap<u32, DeclarationId>,
+    pub requesters: std::collections::BTreeMap<u32, DeclarationId>,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceTrust {
     User,
     Core,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct NativeModuleIdentity {
     pub trust: SourceTrust,
     pub id: DeclarationId,
     pub path: Box<str>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct NativeModuleAccess {
     pub referrer: DeclarationId,
     pub allowed: Vec<DeclarationId>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct Property {
     pub receiver: Type,
     pub name: Box<str>,
     pub getter: Function,
     pub span: Span,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct Record {
+    /// Declared `opaque record`: representation is chosen by the implementer and
+    /// the type cannot be constructed or destructured by importers.
+    pub opaque: bool,
     pub annotations: Vec<DeclarationAnnotation>,
     pub type_params: Vec<Box<str>>,
     pub name: Box<str>,
@@ -606,7 +735,7 @@ impl GetSpan for Param {
 }
 /// One source owns its line index. Spans remain half-open UTF-8 byte ranges.
 /// Spans are u32 byte offsets, so one source is limited to 4 GiB.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SourceTooLarge;
 impl std::fmt::Display for SourceTooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -614,7 +743,7 @@ impl std::fmt::Display for SourceTooLarge {
     }
 }
 impl std::error::Error for SourceTooLarge {}
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct SourceFile {
     text: Box<str>,
     line_starts: Box<[u32]>,
@@ -661,7 +790,7 @@ impl SourceFile {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct CaseLabel {
     pub lower: Expr,
     pub upper: Option<Expr>,

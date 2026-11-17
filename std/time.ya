@@ -1,12 +1,8 @@
-#[cyallo_internal("clock_struct")]
 pub record Clock {}
 
-#[cyallo_internal("clock_new")]
 pub proc clock() -> Clock;
 
 impl Clock {
-    #[cyallo_internal("clock_clone")]
     pub proc clone(self: &Self) -> Self;
-    #[cyallo_internal("clock_sleep")]
     pub proc sleep(self: &Self, duration: u64);
 }

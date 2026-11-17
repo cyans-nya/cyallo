@@ -21,10 +21,18 @@ pub fn callable(t: &Type) -> Option<Callable<'_>> {
 }
 pub fn borrowed(t: &Type) -> bool {
     match t {
+        Type::Enum(contract) => contract
+            .variants
+            .iter()
+            .filter_map(|v| v.payload.as_ref())
+            .any(borrowed),
         Type::Borrowed(_) => true,
         Type::Tuple(ts) => ts.iter().any(borrowed),
-        Type::Record(_, fs) | Type::Object(fs) => fs.iter().any(|(_, t)| borrowed(t)),
+        Type::Record(_, fs) | Type::AnonymousRecord(fs) | Type::Object(fs) => {
+            fs.iter().any(|(_, t)| borrowed(t))
+        }
         Type::Array(_, t) | Type::SparseArray(t) | Type::Storage(_, t) => borrowed(t),
+        Type::Opaque(_, ts, _) => ts.iter().any(borrowed),
         _ => false,
     }
 }
@@ -68,7 +76,7 @@ fn bound_names(f: &Function) -> HashSet<String> {
 /// layout are needed. A record's fields remain finite and may contain backedges.
 pub fn type_view(ty: &Type, definitions: &HashMap<String, Type>) -> Type {
     match ty {
-        Type::RecordRef(name) => definitions
+        Type::EnumRef(_, name) | Type::RecordRef(name) => definitions
             .get(name.as_ref())
             .cloned()
             .expect("resolved record identity"),
@@ -93,6 +101,11 @@ pub fn type_view(ty: &Type, definitions: &HashMap<String, Type>) -> Type {
             pointee: Box::new(type_view(pointee, definitions)),
         },
         Type::Storage(kind, inner) => Type::Storage(*kind, Box::new(type_view(inner, definitions))),
+        Type::Opaque(name, arguments, traits) => Type::Opaque(
+            name.clone(),
+            arguments.iter().map(|t| type_view(t, definitions)).collect(),
+            *traits,
+        ),
         Type::Array(bounds, inner) => {
             Type::Array(bounds.clone(), Box::new(type_view(inner, definitions)))
         }
@@ -105,15 +118,74 @@ pub fn type_view(ty: &Type, definitions: &HashMap<String, Type>) -> Type {
     }
 }
 pub fn resolve(ast: &mut Ast) -> Result<HashMap<String, Type>> {
+    let native = ast.native.clone();
+    let definitions = record_definitions(std::iter::once(&*ast), &native)?;
+    resolve_using(ast, &definitions)
+}
+#[derive(Clone)]
+enum CompositeDefinition {
+    Record(Record),
+    Enum(EnumDeclaration),
+    /// A declared `core` enum denoted by a `Storage` marker.
+    Native(EnumDeclaration),
+}
+fn native_key(kind: StorageKind) -> String {
+    format!("$native:{kind:?}")
+}
+fn record_definitions<'a>(
+    asts: impl Iterator<Item = &'a Ast>,
+    native: &NativeDeclarations,
+) -> Result<HashMap<String, CompositeDefinition>> {
     let mut definitions = HashMap::new();
-    for r in &ast.records {
-        if definitions.insert(key(&r.name), r.clone()).is_some() {
-            return Err(Diagnostic::new("E101", "duplicate record type", r.span));
+    for declaration in &native.enums {
+        definitions.insert(
+            native_key(declaration.storage),
+            CompositeDefinition::Native(declaration.declaration.clone()),
+        );
+    }
+    for ast in asts {
+        for e in &ast.enums {
+            if definitions
+                .insert(key(&e.name), CompositeDefinition::Enum(e.clone()))
+                .is_some()
+            {
+                return Err(crate::enums::invalid_enum(
+                    crate::enums::EnumError::DuplicateType {
+                        name: e.name.clone(),
+                    },
+                    e.span,
+                ));
+            }
+        }
+        for r in &ast.records {
+            if definitions
+                .insert(key(&r.name), CompositeDefinition::Record(r.clone()))
+                .is_some()
+            {
+                return Err(Diagnostic::new("E101", "duplicate record type", r.span));
+            }
         }
     }
+    Ok(definitions)
+}
+pub fn resolve_modules(
+    asts: &mut [Ast],
+    native: &NativeDeclarations,
+) -> Result<HashMap<String, Type>> {
+    let definitions = record_definitions(asts.iter(), native)?;
+    let mut types = HashMap::new();
+    for ast in asts {
+        types.extend(resolve_using(ast, &definitions)?);
+    }
+    Ok(types)
+}
+fn resolve_using(
+    ast: &mut Ast,
+    definitions: &HashMap<String, CompositeDefinition>,
+) -> Result<HashMap<String, Type>> {
     fn ty(
         t: &mut Type,
-        defs: &HashMap<String, Record>,
+        defs: &HashMap<String, CompositeDefinition>,
         active: &mut HashMap<String, usize>,
         depth: usize,
         span: Span,
@@ -128,13 +200,74 @@ pub fn resolve(ast: &mut Ast) -> Result<HashMap<String, Type>> {
             }
             Type::Named(name) => {
                 let identity = key(name);
-                let record = defs.get(&identity).ok_or_else(|| {
+                let definition = defs.get(&identity).ok_or_else(|| {
                     Diagnostic::new(
                         "E116",
                         format!("unknown type `{}`", cyallo_ast::source_name(name)),
                         span,
                     )
                 })?;
+                if let CompositeDefinition::Enum(declaration) = definition {
+                    let resolved = declaration.resolved.as_ref().ok_or_else(|| {
+                        crate::enums::invalid_enum(
+                            crate::enums::EnumError::UnresolvedDeclaration {
+                                name: declaration.name.clone(),
+                            },
+                            span,
+                        )
+                    })?;
+                    let instance = EnumIdentity {
+                        declaration: resolved.declaration,
+                        arguments: resolved.arguments.clone(),
+                    };
+                    if let Some(start) = active.get(&identity) {
+                        if depth > *start {
+                            *t = Type::EnumRef(Box::new(instance), declaration.name.clone());
+                            return Ok(());
+                        }
+                        return Err(crate::enums::invalid_enum(
+                            crate::enums::EnumError::RecursiveValue {
+                                name: declaration.name.clone(),
+                            },
+                            declaration.span,
+                        ));
+                    }
+                    active.insert(identity.clone(), depth);
+                    let mut variants = vec![];
+                    for variant in &declaration.variants {
+                        let resolved = variant.resolved.as_ref().ok_or_else(|| {
+                            crate::enums::invalid_enum(
+                                crate::enums::EnumError::UnresolvedDeclaration {
+                                    name: variant.name.clone(),
+                                },
+                                variant.span,
+                            )
+                        })?;
+                        let mut payload = variant.payload.clone();
+                        if let Some(payload) = &mut payload {
+                            ty(payload, defs, active, depth, variant.span)?;
+                        }
+                        variants.push(VariantType {
+                            encoding: resolved.encoding,
+                            declaration: resolved.declaration,
+                            name: variant.name.clone(),
+                            symbol: resolved.symbol.clone(),
+                            payload,
+                        });
+                    }
+                    active.remove(&identity);
+                    *t = Type::Enum(std::sync::Arc::new(EnumType {
+                        identity: instance,
+                        name: declaration.name.clone(),
+                        package: resolved.package,
+                        open: declaration.open,
+                        variants,
+                    }));
+                    return Ok(());
+                }
+                let CompositeDefinition::Record(record) = definition else {
+                    unreachable!()
+                };
                 if let Some(start) = active.get(&identity) {
                     if depth > *start {
                         *t = Type::RecordRef(identity.into());
@@ -162,6 +295,11 @@ pub fn resolve(ast: &mut Ast) -> Result<HashMap<String, Type>> {
                 active.remove(&identity);
                 *t = Type::Record(identity.into(), fields);
             }
+            Type::AnonymousRecord(fields) => {
+                for (_, field) in fields {
+                    ty(field, defs, active, depth, span)?;
+                }
+            }
             Type::Tuple(types) => {
                 for t in types {
                     ty(t, defs, active, depth, span)?;
@@ -170,21 +308,31 @@ pub fn resolve(ast: &mut Ast) -> Result<HashMap<String, Type>> {
             Type::Reference { pointee: t, .. } | Type::Managed { pointee: t, .. } => {
                 ty(t, defs, active, depth + 1, span)?
             }
-            Type::Storage(
-                StorageKind::Vec
-                | StorageKind::VecDeque
-                | StorageKind::Weak
-                | StorageKind::Location
-                | StorageKind::StoragePath
-                | StorageKind::ArenaCell,
-                t,
-            ) => ty(t, defs, active, depth + 1, span)?,
+            Type::Opaque(_, arguments, traits) if traits.indirect() => {
+                for t in arguments {
+                    ty(t, defs, active, depth + 1, span)?;
+                }
+            }
             Type::Slice(t)
             | Type::Array(_, t)
             | Type::SparseArray(t)
             | Type::ServiceKey(t)
-            | Type::ServiceRef(t)
-            | Type::Storage(_, t) => ty(t, defs, active, depth, span)?,
+            | Type::ServiceRef(t) => ty(t, defs, active, depth, span)?,
+            Type::Storage(kind, inner) => {
+                ty(inner, defs, active, depth, span)?;
+                // A core enum spelled as its marker becomes the declared enum.
+                if let Some(CompositeDefinition::Native(declaration)) = defs.get(&native_key(*kind))
+                    && let Some(contract) =
+                        crate::enums::contract_for(declaration, *kind, inner)
+                {
+                    *t = Type::Enum(std::sync::Arc::new(contract));
+                }
+            }
+            Type::Opaque(_, arguments, _) => {
+                for t in arguments {
+                    ty(t, defs, active, depth, span)?;
+                }
+            }
             Type::Borrowed(inner) => {
                 ty(inner, defs, active, depth, span)?;
                 if !matches!(inner.as_ref(), Type::Function(..)) {
@@ -219,11 +367,16 @@ pub fn resolve(ast: &mut Ast) -> Result<HashMap<String, Type>> {
         }
         Ok(())
     }
-    fn function(f: &mut Function, defs: &HashMap<String, Record>) -> Result<()> {
+    fn function(f: &mut Function, defs: &HashMap<String, CompositeDefinition>) -> Result<()> {
         for p in &mut f.params {
             ty(&mut p.ty, defs, &mut HashMap::new(), 0, p.span)?;
         }
         ty(&mut f.result, defs, &mut HashMap::new(), 0, f.span)?;
+        if f.origin == RoutineOrigin::EnumConstructor
+            && crate::ownership::effectful_lifecycle(&f.result)
+        {
+            f.kind = RoutineKind::Procedure;
+        }
         if borrowed(&f.result) {
             return Err(Diagnostic::new(
                 "E117",
@@ -233,7 +386,7 @@ pub fn resolve(ast: &mut Ast) -> Result<HashMap<String, Type>> {
         }
         block(&mut f.body, defs)
     }
-    fn block(body: &mut [Stmt], defs: &HashMap<String, Record>) -> Result<()> {
+    fn block(body: &mut [Stmt], defs: &HashMap<String, CompositeDefinition>) -> Result<()> {
         visit_block(
             body,
             &mut |e| {
@@ -253,24 +406,24 @@ pub fn resolve(ast: &mut Ast) -> Result<HashMap<String, Type>> {
             &mut |t, span| ty(t, defs, &mut HashMap::new(), 0, span),
         )
     }
-    block(&mut ast.body, &definitions)?;
+    block(&mut ast.body, definitions)?;
     for f in &mut ast.functions {
-        function(f, &definitions)?;
+        function(f, definitions)?;
     }
     for t in &mut ast.traits {
         for f in &mut t.methods {
             for p in &mut f.params {
                 if !p.receiver {
-                    ty(&mut p.ty, &definitions, &mut HashMap::new(), 0, p.span)?;
+                    ty(&mut p.ty, definitions, &mut HashMap::new(), 0, p.span)?;
                 }
             }
-            ty(&mut f.result, &definitions, &mut HashMap::new(), 0, f.span)?;
+            ty(&mut f.result, definitions, &mut HashMap::new(), 0, f.span)?;
         }
     }
     for implementation in &mut ast.implementations {
         ty(
             &mut implementation.receiver,
-            &definitions,
+            definitions,
             &mut HashMap::new(),
             0,
             implementation.span,
@@ -290,23 +443,34 @@ pub fn resolve(ast: &mut Ast) -> Result<HashMap<String, Type>> {
                     self_type(&mut p.ty, &implementation.receiver);
                 }
             }
-            function(f, &definitions)?;
+            function(f, definitions)?;
         }
     }
     for property in &mut ast.properties {
         ty(
             &mut property.receiver,
-            &definitions,
+            definitions,
             &mut HashMap::new(),
             0,
             property.span,
         )?;
-        function(&mut property.getter, &definitions)?;
+        function(&mut property.getter, definitions)?;
     }
     let mut types = HashMap::new();
+    for declaration in &ast.enums {
+        let mut t = Type::Named(declaration.name.clone());
+        ty(
+            &mut t,
+            definitions,
+            &mut HashMap::new(),
+            0,
+            declaration.span,
+        )?;
+        types.insert(key(&declaration.name), t);
+    }
     for r in &ast.records {
         let mut t = Type::Named(r.name.clone());
-        ty(&mut t, &definitions, &mut HashMap::new(), 0, r.span)?;
+        ty(&mut t, definitions, &mut HashMap::new(), 0, r.span)?;
         types.insert(key(&r.name), t);
     }
     Ok(types)
@@ -319,6 +483,15 @@ pub fn lift(
     types: &crate::declarations::TypeEnvironment,
     options: CompileOptions,
 ) -> Result<()> {
+    lift_module(ast, globals, types, options, "main")
+}
+pub fn lift_module(
+    ast: &mut Ast,
+    globals: &[Local],
+    types: &crate::declarations::TypeEnvironment,
+    options: CompileOptions,
+    module: &str,
+) -> Result<()> {
     fn block(
         body: &mut [Stmt],
         known: &[Local],
@@ -327,6 +500,7 @@ pub fn lift(
         generated: &mut Vec<Function>,
         owner: &str,
     ) -> Result<()> {
+        let mut closure_index = 0;
         visit_block(
             body,
             &mut |e| {
@@ -496,7 +670,8 @@ pub fn lift(
                 // Reserve a stable name before descending into nested closures.
                 let index = generated.len();
                 f.origin = RoutineOrigin::Closure;
-                f.name = format!("$closure{}${owner}", e.span.start).into();
+                f.name = format!("$closure{closure_index}${owner}").into();
+                closure_index += 1;
                 generated.push(f.clone());
                 let mut locals = analysis::collect(&f.body, &f.params)?;
                 crate::generator::input_local(&f, &mut locals);
@@ -521,7 +696,7 @@ pub fn lift(
         types,
         options,
         &mut generated,
-        "main",
+        module,
     )?;
     for f in &mut ast.functions {
         // Keep deferred routines deferred when they contain no closure syntax.

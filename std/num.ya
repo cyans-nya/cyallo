@@ -1,32 +1,18 @@
 use std::result::Result;
 
-#[cyallo_internal("numeric_trait")]
 pub trait Numeric {}
-#[cyallo_internal("integer_trait")]
 pub trait Integer {}
-#[cyallo_internal("floating_trait")]
 pub trait Floating {}
 
-#[cyallo_internal("parse_error_struct")]
 pub record ParseError {}
 
-#[cyallo_internal("numeric_parse")]
 pub fn parse<T: Numeric>(read text: string) -> Result<T, ParseError>;
-#[cyallo_internal("numeric_abs")]
 pub fn abs<T: Numeric>(value: T) -> T;
-#[cyallo_internal("numeric_min")]
 pub fn min<T: Numeric>(left: T, right: T) -> T;
-#[cyallo_internal("numeric_max")]
 pub fn max<T: Numeric>(left: T, right: T) -> T;
-#[cyallo_internal("numeric_clamp")]
 pub fn clamp<T: Numeric>(value: T, lower: T, upper: T) -> T;
-#[cyallo_internal("float_round")]
 pub fn round<T: Floating>(value: T) -> T;
-#[cyallo_internal("float_floor")]
 pub fn floor<T: Floating>(value: T) -> T;
-#[cyallo_internal("float_ceil")]
 pub fn ceil<T: Floating>(value: T) -> T;
-#[cyallo_internal("float_sqrt")]
 pub fn sqrt<T: Floating>(value: T) -> T;
-#[cyallo_internal("float_pow")]
 pub fn pow<T: Floating>(value: T, exponent: T) -> T;

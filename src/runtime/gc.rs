@@ -539,7 +539,6 @@ impl Collector {
                         Value::TaskOutcome(cyallo_concurrent_values::TaskOutcome::Completed(
                             value,
                         )) => owners(value, pending),
-                        Value::SendError(error) => owners(&error.value, pending),
                         Value::ObjectStorage { slots: values, .. }
                         | Value::ArraySnapshot(values)
                         | Value::Function(_, values) => {
@@ -552,13 +551,8 @@ impl Collector {
                                 owners(value, pending);
                             }
                         }
-                        Value::GeneratorStep(
-                            cyallo_values::GeneratorStep::Yielded(value)
-                            | cyallo_values::GeneratorStep::Complete(value),
-                        )
                         | Value::Cell(value)
-                        | Value::Optional(Some(value))
-                        | Value::Result(Ok(value) | Err(value))
+                        | Value::Enum(_, Some(value))
                         | Value::Dynamic(_, value)
                         | Value::Erased(_, value)
                         | Value::StoragePath(value, _) => owners(value, pending),
@@ -592,17 +586,13 @@ fn trace(
     match value {
         // Task results and failed sends retain values that may hold heap cells.
         Value::TaskOutcome(cyallo_concurrent_values::TaskOutcome::Completed(v)) => trace(v, visit)?,
-        Value::SendError(error) => trace(&error.value, visit)?,
         Value::Object(id) | Value::Managed(id) | Value::Address(id) | Value::TraitObject(id, _) => {
             visit(*id)?
         }
         Value::Slice { owner, .. } => visit(*owner)?,
-        Value::GeneratorStep(
-            cyallo_values::GeneratorStep::Yielded(v) | cyallo_values::GeneratorStep::Complete(v),
-        )
+        Value::EnumStorage(_, Some(id)) | Value::NativeEnumStorage(_, Some(id)) => visit(*id)?,
         | Value::Cell(v)
-        | Value::Optional(Some(v))
-        | Value::Result(Ok(v) | Err(v))
+        | Value::Enum(_, Some(v))
         | Value::Dynamic(_, v)
         | Value::Erased(_, v)
         | Value::StoragePath(v, _) => trace(v, visit)?,
@@ -642,17 +632,13 @@ fn relocate(value: &mut Value, rewrite: &impl Fn(&mut usize)) {
         Value::TaskOutcome(cyallo_concurrent_values::TaskOutcome::Completed(v)) => {
             relocate(v, rewrite)
         }
-        Value::SendError(error) => relocate(&mut error.value, rewrite),
         Value::Object(id) | Value::Managed(id) | Value::Address(id) | Value::TraitObject(id, _) => {
             rewrite(id)
         }
         Value::Slice { owner, .. } => rewrite(owner),
-        Value::GeneratorStep(
-            cyallo_values::GeneratorStep::Yielded(v) | cyallo_values::GeneratorStep::Complete(v),
-        )
+        Value::EnumStorage(_, Some(id)) | Value::NativeEnumStorage(_, Some(id)) => rewrite(id),
         | Value::Cell(v)
-        | Value::Optional(Some(v))
-        | Value::Result(Ok(v) | Err(v))
+        | Value::Enum(_, Some(v))
         | Value::Dynamic(_, v)
         | Value::Erased(_, v)
         | Value::StoragePath(v, _) => relocate(v, rewrite),
@@ -871,10 +857,10 @@ mod tests {
         let completed = roots.value(Value::TaskOutcome(
             cyallo_concurrent_values::TaskOutcome::Completed(Box::new(Value::Managed(1))),
         ));
-        let unsent = roots.value(Value::SendError(cyallo_concurrent_values::SendError {
-            kind: cyallo_concurrent_values::SendFailure::Closed,
-            value: Box::new(Value::Managed(2)),
-        }));
+        let unsent = roots.value(Value::send_error(
+            cyallo_concurrent_values::SendFailure::Closed,
+            Box::new(Value::Managed(2)),
+        ));
         gc.collect(&mut heap, 1).unwrap();
         // Cell 0 is unreachable; the two referenced cells survive and are renumbered.
         assert_eq!(heap.len(), 2);
@@ -885,10 +871,11 @@ mod tests {
                 Value::Managed(0)
             )))
         );
-        let Value::SendError(error) = roots.value_copy(unsent) else {
+        let copy = roots.value_copy(unsent);
+        let Some((_, value)) = copy.as_send_error() else {
             panic!("expected a send error")
         };
-        assert_eq!(*error.value, Value::Managed(1));
+        assert_eq!(*value, Value::Managed(1));
     }
     #[test]
     fn invalid_edge_fails_before_rewriting_roots_or_heap() {

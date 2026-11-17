@@ -180,7 +180,7 @@ pub fn lex(source: &str) -> Result<Lexed<'_>, Diagnostic> {
                 }
                 kind
             }
-            b'a'..=b'z' | b'A'..=b'Z' => {
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
                 pos += 1;
                 while bytes
                     .get(pos)
@@ -194,6 +194,7 @@ pub fn lex(source: &str) -> Result<Lexed<'_>, Diagnostic> {
             _ => {
                 let two = match (bytes[pos], bytes.get(pos + 1)) {
                     (b'-', Some(b'>')) => Some(TokenKind::Arrow),
+                    (b'=', Some(b'>')) => Some(TokenKind::FatArrow),
                     (b'=', Some(b'=')) => Some(TokenKind::EqualEqual),
                     (b'!', Some(b'=')) => Some(TokenKind::BangEqual),
                     (b'&', Some(b'&')) => Some(TokenKind::AndAnd),
@@ -232,6 +233,7 @@ pub fn lex(source: &str) -> Result<Lexed<'_>, Diagnostic> {
                         '*' => TokenKind::Star,
                         '/' => TokenKind::Slash,
                         '&' => TokenKind::Ampersand,
+                        '|' => TokenKind::Pipe,
                         '=' => TokenKind::Equal,
                         '<' => TokenKind::Less,
                         '>' => TokenKind::Greater,

@@ -1,33 +1,21 @@
-#[cyallo_internal("transferable_trait")]
 pub trait Transferable {}
 
 // Native declarations are opaque: source code cannot fabricate their storage.
-#[cyallo_internal("task_struct")]
 pub record Task<T> {}
-#[cyallo_internal("task_outcome_struct")]
 pub record TaskOutcome<T> {}
 
-#[cyallo_internal("task_spawn")]
 pub proc spawn<T: Transferable>(body: proc() -> T) -> Task<T>;
 
 impl<T> Task<T> {
-    #[cyallo_internal("task_join")]
     pub proc join(self) -> TaskOutcome<T>;
-    #[cyallo_internal("task_cancel")]
     pub proc cancel(self: &Self);
-    #[cyallo_internal("task_is_finished")]
     pub proc is_finished(self: &Self) -> bool;
 }
 
 impl<T> TaskOutcome<T> {
-    #[cyallo_internal("task_completed")]
     pub proc completed(self) -> T;
-    #[cyallo_internal("task_is_completed")]
     pub proc is_completed(self: &Self) -> bool;
-    #[cyallo_internal("task_is_failed")]
     pub proc is_failed(self: &Self) -> bool;
-    #[cyallo_internal("task_is_cancelled")]
     pub proc is_cancelled(self: &Self) -> bool;
-    #[cyallo_internal("task_is_stopped")]
     pub proc is_stopped(self: &Self) -> bool;
 }

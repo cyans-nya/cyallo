@@ -9,13 +9,13 @@ use std::collections::HashMap;
 fn key(s: &str) -> String {
     s.to_owned()
 }
-struct Candidate<'a> {
-    name: &'a str,
+struct Candidate {
+    name: String,
     depth: usize,
     span: Span,
     constant: bool,
     binding: bool,
-    value: Option<&'a Expr>,
+    value: Option<Expr>,
 }
 pub fn infer(
     body: &[Stmt],
@@ -33,40 +33,40 @@ pub fn infer(
             _ => None,
         }
     }
-    fn gather<'a>(
-        body: &'a [Stmt],
-        candidates: &mut Vec<Candidate<'a>>,
-        loops: &mut Vec<(&'a str, Option<&'a Expr>, Span)>,
+    fn gather(
+        body: &[Stmt],
+        candidates: &mut Vec<Candidate>,
+        loops: &mut Vec<(String, Option<Expr>, Span)>,
     ) {
         cyallo_ast::with_stack(|| {
             for s in body {
                 match &s.kind {
                     StmtKind::Binding(name, _, constant, mutable, value) => {
                         candidates.push(Candidate {
-                            name,
+                            name: name.to_string(),
                             depth: 0,
                             span: s.span,
                             constant: *constant || !*mutable,
                             binding: true,
-                            value: Some(value),
+                            value: Some(value.clone()),
                         })
                     }
                     StmtKind::Assign(target, value) => {
                         if let Some((name, depth)) = root(target) {
                             candidates.push(Candidate {
-                                name,
+                                name: name.to_string(),
                                 depth,
                                 span: target.span,
                                 constant: false,
                                 binding: false,
-                                value: Some(value),
+                                value: Some(value.clone()),
                             });
                         }
                     }
                     StmtKind::Input(target) => {
                         if let Some((name, depth)) = root(target) {
                             candidates.push(Candidate {
-                                name,
+                                name: name.to_string(),
                                 depth,
                                 span: target.span,
                                 constant: false,
@@ -76,11 +76,11 @@ pub fn infer(
                         }
                     }
                     StmtKind::For(n, _, _, _, b) => {
-                        loops.push((n, None, s.span));
+                        loops.push((n.to_string(), None, s.span));
                         gather(b, candidates, loops);
                     }
                     StmtKind::ForIn(n, iterable, b) => {
-                        loops.push((n, Some(iterable), s.span));
+                        loops.push((n.to_string(), Some(iterable.clone()), s.span));
                         gather(b, candidates, loops);
                     }
                     StmtKind::If(_, a, b) => {
@@ -102,14 +102,31 @@ pub fn infer(
     let mut candidates = vec![];
     let mut loops = vec![];
     gather(body, &mut candidates, &mut loops);
+    let mut patterns = vec![];
+    let mut copy = body.to_vec();
+    cyallo_ast::visit::visit_block(
+        &mut copy,
+        &mut |expression| {
+            if let ExprKind::Match(value, arms) = &expression.kind {
+                for arm in arms {
+                    patterns.push((arm.pattern.clone(), *value.clone()));
+                    if let MatchBody::Block(body, _) = &arm.body {
+                        gather(body, &mut candidates, &mut loops);
+                    }
+                }
+            }
+            Ok(())
+        },
+        &mut |_, _| Ok(()),
+    )?;
     let mut known: HashMap<_, _> = globals
         .iter()
         .chain(locals.iter())
         .map(|l| (key(&l.name), l.ty.clone()))
         .collect();
     for candidate in candidates.iter().filter(|c| c.binding) {
-        if !locals.iter().any(|l| l.name.eq_identifier(candidate.name)) {
-            known.remove(&key(candidate.name));
+        if !locals.iter().any(|l| l.name.eq_identifier(&candidate.name)) {
+            known.remove(&key(&candidate.name));
         }
     }
     let mut range_loops = vec![];
@@ -117,10 +134,10 @@ pub fn infer(
         match iterable {
             // CAIE FOR counters are INTEGER.
             None => {
-                if let std::collections::hash_map::Entry::Vacant(entry) = known.entry(key(n)) {
+                if let std::collections::hash_map::Entry::Vacant(entry) = known.entry(key(&n)) {
                     entry.insert(Type::Integer);
                     locals.push(Local {
-                        display_name: Some(n.into()),
+                        display_name: Some(n.clone().into()),
                         name: n.into(),
                         ty: Type::Integer,
                         constant: false,
@@ -134,7 +151,7 @@ pub fn infer(
     loop {
         let mut changed = false;
         // A range loop variable has the range's element type once that is known.
-        for &(name, iterable, span) in &range_loops {
+        for (name, iterable, span) in &range_loops {
             if known.contains_key(&key(name)) {
                 continue;
             }
@@ -143,21 +160,38 @@ pub fn infer(
             {
                 known.insert(key(name), (*element).clone());
                 locals.push(Local {
-                    display_name: Some(name.into()),
-                    name: name.into(),
+                    display_name: Some(name.clone().into()),
+                    name: name.clone().into(),
                     ty: *element,
                     constant: false,
-                    span,
+                    span: *span,
                 });
                 changed = true;
             }
         }
+        for (pattern, value) in &patterns {
+            if let Ok(ty) = crate::patterns::scrutinee_type(value, &known, routines) {
+                for binding in crate::patterns::check(pattern, &ty, routines)?.bindings() {
+                    if !known.contains_key(binding.name.as_ref()) {
+                        known.insert(binding.name.to_string(), binding.ty.clone());
+                        locals.push(Local {
+                            display_name: Some(binding.name.clone()),
+                            name: binding.name,
+                            ty: binding.ty,
+                            constant: true,
+                            span: binding.span,
+                        });
+                        changed = true;
+                    }
+                }
+            }
+        }
         for c in &candidates {
-            let (name, depth) = (c.name, c.depth);
+            let (name, depth) = (&c.name, c.depth);
             if known.contains_key(&key(name)) {
                 continue;
             }
-            let inferred = match c.value {
+            let inferred = match &c.value {
                 Some(e) => expression_type(e, &known, routines),
                 None => Ok(Type::String),
             };
@@ -167,8 +201,8 @@ pub fn infer(
                 }
                 known.insert(key(name), ty.clone());
                 locals.push(Local {
-                    display_name: Some(name.into()),
-                    name: name.into(),
+                    display_name: Some(name.clone().into()),
+                    name: name.clone().into(),
                     ty,
                     constant: c.constant,
                     span: c.span,
@@ -183,22 +217,22 @@ pub fn infer(
     for candidate in candidates.iter().filter(|c| c.binding) {
         if let Some(local) = locals
             .iter_mut()
-            .find(|l| l.name.eq_identifier(candidate.name))
+            .find(|l| l.name.eq_identifier(&candidate.name))
         {
             local.constant = candidate.constant;
         }
     }
     let unresolved: std::collections::HashSet<&str> = candidates
         .iter()
-        .map(|c| c.name)
+        .map(|c| c.name.as_str())
         .filter(|name| !known.contains_key(&key(name)))
         .collect();
-    for c in candidates {
-        let name = c.name;
+    for c in &candidates {
+        let name = &c.name;
         if !known.contains_key(&key(name)) {
             // An initializer that does not wait on another uninferred binding
             // failed on its own; report that error rather than hiding it.
-            if let Some(value) = c.value
+            if let Some(value) = &c.value
                 && !mentions(value, &unresolved)
                 && let Err(error) = expression_type(value, &known, routines)
             {
@@ -242,6 +276,18 @@ fn expression_type_inner(
     routines: &crate::declarations::TypeEnvironment,
 ) -> Result<Type, Diagnostic> {
     cyallo_ast::with_stack(|| match &e.kind {
+        ExprKind::EnumConstruct(_, ty, _) => Ok(ty.clone()),
+        ExprKind::AnonymousRecord(fields) | ExprKind::VariantPayload(fields) => {
+            let mut types = fields
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), expression_type(value, known, routines)?)))
+                .collect::<Result<Vec<_>, Diagnostic>>()?;
+            types.sort_by(|(a, _), (b, _)| a.cmp(b));
+            Ok(Type::AnonymousRecord(types))
+        }
+        ExprKind::Match(value, arms) => {
+            crate::patterns::expression_type(value, arms, known, routines, e.span)
+        }
         ExprKind::TypeDescriptor(_) => Ok(Type::Storage(
             StorageKind::TypeDescriptor,
             Box::new(Type::Void),
@@ -326,7 +372,8 @@ fn expression_type_inner(
         )),
         ExprKind::Cast(_, t) => Ok(t.clone()),
         ExprKind::ExtensionField(base, name, getter) => {
-            if let Type::Record(_, fs) = expression_type(base, known, routines)?
+            if let Type::Record(_, fs) | Type::AnonymousRecord(fs) =
+                expression_type(base, known, routines)?
                 && let Some((_, t)) = fs.iter().find(|(n, _)| n.eq_identifier(name))
             {
                 return Ok(t.clone());
@@ -364,7 +411,7 @@ fn expression_type_inner(
                 .into_iter()
                 .find(|(name, _)| name == n)
                 .map_or(Type::Dynamic, |(_, ty)| ty)),
-            Type::Record(_, fs) => fs
+            Type::Record(_, fs) | Type::AnonymousRecord(fs) => fs
                 .into_iter()
                 .find(|(name, _)| name.eq_identifier(n))
                 .map(|(_, t)| t)
@@ -421,7 +468,7 @@ fn expression_type_inner(
                         expression_type(&argument, known, routines)
                     })
                     .collect::<Result<Vec<_>, Diagnostic>>()?;
-                let actual_field = matches!(&receiver,Type::Record(_,fs) if fs.iter().any(|(n,_)|n.eq_identifier(name)));
+                let actual_field = matches!(&receiver,Type::Record(_,fs) | Type::AnonymousRecord(fs) if fs.iter().any(|(n,_)|n.eq_identifier(name)));
                 if !actual_field
                     && let Some(t) = routines
                         .get(&format!("$CONCRETE${:?}.{}", receiver, key(name)))
@@ -482,7 +529,9 @@ fn expression_type_inner(
         }),
         ExprKind::Unary(Operator::Dereference, a) => match expression_type(a, known, routines)? {
             Type::Reference { pointee, .. } | Type::Managed { pointee, .. } => Ok(*pointee),
-            Type::Storage(StorageKind::Cell, inner) => Ok(*inner),
+            Type::Opaque(_, mut arguments, traits) if traits.deref() && arguments.len() == 1 => {
+                Ok(arguments.remove(0))
+            }
             _ => Err(Diagnostic::new(
                 "E109",
                 "dereference requires a reference, managed owner, or Cell",
@@ -517,10 +566,12 @@ fn expression_type_inner(
             .clone()
         {
             Type::Dynamic | Type::Object(_) => Ok(Type::Dynamic),
-            Type::Array(_, element)
-            | Type::SparseArray(element)
-            | Type::Slice(element)
-            | Type::Storage(StorageKind::Vec | StorageKind::VecDeque, element) => Ok(*element),
+            Type::Array(_, element) | Type::SparseArray(element) | Type::Slice(element) => {
+                Ok(*element)
+            }
+            collection if collection.collection_element().is_some() => {
+                Ok(collection.collection_element().unwrap().clone())
+            }
             _ => Err(Diagnostic::new("E114", "not an array", e.span)),
         },
         ExprKind::Call(n, args) => {

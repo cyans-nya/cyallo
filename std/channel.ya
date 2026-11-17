@@ -1,60 +1,45 @@
 use std::task::Transferable;
 use std::result::Result;
 
-#[cyallo_internal("sender_struct")]
 pub record Sender<T> {}
-#[cyallo_internal("receiver_struct")]
 pub record Receiver<T> {}
-#[cyallo_internal("send_error_struct")]
-pub record SendError<T> {}
-#[cyallo_internal("receive_error_struct")]
-pub record ReceiveError {}
+pub enum SendError<T> {
+    Closed: T,
+    Full: T,
+    Limit: T,
+}
+pub enum ReceiveError {
+    Closed,
+    Empty,
+}
 
-#[cyallo_internal("channel_bounded")]
 pub proc bounded<T: Transferable>(capacity: usize) -> (Sender<T>, Receiver<T>);
-#[cyallo_internal("channel_unbounded")]
 pub proc unbounded<T: Transferable>() -> (Sender<T>, Receiver<T>);
 
 impl<T> Sender<T> {
-    #[cyallo_internal("channel_clone")]
     pub proc clone(self: &Self) -> Self;
-    #[cyallo_internal("channel_close")]
     pub proc close(self: &Self);
-    #[cyallo_internal("channel_is_closed")]
     pub proc is_closed(self: &Self) -> bool;
-    #[cyallo_internal("channel_send")]
     pub proc send(self: &Self, value: T) -> Result<(), SendError<T>>;
-    #[cyallo_internal("channel_try_send")]
     pub proc try_send(self: &Self, value: T) -> Result<(), SendError<T>>;
 }
 
 impl<T> Receiver<T> {
-    #[cyallo_internal("channel_clone")]
     pub proc clone(self: &Self) -> Self;
-    #[cyallo_internal("channel_close")]
     pub proc close(self: &Self);
-    #[cyallo_internal("channel_is_closed")]
     pub proc is_closed(self: &Self) -> bool;
-    #[cyallo_internal("channel_receive")]
     pub proc recv(self: &Self) -> Result<T, ReceiveError>;
-    #[cyallo_internal("channel_try_receive")]
     pub proc try_recv(self: &Self) -> Result<T, ReceiveError>;
 }
 
 impl<T> SendError<T> {
-    #[cyallo_internal("send_error_value")]
     pub proc into_value(self) -> T;
-    #[cyallo_internal("send_error_closed")]
     pub proc is_closed(self: &Self) -> bool;
-    #[cyallo_internal("send_error_full")]
     pub proc is_full(self: &Self) -> bool;
-    #[cyallo_internal("send_error_limit")]
     pub proc is_limit(self: &Self) -> bool;
 }
 
 impl ReceiveError {
-    #[cyallo_internal("receive_error_closed")]
     pub proc is_closed(self: &Self) -> bool;
-    #[cyallo_internal("receive_error_empty")]
     pub proc is_empty(self: &Self) -> bool;
 }

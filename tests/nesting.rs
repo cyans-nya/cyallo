@@ -61,3 +61,28 @@ fn cyallo_parser_probe(source: &str) {
     // Name resolution fails (`f` is undefined); parsing must still finish.
     let _ = compile(source);
 }
+
+#[test]
+fn enum_patterns_and_constructor_contexts_fit_compiler_worker_stacks() {
+    let output = on_small_stack(|| {
+        let mut ty = "i64".to_owned();
+        let mut value = "7".to_owned();
+        let mut pattern = "number".to_owned();
+        for _ in 0..100 {
+            ty = format!("({ty},)");
+            value = format!("({value},)");
+            pattern = format!("({pattern},)");
+        }
+        let source = format!(
+            "enum E {{ Value: {ty} }}\nlet result = match E::Value({value}) {{ E::Value({pattern}) => number }}\n{}std::io::print(result){}\n",
+            "if true { ".repeat(100),
+            " }".repeat(100)
+        );
+        let program = Arc::new(compile(&source).unwrap());
+        let mut session = Session::new(program).unwrap();
+        session.run(100_000);
+        assert_eq!(session.status(), &Status::Finished);
+        session.context.output.clone()
+    });
+    assert_eq!(output, "7\n");
+}

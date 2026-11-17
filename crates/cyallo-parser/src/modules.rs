@@ -89,6 +89,16 @@ impl Parser<'_> {
             }
             self.expect(")")?;
         }
+        if self.at("enum")
+            || (self.token_text() == "open"
+                && self
+                    .tokens
+                    .get(self.pos + 1)
+                    .is_some_and(|t| t.kind == TokenKind::Enum))
+        {
+            self.enum_declaration(ast, public, start)?;
+            return Ok(true);
+        }
         if self.word("type") {
             let name = self.name()?;
             self.expect("=")?;
@@ -109,6 +119,11 @@ impl Parser<'_> {
             self.eol()?;
             return Ok(true);
         }
+        let interface = self.token_text() == "interface"
+            && self.tokens.get(self.pos + 1).is_some_and(|t| self.tokens.text(*t) == "mod");
+        if interface {
+            self.pos += 1;
+        }
         if self.word("mod") {
             if self.token().kind != TokenKind::Identifier && !self.token().kind.is_keyword() {
                 return Err(self.error("expected module name"));
@@ -121,6 +136,7 @@ impl Parser<'_> {
                 None
             };
             ast.modules.push(ModuleDeclaration {
+                interface,
                 boundary: Default::default(),
                 annotations: vec![],
                 name,
@@ -129,6 +145,29 @@ impl Parser<'_> {
                 span: self.finish_span(start),
             });
             self.eol()?;
+            return Ok(true);
+        }
+        if self.token_text() == "opaque"
+            && self.tokens.get(self.pos + 1).is_some_and(|t| t.kind == TokenKind::Record)
+        {
+            self.pos += 1;
+            let mut record = self.opaque_record(start)?;
+            record.opaque = true;
+            if public {
+                ast.exports.push(format!("$type${}", record.name).into());
+            }
+            ast.records.push(record);
+            return Ok(true);
+        }
+        if self.token_text() == "world"
+            && self.tokens.get(self.pos + 1).is_some_and(|t| t.kind == TokenKind::Identifier)
+        {
+            self.pos += 1;
+            let world = self.world_declaration(public, start)?;
+            if public {
+                ast.exports.push(format!("$world${}", world.name).into());
+            }
+            ast.worlds.push(world);
             return Ok(true);
         }
         if public && self.token_text() != "property" {
@@ -166,6 +205,33 @@ impl Parser<'_> {
             return Ok(true);
         }
         if self.word("impl") {
+            if self.token_text() == "interface" {
+                self.pos += 1;
+                let interface = self.qualified_name()?;
+                self.expect("for")?;
+                let module = self.qualified_name()?;
+                self.expect("{")?;
+                self.newlines();
+                let mut bindings: Vec<(Box<str>, Type)> = vec![];
+                while !self.take("}") {
+                    self.expect("type")?;
+                    let name = self.name()?;
+                    if bindings.iter().any(|(existing, _)| *existing == name) {
+                        return Err(self.error("duplicate type binding"));
+                    }
+                    self.expect("=")?;
+                    bindings.push((name, self.ty()?));
+                    self.eol()?;
+                }
+                ast.interface_implementations.push(InterfaceImplementation {
+                    interface,
+                    module,
+                    bindings,
+                    span: self.finish_span(start),
+                });
+                self.eol()?;
+                return Ok(true);
+            }
             let type_params = self.type_params()?;
             let first = self.ty()?;
             if self.at("{") {
@@ -257,5 +323,82 @@ impl Parser<'_> {
             return Ok(false);
         }
         Ok(false)
+    }
+    /// `record Name<T>;` after the `opaque` word: no fields, no body.
+    fn opaque_record(&mut self, start: Span) -> Result<Record, Diagnostic> {
+        self.expect("record")?;
+        let name = self.name()?;
+        let type_params = self.type_params()?;
+        if self.at("{") {
+            return Err(self.error("an opaque record has no fields"));
+        }
+        let span = self.finish_span(start);
+        self.eol()?;
+        Ok(Record {
+            opaque: true,
+            annotations: vec![],
+            type_params,
+            name,
+            fields: vec![],
+            span,
+        })
+    }
+    fn world_declaration(&mut self, public: bool, start: Span) -> Result<World, Diagnostic> {
+        let name = self.name()?;
+        self.expect("{")?;
+        self.newlines();
+        let mut items = vec![];
+        while !self.take("}") {
+            let item_start = self.token().span;
+            if self.word("include") {
+                let path = self.qualified_name()?;
+                items.push(WorldItem::Include {
+                    path,
+                    span: self.finish_span(item_start),
+                });
+                self.eol()?;
+            } else if self.word("import") {
+                let path = self.qualified_name()?;
+                let alias = if self.word("as") { Some(self.name()?) } else { None };
+                let members = if self.take("{") {
+                    self.newlines();
+                    let mut members = vec![];
+                    while !self.take("}") {
+                        let function = self.modern_function()?;
+                        if function.body_kind != FunctionBodyKind::Declaration {
+                            return Err(self.error("a world import lists signatures only"));
+                        }
+                        members.push(function);
+                    }
+                    Some(members)
+                } else {
+                    None
+                };
+                items.push(WorldItem::Import {
+                    path,
+                    alias,
+                    members,
+                    span: self.finish_span(item_start),
+                });
+                self.eol()?;
+            } else if self.word("export") {
+                let function = self.modern_function()?;
+                if function.body_kind != FunctionBodyKind::Declaration {
+                    return Err(self.error("a world export declares a signature only"));
+                }
+                items.push(WorldItem::Export { function });
+            } else {
+                return Err(self.error("expected include, import or export"));
+            }
+        }
+        let span = self.finish_span(start);
+        self.eol()?;
+        Ok(World {
+            annotations: vec![],
+            name,
+            public,
+            items,
+            span,
+        })
     }
 }

@@ -2,6 +2,8 @@ use cyallo_ast::Span;
 pub use cyallo_ir::ir::*;
 #[derive(Debug, Clone)]
 pub struct Program {
+    pub(crate) module_cache: std::sync::Arc<cyallo_ir::module_cache::ModuleCache>,
+    pub(crate) module_units: std::sync::Arc<[std::sync::Arc<cyallo_ir::analysis::CheckedModule>]>,
     pub(crate) dynamic_plan: Option<std::sync::Arc<crate::dynamic_modules::CompilePlan>>,
     pub(crate) module_loader: Option<cyallo_modules::ModuleLoader>,
     pub(crate) parent: Option<std::sync::Arc<Program>>,
@@ -20,6 +22,9 @@ pub struct Program {
     pub(crate) code_versions: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 impl Program {
+    pub fn modules(&self) -> &[std::sync::Arc<cyallo_ir::analysis::CheckedModule>] {
+        &self.module_units
+    }
     pub fn with_module_loader(mut self, loader: cyallo_modules::ModuleLoader) -> Self {
         self.module_loader = Some(loader);
         self

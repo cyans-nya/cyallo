@@ -2,6 +2,7 @@
 mod lexer;
 mod modern;
 mod modules;
+mod patterns;
 mod token;
 mod units;
 use cyallo_ast::*;
@@ -176,6 +177,9 @@ impl<'src> Parser<'src> {
             let (attributes, annotations) = self.declaration_attributes()?;
             let module_count = ast.modules.len();
             let trait_count = ast.traits.len();
+            let enum_count = ast.enums.len();
+            let record_count = ast.records.len();
+            let world_count = ast.worlds.len();
             if self.module_declaration(&mut ast)? {
                 if !attributes.is_empty() {
                     return Err(
@@ -183,10 +187,16 @@ impl<'src> Parser<'src> {
                     );
                 }
                 if !annotations.is_empty() {
-                    if ast.modules.len() > module_count {
+                    if ast.enums.len() > enum_count {
+                        ast.enums.last_mut().unwrap().annotations = annotations;
+                    } else if ast.modules.len() > module_count {
                         ast.modules.last_mut().unwrap().annotations = annotations;
                     } else if ast.traits.len() > trait_count {
                         ast.traits.last_mut().unwrap().annotations = annotations;
+                    } else if ast.records.len() > record_count {
+                        ast.records.last_mut().unwrap().annotations = annotations;
+                    } else if ast.worlds.len() > world_count {
+                        ast.worlds.last_mut().unwrap().annotations = annotations;
                     } else {
                         return Err(self.error(
                             "annotation requires a module, type, trait or callable declaration",
@@ -304,6 +314,10 @@ impl<'src> Parser<'src> {
     fn base_ty(&mut self) -> Result<Type, Diagnostic> {
         if self.take("dynamic") {
             return Ok(Type::Dynamic);
+        }
+        if self.at("record") {
+            self.pos += 1;
+            return self.anonymous_record_type();
         }
         if self.take("object") {
             self.expect("{")?;
@@ -456,6 +470,7 @@ impl<'src> Parser<'src> {
                         | ExprKind::Invoke(..)
                         | ExprKind::Yield(..)
                         | ExprKind::DeleteProperty(..)
+                        | ExprKind::Match(..)
                 ) {
                     StmtKind::Evaluate(value)
                 } else {
@@ -511,6 +526,16 @@ impl<'src> Parser<'src> {
             };
             Expr {
                 kind: ExprKind::ManagedNew(kind, locality, allocator, value),
+                span: self.finish_span(span),
+            }
+        } else if self.word("match") {
+            Expr {
+                kind: self.match_expression()?,
+                span: self.finish_span(span),
+            }
+        } else if self.take("record") {
+            Expr {
+                kind: self.anonymous_record_literal()?,
                 span: self.finish_span(span),
             }
         } else if (self.at("object") || self.at("dynamic"))

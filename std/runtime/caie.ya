@@ -1,8 +1,6 @@
 use std::io::Printable;
 
-#[cyallo_internal("lengthable_trait")]
 pub trait Lengthable {}
-#[cyallo_internal("legacy_numeric_trait")]
 pub trait Number {}
 
 pub use std::io::print as output;
@@ -10,23 +8,13 @@ pub use std::random::uniform as rand;
 pub use std::char::{code as asc, from_code as chr};
 pub use std::string::from as num_to_str;
 
-#[cyallo_internal("input")]
 pub proc input<T: Printable>(target: &mut T);
-#[cyallo_internal("caie_left")]
 pub fn left(read value: string, count: i64) -> string;
-#[cyallo_internal("caie_right")]
 pub fn right(read value: string, count: i64) -> string;
-#[cyallo_internal("caie_mid")]
 pub fn mid(read value: string, start: i64, count: i64) -> string;
-#[cyallo_internal("caie_length")]
 pub fn length<C: Lengthable>(read value: C) -> i64;
-#[cyallo_internal("caie_lower_char")]
 pub fn lcase(value: char) -> char;
-#[cyallo_internal("caie_upper_char")]
 pub fn ucase(value: char) -> char;
-#[cyallo_internal("caie_truncate")]
 pub fn int<T: Number>(value: T) -> i64;
-#[cyallo_internal("caie_parse")]
 pub fn str_to_num(read value: string) -> f64;
-#[cyallo_internal("caie_is_numeric")]
 pub fn is_num(read value: string) -> bool;

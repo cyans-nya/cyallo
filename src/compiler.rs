@@ -83,7 +83,7 @@ fn compile_source_configured(
             .append_to(&mut archive)
             .map_err(cyallo_ir::core_package::invalid_core_source)?;
         let raw = ast.clone();
-        let ast = crate::namespace::link_with_core(
+        let mut ast = crate::namespace::link_with_core(
             vec![ast],
             &["main.ya".into()],
             0,
@@ -91,8 +91,29 @@ fn compile_source_configured(
             core,
             core_archive.base,
         )?;
+        ast.source_files = std::iter::once(cyallo_ir::module_graph::SourceFile {
+            id: cyallo_ir::module_graph::SourceFileId {
+                path: "main.ya".into(),
+                trust: SourceTrust::User,
+            },
+            span: Span::new(0, source.len() as u32),
+        })
+        .chain(
+            core_archive
+                .ranges
+                .iter()
+                .map(|r| cyallo_ir::module_graph::SourceFile {
+                    id: cyallo_ir::module_graph::SourceFileId {
+                        path: r.path.clone(),
+                        trust: SourceTrust::Core,
+                    },
+                    span: r.span,
+                }),
+        )
+        .collect();
+        let source_files = ast.source_files.clone();
         let authorization = ast.native.import_policy.clone();
-        let mut program = compile_ast(&archive, ast, options, deferred)?;
+        let mut program = compile_resolved(&archive, ast, options, deferred)?;
         let mut ranges = vec![crate::modules::SourceRange {
             path: None,
             span: Span::new(0, source.len() as u32),
@@ -108,6 +129,7 @@ fn compile_source_configured(
         );
         let mut plan = crate::dynamic_modules::CompilePlan::new(
             crate::dynamic_modules::CompileSources {
+                source_files,
                 asts: vec![raw],
                 paths: vec!["main.ya".into()],
                 entry: 0,
@@ -148,9 +170,75 @@ pub(crate) fn compile_ast_unfolded(
     deferred: bool,
 ) -> Result<ir::Program> {
     let checked = cyallo_ir::analysis::analyze(source.len(), ast, options, deferred)?;
+    Ok(package(source, checked, options))
+}
+
+pub(crate) fn compile_resolved(
+    source: &str,
+    graph: cyallo_ir::module_graph::ResolvedProgram,
+    options: CompileOptions,
+    deferred: bool,
+) -> Result<ir::Program> {
+    compile_resolved_with_cache(
+        source,
+        graph,
+        options,
+        deferred,
+        std::sync::Arc::new(cyallo_ir::module_cache::ModuleCache::default()),
+    )
+}
+pub(crate) fn compile_resolved_with_cache(
+    source: &str,
+    mut graph: cyallo_ir::module_graph::ResolvedProgram,
+    options: CompileOptions,
+    deferred: bool,
+    cache: std::sync::Arc<cyallo_ir::module_cache::ModuleCache>,
+) -> Result<ir::Program> {
+    let native = graph.native.clone();
+    graph.with_sources(|asts| cyallo_ir::generics::specialize_modules(asts, &native, options))?;
+    crate::constants::evaluate_modules(source, &mut graph, options)?;
+    compile_resolved_unfolded_cached(source, graph, options, deferred, cache)
+}
+pub(crate) fn compile_resolved_unfolded(
+    source: &str,
+    graph: cyallo_ir::module_graph::ResolvedProgram,
+    options: CompileOptions,
+    deferred: bool,
+) -> Result<ir::Program> {
+    compile_resolved_unfolded_cached(
+        source,
+        graph,
+        options,
+        deferred,
+        std::sync::Arc::new(cyallo_ir::module_cache::ModuleCache::default()),
+    )
+}
+fn compile_resolved_unfolded_cached(
+    source: &str,
+    mut graph: cyallo_ir::module_graph::ResolvedProgram,
+    options: CompileOptions,
+    deferred: bool,
+    cache: std::sync::Arc<cyallo_ir::module_cache::ModuleCache>,
+) -> Result<ir::Program> {
+    let checked = cyallo_ir::analysis::analyze_modules_cached(
+        source.len(),
+        &mut graph,
+        options,
+        deferred,
+        &cache,
+    )?;
+    let units = checked.modules;
+    let mut program = package(source, checked.executable, options);
+    program.module_units = units.into();
+    program.module_cache = cache;
+    Ok(program)
+}
+fn package(source: &str, checked: cyallo_ir::ir::Module, options: CompileOptions) -> ir::Program {
     let bytecode =
         crate::bytecode::Module::lower(&checked.functions, cyallo_compile_jobs::Jobs(options.jobs));
-    Ok(ir::Program {
+    ir::Program {
+        module_units: Default::default(),
+        module_cache: Default::default(),
         dynamic_plan: None,
         module_loader: None,
         parent: None,
@@ -165,5 +253,5 @@ pub(crate) fn compile_ast_unfolded(
         functions: checked.functions,
         bytecode,
         code_versions: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
-    })
+    }
 }

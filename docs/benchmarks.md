@@ -248,3 +248,88 @@ At the start of this implementation batch, single-sample totals for 100 executio
 These were single samples, unlike the median results above, so ratios are directional rather than a controlled statistical comparison. Changes include removing full-function IR clones at entry, shared strings/constants, compact bytecode decoding, direct Cranelift branch edges, and length operations that avoid array snapshots.
 
 Token tests separately verify a one-byte kind, a 16-byte token, no token destructor, and fewer than 32 shared-buffer allocations for more than 100,000 tokens. Bytecode words are 16 bytes, but source maps, pooled operations, metadata, and currently retained inspection IR add memory beyond that word stream.
+
+## Collections after `StorageKind` removal, 2026-11-17
+
+Question: did moving `Vec`/`VecDeque` to declared traits slow collection code? Method: release builds of the original
+workspace (`overhaul`, before the data-enum and SDK work) and of the `data-enums` worktree, same host, run through
+`cyallo run <file> --engine <engine>`; runs of the two binaries alternate; medians of 5-15 runs; the fixed cost of
+`std::io::print(1)` is measured separately and subtracted. Output was identical in every comparison.
+
+| Workload (startup-subtracted) | Engine | Baseline | Current | Ratio |
+| --- | --- | ---: | ---: | ---: |
+| Vec push, indexed reads x10, VecDeque push/pop both ends, 20k elements | interpreter | 115.7 ms | 118.6 ms | 1.026 |
+| same, 80k elements | interpreter | 459.2 ms | 473.9 ms | 1.032 |
+| same, 20k elements | jit | 50.6 ms | 51.8 ms | 1.023 |
+| same, 80k elements | jit | 200.0 ms | 204.0 ms | 1.020 |
+| Control: integer loops only (4M iterations), no collections | interpreter | 1727.7 ms | 1775.7 ms | 1.028 |
+| Control: same | jit | 28.1 ms | 28.6 ms | 1.016 |
+| Fixed startup (`print(1)`) | both | 8.5 ms | 11.3 ms | +2.8 ms |
+
+Reading: the current tree is about 2-3% slower than the baseline on throughput and about 3 ms slower to start. The
+integer-only control shows the same 1.6-2.8%, so the slowdown is **not specific to collections**: the collection
+migration added no measurable collection-specific cost. The general 2-3% and the startup cost come from the earlier
+work on this branch (data-enum machinery, a larger standard package and binding application); I did not bisect them.
+A pre-migration snapshot of this branch does not exist, so the collection step itself cannot be isolated exactly; the
+control bounds it. Not run: the Criterion `engines`/`gc`/`objects` benches (long), and an array benchmark (my source
+did not compile and was dropped). Single host, single run set; differences under about 2% are within noise.
+
+### Resolution: the 2-3% slowdown and the startup cost, 2026-11-17
+
+There was no commit history to bisect (all of the branch's work is uncommitted), so the causes were found by measuring.
+Throughput and startup had different causes.
+
+**Throughput (2-3%): instruction and type sizes.** `size_of` in release builds, original workspace vs this branch:
+
+| Type | Baseline | Branch before | Branch after |
+| --- | ---: | ---: | ---: |
+| `Type` | 48 | 56 | 48 |
+| `Value` | 64 | 72 | 64 |
+| `Op` | 80 | 96 | 80 |
+| `Instruction` | 88 | 104 | 88 |
+
+Three causes, each making every instruction or value bigger: `Type::EnumRef(EnumIdentity, Box<str>)` held a `Vec` inline
+(now `Box<EnumIdentity>`); `Op::EnumPayload` carried a `Type` inline and was the largest `Op` (now `Box<Type>`); my
+`OpaqueTraits` was 16 bools and made `Type::Opaque` 56 bytes (now a `u16` bitset with getters). The first two came from
+the earlier enum work, the third from the opaque-type work. The interpreter walks `Instruction`/`Value`/`Type`, so size is
+traffic.
+
+**Startup (+2.8 ms): hashing the module-cache key.** In-process `compile("std::io::print(1)")` was 6.8 ms against 4.9 ms.
+A profile of both showed `SipHasher::write` as the top frame (about 40% of samples) in both trees: `ModuleKey` held the
+normalized `Debug` text of the whole native-declaration set (the entire standard package) per module, and every cache
+lookup hashed it. The branch's larger native set made it longer. `ModuleKey` now holds SHA-256 digests of those texts
+(`source` and `native`); compile time is 4.1 ms, below the baseline's 4.7-4.9 ms.
+
+After both fixes (release CLI, alternating runs, medians): startup 7.9 ms against 8.4 ms; collection workloads
+0.990-1.014x, the integer control 0.985-1.006x. That is parity within noise. The earlier table above records the state
+before these fixes. Not run: Criterion benches; single host.
+
+**Follow-up: no `Debug` text as identity.** `ModuleKey` was built from `format!("{:?}")` of the AST, native declarations,
+signatures and types; `Debug` output is not a contract (it can change or omit fields) and `Ast` held two `HashMap`s whose
+order made the text nondeterministic. The key is now a SHA-256 fingerprint of the *structure*: `Hash` is derived on the AST
+(`cyallo-ast`, `services` types), real literals hash by bit pattern (`0.0` and `-0.0` differ), `Ast.source_names` and
+`NativeImportPolicy.requesters` are `BTreeMap`s, and a `Hasher` adapter streams the values into SHA-256. In-process
+`compile("std::io::print(1)")`: 3.7 ms, against 4.1 ms with digested Debug text and 4.9 ms for the baseline.
+
+**Follow-up: persistent compile workers.** `cyallo-compile-jobs` created and joined a `std::thread::scope` worth of threads for
+every parallel stage (parse units, function bodies, module lowering, codegen): `pthread_create`, `mmap` and `munmap`
+were the top frames after the hashing fix. Stages now run on a pool of persistent workers (`rayon-core`), one pool per
+configured `Jobs` width, created on first use and kept for the process; nested stages still run sequentially on their worker.
+In-process `compile("std::io::print(1)")` with a warm pool: 3.2 ms (3.7 ms before, 4.8-4.9 ms baseline). One-shot CLI
+startup: 7.7 ms against 8.8 ms (median of 41 alternating runs); a one-shot process still pays for creating its workers once,
+so the large gain is for repeated compilation (REPL, dynamic `std::module::load`, language server, tests, embedders).
+
+### Option and Result as general enum values, 2026-11-17
+
+Program: 800k iterations of an `Option<i64>`-returning and a `Result<i64, i64>`-returning function, each followed by
+`is_some`/`unwrap` and `is_ok`/`unwrap` (written in the syntax both trees accept; both print 8860314200). Release CLI,
+original workspace (dedicated `Value::Optional`/`Value::Result`) against this branch (`Value::Enum` with reserved ids),
+9 alternating runs, medians, whole-process time.
+
+| Engine | Baseline | Branch | Ratio |
+| --- | ---: | ---: | ---: |
+| interpreter | 1954.3 ms | 1907.0 ms | 0.976 |
+| jit | 1338.6 ms | 1273.7 ms | 0.952 |
+
+The branch is 2-5% faster on this workload; no slowdown from the move. Single host, single run set; the Criterion
+benches were not run.

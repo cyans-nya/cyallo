@@ -30,6 +30,17 @@ pub enum TextStyle {
 }
 #[derive(Debug, Clone)]
 pub enum Op {
+    Unreachable,
+    EnumConstruct(Reg, cyallo_ast::EnumVariant, Option<Reg>),
+    EnumTest(Reg, Reg, cyallo_ast::EnumVariant),
+    EnumPayload(
+        Reg,
+        Reg,
+        cyallo_ast::EnumVariant,
+        crate::enums::Projection,
+        // Boxed: an inline `Type` made this the largest `Op` and grew every instruction.
+        Box<Type>,
+    ),
     Dynamic(Reg, crate::dynamic::Operation, Vec<Reg>),
     Yield(Reg, Reg),
     Frozen(Reg, std::sync::Arc<cyallo_ast::ConstantValue>),
@@ -134,8 +145,38 @@ pub struct Routine {
 struct RoutineBody {
     checked: std::sync::OnceLock<Function>,
     deferred: Option<crate::analysis::DeferredBody>,
+    relocated: Option<crate::linking::RelocatedBody>,
 }
 impl Routine {
+    pub fn relocated(
+        source: Routine,
+        relocation: std::sync::Arc<crate::linking::Relocation>,
+        entry: bool,
+    ) -> Self {
+        let mut routine = source.clone();
+        routine.span = relocation.span(source.span);
+        for span in [
+            &mut routine.attributes.heat_span,
+            &mut routine.attributes.compilation_span,
+            &mut routine.attributes.inline_span,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *span = relocation.span(*span);
+        }
+        routine.direct_calls = relocation.header_calls(&source.direct_calls);
+        routine.body = std::sync::Arc::new(RoutineBody {
+            checked: Default::default(),
+            deferred: None,
+            relocated: Some(crate::linking::RelocatedBody {
+                source,
+                relocation,
+                entry,
+            }),
+        });
+        routine
+    }
     pub fn ready(function: Function) -> Self {
         let shape = RoutineShape {
             loops: !function.resume.loop_headers.is_empty(),
@@ -177,6 +218,7 @@ impl Routine {
             body: std::sync::Arc::new(RoutineBody {
                 checked: std::sync::OnceLock::from(function),
                 deferred: None,
+                relocated: None,
             }),
         }
     }
@@ -204,6 +246,7 @@ impl Routine {
             body: std::sync::Arc::new(RoutineBody {
                 checked: Default::default(),
                 deferred: Some(body),
+                relocated: None,
             }),
         }
     }
@@ -222,6 +265,9 @@ impl std::ops::Deref for Routine {
     type Target = Function;
     fn deref(&self) -> &Function {
         self.body.checked.get_or_init(|| {
+            if let Some(body) = &self.body.relocated {
+                return body.analyze();
+            }
             self.body
                 .deferred
                 .as_ref()

@@ -25,6 +25,9 @@ use std::{
 struct CoreSources {
     root: String,
     sources: Vec<SourceModule>,
+    /// The host package's own implementation bindings: runtime-loaded modules link
+    /// against exactly the core the host compiled with.
+    bindings: cyallo_ir::bindings::NativeBindings,
 }
 impl CoreSources {
     fn view(&self) -> CorePackage<'_> {
@@ -36,6 +39,7 @@ impl CoreSources {
             }),
         )
         .expect("validated owned core source")
+        .with_bindings(self.bindings.clone())
     }
 }
 #[derive(Debug, Clone)]
@@ -49,6 +53,7 @@ struct Loaded {
 }
 #[derive(Debug, Clone)]
 pub(crate) struct CompilePlan {
+    source_files: Vec<cyallo_ir::module_graph::SourceFile>,
     asts: Vec<Ast>,
     paths: Vec<String>,
     entry: usize,
@@ -64,6 +69,7 @@ pub(crate) struct CompilePlan {
     calls: Vec<(CallRequest, Adapter)>,
 }
 pub(crate) struct CompileSources {
+    pub source_files: Vec<cyallo_ir::module_graph::SourceFile>,
     pub asts: Vec<Ast>,
     pub paths: Vec<String>,
     pub entry: usize,
@@ -85,6 +91,7 @@ impl CompilePlan {
         core: &CorePackage<'_>,
     ) -> Self {
         let CompileSources {
+            source_files,
             asts,
             paths,
             entry,
@@ -93,6 +100,7 @@ impl CompilePlan {
             core_base,
         } = sources;
         Self {
+            source_files,
             asts,
             paths,
             entry,
@@ -105,6 +113,7 @@ impl CompilePlan {
                     .iter()
                     .map(|source| SourceModule::new(source.path, source.source))
                     .collect(),
+                bindings: core.bindings().clone(),
             },
             core_base,
             options,
@@ -265,6 +274,13 @@ pub(crate) fn load(
                 path: Some(source.path.clone().into()),
                 span: Span::new(offset, end),
             });
+            plan.source_files.push(cyallo_ir::module_graph::SourceFile {
+                id: cyallo_ir::module_graph::SourceFileId {
+                    path: source.path.clone().into(),
+                    trust: ast::SourceTrust::User,
+                },
+                span: Span::new(offset, end),
+            });
             files.insert(PathBuf::from(&source.path), parsed);
         }
         let mut root = files
@@ -278,6 +294,7 @@ pub(crate) fn load(
         let name: Box<str> = format!("cyalloDynamicModule{}", plan.loaded.len()).into();
         let module: Box<str> = format!("crate::{name}").into();
         plan.asts[plan.entry].modules.push(ModuleDeclaration {
+            interface: false,
             boundary: ast::ModuleBoundary::Package,
             annotations: vec![],
             name,
@@ -318,6 +335,7 @@ pub(crate) fn load(
             },
         )
     })?;
+    linked.source_files = plan.source_files.clone();
     plan.authorization = linked.native.import_policy.clone();
     let factory_name: Box<str> = format!("$dynamicLoadFactory{}", plan.next_factory).into();
     plan.next_factory += 1;
@@ -327,7 +345,7 @@ pub(crate) fn load(
     let mut index = 0;
     while index < modules.len() {
         let exports = &linked
-            .resolved_modules
+            .exports
             .iter()
             .find(|module| module.path == modules[index])
             .ok_or(LoadError::Publication(P::MissingModuleSource))?
@@ -360,7 +378,7 @@ pub(crate) fn load(
     }
     for (index, module) in modules.iter().enumerate() {
         let exports = linked
-            .resolved_modules
+            .exports
             .iter()
             .find(|entry| entry.path == *module)
             .unwrap()
@@ -394,7 +412,7 @@ pub(crate) fn load(
                     request.span,
                 ),
                 ast::ExportKind::Value => {
-                    if linked.functions.iter().any(|function| {
+                    if linked.functions().any(|function| {
                         function.name == export.target && !function.type_params.is_empty()
                     }) {
                         expression(
@@ -402,8 +420,7 @@ pub(crate) fn load(
                             request.span,
                         )
                     } else if linked
-                        .functions
-                        .iter()
+                        .functions()
                         .any(|function| function.name == export.target)
                         || linked
                             .native
@@ -467,10 +484,10 @@ pub(crate) fn load(
         Box::new(Type::Tuple(vec![Type::Dynamic, error.clone()])),
     );
     let returned = expression(
-        ExprKind::IntrinsicCall(
-            Intrinsic::ResultOk.id(),
-            vec![Type::Dynamic, error],
-            vec![erased],
+        ExprKind::EnumConstruct(
+            cyallo_ast::VariantId::RESULT_OK,
+            result.clone(),
+            Some(Box::new(erased)),
         ),
         request.span,
     );
@@ -478,23 +495,29 @@ pub(crate) fn load(
         kind: StmtKind::Return(returned),
         span: request.span,
     });
-    linked.functions.push(function(
+    linked.entry_mut().source.functions.push(function(
         factory_name.clone(),
         vec![],
         result,
         body,
         request.span,
     ));
-    let compiled =
-        compiler::compile_ast(&plan.archive, linked, plan.options, true).map_err(|diagnostic| {
-            localize(
-                &plan,
-                LoadError::Check {
-                    path: canonical.clone(),
-                    diagnostic,
-                },
-            )
-        })?;
+    let compiled = compiler::compile_resolved_with_cache(
+        &plan.archive,
+        linked,
+        plan.options,
+        true,
+        program.module_cache.clone(),
+    )
+    .map_err(|diagnostic| {
+        localize(
+            &plan,
+            LoadError::Check {
+                path: canonical.clone(),
+                diagnostic,
+            },
+        )
+    })?;
     let (mut extension, entry, factory) = publication::publish(&program, compiled, &factory_name)
         .map_err(|error| localize(&plan, error))?;
     plan.loaded[loaded_index].factory = Some(factory);

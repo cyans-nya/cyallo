@@ -32,6 +32,23 @@ fn representation(ty: &Type) -> &Type {
         _ => ty,
     }
 }
+/// The single type argument of an opaque host type (`Sender<T>` → `T`). The type is
+/// known by its declaration; its element type is whatever the declaration applied.
+/// The argument of an opaque type whose declaration carries a given trait.
+fn trait_argument(ty: &Type, has: fn(&cyallo_ast::OpaqueTraits) -> bool) -> Option<&Type> {
+    match representation(ty) {
+        Type::Opaque(_, arguments, traits) if has(traits) && arguments.len() == 1 => {
+            arguments.first()
+        }
+        _ => None,
+    }
+}
+fn opaque_argument(ty: &Type) -> Option<&Type> {
+    match representation(ty) {
+        Type::Opaque(_, arguments, _) if arguments.len() == 1 => arguments.first(),
+        _ => None,
+    }
+}
 fn payload(ty: &Type, kind: StorageKind) -> Option<&Type> {
     lookup::inner(representation(ty), kind)
 }
@@ -62,6 +79,7 @@ pub fn resolve(
         &member.receiver_type,
         types,
         args.first().and_then(constant_text),
+        &callable.result,
     )
     .ok_or_else(|| invalid_declaration(DeclarationError::InvalidSignature, span))?;
     if !equivalent(&callable.result, &result) {
@@ -125,7 +143,13 @@ pub fn resolve(
         body,
     }))
 }
-fn specialize(id: M, receiver: &Type, args: &[Type], field: Option<&str>) -> Option<(Body, Type)> {
+fn specialize(
+    id: M,
+    receiver: &Type,
+    args: &[Type],
+    field: Option<&str>,
+    declared: &Type,
+) -> Option<(Body, Type)> {
     use Body::{Service, Storage};
     use StorageKind as K;
     let r = representation(receiver);
@@ -153,7 +177,9 @@ fn specialize(id: M, receiver: &Type, args: &[Type], field: Option<&str>) -> Opt
                 if matches!(id, M::GeneratorClose) {
                     Type::Void
                 } else {
-                    crate::generator::step(r)?
+                    // The declaration names the step type.
+                    let step = crate::generator::step(r)?;
+                    equivalent(&step, declared).then(|| declared.clone())?
                 },
             )
         }
@@ -161,12 +187,7 @@ fn specialize(id: M, receiver: &Type, args: &[Type], field: Option<&str>) -> Opt
         | M::GeneratorIsYielded
         | M::GeneratorYielded
         | M::GeneratorCompleted => {
-            let Type::Tuple(types) = payload(r, K::GeneratorStep)? else {
-                return None;
-            };
-            let [yielded, completed] = types.as_slice() else {
-                return None;
-            };
+            let (yielded, completed) = lookup::step_payload(representation(r))?;
             match id {
                 M::GeneratorIsComplete => (Storage(O::GeneratorIsComplete), boolean),
                 M::GeneratorIsYielded => (Storage(O::GeneratorIsYielded), boolean),
@@ -175,7 +196,9 @@ fn specialize(id: M, receiver: &Type, args: &[Type], field: Option<&str>) -> Opt
                 _ => return None,
             }
         }
-        M::LayoutSize | M::LayoutAlign if payload(r, K::Layout).is_some() => (
+        M::LayoutSize | M::LayoutAlign
+            if matches!(r, Type::Opaque(_, _, traits) if traits.layout()) =>
+        (
             Storage(if id == M::LayoutSize {
                 O::LayoutSize
             } else {
@@ -209,11 +232,14 @@ fn specialize(id: M, receiver: &Type, args: &[Type], field: Option<&str>) -> Opt
             ) {
                 return None;
             }
-            (Storage(O::RcDowngrade), storage(K::Weak, r.clone()))
+            // The weak type is the declared result.
+            (Storage(O::RcDowngrade), declared.clone())
         }
-        M::RcUpgrade => (
+        M::RcUpgrade if matches!(r, Type::Opaque(_, _, traits) if traits.weak()) => (
             Storage(O::RcUpgrade),
-            storage(K::Option, payload(r, K::Weak)?.clone()),
+            // The declaration names the optional owner.
+            matches!(lookup::option_payload(declared), Some(t) if equivalent(t, opaque_argument(r)?))
+                .then(|| declared.clone())?,
         ),
         M::RcStrongCount | M::RcWeakCount
             if matches!(
@@ -234,12 +260,7 @@ fn specialize(id: M, receiver: &Type, args: &[Type], field: Option<&str>) -> Opt
             )
         }
         M::ResultIsOk | M::ResultIsErr | M::ResultUnwrap | M::ResultUnwrapErr => {
-            let Type::Tuple(types) = payload(r, K::Result)? else {
-                return None;
-            };
-            let [value, error] = types.as_slice() else {
-                return None;
-            };
+            let (value, error) = lookup::result_payload(representation(r))?;
             match id {
                 M::ResultIsOk => (Storage(O::IsOk), boolean),
                 M::ResultIsErr => (Storage(O::IsErr), boolean),
@@ -249,8 +270,10 @@ fn specialize(id: M, receiver: &Type, args: &[Type], field: Option<&str>) -> Opt
             }
         }
         M::Slice | M::MutableSlice => {
-            let element = match r {
-                Type::Array(_, e) | Type::Slice(e) | Type::Storage(K::Vec, e) => e,
+            let element: &Type = match r {
+                Type::Array(_, e) | Type::Slice(e) => e,
+                // A growable collection that only grows at the back slices contiguously.
+                other if !other.is_double_ended() => other.collection_element()?,
                 _ => return None,
             };
             (
@@ -258,7 +281,7 @@ fn specialize(id: M, receiver: &Type, args: &[Type], field: Option<&str>) -> Opt
                 Type::Reference {
                     mutable: id == M::MutableSlice,
                     lifetime: None,
-                    pointee: Box::new(Type::Slice(element.clone())),
+                    pointee: Box::new(Type::Slice(Box::new(element.clone()))),
                 },
             )
         }
@@ -266,10 +289,9 @@ fn specialize(id: M, receiver: &Type, args: &[Type], field: Option<&str>) -> Opt
         | M::CollectionPushFront
         | M::CollectionPopBack
         | M::CollectionPopFront => {
-            let Type::Storage(kind @ (K::Vec | K::VecDeque), t) = r else {
-                return None;
-            };
-            if matches!(id, M::CollectionPushFront | M::CollectionPopFront) && *kind != K::VecDeque
+            let t = r.collection_element()?;
+            if matches!(id, M::CollectionPushFront | M::CollectionPopFront)
+                && !r.is_double_ended()
             {
                 return None;
             }
@@ -282,30 +304,27 @@ fn specialize(id: M, receiver: &Type, args: &[Type], field: Option<&str>) -> Opt
                 }
                 M::CollectionPopBack | M::CollectionPopFront => (
                     Storage(O::CollectionPop(id == M::CollectionPopFront)),
-                    storage(K::Option, *t.clone()),
+                    matches!(lookup::option_payload(declared), Some(p) if equivalent(p, t))
+                        .then(|| declared.clone())?,
                 ),
                 _ => return None,
             }
         }
         M::CollectionLength
-            if matches!(
-                r,
-                Type::Array(..) | Type::Slice(_) | Type::Storage(K::Vec | K::VecDeque, _)
-            ) =>
+            if matches!(r, Type::Array(..) | Type::Slice(_)) || r.collection_element().is_some() =>
         {
             (Storage(O::CollectionLength), usize_type())
         }
         M::RangeReverse if payload(r, K::Range).is_some() => (Storage(O::RangeReverse), r.clone()),
-        M::CellReplace if payload(r, K::Cell).is_some() => {
-            (Storage(O::CellReplace), payload(r, K::Cell)?.clone())
+        M::CellReplace if trait_argument(r, |t| t.deref()).is_some() => (
+            Storage(O::CellReplace),
+            trait_argument(r, |t| t.deref())?.clone(),
+        ),
+        M::LocationLoad if opaque_argument(r).is_some() => {
+            (Storage(O::LocationLoad), opaque_argument(r)?.clone())
         }
-        M::LocationLoad if payload(r, K::Location).is_some() => {
-            (Storage(O::LocationLoad), payload(r, K::Location)?.clone())
-        }
-        M::LocationStore if payload(r, K::Location).is_some() => {
-            (Storage(O::LocationStore), Type::Void)
-        }
-        M::OptionIsSome | M::OptionIsNone if payload(r, K::Option).is_some() => (
+        M::LocationStore if opaque_argument(r).is_some() => (Storage(O::LocationStore), Type::Void),
+        M::OptionIsSome | M::OptionIsNone if lookup::option_payload(representation(r)).is_some() => (
             Storage(if id == M::OptionIsSome {
                 O::IsSome
             } else {
@@ -313,47 +332,40 @@ fn specialize(id: M, receiver: &Type, args: &[Type], field: Option<&str>) -> Opt
             }),
             boolean,
         ),
-        M::OptionUnwrap | M::OptionOrFail => (Storage(O::Unwrap), payload(r, K::Option)?.clone()),
+        M::OptionUnwrap | M::OptionOrFail => (
+            Storage(O::Unwrap),
+            lookup::option_payload(representation(r))?.clone(),
+        ),
         M::StoragePathField => {
-            let Type::Record(_, fields) = payload(r, K::StoragePath)? else {
+            let Type::Record(_, fields) = trait_argument(r, |t| t.path())? else {
                 return None;
             };
             let index = fields
                 .iter()
                 .position(|(name, _)| Some(name.as_ref()) == field)?;
-            (
-                Storage(O::Field(index)),
-                storage(K::StoragePath, fields[index].1.clone()),
-            )
+            // The path type is the declared result; the index comes from the receiver.
+            (Storage(O::Field(index)), declared.clone())
         }
         M::StoragePathElement => {
-            let element = match payload(r, K::StoragePath)? {
-                Type::Array(_, t) | Type::Storage(K::Vec | K::VecDeque, t) => t,
-                _ => return None,
-            };
-            (
-                Storage(O::Element),
-                storage(K::StoragePath, *element.clone()),
-            )
+            let path_target = trait_argument(r, |t| t.path())?;
+            if !matches!(path_target, Type::Array(..)) && path_target.collection_element().is_none() {
+                return None;
+            }
+            (Storage(O::Element), declared.clone())
         }
         M::StoragePathTarget => {
-            let pointee = match payload(r, K::StoragePath)? {
-                Type::Managed { pointee, .. } | Type::Storage(K::Cell, pointee) => pointee,
+            match trait_argument(r, |t| t.path())? {
+                Type::Managed { .. } => {}
+                Type::Opaque(_, arguments, traits) if traits.deref() && arguments.len() == 1 => {}
                 _ => return None,
-            };
-            (
-                Storage(O::Target),
-                storage(K::StoragePath, *pointee.clone()),
-            )
+            }
+            (Storage(O::Target), declared.clone())
         }
-        M::ChannelClone | M::ClockClone
-            if matches!(r, Type::Storage(K::Sender | K::Receiver | K::Clock, _)) =>
-        {
-            (concurrent(C::Clone), r.clone())
-        }
-        M::ChannelClose | M::ChannelIsClosed
-            if matches!(r, Type::Storage(K::Sender | K::Receiver, _)) =>
-        {
+        M::ChannelClone if matches!(r, Type::Opaque(..)) => (concurrent(C::Clone), r.clone()),
+        // A clock is known by its declaration: the receiver is whatever opaque type
+        // the declared `clone(self: &Self)` names, and the result is that type.
+        M::ClockClone if matches!(r, Type::Opaque(..)) => (concurrent(C::Clone), r.clone()),
+        M::ChannelClose | M::ChannelIsClosed if matches!(r, Type::Opaque(..)) => {
             (
                 concurrent(if id == M::ChannelClose {
                     C::Close
@@ -373,10 +385,14 @@ fn specialize(id: M, receiver: &Type, args: &[Type], field: Option<&str>) -> Opt
             } else {
                 C::TrySend
             }),
-            lookup::result_type(
-                Type::Void,
-                storage(K::SendError, payload(r, K::Sender)?.clone()),
-            ),
+            // The declaration names `Result<(), SendError<T>>`.
+            {
+                let expected = lookup::result_type(
+                    Type::Void,
+                    storage(K::SendError, opaque_argument(r)?.clone()),
+                );
+                equivalent(&expected, declared).then(|| declared.clone())?
+            },
         ),
         M::ChannelReceive | M::ChannelTryReceive => (
             concurrent(if id == M::ChannelReceive {
@@ -384,17 +400,15 @@ fn specialize(id: M, receiver: &Type, args: &[Type], field: Option<&str>) -> Opt
             } else {
                 C::TryReceive
             }),
-            lookup::result_type(
-                payload(r, K::Receiver)?.clone(),
-                storage(K::ReceiveError, Type::Void),
-            ),
+            // The declaration names the error enum: `Result<T, ReceiveError>`.
+            declared.clone(),
         ),
         M::SendErrorValue => (
             concurrent(C::SendErrorValue),
-            payload(r, K::SendError)?.clone(),
+            lookup::send_payload(representation(r))?.clone(),
         ),
         M::SendErrorClosed | M::SendErrorFull | M::SendErrorLimit
-            if payload(r, K::SendError).is_some() =>
+            if lookup::send_payload(representation(r)).is_some() =>
         {
             (
                 concurrent(match id {
@@ -405,7 +419,7 @@ fn specialize(id: M, receiver: &Type, args: &[Type], field: Option<&str>) -> Opt
                 boolean,
             )
         }
-        M::ReceiveErrorClosed | M::ReceiveErrorEmpty if payload(r, K::ReceiveError).is_some() => (
+        M::ReceiveErrorClosed | M::ReceiveErrorEmpty if matches!(representation(r), Type::Enum(_)) => (
             concurrent(if id == M::ReceiveErrorClosed {
                 C::ReceiveErrorClosed
             } else {
@@ -433,12 +447,10 @@ fn specialize(id: M, receiver: &Type, args: &[Type], field: Option<&str>) -> Opt
         M::ViewErrorMessage if payload(r, K::ViewError).is_some() => {
             (Body::Storage(O::ViewErrorMessage), Type::String)
         }
-        M::ClockSleep if payload(r, K::Clock).is_some() => (concurrent(C::Sleep), Type::Void),
-        M::TaskJoin => (
-            concurrent(C::Join),
-            storage(K::TaskOutcome, payload(r, K::Task)?.clone()),
-        ),
-        M::TaskCancel | M::TaskIsFinished if payload(r, K::Task).is_some() => (
+        M::ClockSleep if matches!(r, Type::Opaque(..)) => (concurrent(C::Sleep), Type::Void),
+        // The outcome type is the declared result.
+        M::TaskJoin => (concurrent(C::Join), declared.clone()),
+        M::TaskCancel | M::TaskIsFinished if matches!(r, Type::Opaque(..)) => (
             concurrent(if id == M::TaskCancel {
                 C::Cancel
             } else {
@@ -450,12 +462,9 @@ fn specialize(id: M, receiver: &Type, args: &[Type], field: Option<&str>) -> Opt
                 boolean
             },
         ),
-        M::TaskCompleted => (
-            concurrent(C::Completed),
-            payload(r, K::TaskOutcome)?.clone(),
-        ),
+        M::TaskCompleted => (concurrent(C::Completed), opaque_argument(r)?.clone()),
         M::TaskIsCompleted | M::TaskIsFailed | M::TaskIsCancelled | M::TaskIsStopped
-            if payload(r, K::TaskOutcome).is_some() =>
+            if matches!(r, Type::Opaque(..)) =>
         {
             (
                 concurrent(match id {

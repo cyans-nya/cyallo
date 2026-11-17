@@ -305,6 +305,18 @@ impl Bindings {
             self.values.insert(name.clone(), normalize(actual));
             return Ok(());
         }
+        // A named source enum in a declaration is compared as its definition.
+        let defined;
+        let pattern = match pattern {
+            Type::Named(name) => match env.get(name.as_ref()) {
+                Some(definition @ Type::Enum(_)) => {
+                    defined = definition.clone();
+                    &defined
+                }
+                _ => pattern,
+            },
+            _ => pattern,
+        };
         let actual = view(env, actual);
         let mismatch = || NativeContractError::ArgumentType {
             index,
@@ -337,8 +349,14 @@ impl Bindings {
             ) if !required || *supplied => {
                 if let Type::Slice(element) = p.as_ref() {
                     match a.as_ref() {
-                        Type::Array(_, actual) | Type::Storage(StorageKind::Vec, actual) => {
+                        Type::Array(_, actual) => {
                             return self.unify(env, element, actual, index);
+                        }
+                        // A collection that grows only at the back slices contiguously.
+                        other if !other.is_double_ended() => {
+                            if let Some(actual) = other.collection_element() {
+                                return self.unify(env, element, actual, index);
+                            }
                         }
                         _ => {}
                     }
@@ -364,12 +382,29 @@ impl Bindings {
             {
                 self.unify(env, p, a, index)
             }
-            (Type::Storage(p_kind, p), Type::Storage(a_kind, a))
-                if p_kind == a_kind
-                    || (*p_kind == StorageKind::Generator
-                        && *a_kind == StorageKind::PureGenerator) =>
-            {
+            (Type::Storage(p_kind, p), Type::Storage(a_kind, a)) if p_kind == a_kind => {
                 self.unify(env, p, a, index)
+            }
+            // A declared enum template binds its type parameters through its arguments.
+            (Type::Enum(p), Type::Enum(a))
+                if p.identity.declaration == a.identity.declaration
+                    && p.identity.arguments.len() == a.identity.arguments.len() =>
+            {
+                for (p, a) in p.identity.arguments.iter().zip(&a.identity.arguments) {
+                    self.unify(env, p, a, index)?;
+                }
+                Ok(())
+            }
+            // A pure generator is accepted where the general generator type is expected.
+            (Type::Opaque(p_name, ps, p_traits), Type::Opaque(a_name, args, a_traits))
+                if p_name == a_name
+                    && ps.len() == args.len()
+                    && (p_traits.pure() == a_traits.pure() || (!p_traits.pure() && a_traits.pure())) =>
+            {
+                for (p, a) in ps.iter().zip(args) {
+                    self.unify(env, p, a, index)?;
+                }
+                Ok(())
             }
             (Type::Array(p_bounds, p), Type::Array(a_bounds, a)) if p_bounds == a_bounds => {
                 self.unify(env, p, a, index)
@@ -431,7 +466,17 @@ impl Bindings {
             return Ok(owner.clone());
         }
         Ok(match ty {
-            Type::Named(name) => self.values.get(name).cloned().unwrap_or_else(|| ty.clone()),
+            // A named source type in a declaration (an enum such as `ReceiveError`) is
+            // viewed through the program's definitions, like any other resolved name.
+            Type::Named(name) => self
+                .values
+                .get(name)
+                .or_else(|| {
+                    env.get(name.as_ref())
+                        .filter(|definition| matches!(definition, Type::Enum(_)))
+                })
+                .cloned()
+                .unwrap_or_else(|| ty.clone()),
             Type::ValueParameter(index) => actual
                 .get(*index)
                 .cloned()
@@ -473,6 +518,27 @@ impl Bindings {
             Type::Storage(kind, inner) => Type::Storage(
                 *kind,
                 Box::new(self.substitute(env, inner, expressions, actual)?),
+            ),
+            Type::Enum(contract) => {
+                let mut contract = contract.clone();
+                let contract = std::sync::Arc::make_mut(&mut contract);
+                for argument in &mut contract.identity.arguments {
+                    *argument = self.substitute(env, argument, expressions, actual)?;
+                }
+                for variant in &mut contract.variants {
+                    if let Some(payload) = &mut variant.payload {
+                        *payload = self.substitute(env, payload, expressions, actual)?;
+                    }
+                }
+                Type::Enum(std::sync::Arc::new(contract.clone()))
+            }
+            Type::Opaque(name, types, traits) => Type::Opaque(
+                name.clone(),
+                types
+                    .iter()
+                    .map(|ty| self.substitute(env, ty, expressions, actual))
+                    .collect::<Result<_>>()?,
+                *traits,
             ),
             Type::Array(bounds, inner) => Type::Array(
                 bounds.clone(),
@@ -558,24 +624,35 @@ fn equivalent(a: &Type, b: &Type) -> bool {
 }
 fn view(env: &TypeEnvironment, ty: &Type) -> Type {
     match ty {
-        Type::RecordRef(name) => env
+        Type::RecordRef(name) | Type::EnumRef(_, name) => env
             .get(name.as_ref())
             .cloned()
             .unwrap_or_else(|| ty.clone()),
         Type::Named(name) => env
             .get(name.as_ref())
-            .filter(|ty| matches!(ty, Type::Record(..) | Type::RecordRef(_)))
+            .filter(|ty| {
+                matches!(
+                    ty,
+                    Type::Record(..) | Type::RecordRef(_) | Type::Enum(..) | Type::EnumRef(..)
+                )
+            })
             .cloned()
             .unwrap_or_else(|| ty.clone()),
         _ => ty.clone(),
     }
 }
 fn semantic(function: &Function) -> Result<InternalSemantic> {
-    if function.annotations.len() != 1 || function.annotations[0].name.as_ref() != "cyallo_internal"
-    {
+    let mut annotations = function
+        .annotations
+        .iter()
+        .filter(|a| a.name.as_ref() == "cyallo_internal");
+    let semantic = annotations
+        .next()
+        .and_then(|a| internal::from_key(&a.value));
+    if annotations.next().is_some() {
         return Err(NativeContractError::InvalidAnnotation);
     }
-    match internal::from_key(&function.annotations[0].value) {
+    match semantic {
         Some(semantic @ (InternalSemantic::Function(_) | InternalSemantic::Member(_))) => {
             Ok(semantic)
         }
@@ -585,9 +662,12 @@ fn semantic(function: &Function) -> Result<InternalSemantic> {
 
 fn collection_element(ty: &Type, numeric_only: bool) -> Option<Type> {
     match ty {
-        Type::Array(_, element)
-        | Type::Storage(StorageKind::Vec | StorageKind::VecDeque, element) => {
+        Type::Array(_, element) => {
             (!numeric_only || element.number_kind().is_some()).then(|| *element.clone())
+        }
+        _ if ty.collection_element().is_some() => {
+            let element = ty.collection_element()?;
+            (!numeric_only || element.number_kind().is_some()).then(|| element.clone())
         }
         Type::Reference { pointee, .. } | Type::Borrowed(pointee) if !numeric_only => {
             collection_element(pointee, false)
@@ -597,8 +677,22 @@ fn collection_element(ty: &Type, numeric_only: bool) -> Option<Type> {
     }
 }
 fn transferable(env: &TypeEnvironment, ty: &Type, active: &mut HashSet<Box<str>>) -> bool {
+    if matches!(ty, Type::Storage(..))
+        && let Some(contract) = crate::enums::contract(ty, &env.native)
+    {
+        return contract
+            .variants
+            .iter()
+            .filter_map(|v| v.payload.as_ref())
+            .all(|ty| transferable(env, ty, active));
+    }
     match ty {
-        Type::RecordRef(name) => {
+        Type::Enum(contract) => contract
+            .variants
+            .iter()
+            .filter_map(|v| v.payload.as_ref())
+            .all(|ty| transferable(env, ty, active)),
+        Type::RecordRef(name) | Type::EnumRef(_, name) => {
             if !active.insert(name.clone()) {
                 return false;
             }
@@ -608,17 +702,18 @@ fn transferable(env: &TypeEnvironment, ty: &Type, active: &mut HashSet<Box<str>>
             active.remove(name);
             result
         }
-        Type::Record(_, fields) => fields.iter().all(|(_, ty)| transferable(env, ty, active)),
+        Type::Record(_, fields) | Type::AnonymousRecord(fields) => {
+            fields.iter().all(|(_, ty)| transferable(env, ty, active))
+        }
         Type::Array(_, inner) | Type::SparseArray(inner) => transferable(env, inner, active),
         Type::Tuple(types) => types.iter().all(|ty| transferable(env, ty, active)),
         Type::Storage(
-            StorageKind::Vec
-            | StorageKind::VecDeque
-            | StorageKind::Option
-            | StorageKind::Result
-            | StorageKind::SendError,
+            StorageKind::Option | StorageKind::Result | StorageKind::SendError,
             inner,
         ) => transferable(env, inner, active),
+        Type::Opaque(_, arguments, traits) => {
+            traits.transferable() && arguments.iter().all(|ty| transferable(env, ty, active))
+        }
         _ => crate::concurrent::transferable(ty),
     }
 }
@@ -627,7 +722,12 @@ fn cloneable(env: &TypeEnvironment, ty: &Type, active: &mut HashSet<Box<str>>) -
         return false;
     }
     match ty {
-        Type::RecordRef(name) => {
+        Type::Enum(contract) => contract
+            .variants
+            .iter()
+            .filter_map(|v| v.payload.as_ref())
+            .all(|ty| cloneable(env, ty, active)),
+        Type::RecordRef(name) | Type::EnumRef(_, name) => {
             if !active.insert(name.clone()) {
                 return false;
             }
@@ -637,12 +737,17 @@ fn cloneable(env: &TypeEnvironment, ty: &Type, active: &mut HashSet<Box<str>>) -
             active.remove(name);
             result
         }
-        Type::Record(_, fields) => fields.iter().all(|(_, ty)| cloneable(env, ty, active)),
+        Type::Record(_, fields) | Type::AnonymousRecord(fields) => {
+            fields.iter().all(|(_, ty)| cloneable(env, ty, active))
+        }
         Type::Array(_, inner)
         | Type::SparseArray(inner)
         | Type::Slice(inner)
         | Type::Storage(_, inner) => cloneable(env, inner, active),
         Type::Tuple(types) => types.iter().all(|ty| cloneable(env, ty, active)),
+        Type::Opaque(_, arguments, traits) => {
+            traits.cloneable() && arguments.iter().all(|ty| cloneable(env, ty, active))
+        }
         _ => crate::memory::cloneable(ty),
     }
 }
@@ -669,7 +774,7 @@ fn predicate(env: &TypeEnvironment, predicate: NativeTrait, ty: &Type) -> bool {
             }
         ),
         NativeTrait::WeakOwner => {
-            matches!(ty, Type::Storage(StorageKind::Weak, owner) if matches!(owner.as_ref(), Type::Managed {kind: MemoryKind::Rc, ..}))
+            matches!(ty, Type::Opaque(_, owner, traits) if traits.weak() && matches!(owner.as_slice(), [Type::Managed {kind: MemoryKind::Rc, ..}]))
         }
         NativeTrait::GcOwner => matches!(
             ty,
@@ -731,7 +836,9 @@ fn bounds(
                         .iter()
                         .find(|(_, declaration)| declaration.name == *name);
                     let bound_semantic = declared
-                        .and_then(|(_, declaration)| declaration.annotations.first())
+                        .and_then(|(_, declaration)| {
+                            crate::declarations::internal_annotation(&declaration.annotations)
+                        })
                         .and_then(|annotation| internal::from_key(&annotation.value));
                     match bound_semantic {
                         Some(InternalSemantic::Trait(native)) => {
@@ -1186,10 +1293,14 @@ fn member_owner(
             });
         }
         bindings.unify(env, p, a, 0)?;
-    } else if let (Type::Storage(StorageKind::Weak, p), Type::Storage(StorageKind::Weak, a)) =
+    } else if let (Type::Opaque(_, p, p_traits), Type::Opaque(_, a, a_traits)) =
         (&header.receiver, owner)
+        && p_traits.weak()
+        && a_traits.weak()
+        && p.len() == 1
+        && a.len() == 1
     {
-        match (p.as_ref(), a.as_ref()) {
+        match (&p[0], &a[0]) {
             (
                 Type::Managed {
                     kind: MemoryKind::Rc,
@@ -1353,7 +1464,7 @@ fn member_direct(
                 Type::Reference { pointee, .. } => pointee.as_ref(),
                 _ => receiver,
             };
-            if matches!(owner, Type::Storage(StorageKind::PureGenerator, _))
+            if matches!(owner, Type::Opaque(_, _, traits) if traits.generator() && traits.pure())
                 && matches!(
                     callable.semantic,
                     InternalSemantic::Member(
@@ -1461,9 +1572,7 @@ fn family(
         .find(|(id, _)| *id == declaration)
         .map(|(_, record)| record)
         .ok_or(NativeContractError::UnknownFamily(declaration))?;
-    let family = match record
-        .annotations
-        .first()
+    let family = match crate::declarations::internal_annotation(&record.annotations)
         .and_then(|annotation| internal::from_key(&annotation.value))
     {
         Some(InternalSemantic::TypeFamily(family)) => family,
@@ -1542,7 +1651,7 @@ fn family(
             owner = view(env, &owner);
             let field = constant_text(expression(&operands[1])?)
                 .ok_or(NativeContractError::ConstantFieldRequired)?;
-            let Type::Record(_, fields) = &owner else {
+            let (Type::Record(_, fields) | Type::AnonymousRecord(fields)) = &owner else {
                 return Err(invalid(owner));
             };
             fields
@@ -1561,12 +1670,12 @@ fn family(
         NativeTypeFamily::Target => {
             let owner = ty(&operands[0])?;
             match owner {
-                Type::Reference { pointee, .. }
-                | Type::Managed { pointee, .. }
-                | Type::Storage(
-                    StorageKind::Cell | StorageKind::Weak | StorageKind::StoragePath,
-                    pointee,
-                ) => Ok(*pointee),
+                Type::Reference { pointee, .. } | Type::Managed { pointee, .. } => Ok(*pointee),
+                Type::Opaque(_, arguments, traits)
+                    if (traits.weak() || traits.target()) && arguments.len() == 1 =>
+                {
+                    Ok(arguments[0].clone())
+                }
                 _ => Err(invalid(owner)),
             }
         }
@@ -1587,7 +1696,8 @@ fn family(
             ) {
                 return Err(invalid(owner));
             }
-            Ok(Type::Storage(StorageKind::Weak, Box::new(owner)))
+            let (name, traits) = env.weak_type().ok_or_else(|| invalid(owner.clone()))?;
+            Ok(Type::Opaque(name, vec![owner], traits))
         }
     }
 }
@@ -1644,9 +1754,17 @@ mod tests {
     use std::sync::Arc;
 
     fn environment() -> TypeEnvironment {
-        let mut ast = crate::namespace::single(cyallo_parser::parse("").unwrap()).unwrap();
-        let types = crate::composites::resolve(&mut ast).unwrap();
-        TypeEnvironment::new(types, ast.native)
+        let mut graph = crate::namespace::single(cyallo_parser::parse("").unwrap()).unwrap();
+        let native = graph.native.clone();
+        graph
+            .with_sources(|asts| {
+                crate::generics::specialize_modules(asts, &native, crate::CompileOptions::default())
+            })
+            .unwrap();
+        let types = graph
+            .with_sources(|asts| crate::composites::resolve_modules(asts, &native))
+            .unwrap();
+        TypeEnvironment::new(types, graph.native)
     }
     fn value() -> Expr {
         Expr {
@@ -1744,8 +1862,8 @@ mod tests {
         assert_eq!(
             call.result,
             Type::Tuple(vec![
-                storage(StorageKind::Sender, Type::Integer),
-                storage(StorageKind::Receiver, Type::Integer)
+                host_type(&env, "send", Type::Integer),
+                host_type(&env, "recv", Type::Integer),
             ])
         );
     }
@@ -1874,7 +1992,7 @@ mod tests {
         let pure_callback = Type::Function(RoutineKind::Function, vec![], Box::new(Type::String));
         let spawned = call(&env, "task_spawn", &[], &[value()], &[pure_callback]).unwrap();
         assert_eq!(spawned.kind, RoutineKind::Procedure);
-        assert_eq!(spawned.result, storage(StorageKind::Task, Type::String));
+        assert_eq!(spawned.result, host_type(&env, "join", Type::String));
         let local_return = Type::Function(
             RoutineKind::Procedure,
             vec![],
@@ -1904,7 +2022,7 @@ mod tests {
             "array_sum",
             &[],
             &[value()],
-            &[storage(StorageKind::Vec, element.clone())],
+            &[host_type(&env, "len", element.clone())],
         )
         .unwrap();
         assert_eq!(summed.result, element);
@@ -1914,7 +2032,7 @@ mod tests {
                 "array_sum",
                 &[],
                 &[value()],
-                &[storage(StorageKind::Vec, Type::String)]
+                &[host_type(&env, "len", Type::String)]
             ),
             Err(NativeContractError::UnsatisfiedBound { .. })
         ));
@@ -1996,7 +2114,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             location.result,
-            storage(StorageKind::Location, Type::Boolean)
+            host_type(&env, "load", Type::Boolean)
         );
         assert_eq!(location.params[0].passing, ParameterPassing::Read);
         assert_eq!(location.params[1].passing, ParameterPassing::Read);
@@ -2011,7 +2129,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(direct.params[0].ty, direct_owner);
-        assert_eq!(direct.result, storage(StorageKind::Location, Type::Boolean));
+        assert_eq!(direct.result, host_type(&env, "load", Type::Boolean));
         assert!(matches!(
             call(
                 &env,
@@ -2042,7 +2160,7 @@ mod tests {
             ),
             Err(NativeContractError::ConstantFieldRequired)
         ));
-        let path = storage(StorageKind::StoragePath, record);
+        let path = host_type(&env, "element", record);
         let field = member(
             &env,
             &path,
@@ -2055,8 +2173,29 @@ mod tests {
         .unwrap();
         assert_eq!(
             field.callable.result,
-            storage(StorageKind::StoragePath, Type::Boolean)
+            host_type(&env, "element", Type::Boolean)
         );
+    }
+
+    /// An opaque host type is known by its declaration: take it from the declared
+    /// receiver of a member (`send`, `recv`, `join`, `completed`, ...) and apply the
+    /// element type.
+    fn host_type(env: &TypeEnvironment, member: &str, element: Type) -> Type {
+        host_type_args(env, member, vec![element])
+    }
+    fn host_type_args(env: &TypeEnvironment, member: &str, arguments: Vec<Type>) -> Type {
+        let receiver = env
+            .native
+            .methods
+            .iter()
+            .filter(|method| method.function.source_name.as_ref() == member)
+            .map(|method| method.receiver.clone())
+            .find(|receiver| matches!(receiver, Type::Opaque(..)))
+            .unwrap_or_else(|| panic!("no opaque receiver declares `{member}`"));
+        match receiver {
+            Type::Opaque(name, _, traits) => Type::Opaque(name, arguments, traits),
+            other => panic!("not an opaque type: {other:?}"),
+        }
     }
 
     #[test]
@@ -2067,7 +2206,16 @@ mod tests {
                 method.function.source_name = "pause".into();
             }
         }
-        let clock = storage(StorageKind::Clock, Type::Void);
+        // The clock is an opaque host type known by its declaration: take its type
+        // from the declared receiver of `sleep`, as a caller would.
+        let clock = env
+            .native
+            .methods
+            .iter()
+            .find(|method| method.function.source_name.as_ref() == "pause")
+            .map(|method| method.receiver.clone())
+            .unwrap();
+        assert!(matches!(clock, Type::Opaque(..)), "{clock:?}");
         assert!(
             member(&env, &clock, "sleep", &[integer(1)], &[Type::Integer], SPAN)
                 .unwrap()
@@ -2102,20 +2250,26 @@ mod tests {
     #[test]
     fn ownership_and_generic_unit_overloads_come_from_source_headers() {
         let env = environment();
-        let task = storage(StorageKind::Task, Type::Integer);
+        let task = host_type(&env, "join", Type::Integer);
         let joined = member(&env, &task, "join", &[], &[], SPAN)
             .unwrap()
             .unwrap();
         assert_eq!(joined.receiver, ReceiverMode::Move);
         assert_eq!(
             joined.callable.result,
-            storage(StorageKind::TaskOutcome, Type::Integer)
+            host_type(&env, "completed", Type::Integer)
         );
         assert!(member(&env, &reference(task), "join", &[], &[], SPAN).is_err());
-        let pure = storage(
-            StorageKind::PureGenerator,
-            Type::Tuple(vec![Type::Integer, Type::Void, Type::Integer]),
-        );
+        let pure = match host_type_args(
+            &env,
+            "next",
+            vec![Type::Integer, Type::Void, Type::Integer],
+        ) {
+            Type::Opaque(name, arguments, traits) => {
+                Type::Opaque(name, arguments, traits.with_pure(true))
+            }
+            other => panic!("{other:?}"),
+        };
         let resumed = member(&env, &pure, "resume", &[], &[], SPAN)
             .unwrap()
             .unwrap();
@@ -2152,7 +2306,7 @@ mod tests {
         )
         .unwrap()
         .result;
-        assert_eq!(weak, storage(StorageKind::Weak, owner.clone()));
+        assert_eq!(weak, host_type_args(&env, "upgrade", vec![owner.clone()]));
         let upgraded = call(
             &env,
             "rc_upgrade",
@@ -2393,7 +2547,7 @@ mod tests {
         let env = environment();
         let sent = member(
             &env,
-            &storage(StorageKind::Sender, Type::String),
+            &host_type(&env, "send", Type::String),
             "send",
             &[text("payload")],
             &[Type::String],
@@ -2418,7 +2572,7 @@ mod tests {
         let mapper = Type::Function(
             RoutineKind::Function,
             vec![(Type::Integer, false), (Type::Integer, false)],
-            Box::new(storage(StorageKind::StoragePath, Type::Integer)),
+            Box::new(host_type(&env, "element", Type::Integer)),
         );
         let mapped = call(
             &env,
@@ -2657,7 +2811,7 @@ mod tests {
     #[test]
     fn gc_member_autoderef_preserves_direct_owner_priority_and_borrow_mutability() {
         let env = environment();
-        let vector = storage(StorageKind::Vec, Type::Integer);
+        let vector = host_type(&env, "len", Type::Integer);
         let gc = managed(MemoryKind::Gc, None, vector.clone());
         let length = member(&env, &gc, "len", &[], &[], SPAN).unwrap().unwrap();
         assert_eq!(length.receiver_type, vector);
@@ -2698,7 +2852,7 @@ mod tests {
                 "clone_value",
                 &[],
                 &[value()],
-                &[reference(storage(StorageKind::Task, Type::Integer))]
+                &[reference(host_type(&env, "join", Type::Integer))]
             ),
             Err(NativeContractError::UnsatisfiedBound { .. })
         ));
