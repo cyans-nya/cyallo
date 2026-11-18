@@ -6,6 +6,22 @@ implementing component supplies the rest. This page describes how the runtime (o
 embedder) binds the SDK's **bodyless** items, using the contracts in
 [intrinsic effect contracts](intrinsic-contracts.md).
 
+## Terminology
+
+These terms are used by the [backend design](backend-design.md) and the component
+worlds drafts. Use them the same way.
+
+| Term | Meaning |
+| --- | --- |
+| SDK | A package of worlds and interface modules: signatures only, no bodies. |
+| Provider | The runtime or embedder that implements an SDK's bodyless items. It owns its `NativeBindings`. |
+| Binding | The contract and implementation for one SDK item path: `host_call`, `intrinsic` or a Cyallo body. |
+| Installed table | The immutable `Installed` result of installing a provider's bindings against an SDK interface, scoped to that program and provider. |
+| Bound call | A call to an SDK item, resolved through its installed binding. |
+
+Avoid "provider call" or "installed provider" for a bound call or an installed
+table. "Provider bindings" in older text means the provider's `NativeBindings`.
+
 ## What needs binding
 
 `InterfaceItem::requires_binding` (from `ResolvedProgram.interface`, see

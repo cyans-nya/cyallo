@@ -1,3 +1,5 @@
+> **Superseded** by [pending-decisions/](pending-decisions/README.md) (2026-11-17). Kept for history.
+
 # Pending implementation work
 
 Handoff recorded 2026-11-17. These are the agent's outstanding tasks, not work

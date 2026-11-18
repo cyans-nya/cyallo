@@ -1,0 +1,25 @@
+# 07 — Failing tests carried since the baseline
+
+The full root suite fails the same 15 tests as the pre-existing baseline (compared by name).
+They fail in this tree and pass in the original workspace baseline because the standard enum
+constructor functions the std package now emits shift function indices:
+
+attributes_survive_parallel_parsing_and_specialization,
+call_soon_coalesces_and_lazy_remains_eligible_for_observed_tiering,
+declaration_errors_are_eager_and_analysis_is_shared_between_workers,
+native_callees_are_charged_to_their_own_tier_and_caller_is_restored,
+native_callees_request_fast_without_returning_to_the_driver,
+never_and_always_lazy_are_honored_by_all_layouts,
+optimized_budget_resumes_stay_in_speed_without_repeat_promotions,
+osr_keeps_byref_aliases_to_caller_storage,
+osr_promotes_a_running_invocation_without_restarting_it,
+osr_report_tracks_same_invocation_and_executed_tiers,
+recursion_and_checked_failures_remain_observable,
+reports_use_real_frames_and_dynamic_targets_remain_dynamic,
+returning_procedures_and_private_mutation,
+speculative_work_is_bounded_and_lowered_rejections_wake_waiters,
+stateless_procedure_values_do_not_execute_during_initialization.
+
+**Decision needed.** Either emit enum constructor functions only when used (lazy emission,
+better for startup and code size), or update the tests to not depend on function indices.
+The crate test `payload_contracts_are_nominal_and_constructor_bodies_keep_variant_ids` now passes.
