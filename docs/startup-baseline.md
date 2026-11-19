@@ -412,3 +412,27 @@ Host, revision and cache state are in the JSON `meta`.
 | call every routine | 0 | all n=1024 b8 m0 | 82.3 | 124.6 | +75.4 | 500.5 | 852.8 | 582.7 |
 | call every routine | 0 | unu n=4096 b8 m0 | 292.0 | 302.7 | +284.7 | 9.6 | 11.1 | 301.5 |
 | call every routine | 0 | all n=4096 b8 m0 | 325.3 | 375.1 | +318.1 | 2571.3 | 4304.9 | 2892.5 |
+
+## Update: resolver indexing (before/after)
+
+Cause of the superlinear `resolve` stage: `Resolver::declarations` ran a linear `find` over the
+function, record, enum, trait and alias lists, and a linear scan of the `exports` vector, for
+every declared name (quadratic in routine count). It now indexes each list once per module
+(first declaration wins, as before). `constant_order` also stopped cloning every function body
+(new read-only `cyallo_ast::visit::walk_block`).
+
+`unused` workloads, `--jobs 1`, release, no profile feature, 15 interleaved fresh-process runs
+per binary on a machine shared with other builds; median ms to first output.
+
+| Routines | Before | After |
+| ---: | ---: | ---: |
+| 4096 | 368.3 | 333.8 |
+| 16384 | 1682.3 | 1338.4 |
+
+`resolve` stage (profile build, single run): n=4096 66.5 → 41.9 ms; n=16384 559 → 166 ms
+(×4 for ×4 routines, no longer superlinear). Remaining body copies are unchanged
+(`bodies_materialized`, `bodies_tracing_copied`, `bodies_deferred_copied` still N+2): the
+tracing, deferred and key copies sit in `analysis/modules.rs` and `module_cache.rs`, and sharing
+`DeferredBody` needs a shared `Function.body` representation. Tests: `tests/resolution_bindings.rs`
+(passes on old and new resolver). The workspace has 29 failing tests that fail identically
+without these changes.
