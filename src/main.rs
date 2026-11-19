@@ -506,7 +506,7 @@ fn main() -> color_eyre::Result<()> {
         Command::Run {
             engine: Engine::Verified,
             ..
-        } => run_verified(&program, runtime.gc.stress)?,
+        } => run_verified(program.clone(), runtime.gc.stress)?,
         Command::Run { engine, .. } => {
             if !run(
                 program,
@@ -556,9 +556,12 @@ const VERIFIED_LIMITS: cyallo::bytecode::verified::ExecutionLimits =
     };
 /// Run the entry routine in the verified interpreter. A program that uses an
 /// operation it cannot execute stops before running, with the reason.
-fn run_verified(program: &cyallo::ir::Program, gc_stress: bool) -> color_eyre::Result<()> {
+fn run_verified(
+    program: std::sync::Arc<cyallo::ir::Program>,
+    gc_stress: bool,
+) -> color_eyre::Result<()> {
     use cyallo::bytecode::verified::ExecutionStatus;
-    let module = cyallo::bytecode::verified::VerifiedModule::lower(program, ENTRY_ROUTINE)?;
+    let module = cyallo::bytecode::verified::VerifiedModule::lower_shared(program, ENTRY_ROUTINE)?;
     let mut activation = module
         .start(&[], VERIFIED_LIMITS)
         .map_err(|error| color_eyre::eyre::eyre!(error))?;

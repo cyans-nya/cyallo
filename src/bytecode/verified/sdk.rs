@@ -191,6 +191,7 @@ impl VerifiedModule {
             });
             host_ids.insert(routine, binding);
         }
-        Self::lower_with_hosts(routines, id, &host_ids, hosts, None).map_err(SdkCompileError::Lower)
+        Self::lower_with_hosts(routines, id, &host_ids, hosts, None, &[])
+            .map_err(SdkCompileError::Lower)
     }
 }

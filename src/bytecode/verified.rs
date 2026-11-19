@@ -15,9 +15,9 @@ mod run;
 mod sdk;
 mod shapes;
 
-use crate::Span;
+use crate::{Span, ir::Program};
 use bound::ScalarHostBinding;
-use std::{fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 pub use crate::ir::TextStyle;
 pub use bound::{HostFailure, ScalarSdk};
@@ -33,12 +33,12 @@ pub use run::{
 };
 pub use sdk::SdkCompileError;
 
-/// Version 30 adds by-value trait receivers. Version 29 adds open objects and erased values. Version 28 adds tasks and clocks. Version 27 adds channels. Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 31 adds run-time module loading. Version 30 adds by-value trait receivers. Version 29 adds open objects and erased values. Version 28 adds tasks and clocks. Version 27 adds channels. Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 30;
+pub const FORMAT_VERSION: u32 = 31;
 
 macro_rules! index {
     ($name:ident) => {
@@ -127,6 +127,8 @@ pub enum ValueType {
     /// A value of any erasable type together with its type. What it holds is
     /// checked when it is read back.
     Dynamic,
+    /// A failure to load a module or to view an object, with its message.
+    Failure,
 }
 
 /// A method a trait declares: what its receiver may do and its other types.
@@ -184,6 +186,10 @@ pub enum DynamicOp {
     Not,
 }
 
+fn is_prefix<T: PartialEq>(shorter: &[T], longer: &[T]) -> bool {
+    shorter.len() <= longer.len() && shorter == &longer[..shorter.len()]
+}
+
 /// A callable's parameter and result types, without its captures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Signature {
@@ -225,7 +231,8 @@ impl ValueType {
             | Self::Task(_)
             | Self::Clock
             | Self::OpenObject
-            | Self::Dynamic => None,
+            | Self::Dynamic
+            | Self::Failure => None,
         }
     }
 }
@@ -345,6 +352,8 @@ pub enum RegisterType {
     OpenObject,
     /// An erased value.
     Dynamic,
+    /// A failure to load a module or to view an object: a message and what kind.
+    Failure,
     /// A closure that captured loans. It behaves like a loan on their root:
     /// the root stays live and borrowed while it lives, and the value cannot
     /// be stored, passed or returned by value.
@@ -384,6 +393,7 @@ impl From<ValueType> for RegisterType {
             ValueType::Clock => Self::Clock,
             ValueType::OpenObject => Self::OpenObject,
             ValueType::Dynamic => Self::Dynamic,
+            ValueType::Failure => Self::Failure,
         }
     }
 }
@@ -428,6 +438,7 @@ impl RegisterType {
             Self::Clock => ValueType::Clock,
             Self::OpenObject => ValueType::OpenObject,
             Self::Dynamic => ValueType::Dynamic,
+            Self::Failure => ValueType::Failure,
             _ => return None,
         })
     }
@@ -776,8 +787,20 @@ pub enum Instruction {
     /// Check that the object has the contract's properties with those types
     /// and require them from now on, through every alias.
     ObjectView(Register, Register, ContractId),
+    /// Like a view, but a failure is a value: the result is the viewed object or
+    /// a failure carrying why the view cannot be made.
+    ObjectTryView(Register, Register, ContractId),
     /// Make the object readonly through every alias.
     ObjectFreeze(Register),
+    /// Load a module by path at run time. The result is the module's namespace
+    /// object, or a failure.
+    ModuleLoad(Register, Register),
+    /// Whether a failure is of a kind: 0 not found, 1 denied, 2 failed checks.
+    FailureFlag(Register, Register, u32),
+    FailureMessage(Register, Register),
+    /// Call the callable an erased value holds with erased or typed arguments.
+    /// The result is erased.
+    DynamicInvoke(Register, Register, OperandListId),
     /// Wrap the value with its type.
     Erase(Register, Register),
     /// Read an erased value as the destination's type, which it must have.
@@ -960,7 +983,7 @@ pub struct OutputTemplate {
     pub pieces: Box<[OutputPiece]>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallSite {
     pub target: CallTarget,
     pub arguments: Box<[Register]>,
@@ -1017,9 +1040,17 @@ impl Instruction {
             }
             ObjectSet(object, _, value) => ([Some(object), Some(value)], &[], None),
             ObjectSetKey(object, list) => ([Some(object), None], &lists[list.index()], None),
-            ObjectView(dst, source, _) | Erase(dst, source) | DynamicCast(dst, source) => {
-                ([Some(source), None], &[], Some(dst))
+            ModuleLoad(dst, path) => ([Some(path), None], &[], Some(dst)),
+            FailureFlag(dst, failure, _) | FailureMessage(dst, failure) => {
+                ([Some(failure), None], &[], Some(dst))
             }
+            DynamicInvoke(dst, callee, list) => {
+                ([Some(callee), None], &lists[list.index()], Some(dst))
+            }
+            ObjectView(dst, source, _)
+            | ObjectTryView(dst, source, _)
+            | Erase(dst, source)
+            | DynamicCast(dst, source) => ([Some(source), None], &[], Some(dst)),
             DynamicUnary(_, dst, source) => ([Some(source), None], &[], Some(dst)),
             DynamicBinary(_, dst, lhs, rhs) => ([Some(lhs), Some(rhs)], &[], Some(dst)),
             ObjectFreeze(object) => ([Some(object), None], &[], None),
@@ -1394,6 +1425,7 @@ impl VerifiedFunction {
             RegisterType::Clock => Ok(ValueType::Clock),
             RegisterType::OpenObject => Ok(ValueType::OpenObject),
             RegisterType::Dynamic => Ok(ValueType::Dynamic),
+            RegisterType::Failure => Ok(ValueType::Failure),
             RegisterType::BorrowingFunction { .. } => {
                 Err(InvalidBytecode::EscapingBorrow(register))
             }
@@ -1472,6 +1504,24 @@ impl VerifiedFunction {
         self.texts
             .get(id.index())
             .ok_or(InvalidBytecode::UnknownText(id))
+    }
+
+    /// The variants of a result whose error is a failure: the one that carries
+    /// the value, then the failure.
+    fn failure_result(&self, register: Register) -> Result<(u32, u32), InvalidBytecode> {
+        match self.enum_variants(register)? {
+            [Some(value), Some(ValueType::Failure)] if *value != ValueType::Failure => Ok((0, 1)),
+            [Some(ValueType::Failure), Some(value)] if *value != ValueType::Failure => Ok((1, 0)),
+            _ => Err(InvalidBytecode::ExpectedEnum(register)),
+        }
+    }
+
+    /// [`Self::failure_result`] for a verified register.
+    fn failure_result_runtime(&self, register: Register) -> (u32, u32) {
+        match self.failure_result(register) {
+            Ok(variants) => variants,
+            Err(_) => unreachable!("verified failure result"),
+        }
     }
 
     /// The register holds an object, or an erased value that may hold one.
@@ -1971,6 +2021,14 @@ impl VerifiedFunction {
 
 #[derive(Debug, Clone)]
 pub struct VerifiedModule {
+    /// The checked program this was lowered from, which a run-time load
+    /// extends.
+    source: Option<Arc<Program>>,
+    /// The checked routine each verified routine was lowered from.
+    routine_ids: Arc<HashMap<usize, FunctionId>>,
+    /// Checked routines lowered although nothing reachable calls them: the
+    /// builders of loaded modules, in load order.
+    roots: Arc<[usize]>,
     entry: FunctionId,
     functions: Arc<[VerifiedFunction]>,
     shapes: Arc<[Shape]>,
@@ -1980,6 +2038,89 @@ pub struct VerifiedModule {
 }
 
 impl VerifiedModule {
+    /// Whether code lowered from an extended program can replace this one under
+    /// frames that are already running: every routine this module has is
+    /// identical in it, and every table keeps its entries and their numbers.
+    pub(crate) fn is_extended_by(&self, next: &Self) -> Result<(), String> {
+        let (Some(old), Some(new)) = (self.functions.first(), next.functions.first()) else {
+            return Err("there is no routine to compare".into());
+        };
+        if self.entry != next.entry {
+            return Err("the entry routine moved".into());
+        }
+        if self.functions.len() > next.functions.len() {
+            return Err("routines were removed".into());
+        }
+        for (name, same) in [
+            ("shapes", is_prefix(&self.shapes, &next.shapes)),
+            ("module variables", is_prefix(&self.globals, &next.globals)),
+            (
+                "implementations",
+                is_prefix(&self.implementations, &next.implementations),
+            ),
+            ("signatures", is_prefix(&old.signatures, &new.signatures)),
+            ("managed types", is_prefix(&old.managed, &new.managed)),
+            ("traits", is_prefix(&old.traits, &new.traits)),
+        ] {
+            if !same {
+                return Err(format!("the table of {name} changed"));
+            }
+        }
+        for (index, (a, b)) in self.functions.iter().zip(next.functions.iter()).enumerate() {
+            for (name, same) in [
+                ("instructions", a.instructions == b.instructions),
+                // New module variables of the entry routine add unused registers.
+                (
+                    "registers",
+                    is_prefix(&a.registers, &b.registers)
+                        && b.registers[a.registers.len()..]
+                            .iter()
+                            .all(|kind| *kind == RegisterType::Unused),
+                ),
+                ("parameters", a.parameters == b.parameters),
+                ("result", a.result == b.result),
+                ("generator", a.generator == b.generator),
+                ("calls", a.calls == b.calls),
+                ("lists", a.lists == b.lists),
+                ("texts", a.texts == b.texts),
+                ("contracts", a.contracts == b.contracts),
+                ("outputs", a.outputs == b.outputs),
+            ] {
+                if !same {
+                    return Err(format!("the {name} of routine {index} changed"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::lower`] for a program that run-time loads may extend.
+    pub fn lower_shared(program: Arc<Program>, routine: usize) -> Result<Self, LowerError> {
+        Self::lower_extended(program, routine, &[])
+    }
+
+    /// Lower the program with these checked routines as extra roots, after
+    /// everything the entry reaches so that its routines keep their numbers.
+    pub(crate) fn lower_extended(
+        program: Arc<Program>,
+        routine: usize,
+        roots: &[usize],
+    ) -> Result<Self, LowerError> {
+        let mut module = Self::lower_checked_roots(
+            program.functions(),
+            routine,
+            Some(program.services.clone()),
+            roots,
+        )?;
+        module.source = Some(program);
+        Ok(module)
+    }
+
+    /// The verified routine a checked routine was lowered to.
+    pub(crate) fn lowered(&self, routine: usize) -> Option<FunctionId> {
+        self.routine_ids.get(&routine).copied()
+    }
+
     pub fn entry(&self) -> FunctionId {
         self.entry
     }
@@ -2330,6 +2471,9 @@ impl ModuleImage {
             functions[index].storage_entries = storage_entries;
         }
         Ok(VerifiedModule {
+            source: None,
+            routine_ids: Arc::new(HashMap::new()),
+            roots: Arc::from([]),
             entry: self.entry,
             shapes,
             globals,
@@ -2519,7 +2663,8 @@ impl VerifiedFunction {
                 | RegisterType::Task(_)
                 | RegisterType::Clock
                 | RegisterType::OpenObject
-                | RegisterType::Dynamic => {}
+                | RegisterType::Dynamic
+                | RegisterType::Failure => {}
                 RegisterType::Loan {
                     origin: LoanOrigin::Parameter { register: origin },
                     ..
@@ -2840,6 +2985,7 @@ impl VerifiedFunction {
                 RegisterType::Clock => self.require_value(arg, ValueType::Clock)?,
                 RegisterType::OpenObject => self.require_value(arg, ValueType::OpenObject)?,
                 RegisterType::Dynamic => self.require_value(arg, ValueType::Dynamic)?,
+                RegisterType::Failure => self.require_value(arg, ValueType::Failure)?,
                 RegisterType::Weak(managed) => self.require_value(arg, ValueType::Weak(managed))?,
                 RegisterType::Composite(shape) => {
                     self.require_value(arg, ValueType::Composite(shape))?;
@@ -3180,6 +3326,38 @@ impl VerifiedFunction {
                 Ok(())
             }
             Instruction::ObjectFreeze(object) => self.require_object(object),
+            Instruction::ObjectTryView(dst, source, contract) => {
+                self.require_object(source)?;
+                for (_, ty) in self.contract(contract)?.fields.iter() {
+                    if !self.erasable_type(*ty) {
+                        return Err(InvalidBytecode::NotErasable(source));
+                    }
+                }
+                self.failure_result(dst).map(|_| ())
+            }
+            Instruction::ModuleLoad(dst, path) => {
+                self.require_text(path)?;
+                self.failure_result(dst).map(|_| ())
+            }
+            Instruction::FailureFlag(dst, failure, which) => {
+                self.require_value(failure, ValueType::Failure)?;
+                if which > 2 {
+                    return Err(InvalidBytecode::ExpectedDynamic(failure));
+                }
+                self.require_type(dst, ScalarType::Bool)
+            }
+            Instruction::FailureMessage(dst, failure) => {
+                self.require_value(failure, ValueType::Failure)?;
+                self.require_text(dst)
+            }
+            Instruction::DynamicInvoke(dst, callee, list) => {
+                self.require_value(callee, ValueType::Dynamic)?;
+                self.require_value(dst, ValueType::Dynamic)?;
+                for &argument in self.operand_list(list)? {
+                    self.require_erasable(argument)?;
+                }
+                Ok(())
+            }
             Instruction::Erase(dst, source) => {
                 self.require_value(dst, ValueType::Dynamic)?;
                 self.require_erasable(source)

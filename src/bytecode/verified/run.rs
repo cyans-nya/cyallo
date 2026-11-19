@@ -1,16 +1,16 @@
 use super::{
-    BooleanOp, CallSite, CallTarget, DynamicOp, Extremum, FloatOp, FrameLayout, FunctionId,
-    GlobalId, HostBindingId, HostFailure, InputKind, Instruction, InstructionId, IntegerOp,
-    OutputPiece, OutputTemplate, Register, RegisterType, Scalar, ScalarType, StatementArrival,
-    StatementBoundary, TextFailure, TextMapOp, TextOp, TextStyle, TextTestOp, ValueType,
-    VerifiedFunction, VerifiedModule, array_len,
+    BooleanOp, CallSite, CallTarget, Contract, DynamicOp, Extremum, FloatOp, FrameLayout,
+    FunctionId, GlobalId, HostBindingId, HostFailure, InputKind, Instruction, InstructionId,
+    IntegerOp, OutputPiece, OutputTemplate, Register, RegisterType, Scalar, ScalarType,
+    StatementArrival, StatementBoundary, TextFailure, TextMapOp, TextOp, TextStyle, TextTestOp,
+    ValueType, VerifiedFunction, VerifiedModule, array_len,
 };
 use crate::{
     Span,
     integer::{IntegerDivision, IntegerError},
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
@@ -443,6 +443,11 @@ struct Frame {
     /// The generator this frame is the body of while it runs, and the
     /// register of the resumer that receives the step.
     generator: Option<(usize, Register)>,
+    /// What the returned value becomes in an erased result: its type, or none
+    /// for a routine that returns nothing.
+    wrap: Option<Option<ValueType>>,
+    /// The loaded module whose namespace this frame builds.
+    namespace: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -476,6 +481,8 @@ enum FrameValue {
     Properties(Box<ObjectData>),
     /// A value with the type it had when it was erased.
     Dynamic(Box<(ValueType, FrameValue)>),
+    /// Why a module could not be loaded or an object not viewed.
+    Failure(Arc<FailureData>),
     /// A retained reference to a field of a heap record: a place rooted in a
     /// heap object, which the collector keeps alive.
     Location(BorrowedPlace),
@@ -490,6 +497,53 @@ enum FrameValue {
         heap: usize,
         implementation: u32,
     },
+}
+
+/// Why a load or a view failed, as the program can ask.
+#[derive(Debug)]
+struct FailureData {
+    message: Box<str>,
+    not_found: bool,
+    denied: bool,
+    check: bool,
+}
+
+impl FailureData {
+    fn plain(message: &str) -> Arc<Self> {
+        Arc::new(Self {
+            message: message.into(),
+            not_found: false,
+            denied: false,
+            check: false,
+        })
+    }
+}
+
+/// Check a view's properties and require them, through every alias.
+fn view_object(data: &mut ObjectData, contract: &Contract) -> Result<(), ObjectFault> {
+    let mut requirements = Vec::with_capacity(contract.fields.len());
+    for (name, expected) in contract.fields.iter() {
+        let at = data.find(name).ok_or(ObjectFault::Missing)?;
+        let property = &data.properties[at];
+        if *expected != ValueType::Dynamic && property.value.0 != *expected {
+            return Err(ObjectFault::Type);
+        }
+        if !data.readonly
+            && let Some(old) = property.required
+            && old != ValueType::Dynamic
+            && *expected != ValueType::Dynamic
+            && old != *expected
+        {
+            return Err(ObjectFault::Contract);
+        }
+        requirements.push((at, *expected));
+    }
+    if !data.readonly {
+        for (at, expected) in requirements {
+            data.properties[at].required = Some(expected);
+        }
+    }
+    Ok(())
 }
 
 /// The properties of an object. A readonly object accepts no writes.
@@ -679,6 +733,10 @@ struct Memory {
     waiting: Option<usize>,
     /// When the running task's sleep ends.
     sleeping_until: Option<Instant>,
+    /// The namespace object of each module loaded so far, by load key.
+    namespaces: HashMap<usize, FrameValue>,
+    /// The loaded modules whose initializers have run.
+    initialized: HashSet<usize>,
 }
 
 /// More tasks than this exhaust the table.
@@ -798,6 +856,8 @@ impl Memory {
             current_task: 0,
             waiting: None,
             sleeping_until: None,
+            namespaces: HashMap::new(),
+            initialized: HashSet::new(),
         }
     }
 
@@ -899,6 +959,7 @@ impl Memory {
                 | FrameValue::OpenObject(_)
                 | FrameValue::Properties(_)
                 | FrameValue::Dynamic(_)
+                | FrameValue::Failure(_)
                 | FrameValue::Loan(_)
                 | FrameValue::Closure(_)
                 | FrameValue::Handle(_)
@@ -1118,6 +1179,7 @@ impl Memory {
                     .flatten()
                     .flat_map(|channel| channel.queue.iter()),
             )
+            .chain(self.namespaces.values())
         {
             trace(value, &mut marks, &mut pending);
         }
@@ -1172,6 +1234,7 @@ fn trace(value: &FrameValue, marks: &mut [bool], pending: &mut Vec<usize>) {
             FrameValue::Closure(closure) => stack.extend(closure.captures.iter()),
             FrameValue::Scalar(_)
             | FrameValue::Text(_)
+            | FrameValue::Failure(_)
             | FrameValue::Path(_)
             | FrameValue::Allocation(_)
             | FrameValue::Generator(_)
@@ -1374,6 +1437,8 @@ impl Frame {
             mapped: None,
             finalizing: None,
             generator: None,
+            wrap: None,
+            namespace: None,
         };
         for (&register, value) in body.parameters.iter().zip(values) {
             frame.set_value(layout, register, value);
@@ -1403,6 +1468,7 @@ impl Frame {
             | FrameValue::OpenObject(_)
             | FrameValue::Properties(_)
             | FrameValue::Dynamic(_)
+            | FrameValue::Failure(_)
             | FrameValue::Moved => {
                 unreachable!("verified scalar operand")
             }
@@ -1431,6 +1497,7 @@ impl Frame {
             | FrameValue::OpenObject(_)
             | FrameValue::Properties(_)
             | FrameValue::Dynamic(_)
+            | FrameValue::Failure(_)
             | FrameValue::Moved => {
                 unreachable!("verified loan operand")
             }
@@ -1572,6 +1639,12 @@ enum StepOutcome {
     Continue,
     /// The instruction could not finish yet and will be tried again.
     Blocked,
+    /// A module is to be loaded, and its namespace delivered to the register.
+    Load {
+        destination: Register,
+        path: Arc<str>,
+        span: Span,
+    },
     Returned(Option<FrameValue>),
 }
 
@@ -2956,6 +3029,7 @@ impl VerifiedModule {
             | Instruction::ObjectDelete(..)
             | Instruction::ObjectDeleteKey(..)
             | Instruction::ObjectView(..)
+            | Instruction::ObjectTryView(..)
             | Instruction::ObjectFreeze(..) => {
                 let fault = |fault| RunError::Object {
                     function,
@@ -2978,9 +3052,9 @@ impl VerifiedModule {
                         let key = body.lists[list.index()][0];
                         (object, Some(stack[depth - 1].text(layout, key).clone()))
                     }
-                    Instruction::ObjectView(_, object, _) | Instruction::ObjectFreeze(object) => {
-                        (object, None)
-                    }
+                    Instruction::ObjectView(_, object, _)
+                    | Instruction::ObjectTryView(_, object, _)
+                    | Instruction::ObjectFreeze(object) => (object, None),
                     _ => unreachable!("matched object instruction"),
                 };
                 let held = self
@@ -3067,30 +3141,50 @@ impl VerifiedModule {
                         stack[depth - 1].set(layout, dst, Scalar::Bool(existed));
                     }
                     Instruction::ObjectView(dst, _, contract) => {
-                        let contract = &body.contracts[contract.index()];
-                        let mut requirements = Vec::with_capacity(contract.fields.len());
-                        for (name, expected) in contract.fields.iter() {
-                            let at = data.find(name).ok_or(fault(ObjectFault::Missing))?;
-                            let property = &data.properties[at];
-                            if *expected != ValueType::Dynamic && property.value.0 != *expected {
-                                return Err(fault(ObjectFault::Type));
-                            }
-                            if !data.readonly
-                                && let Some(old) = property.required
-                                && old != ValueType::Dynamic
-                                && *expected != ValueType::Dynamic
-                                && old != *expected
-                            {
-                                return Err(fault(ObjectFault::Contract));
-                            }
-                            requirements.push((at, *expected));
-                        }
-                        if !data.readonly {
-                            for (at, expected) in requirements {
-                                data.properties[at].required = Some(expected);
-                            }
-                        }
+                        view_object(data, &body.contracts[contract.index()]).map_err(fault)?;
                         stack[depth - 1].set_value(layout, dst, FrameValue::OpenObject(id));
+                    }
+                    Instruction::ObjectTryView(dst, _, contract) => {
+                        let outcome = view_object(data, &body.contracts[contract.index()]);
+                        let (ok, err) = body.failure_result_runtime(dst);
+                        let result = match outcome {
+                            Ok(()) => {
+                                let object = FrameValue::OpenObject(id);
+                                let wrapped = matches!(
+                                    body.enum_variants(dst),
+                                    Ok(variants) if variants[ok as usize] == Some(ValueType::Dynamic)
+                                );
+                                Composite::Enum {
+                                    variant: ok,
+                                    payload: Some(Box::new(if wrapped {
+                                        FrameValue::Dynamic(Box::new((
+                                            ValueType::OpenObject,
+                                            object,
+                                        )))
+                                    } else {
+                                        object
+                                    })),
+                                }
+                            }
+                            Err(why) => Composite::Enum {
+                                variant: err,
+                                payload: Some(Box::new(FrameValue::Failure(FailureData::plain(
+                                    match why {
+                                        ObjectFault::Missing => {
+                                            "the object lacks a required property"
+                                        }
+                                        ObjectFault::Type => {
+                                            "a property has another type than required"
+                                        }
+                                        ObjectFault::Contract => {
+                                            "the view conflicts with a required property"
+                                        }
+                                        ObjectFault::Readonly => "the object is readonly",
+                                    },
+                                )))),
+                            },
+                        };
+                        stack[depth - 1].set_value(layout, dst, FrameValue::Composite(result));
                     }
                     _ => data.readonly = true,
                 }
@@ -3205,6 +3299,73 @@ impl VerifiedModule {
                     }
                 };
                 frame.set_value(layout, dst, FrameValue::Dynamic(Box::new(result)));
+            }
+            Instruction::FailureFlag(dst, failure, which) => {
+                let FrameValue::Failure(data) = frame.value(layout, failure) else {
+                    unreachable!("verified failure operand");
+                };
+                let flag = match which {
+                    0 => data.not_found,
+                    1 => data.denied,
+                    _ => data.check,
+                };
+                frame.set(layout, dst, Scalar::Bool(flag));
+            }
+            Instruction::FailureMessage(dst, failure) => {
+                let FrameValue::Failure(data) = frame.value(layout, failure) else {
+                    unreachable!("verified failure operand");
+                };
+                let text: Arc<str> = data.message.as_ref().into();
+                frame.set_value(layout, dst, FrameValue::Text(text));
+            }
+            Instruction::ModuleLoad(destination, path) => {
+                let path = frame.text(layout, path).clone();
+                return Ok(StepOutcome::Load {
+                    destination,
+                    path,
+                    span: body.spans[pc],
+                });
+            }
+            Instruction::DynamicInvoke(dst, callee, list) => {
+                let fault = || RunError::Object {
+                    function,
+                    instruction: from,
+                    span: body.spans[pc],
+                    fault: ObjectFault::Type,
+                };
+                let FrameValue::Dynamic(erased) = frame.value(layout, callee) else {
+                    unreachable!("verified erased callee");
+                };
+                let (ValueType::Function(signature), FrameValue::Closure(closure)) = *erased else {
+                    return Err(fault());
+                };
+                let description = &body.signatures[signature.index()];
+                let arguments = &body.lists[list.index()];
+                if arguments.len() != description.parameters.len() {
+                    return Err(fault());
+                }
+                let mut values = Vec::with_capacity(arguments.len());
+                for (&register, &expected) in arguments.iter().zip(description.parameters.iter()) {
+                    let ty = body.registers()[register.index()]
+                        .value()
+                        .unwrap_or(ValueType::Dynamic);
+                    let (actual, value) = erased_parts(frame.value(layout, register), ty);
+                    if expected == ValueType::Dynamic {
+                        values.push(FrameValue::Dynamic(Box::new((actual, value))));
+                    } else if actual == expected {
+                        values.push(value);
+                    } else {
+                        return Err(fault());
+                    }
+                }
+                if depth == max_frames {
+                    return Err(RunError::FrameLimit);
+                }
+                let target = &self.functions[closure.function.index()];
+                let all = closure.captures.iter().cloned().chain(values);
+                let mut next = Frame::new(closure.function, target, all, Some(dst));
+                next.wrap = Some(description.result);
+                stack.push(next);
             }
             Instruction::ClockNew(dst) => frame.set_value(layout, dst, FrameValue::Clock),
             Instruction::ClockClone(dst, _) => frame.set_value(layout, dst, FrameValue::Clock),
@@ -3440,7 +3601,22 @@ impl VerifiedModule {
                 memory.close_generator(id);
             }
             Instruction::Return(value) => {
-                let value = value.map(|reg| frame.value(layout, reg));
+                let mut value = value.map(|reg| frame.value(layout, reg));
+                if let Some(wrapped) = frame.wrap.take() {
+                    value = Some(match (wrapped, value) {
+                        (Some(ty), Some(value)) => FrameValue::Dynamic(Box::new((ty, value))),
+                        _ => FrameValue::Dynamic(Box::new((ValueType::Dynamic, unit()))),
+                    });
+                }
+                if let Some(key) = frame.namespace.take()
+                    && let Some(FrameValue::Composite(Composite::Enum {
+                        payload: Some(namespace),
+                        ..
+                    })) = &value
+                    && matches!(**namespace, FrameValue::Dynamic(_))
+                {
+                    memory.namespaces.insert(key, (**namespace).clone());
+                }
                 let destination = frame.destination;
                 let receiver = frame.mapped.take();
                 let finalizing = frame.finalizing.take();
@@ -4451,6 +4627,7 @@ fn spell(value: &FrameValue, style: TextStyle) -> String {
             | FrameValue::Task(_)
             | FrameValue::Clock
             | FrameValue::Properties(_)
+            | FrameValue::Failure(_)
             | FrameValue::Moved,
         ) => unreachable!("verified text operand is a scalar or string"),
     }
@@ -4534,6 +4711,147 @@ impl Activation {
         }
     }
 
+    /// Load the module at the path, extend the running code with it, and run
+    /// what builds its namespace; the register receives that, or why not.
+    fn perform_load(
+        module: &mut VerifiedModule,
+        memory: &mut Memory,
+        stack: &mut Vec<Frame>,
+        frames: usize,
+        destination: Register,
+        path: &str,
+        span: Span,
+    ) -> Result<(), RunError> {
+        let top = stack.len() - 1;
+        let function = stack[top].function.index();
+        let deliver = |module: &VerifiedModule,
+                       stack: &mut Vec<Frame>,
+                       result: Result<FrameValue, Arc<FailureData>>| {
+            let body = &module.functions[function];
+            let (ok, err) = body.failure_result_runtime(destination);
+            let composite = match result {
+                Ok(value) => Composite::Enum {
+                    variant: ok,
+                    payload: Some(Box::new(value)),
+                },
+                Err(failure) => Composite::Enum {
+                    variant: err,
+                    payload: Some(Box::new(FrameValue::Failure(failure))),
+                },
+            };
+            stack[top].set_value(
+                body.frame_layout(),
+                destination,
+                FrameValue::Composite(composite),
+            );
+        };
+        let failed = |error: &cyallo_modules::LoadError| {
+            Arc::new(FailureData {
+                message: error.to_string().into(),
+                not_found: error.is_not_found(),
+                denied: error.is_denied(),
+                check: error.is_check_error(),
+            })
+        };
+        let Some(program) = module.source.clone() else {
+            deliver(
+                module,
+                stack,
+                Err(FailureData::plain("this program cannot load modules")),
+            );
+            return Ok(());
+        };
+        let Some(loader) = program.module_loader.clone() else {
+            deliver(
+                module,
+                stack,
+                Err(failed(&cyallo_modules::LoadError::NoReadGrant)),
+            );
+            return Ok(());
+        };
+        let Some(plan) = program.dynamic_plan.as_ref() else {
+            deliver(
+                module,
+                stack,
+                Err(FailureData::plain("the program has no compile plan")),
+            );
+            return Ok(());
+        };
+        let request = match plan.request(span, path) {
+            Ok(request) => request,
+            Err(error) => {
+                deliver(module, stack, Err(failed(&error)));
+                return Ok(());
+            }
+        };
+        let imported = match crate::dynamic_modules::load(program.clone(), loader, request) {
+            Ok(imported) => imported,
+            Err(error) => {
+                deliver(module, stack, Err(failed(&error)));
+                return Ok(());
+            }
+        };
+        // The builder and the initializers are reached by nothing else, so each
+        // load lowers them as extra roots, after every earlier root.
+        let mut roots: Vec<usize> = module.roots.to_vec();
+        for routine in
+            std::iter::once(imported.factory).chain(imported.initializers.iter().copied())
+        {
+            if !roots.contains(&routine) {
+                roots.push(routine);
+            }
+        }
+        if let Some(next_program) = imported.program {
+            let next =
+                match VerifiedModule::lower_extended(next_program, module.entry.index(), &roots) {
+                    Ok(next) => next,
+                    Err(error) => {
+                        let why = FailureData::plain(&error.to_string());
+                        deliver(module, stack, Err(why));
+                        return Ok(());
+                    }
+                };
+            if let Err(reason) = module.is_extended_by(&next) {
+                let why = FailureData::plain(&format!(
+                    "the loaded module would change running code: {reason}"
+                ));
+                deliver(module, stack, Err(why));
+                return Ok(());
+            }
+            memory.globals.resize(next.globals.len(), None);
+            *module = next;
+        }
+        if let Some(cached) = memory.namespaces.get(&imported.key).cloned() {
+            let copy = memory.clone_value(&cached);
+            deliver(module, stack, Ok(copy));
+            return Ok(());
+        }
+        let Some(builder) = module.lowered(imported.factory) else {
+            let why = FailureData::plain("the namespace builder was not lowered");
+            deliver(module, stack, Err(why));
+            return Ok(());
+        };
+        let mut pushed = vec![];
+        let target = &module.functions[builder.index()];
+        let mut factory = Frame::new(builder, target, std::iter::empty(), Some(destination));
+        factory.namespace = Some(imported.key);
+        pushed.push(factory);
+        for initializer in imported.initializers.into_iter().rev() {
+            if memory.initialized.insert(initializer) {
+                let Some(id) = module.lowered(initializer) else {
+                    continue;
+                };
+                let target = &module.functions[id.index()];
+                pushed.push(Frame::new(id, target, std::iter::empty(), None));
+            }
+        }
+        if stack.len() + pushed.len() > frames {
+            return Err(RunError::FrameLimit);
+        }
+        stack.extend(pushed);
+        Ok(())
+    }
+
     /// Advance by at most `budget` instructions. A zero budget only reports the
     /// current status. Terminal outcomes are retained across subsequent calls.
     pub fn resume(&mut self, budget: usize) -> ExecutionStatus {
@@ -4551,6 +4869,25 @@ impl Activation {
                 &mut self.input,
             );
             let entry = self.memory.current_task == 0;
+            // A module load changes the code under the running frames, so it
+            // happens here, between instructions.
+            let outcome = match outcome {
+                Ok(StepOutcome::Load {
+                    destination,
+                    path,
+                    span,
+                }) => Self::perform_load(
+                    &mut self.module,
+                    &mut self.memory,
+                    stack,
+                    self.limits.frames,
+                    destination,
+                    &path,
+                    span,
+                )
+                .map(|()| StepOutcome::Continue),
+                other => other,
+            };
             match outcome {
                 Ok(StepOutcome::Continue) => {
                     self.stalled = 0;
@@ -4583,6 +4920,7 @@ impl Activation {
                         self.module.rotate(stack, &mut self.memory, false);
                     }
                 }
+                Ok(StepOutcome::Load { .. }) => unreachable!("a load was just performed"),
                 Ok(StepOutcome::Returned(value)) if entry => {
                     let scalar = value.map(|value| match value {
                         FrameValue::Scalar(value) => value,

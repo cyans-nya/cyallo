@@ -125,6 +125,7 @@ impl fmt::Display for VerifiedModule {
                     RegisterType::Allocation => write!(f, "  r{index}: allocation")?,
                     RegisterType::OpenObject => write!(f, "  r{index}: object")?,
                     RegisterType::Dynamic => write!(f, "  r{index}: dynamic")?,
+                    RegisterType::Failure => write!(f, "  r{index}: failure")?,
                     RegisterType::Task(id) => write!(f, "  r{index}: task managed{}", id.0)?,
                     RegisterType::Clock => write!(f, "  r{index}: clock")?,
                     RegisterType::Sender(id) => write!(f, "  r{index}: sender managed{}", id.0)?,
@@ -549,6 +550,24 @@ impl fmt::Display for VerifiedModule {
                     Instruction::ObjectView(dst, source, contract) => {
                         write!(f, "r{} = object.view r{}, c{}", dst.0, source.0, contract.0)?
                     }
+                    Instruction::ObjectTryView(dst, source, contract) => write!(
+                        f,
+                        "r{} = object.try_view r{}, c{}",
+                        dst.0, source.0, contract.0
+                    )?,
+                    Instruction::ModuleLoad(dst, path) => {
+                        write!(f, "r{} = module.load r{}", dst.0, path.0)?
+                    }
+                    Instruction::FailureFlag(dst, failure, which) => {
+                        write!(f, "r{} = failure.flag r{}, {which}", dst.0, failure.0)?
+                    }
+                    Instruction::FailureMessage(dst, failure) => {
+                        write!(f, "r{} = failure.message r{}", dst.0, failure.0)?
+                    }
+                    Instruction::DynamicInvoke(dst, callee, list) => {
+                        write!(f, "r{} = dynamic.invoke r{}", dst.0, callee.0)?;
+                        write_list(f, &function.lists()[list.index()])?;
+                    }
                     Instruction::ObjectFreeze(object) => write!(f, "object.freeze r{}", object.0)?,
                     Instruction::Erase(dst, source) => {
                         write!(f, "r{} = erase r{}", dst.0, source.0)?
@@ -624,6 +643,7 @@ fn value_name(ty: ValueType) -> String {
         ValueType::Generator(id) => format!("generator sig{}", id.0),
         ValueType::OpenObject => "object".to_owned(),
         ValueType::Dynamic => "dynamic".to_owned(),
+        ValueType::Failure => "failure".to_owned(),
         ValueType::Task(id) => format!("task managed{}", id.0),
         ValueType::Clock => "clock".to_owned(),
         ValueType::Sender(id) => format!("sender managed{}", id.0),

@@ -134,8 +134,56 @@ impl Shapes {
             Type::Boolean => ScalarType::Bool.into(),
             Type::Object(_) => ValueType::OpenObject,
             Type::Dynamic => ValueType::Dynamic,
+            Type::Function(_, parameters, result) => {
+                if parameters.iter().any(|&(_, by_reference)| by_reference) {
+                    return None;
+                }
+                let parameters = parameters
+                    .iter()
+                    .map(|(ty, _)| self.value_of(ty))
+                    .collect::<Option<Box<[_]>>>()?;
+                let result = match &**result {
+                    Type::Void => None,
+                    other => Some(self.value_of(other)?),
+                };
+                let signature = Signature { parameters, result };
+                let index = self
+                    .signatures
+                    .iter()
+                    .position(|known| *known == signature)?;
+                ValueType::Function(SignatureId(u32::try_from(index).ok()?))
+            }
+            Type::Managed {
+                kind: kind @ (MemoryKind::Gc | MemoryKind::Rc),
+                locality: Locality::Local,
+                pointee,
+                ..
+            } => {
+                let pointee = self.value_of(pointee)?;
+                let index = self.managed.iter().position(|known| *known == pointee)?;
+                let id = ManagedId(u32::try_from(index).ok()?);
+                match kind {
+                    MemoryKind::Gc => ValueType::Gc(id),
+                    MemoryKind::Rc => ValueType::Rc(id),
+                }
+            }
+            Type::Opaque(_, arguments, traits) if traits.deref() && arguments.len() == 1 => {
+                let element = self.value_of(&arguments[0])?;
+                ValueType::Composite(*self.structural.get(&Shape::Cell { element })?)
+            }
+            Type::Opaque(_, arguments, traits)
+                if traits.collection() && !traits.double_ended() && arguments.len() == 1 =>
+            {
+                let element = self.value_of(&arguments[0])?;
+                ValueType::Composite(*self.structural.get(&Shape::Vec { element })?)
+            }
             other => ValueType::Composite(*self.by_type.get(other)?),
         })
+    }
+
+    /// Intern the types a contract names, so [`Self::value_of`] finds them.
+    pub fn prepare(&mut self, ty: &Type) {
+        let _ = self.value(ty);
     }
 
     /// The verified type of a checked type, or `None` while it has no verified
@@ -204,6 +252,8 @@ impl Shapes {
                     .collect::<Option<Box<[_]>>>()?;
                 self.structural_shape(Shape::Tuple(fields))?
             }
+            // A failure to load a module or to view an object.
+            Type::Storage(StorageKind::LoadError | StorageKind::ViewError, _) => ValueType::Failure,
             // An object, open or typed, and a value of any type.
             Type::Object(_) => ValueType::OpenObject,
             Type::Dynamic => ValueType::Dynamic,
@@ -527,7 +577,8 @@ impl Shapes {
             | ValueType::Task(_)
             | ValueType::Clock
             | ValueType::OpenObject
-            | ValueType::Dynamic => false,
+            | ValueType::Dynamic
+            | ValueType::Failure => false,
         }
     }
 

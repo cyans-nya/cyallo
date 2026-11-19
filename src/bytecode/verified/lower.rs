@@ -151,7 +151,23 @@ impl VerifiedModule {
         routine: usize,
         services: Option<Arc<Metadata>>,
     ) -> Result<Self, LowerError> {
-        Self::lower_with_hosts(checked, routine, &HashMap::new(), Vec::new(), services)
+        Self::lower_with_hosts(checked, routine, &HashMap::new(), Vec::new(), services, &[])
+    }
+
+    pub(super) fn lower_checked_roots(
+        checked: &[Routine],
+        routine: usize,
+        services: Option<Arc<Metadata>>,
+        roots: &[usize],
+    ) -> Result<Self, LowerError> {
+        Self::lower_with_hosts(
+            checked,
+            routine,
+            &HashMap::new(),
+            Vec::new(),
+            services,
+            roots,
+        )
     }
 
     pub(super) fn lower_with_hosts(
@@ -160,8 +176,10 @@ impl VerifiedModule {
         host_ids: &HashMap<usize, HostBindingId>,
         host_bindings: Vec<ScalarHostBinding>,
         services: Option<Arc<Metadata>>,
+        extra_roots: &[usize],
     ) -> Result<Self, LowerError> {
         let entry = FunctionId(0);
+        let mut pending_roots = extra_roots.iter().copied();
         let mut ids = HashMap::from([(routine, entry)]);
         let mut routines = vec![routine];
         let mut functions = Vec::new();
@@ -191,35 +209,46 @@ impl VerifiedModule {
                 }
             }
         }
-        while let Some(&id) = routines.get(functions.len()) {
-            let function = checked
-                .get(id)
-                .ok_or(LowerError::UnknownRoutine(id))?
-                .checked()
-                .map_err(|diagnostic| LowerError::Analysis {
-                    routine: id,
-                    diagnostic: Box::new(diagnostic.clone()),
-                })?;
-            functions.push(lower_function(
-                function,
-                id,
-                &mut shapes,
-                &globals,
-                &implementations,
-                &param_access,
-                |target| {
-                    if let Some(&binding) = host_ids.get(&target) {
-                        return Ok(CallTarget::Bound(binding));
-                    }
-                    if let Some(&candidate) = ids.get(&target) {
-                        return Ok(CallTarget::Direct(candidate));
-                    }
-                    let next = lower_index(id, routines.len()).map(FunctionId)?;
-                    routines.push(target);
-                    ids.insert(target, next);
-                    Ok(CallTarget::Direct(next))
-                },
-            )?);
+        loop {
+            while let Some(&id) = routines.get(functions.len()) {
+                let function = checked
+                    .get(id)
+                    .ok_or(LowerError::UnknownRoutine(id))?
+                    .checked()
+                    .map_err(|diagnostic| LowerError::Analysis {
+                        routine: id,
+                        diagnostic: Box::new(diagnostic.clone()),
+                    })?;
+                functions.push(lower_function(
+                    function,
+                    id,
+                    &mut shapes,
+                    &globals,
+                    &implementations,
+                    &param_access,
+                    |target| {
+                        if let Some(&binding) = host_ids.get(&target) {
+                            return Ok(CallTarget::Bound(binding));
+                        }
+                        if let Some(&candidate) = ids.get(&target) {
+                            return Ok(CallTarget::Direct(candidate));
+                        }
+                        let next = lower_index(id, routines.len()).map(FunctionId)?;
+                        routines.push(target);
+                        ids.insert(target, next);
+                        Ok(CallTarget::Direct(next))
+                    },
+                )?);
+            }
+            // The extra roots come after everything the entry reaches.
+            let Some(root) = pending_roots.next() else {
+                break;
+            };
+            if let std::collections::hash_map::Entry::Vacant(slot) = ids.entry(root) {
+                let next = lower_index(root, routines.len()).map(FunctionId)?;
+                routines.push(root);
+                slot.insert(next);
+            }
         }
         let table = implementations
             .drafts
@@ -246,7 +275,8 @@ impl VerifiedModule {
             managed,
             traits,
         } = shapes.into_parts();
-        ModuleImage {
+        let routine_ids = Arc::new(ids.clone());
+        let mut module = ModuleImage {
             version: FORMAT_VERSION,
             entry,
             shapes,
@@ -258,7 +288,10 @@ impl VerifiedModule {
             functions: functions.into_boxed_slice(),
         }
         .verify_with_host_bindings(host_bindings)
-        .map_err(LowerError::Verification)
+        .map_err(LowerError::Verification)?;
+        module.routine_ids = routine_ids;
+        module.roots = Arc::from(extra_roots);
+        Ok(module)
     }
 }
 
@@ -389,6 +422,14 @@ fn lower_dynamic(
                     register(dst)?,
                     register(*object)?,
                     register(*key)?,
+                ))
+            })(),
+            (DynamicOperation::Invoke, [callee, arguments @ ..]) => (|| {
+                let list = new_list(routine, sites, arguments.iter().map(|&a| register(a)))?;
+                Ok(Instruction::DynamicInvoke(
+                    register(dst)?,
+                    register(*callee)?,
+                    list,
                 ))
             })(),
             (DynamicOperation::Erase, [source]) => {
@@ -932,12 +973,31 @@ fn lower_function(
         ref ty => Some(shapes.value(ty).ok_or_else(signature_error)?),
     };
     let reachable = cfg::reachable(&function.code, routine, result.is_some())?;
+    // The types a contract names must be interned before lowering reads them.
+    for record in function.code.iter() {
+        let fields = match &record.op {
+            Op::Dynamic(_, DynamicOperation::Check(Type::Object(fields)), _) => Some(fields),
+            Op::Lookup(dst, Operation::ObjectView, _) => function
+                .registers
+                .get(*dst)
+                .and_then(cyallo_ir::lookup::result_payload)
+                .and_then(|(value, _)| match value {
+                    Type::Object(fields) => Some(fields),
+                    _ => None,
+                }),
+            _ => None,
+        };
+        for (_, ty) in fields.into_iter().flatten() {
+            shapes.prepare(ty);
+        }
+    }
     let places = Places::collect(function, routine, &reachable, shapes, globals, param_access)?;
     let context = Context {
         routine,
         places: &places,
         shapes,
         implementations,
+        types: &function.registers,
     };
     let register = |index| places.register(index);
     let parameters: Box<[_]> = places
@@ -1176,6 +1236,8 @@ struct Context<'a> {
     places: &'a Places,
     shapes: &'a Shapes,
     implementations: &'a Implementations,
+    /// The checked type of each register.
+    types: &'a [Type],
 }
 
 fn lower_operation(
@@ -1191,6 +1253,7 @@ fn lower_operation(
         places,
         shapes,
         implementations,
+        ..
     } = *context;
     let register = |index| places.register(index);
     // A generator or channel operand is a local's address or a loan of one.
@@ -1208,6 +1271,18 @@ fn lower_operation(
         Op::Literal(dst, Literal::Integer(value)) => {
             Instruction::Constant(register(*dst)?, Scalar::I64(*value))
         }
+        // A literal of a sized number: unsigned counts and 64-bit values; its bits
+        // are the value (floats as their binary64 bits).
+        Op::Literal(dst, Literal::Number(number)) => match number.kind {
+            NumberKind::Usize | NumberKind::U64 => {
+                Instruction::Constant(register(*dst)?, Scalar::U64(number.bits))
+            }
+            NumberKind::I64 => {
+                Instruction::Constant(register(*dst)?, Scalar::I64(number.bits as i64))
+            }
+            NumberKind::F64 => Instruction::Constant(register(*dst)?, Scalar::F64(number.bits)),
+            _ => return Err(unsupported()),
+        },
         Op::Literal(dst, Literal::Real(value)) => {
             Instruction::Constant(register(*dst)?, Scalar::from_f64(*value))
         }
@@ -1381,6 +1456,60 @@ fn lower_operation(
         Op::Dynamic(dst, operation, args) => {
             lower_dynamic(operation, *dst, args, context, sites, routine)
                 .ok_or_else(unsupported)??
+        }
+        // A traced handle is copied by copying the handle: both name one object.
+        Op::Lookup(dst, Operation::GcClone, args) if args.len() == 1 => {
+            let source = register(args[0])?;
+            match places.registers.get(source.index()) {
+                Some(RegisterType::Loan { .. }) => Instruction::ReadLoan(register(*dst)?, source),
+                Some(RegisterType::Gc(_)) => Instruction::Copy(register(*dst)?, source),
+                _ => return Err(unsupported()),
+            }
+        }
+        Op::Lookup(dst, Operation::ModuleLoad, args) if args.len() == 1 => {
+            Instruction::ModuleLoad(register(*dst)?, register(args[0])?)
+        }
+        Op::Lookup(
+            dst,
+            operation @ (Operation::LoadErrorNotFound
+            | Operation::LoadErrorDenied
+            | Operation::LoadErrorCheck),
+            args,
+        ) if args.len() == 1 => {
+            let which = match operation {
+                Operation::LoadErrorNotFound => 0,
+                Operation::LoadErrorDenied => 1,
+                _ => 2,
+            };
+            Instruction::FailureFlag(register(*dst)?, register(args[0])?, which)
+        }
+        Op::Lookup(dst, Operation::LoadErrorMessage | Operation::ViewErrorMessage, args)
+            if args.len() == 1 =>
+        {
+            Instruction::FailureMessage(register(*dst)?, register(args[0])?)
+        }
+        Op::Lookup(dst, Operation::ObjectView, args) if args.len() == 1 => {
+            let viewed = context
+                .types
+                .get(*dst)
+                .and_then(cyallo_ir::lookup::result_payload)
+                .map(|(value, _)| value);
+            let Some(Type::Object(fields)) = viewed else {
+                return Err(unsupported());
+            };
+            let mut required = Vec::with_capacity(fields.len());
+            for (name, ty) in fields {
+                required.push((
+                    Arc::from(&**name),
+                    shapes.value_of(ty).ok_or_else(unsupported)?,
+                ));
+            }
+            sites.contracts.push(Contract {
+                required: true,
+                fields: required.into_boxed_slice(),
+            });
+            let id = ContractId(lower_index(routine, sites.contracts.len() - 1)?);
+            Instruction::ObjectTryView(register(*dst)?, register(args[0])?, id)
         }
         Op::Lookup(_, Operation::ObjectFreeze, args) if args.len() == 1 => {
             Instruction::ObjectFreeze(register(args[0])?)

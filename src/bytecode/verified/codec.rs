@@ -210,6 +210,11 @@ opcodes! {
     DynamicOr = 178, 4;
     DynamicNegate = 179, 3;
     DynamicNot = 180, 3;
+    ObjectTryView = 181, 4;
+    ModuleLoad = 182, 3;
+    FailureFlag = 183, 4;
+    FailureMessage = 184, 3;
+    DynamicInvoke = 185, 4;
 }
 
 impl TextOp {
@@ -522,6 +527,19 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
             Instruction::ObjectView(dst, source, contract) => {
                 (Opcode::ObjectView, [dst.0, source.0, contract.0], 3)
             }
+            Instruction::ObjectTryView(dst, source, contract) => {
+                (Opcode::ObjectTryView, [dst.0, source.0, contract.0], 3)
+            }
+            Instruction::ModuleLoad(dst, path) => (Opcode::ModuleLoad, [dst.0, path.0, 0], 2),
+            Instruction::FailureFlag(dst, failure, which) => {
+                (Opcode::FailureFlag, [dst.0, failure.0, which], 3)
+            }
+            Instruction::FailureMessage(dst, failure) => {
+                (Opcode::FailureMessage, [dst.0, failure.0, 0], 2)
+            }
+            Instruction::DynamicInvoke(dst, callee, list) => {
+                (Opcode::DynamicInvoke, [dst.0, callee.0, list.0], 3)
+            }
             Instruction::ObjectFreeze(object) => (Opcode::ObjectFreeze, [object.0, 0, 0], 1),
             Instruction::Erase(dst, source) => (Opcode::Erase, [dst.0, source.0, 0], 2),
             Instruction::DynamicCast(dst, source) => (Opcode::DynamicCast, [dst.0, source.0, 0], 2),
@@ -763,6 +781,13 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::ObjectDelete => Instruction::ObjectDelete(reg(0), reg(1), TextId(values[2])),
             Opcode::ObjectDeleteKey => Instruction::ObjectDeleteKey(reg(0), reg(1), reg(2)),
             Opcode::ObjectView => Instruction::ObjectView(reg(0), reg(1), ContractId(values[2])),
+            Opcode::ObjectTryView => {
+                Instruction::ObjectTryView(reg(0), reg(1), ContractId(values[2]))
+            }
+            Opcode::ModuleLoad => Instruction::ModuleLoad(reg(0), reg(1)),
+            Opcode::FailureFlag => Instruction::FailureFlag(reg(0), reg(1), values[2]),
+            Opcode::FailureMessage => Instruction::FailureMessage(reg(0), reg(1)),
+            Opcode::DynamicInvoke => Instruction::DynamicInvoke(reg(0), reg(1), list(2)),
             Opcode::ObjectFreeze => Instruction::ObjectFreeze(reg(0)),
             Opcode::Erase => Instruction::Erase(reg(0), reg(1)),
             Opcode::DynamicCast => Instruction::DynamicCast(reg(0), reg(1)),
