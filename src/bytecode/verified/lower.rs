@@ -12,7 +12,7 @@ use super::{
 };
 use crate::{
     Diagnostic, Span, Type,
-    ir::{Function, Op, Program, Routine},
+    ir::{Function, LocalStorage, Op, Program, Routine},
 };
 use cyallo_ast::{
     ConstantValue, EnumEncoding, Literal, MemoryKind, NumberKind, ObjectKind, Operator,
@@ -151,7 +151,35 @@ impl VerifiedModule {
         routine: usize,
         services: Option<Arc<Metadata>>,
     ) -> Result<Self, LowerError> {
-        Self::lower_with_hosts(checked, routine, &HashMap::new(), Vec::new(), services, &[])
+        Self::lower_with_hosts(
+            checked,
+            routine,
+            &HashMap::new(),
+            Vec::new(),
+            services,
+            &[],
+            false,
+        )
+    }
+
+    /// Lower for a session that runs the entry routine again and again with
+    /// its variables kept: every variable of the entry routine is a module
+    /// variable.
+    pub(crate) fn lower_for_session(
+        program: Arc<Program>,
+        routine: usize,
+    ) -> Result<Self, LowerError> {
+        let mut module = Self::lower_with_hosts(
+            program.functions(),
+            routine,
+            &HashMap::new(),
+            Vec::new(),
+            Some(program.services.clone()),
+            &[],
+            true,
+        )?;
+        module.source = Some(program);
+        Ok(module)
     }
 
     pub(super) fn lower_checked_roots(
@@ -167,6 +195,7 @@ impl VerifiedModule {
             Vec::new(),
             services,
             roots,
+            false,
         )
     }
 
@@ -177,6 +206,7 @@ impl VerifiedModule {
         host_bindings: Vec<ScalarHostBinding>,
         services: Option<Arc<Metadata>>,
         extra_roots: &[usize],
+        every_main_variable: bool,
     ) -> Result<Self, LowerError> {
         let entry = FunctionId(0);
         let mut pending_roots = extra_roots.iter().copied();
@@ -197,7 +227,7 @@ impl VerifiedModule {
             }
         };
         let mut shapes = Shapes::new(services.clone());
-        let globals = Globals::collect(checked, &mut shapes)?;
+        let globals = Globals::collect(checked, &mut shapes, every_main_variable)?;
         let implementations = Implementations::collect(checked, services.as_deref(), &mut shapes)?;
         // Every method of an implementation can be called through an object.
         for draft in &implementations.drafts {
@@ -805,7 +835,11 @@ pub(super) struct Globals {
 }
 
 impl Globals {
-    fn collect(checked: &[Routine], shapes: &mut Shapes) -> Result<Self, LowerError> {
+    fn collect(
+        checked: &[Routine],
+        shapes: &mut Shapes,
+        every_main_variable: bool,
+    ) -> Result<Self, LowerError> {
         let mut globals = Self::default();
         let Some(Ok(main)) = checked.first().map(Routine::checked) else {
             return Ok(globals);
@@ -814,6 +848,17 @@ impl Globals {
             return Ok(globals);
         }
         let mut used = std::collections::BTreeSet::new();
+        // A session that keeps state between entries keeps every variable of
+        // the entry routine outside its frame.
+        if every_main_variable {
+            used.extend(
+                main.local_storage
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, storage)| matches!(storage, LocalStorage::Cell(_)))
+                    .map(|(index, _)| index),
+            );
+        }
         for routine in checked {
             let Ok(function) = routine.checked() else {
                 continue;

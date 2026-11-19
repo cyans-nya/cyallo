@@ -836,3 +836,54 @@ fn programs_the_verified_engine_cannot_lower_fall_back_unless_it_is_asked_for() 
     assert!(!asked.status.success());
     assert!(asked.stdout.is_empty());
 }
+
+fn default_repl(source: &str, extra: &[&str]) -> std::process::Output {
+    let mut command = cli(&["repl"]);
+    command.args(extra);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(source.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn the_default_repl_runs_on_the_verified_interpreter() {
+    let result = default_repl(
+        "let mut n = 40\nn = n + 2\nstd::io::print(n)\nproc twice(k: i64) -> i64 {\n    return k * 2\n}\nstd::io::print(twice(n))\n:vars\n",
+        &[],
+    );
+    assert!(result.status.success());
+    let out = String::from_utf8_lossy(&result.stdout);
+    assert!(out.starts_with("42\n84\n"), "{out}");
+    assert!(out.contains("n = 42"), "{out}");
+    // A failing entry is a diagnostic and later entries still see the state.
+    let result = default_repl(
+        "let mut n = 5\nstd::io::print(1 / (n - 5))\nstd::io::print(n)\nlet y = nothing\nstd::io::print(n + 1)\n",
+        &[],
+    );
+    assert_eq!(String::from_utf8_lossy(&result.stdout), "5\n6\n");
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(error.contains("R100"), "{error}");
+    assert!(error.contains("E1"), "{error}");
+    // Input consumes the line that follows the entry.
+    let result = default_repl(
+        "let mut text = \"\"\nstd::runtime::caie::input(&mut text)\nhello\nstd::io::print(text)\n",
+        &[],
+    );
+    assert_eq!(String::from_utf8_lossy(&result.stdout), "hello\n");
+    // A runaway entry is interrupted at the instruction limit.
+    let result = default_repl(
+        "let mut n = 0\nwhile true { n = n + 1 }\nstd::io::print(n > 0)\n",
+        &["--max-instructions", "5000"],
+    );
+    assert_eq!(String::from_utf8_lossy(&result.stdout), "true\n");
+}

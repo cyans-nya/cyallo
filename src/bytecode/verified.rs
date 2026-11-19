@@ -2247,6 +2247,16 @@ impl VerifiedModule {
     /// frames that are already running: every routine this module has is
     /// identical in it, and every table keeps its entries and their numbers.
     pub(crate) fn is_extended_by(&self, next: &Self) -> Result<(), String> {
+        self.is_extended_by_with(next, false)
+    }
+
+    /// [`Self::is_extended_by`], where the entry routine may differ when no
+    /// frame of it is running: a session appends statements to it.
+    pub(crate) fn is_extended_by_with(
+        &self,
+        next: &Self,
+        entry_may_change: bool,
+    ) -> Result<(), String> {
         let (Some(old), Some(new)) = (self.functions.first(), next.functions.first()) else {
             return Err("there is no routine to compare".into());
         };
@@ -2272,6 +2282,9 @@ impl VerifiedModule {
             }
         }
         for (index, (a, b)) in self.functions.iter().zip(next.functions.iter()).enumerate() {
+            if entry_may_change && index == self.entry.index() {
+                continue;
+            }
             for (name, same) in [
                 ("instructions", a.instructions == b.instructions),
                 // New module variables of the entry routine add unused registers.
@@ -2319,6 +2332,27 @@ impl VerifiedModule {
         )?;
         module.source = Some(program);
         Ok(module)
+    }
+
+    /// The last instruction of the entry routine, its return.
+    pub(crate) fn entry_end(&self) -> InstructionId {
+        let count = self
+            .functions
+            .get(self.entry.index())
+            .map_or(0, |entry| entry.instructions.len());
+        InstructionId(u32::try_from(count.saturating_sub(1)).unwrap_or(0))
+    }
+
+    /// The first instruction of a statement of the entry routine that starts at
+    /// or after this source offset, when there is one.
+    pub(crate) fn entry_statement_from(&self, offset: u32) -> Option<InstructionId> {
+        let entry = self.functions.get(self.entry.index())?;
+        entry
+            .statements
+            .iter()
+            .filter(|statement| statement.span.start >= offset)
+            .map(|statement| statement.instruction)
+            .min()
     }
 
     /// The checked routine a verified routine was lowered from.

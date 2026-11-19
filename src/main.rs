@@ -169,8 +169,11 @@ enum Command {
     },
     /// Start a persistent interactive session (modern syntax by default).
     Repl {
-        #[arg(long, value_enum, default_value = "jit")]
-        engine: Engine,
+        /// Engine to run on. Default: the verified interpreter, or the legacy
+        /// tiered engine for the simplified dialect and when a JIT report is
+        /// asked for.
+        #[arg(long, value_enum)]
+        engine: Option<Engine>,
         #[arg(long, default_value_t = 1_000_000, value_parser = clap::value_parser!(u64).range(1..))]
         max_instructions: u64,
     },
@@ -383,7 +386,19 @@ fn main() -> color_eyre::Result<()> {
             engine,
             max_instructions,
         } => {
-            return repl_cli(options, *engine, *max_instructions, cli.color, runtime);
+            let wants_legacy = runtime.jit_report
+                || runtime.jit_notices
+                || runtime.jit_no_inline
+                || runtime.inspection.is_some()
+                || (engine.is_none() && options.dialect == cyallo::Dialect::Simplified);
+            if matches!(engine, Some(Engine::Verified)) || (engine.is_none() && !wants_legacy) {
+                return repl_verified_cli(options, *max_instructions, cli.color, runtime);
+            }
+            let engine = match engine {
+                Some(Engine::Verified) | None => Engine::Jit,
+                Some(other) => *other,
+            };
+            return repl_cli(options, engine, *max_instructions, cli.color, runtime);
         }
         Command::Pretty { file } => {
             let source = std::fs::read_to_string(file)?;
@@ -1083,6 +1098,140 @@ fn draw(frame: &mut Frame, debugger: &Debugger, input: &str, cursor: usize) {
         .block(Block::bordered()),
         footer,
     );
+}
+
+/// The REPL on the verified interpreter: each entry runs with the variables of
+/// the earlier ones, input is read from the lines that follow, and a failure is
+/// a diagnostic that leaves the session usable.
+fn repl_verified_cli(
+    options: cyallo::CompileOptions,
+    max_instructions: u64,
+    color_mode: ColorMode,
+    runtime: RuntimeOptions,
+) -> color_eyre::Result<()> {
+    use cyallo::vm::repl::{Repl, Submission};
+    let dialect = options.dialect;
+    let mut repl = Repl::with_context(options, runtime.context())?;
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let color = use_color(color_mode, io::stdout().is_terminal());
+    let diagnostic_color = use_color(color_mode, io::stderr().is_terminal());
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut output = io::stdout().lock();
+    let mut written = 0;
+    if interactive {
+        writeln!(output, "REPL — :help for commands; :quit to exit")?;
+    }
+    let render = |source: &str, diagnostic: &Diagnostic| {
+        cyallo::diagnostics::render_with_color_and_dialect(
+            "<repl>",
+            source,
+            diagnostic,
+            diagnostic_color,
+            dialect,
+        )
+    };
+    loop {
+        if interactive {
+            let prompt = if repl.is_pending() { "... " } else { ">>> " };
+            if color {
+                write!(output, "\x1b[36m{prompt}\x1b[0m")?;
+            } else {
+                write!(output, "{prompt}")?;
+            }
+            output.flush()?;
+        }
+        let mut line = String::new();
+        if input.read_line(&mut line)? == 0 {
+            if repl.is_pending() {
+                let d = Diagnostic::new(
+                    "E203",
+                    "incomplete REPL entry",
+                    cyallo::Span::empty(repl.source().len() as u32),
+                );
+                eprintln!("{}", render(repl.source(), &d));
+            }
+            break;
+        }
+        let command = line.trim();
+        if command.starts_with(':') {
+            match command {
+                ":quit" | ":q" => break,
+                ":help" => writeln!(
+                    output,
+                    ":help  :vars  :reset  :cancel  :quit\n{}",
+                    if dialect == cyallo::Dialect::Modern {
+                        "Enter modern code or an expression; close blocks with }. Use std::runtime::caie::input(&mut target) for input."
+                    } else {
+                        "Enter CAIE pseudocode or an expression; close blocks with END keywords."
+                    }
+                )?,
+                ":vars" => {
+                    for (name, value) in repl.session().globals() {
+                        writeln!(output, "{name} = {value}")?;
+                    }
+                }
+                ":reset" => {
+                    repl.reset()?;
+                    written = 0;
+                }
+                ":cancel" => repl.discard_pending(),
+                _ => writeln!(output, "Unknown command. Use :help.")?,
+            }
+            output.flush()?;
+            continue;
+        }
+        match repl.push_line(&line) {
+            Ok(Submission::Incomplete) => continue,
+            Err(d) => {
+                eprintln!("{}", render(repl.source(), &d));
+                continue;
+            }
+            Ok(Submission::Ready) => {}
+        }
+        let initial = repl.session().instruction_count();
+        loop {
+            let remaining =
+                max_instructions.saturating_sub(repl.session().instruction_count() - initial);
+            if remaining == 0 {
+                repl.interrupt();
+            } else {
+                repl.run(remaining.min(10_000) as usize);
+            }
+            if repl.session().context.output.len() > written {
+                output.write_all(&repl.session().context.output.as_bytes()[written..])?;
+                written = repl.session().context.output.len();
+            }
+            output.flush()?;
+            match repl.session().status() {
+                Status::Paused | Status::Waiting => {}
+                Status::Finished => break,
+                Status::Failed(failure) => {
+                    eprintln!("{}", render(repl.source(), &failure.diagnostic()));
+                    break;
+                }
+                Status::WaitingForInput => {
+                    if interactive {
+                        write!(output, "input> ")?;
+                        output.flush()?;
+                    }
+                    let mut value = String::new();
+                    if input.read_line(&mut value)? == 0 {
+                        repl.session_mut().end_input();
+                        continue;
+                    }
+                    if value.ends_with('\n') {
+                        value.pop();
+                        if value.ends_with('\r') {
+                            value.pop();
+                        }
+                    }
+                    repl.session_mut().context.input.push_back(value);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn repl_cli(

@@ -3,6 +3,7 @@
 //! from a program, run for a budget, read the status and the output, feed
 //! input. Engine internals the older session reported (inline-cache and
 //! collector statistics, tiering reports) have no counterpart.
+pub mod repl;
 pub use crate::runtime::{Context, Status};
 use crate::{
     Diagnostic, Span,
@@ -47,6 +48,22 @@ impl Session {
     pub fn with_context(program: Arc<Program>, context: Context) -> Result<Self, Diagnostic> {
         let module = VerifiedModule::lower_shared(program.clone(), 0)
             .map_err(|error| Diagnostic::new("R900", error.to_string(), Span::default()))?;
+        Self::from_module(program, module, context)
+    }
+
+    /// A session that can be continued with more code: every variable of the
+    /// entry routine is kept outside its frame.
+    pub fn persistent(program: Arc<Program>, context: Context) -> Result<Self, Diagnostic> {
+        let module = VerifiedModule::lower_for_session(program.clone(), 0)
+            .map_err(|error| Diagnostic::new("R900", error.to_string(), Span::default()))?;
+        Self::from_module(program, module, context)
+    }
+
+    fn from_module(
+        program: Arc<Program>,
+        module: VerifiedModule,
+        context: Context,
+    ) -> Result<Self, Diagnostic> {
         let written = Arc::new(Mutex::new(String::new()));
         let queued = Arc::new(Mutex::new(VecDeque::new()));
         let activation = Self::start(&module, &context, &written, &queued)?;
@@ -72,9 +89,19 @@ impl Session {
             fuel: TOTAL_FUEL,
             frames: context.max_frames,
         };
-        let mut activation = module
+        let activation = module
             .start(&[], limits)
             .map_err(|error| Diagnostic::new("R900", error.to_string(), Span::default()))?;
+        Ok(Self::attach(activation, context, written, queued))
+    }
+
+    /// Give an activation the context's collection, seed, output and input.
+    fn attach(
+        mut activation: Activation,
+        context: &Context,
+        written: &Arc<Mutex<String>>,
+        queued: &Arc<Mutex<VecDeque<String>>>,
+    ) -> Activation {
         activation.set_gc_stress(context.gc.stress);
         activation.set_random_seed(context.random_seed);
         let written = written.clone();
@@ -87,7 +114,59 @@ impl Session {
         activation.set_input(InputSource::waiting(move || {
             queued.lock().unwrap().pop_front()
         }));
-        Ok(activation)
+        activation
+    }
+
+    /// Replace the code with a longer program and run its new statements, those
+    /// that start at or after `committed` in the source, with the variables
+    /// and everything they refer to kept. The session must be
+    /// [persistent](Self::persistent).
+    pub fn continue_with(
+        &mut self,
+        program: Arc<Program>,
+        committed: u32,
+    ) -> Result<(), Diagnostic> {
+        let refuse = |message: String| Diagnostic::new("E204", message, Span::default());
+        let next = VerifiedModule::lower_for_session(program.clone(), 0)
+            .map_err(|error| Diagnostic::new("R900", error.to_string(), Span::default()))?;
+        self.module
+            .is_extended_by_with(&next, true)
+            .map_err(|reason| {
+                refuse(format!(
+                    "this entry would change code that already ran: {reason}"
+                ))
+            })?;
+        let at = next
+            .entry_statement_from(committed)
+            .unwrap_or_else(|| next.entry_end());
+        let limits = ExecutionLimits {
+            fuel: TOTAL_FUEL,
+            frames: self.context.max_frames,
+        };
+        let counted = self.activation.instructions_executed();
+        let idle = next
+            .start(&[], limits)
+            .map_err(|error| refuse(error.to_string()))?;
+        let memory = std::mem::replace(&mut self.activation, idle).into_memory();
+        let activation = next
+            .continue_at(memory, at, limits, counted)
+            .map_err(|error| refuse(error.to_string()))?;
+        self.activation = Self::attach(activation, &self.context, &self.written, &self.queued);
+        self.module = next;
+        self.program = program;
+        self.status = Status::Paused;
+        self.cursor = 0;
+        Ok(())
+    }
+
+    /// Abandon the running computation, keeping what it already wrote to
+    /// variables, so another entry may be submitted.
+    pub fn interrupt(&mut self) {
+        let span = self.current_span().unwrap_or_default();
+        self.status = Status::Failed(RuntimeFailure::new(
+            RuntimeError::Limit(ResourceLimit::Instructions),
+            span,
+        ));
     }
 
     pub fn status(&self) -> &Status {

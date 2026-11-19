@@ -2253,6 +2253,30 @@ impl VerifiedModule {
         })
     }
 
+    /// A new activation of the entry routine that starts at an instruction and
+    /// continues with the memory of an earlier one, so module variables and
+    /// everything they refer to are kept. Nothing of the entry's frame is
+    /// kept, so the instruction must begin a statement.
+    pub(crate) fn continue_at(
+        &self,
+        memory: ActivationMemory,
+        at: InstructionId,
+        limits: ExecutionLimits,
+        instructions_executed: usize,
+    ) -> Result<Activation, RunError> {
+        let mut activation = self.start(&[], limits)?;
+        let mut memory = memory.0;
+        memory.globals.resize(self.globals.len(), None);
+        activation.memory = memory;
+        activation.instructions_executed = instructions_executed;
+        if let ExecutionState::Active(stack) = &mut activation.state
+            && let Some(frame) = stack.first_mut()
+        {
+            frame.pc = at.index();
+        }
+        Ok(activation)
+    }
+
     /// Run to return, failure, or the total fuel limit. Output lines go to
     /// standard output.
     pub fn run(
@@ -5230,6 +5254,10 @@ fn transferable(value: &FrameValue) -> bool {
     }
 }
 
+/// What an activation leaves behind: module variables, the collected heap and
+/// the counted objects, channels and tasks.
+pub(crate) struct ActivationMemory(Memory);
+
 /// An index operand as a signed integer: counts index too, and one too large
 /// to be an integer is beyond every sequence.
 fn scalar_index(scalar: Scalar) -> i64 {
@@ -5447,6 +5475,12 @@ impl Activation {
             collections: self.memory.heap.collections,
             counted: self.memory.counted.iter().flatten().count(),
         }
+    }
+
+    /// Take the memory out of a finished or abandoned activation, to continue
+    /// with it in the next one.
+    pub(crate) fn into_memory(self) -> ActivationMemory {
+        ActivationMemory(self.memory)
     }
 
     /// The state the pseudo-random generator starts from.
