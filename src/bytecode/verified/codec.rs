@@ -1,5 +1,5 @@
 use super::{
-    BooleanOp, CallSiteId, FloatOp, FunctionId, Instruction, InstructionId, IntegerOp,
+    BooleanOp, CallSiteId, FloatOp, FunctionId, GlobalId, Instruction, InstructionId, IntegerOp,
     InvalidBytecode, OperandListId, Register, Scalar, TextId, TextOp,
 };
 
@@ -103,6 +103,7 @@ opcodes! {
     LoanField = 72, 4;
     LoanPayload = 73, 4;
     LoanElement = 74, 4;
+    BorrowGlobal = 75, 3;
 }
 
 impl TextOp {
@@ -208,6 +209,9 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
                 (Opcode::TextRight, [dst.0, text.0, count.0], 3)
             }
             Instruction::TextMid(dst, text, list) => (Opcode::TextMid, [dst.0, text.0, list.0], 3),
+            Instruction::BorrowGlobal(dst, global) => {
+                (Opcode::BorrowGlobal, [dst.0, global.0, 0], 2)
+            }
             Instruction::LoanField(dst, src, field) => {
                 (Opcode::LoanField, [dst.0, src.0, field], 3)
             }
@@ -350,6 +354,7 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::TextLeft => Instruction::TextLeft(reg(0), reg(1), reg(2)),
             Opcode::TextRight => Instruction::TextRight(reg(0), reg(1), reg(2)),
             Opcode::TextMid => Instruction::TextMid(reg(0), reg(1), list(2)),
+            Opcode::BorrowGlobal => Instruction::BorrowGlobal(reg(0), GlobalId(values[1])),
             Opcode::LoanField => Instruction::LoanField(reg(0), reg(1), values[2]),
             Opcode::LoanPayload => Instruction::LoanPayload(reg(0), reg(1), values[2]),
             Opcode::LoanElement => Instruction::LoanElement(reg(0), reg(1), list(2)),

@@ -1,8 +1,8 @@
 use super::{
-    BooleanOp, CallSite, CallTarget, FloatOp, FrameLayout, FunctionId, HostBindingId, HostFailure,
-    Instruction, InstructionId, IntegerOp, OutputPiece, OutputTemplate, Register, RegisterType,
-    Scalar, ScalarType, StatementArrival, StatementBoundary, TextFailure, TextOp, TextStyle,
-    VerifiedFunction, VerifiedModule, array_len,
+    BooleanOp, CallSite, CallTarget, FloatOp, FrameLayout, FunctionId, GlobalId, HostBindingId,
+    HostFailure, Instruction, InstructionId, IntegerOp, OutputPiece, OutputTemplate, Register,
+    RegisterType, Scalar, ScalarType, StatementArrival, StatementBoundary, TextFailure, TextOp,
+    TextStyle, VerifiedFunction, VerifiedModule, array_len,
 };
 use crate::{
     Span,
@@ -68,6 +68,11 @@ pub enum RunError {
         span: Span,
     },
     EnumVariant {
+        function: FunctionId,
+        instruction: InstructionId,
+        span: Span,
+    },
+    UninitializedGlobal {
         function: FunctionId,
         instruction: InstructionId,
         span: Span,
@@ -167,6 +172,15 @@ impl fmt::Display for RunError {
             } => write!(
                 f,
                 "enum payload read of another variant in function {} at instruction {}",
+                function.0, instruction.0
+            ),
+            Self::UninitializedGlobal {
+                function,
+                instruction,
+                ..
+            } => write!(
+                f,
+                "read of an unassigned module variable in function {} at instruction {}",
                 function.0, instruction.0
             ),
             Self::IndexOutOfBounds {
@@ -294,10 +308,18 @@ enum Composite {
 /// frame and its verified register remain stable until borrowers return.
 #[derive(Debug, Clone)]
 struct BorrowedPlace {
-    frame: usize,
-    register: Register,
+    root: Root,
     /// Projections from the owning register to the borrowed place.
     path: Box<[Step]>,
+}
+
+/// What a borrowed place starts from.
+#[derive(Debug, Clone, Copy)]
+enum Root {
+    /// A register of the frame at this stack index.
+    Frame { frame: usize, register: Register },
+    /// A module-level variable.
+    Global(GlobalId),
 }
 
 /// One projection step into a composite value.
@@ -491,6 +513,8 @@ fn instruction_id(pc: usize) -> InstructionId {
 pub struct Activation {
     module: VerifiedModule,
     output: OutputSink,
+    /// Module-level variables. They start uninitialized.
+    globals: Vec<Option<FrameValue>>,
     limits: ExecutionLimits,
     instructions_executed: usize,
     state: ExecutionState,
@@ -642,6 +666,7 @@ impl VerifiedModule {
         Ok(Activation {
             module: self.clone(),
             output: OutputSink::default(),
+            globals: vec![None; self.globals.len()],
             limits,
             instructions_executed,
             state: ExecutionState::Active(frames),
@@ -692,6 +717,7 @@ impl VerifiedModule {
         Ok(Activation {
             module: self.clone(),
             output: OutputSink::default(),
+            globals: vec![None; self.globals.len()],
             limits,
             instructions_executed: 0,
             state: ExecutionState::Active(vec![entry]),
@@ -727,6 +753,7 @@ impl VerifiedModule {
     fn step(
         &self,
         stack: &mut Vec<Frame>,
+        globals: &mut [Option<FrameValue>],
         max_frames: usize,
         output: &mut OutputSink,
     ) -> Result<StepOutcome, RunError> {
@@ -750,17 +777,31 @@ impl VerifiedModule {
             Instruction::Copy(dst, src) => frame.set_value(layout, dst, frame.value(layout, src)),
             Instruction::Borrow(loan, owner) => {
                 let place = BorrowedPlace {
-                    frame: depth - 1,
-                    register: owner,
+                    root: Root::Frame {
+                        frame: depth - 1,
+                        register: owner,
+                    },
                     path: Box::new([]),
                 };
                 frame.set_value(layout, loan, FrameValue::Loan(place));
             }
+            Instruction::BorrowGlobal(dst, global) => {
+                let place = BorrowedPlace {
+                    root: Root::Global(global),
+                    path: Box::new([]),
+                };
+                frame.set_value(layout, dst, FrameValue::Loan(place));
+            }
             Instruction::ReadLoan(dst, loan) => {
                 let place = frame.loan(layout, loan);
-                let owner = &stack[place.frame];
-                let owner_layout = self.functions[owner.function.index()].frame_layout();
-                let root = owner.value(owner_layout, place.register);
+                let uninitialized = RunError::UninitializedGlobal {
+                    function,
+                    instruction: from,
+                    span: body.spans[pc],
+                };
+                let root = self
+                    .root_value(stack, globals, &place.root)
+                    .ok_or(uninitialized)?;
                 let value = read_place(&root, &place.path)
                     .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
                 stack[depth - 1].set_value(layout, dst, value);
@@ -768,13 +809,18 @@ impl VerifiedModule {
             Instruction::WriteLoan(loan, value) => {
                 let place = frame.loan(layout, loan);
                 let value = frame.value(layout, value);
-                let owner = &mut stack[place.frame];
-                let owner_layout = self.functions[owner.function.index()].frame_layout();
-                let root = owner.slot_mut(owner_layout, place.register);
-                match root {
-                    Some(root) => write_place(root, &place.path, value)
+                let slot = self.root_slot(stack, globals, &place.root);
+                match (slot, place.path.is_empty()) {
+                    (slot, true) => *slot = Some(value),
+                    (Some(root), false) => write_place(root, &place.path, value)
                         .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?,
-                    None => unreachable!("verified loan owner is initialized"),
+                    (None, false) => {
+                        return Err(RunError::UninitializedGlobal {
+                            function,
+                            instruction: from,
+                            span: body.spans[pc],
+                        });
+                    }
                 }
             }
             Instruction::LoanField(dst, src, field) => {
@@ -783,10 +829,15 @@ impl VerifiedModule {
             }
             Instruction::LoanPayload(dst, src, variant) => {
                 let place = project_base(body, frame, layout, depth, src, Step::Payload(variant));
-                let owner = &stack[place.frame];
-                let owner_layout = self.functions[owner.function.index()].frame_layout();
                 // The variant must be held when the borrow is taken.
-                read_place(&owner.value(owner_layout, place.register), &place.path)
+                let root = self.root_value(stack, globals, &place.root).ok_or(
+                    RunError::UninitializedGlobal {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    },
+                )?;
+                read_place(&root, &place.path)
                     .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
                 stack[depth - 1].set_value(layout, dst, FrameValue::Loan(place));
             }
@@ -1197,6 +1248,40 @@ impl VerifiedModule {
         Ok(StepOutcome::Continue)
     }
 
+    /// A copy of the value at a place's root, or `None` when a global has
+    /// not been assigned yet.
+    fn root_value(
+        &self,
+        stack: &[Frame],
+        globals: &[Option<FrameValue>],
+        root: &Root,
+    ) -> Option<FrameValue> {
+        match *root {
+            Root::Frame { frame, register } => {
+                let owner = &stack[frame];
+                let layout = self.functions[owner.function.index()].frame_layout();
+                Some(owner.value(layout, register))
+            }
+            Root::Global(global) => globals[global.index()].clone(),
+        }
+    }
+
+    fn root_slot<'a>(
+        &self,
+        stack: &'a mut [Frame],
+        globals: &'a mut [Option<FrameValue>],
+        root: &Root,
+    ) -> &'a mut Option<FrameValue> {
+        match *root {
+            Root::Frame { frame, register } => {
+                let owner = &mut stack[frame];
+                let layout = self.functions[owner.function.index()].frame_layout();
+                owner.slot_mut(layout, register)
+            }
+            Root::Global(global) => &mut globals[global.index()],
+        }
+    }
+
     fn call_bound(
         &self,
         id: HostBindingId,
@@ -1365,10 +1450,12 @@ impl Activation {
         let available = self.limits.fuel - self.instructions_executed;
         for _ in 0..budget.min(available) {
             self.instructions_executed += 1;
-            self.state = match self
-                .module
-                .step(stack, self.limits.frames, &mut self.output)
-            {
+            self.state = match self.module.step(
+                stack,
+                &mut self.globals,
+                self.limits.frames,
+                &mut self.output,
+            ) {
                 Ok(StepOutcome::Continue) => continue,
                 Ok(StepOutcome::Returned(value)) => ExecutionState::Returned(value),
                 Err(error) => ExecutionState::Failed(error),
@@ -1416,8 +1503,10 @@ fn project_base(
         frame.loan(layout, source)
     } else {
         BorrowedPlace {
-            frame: depth - 1,
-            register: source,
+            root: Root::Frame {
+                frame: depth - 1,
+                register: source,
+            },
             path: Box::new([]),
         }
     };

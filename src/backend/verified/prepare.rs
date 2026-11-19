@@ -470,6 +470,7 @@ fn legalize(
         | Instruction::TextRight(..)
         | Instruction::TextMid(..)
         | Instruction::Closure(..)
+        | Instruction::BorrowGlobal(..)
         | Instruction::LoanField(..)
         | Instruction::LoanPayload(..)
         | Instruction::LoanElement(..)

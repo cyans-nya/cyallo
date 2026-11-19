@@ -1,9 +1,9 @@
 //! Resolve scalar places and loan provenance from checked IR.
 
 use super::{
-    LoanAccess, LoanOrigin, Register, RegisterType, ScalarType, ValueType,
+    GlobalId, LoanAccess, LoanOrigin, Register, RegisterType, ScalarType, ValueType,
     cfg::CheckedBlock,
-    lower::{LowerError, lower_index},
+    lower::{Globals, LowerError, lower_index},
     shapes::Shapes,
 };
 use crate::{
@@ -23,6 +23,8 @@ pub(super) struct Places {
     elements: Vec<Option<ElementPlace>>,
     /// Addresses that are loans on a projection chain.
     projected: Vec<bool>,
+    /// Addresses of module-level variables.
+    global_addresses: Vec<Option<GlobalId>>,
 }
 
 /// An element of a local array reached through checked indices.
@@ -40,7 +42,9 @@ impl Places {
         routine: usize,
         blocks: &[CheckedBlock<'_>],
         shapes: &mut Shapes,
+        globals: &Globals,
     ) -> Result<Self, LowerError> {
+        let is_main = &*function.name == "<main>";
         let mut registers: Vec<_> = function
             .registers
             .iter()
@@ -61,8 +65,21 @@ impl Places {
             return Err(storage_error());
         }
         let mut locals = Vec::with_capacity(function.locals.len());
-        for (local, storage) in function.locals.iter().zip(function.local_storage.iter()) {
+        for (position, (local, storage)) in function
+            .locals
+            .iter()
+            .zip(function.local_storage.iter())
+            .enumerate()
+        {
             let register = match storage {
+                // A module-level variable lives outside the frame.
+                LocalStorage::Cell(_) if is_main && globals.pointee(position).is_some() => {
+                    let index = lower_index(routine, registers.len())?;
+                    registers.push(RegisterType::Unused);
+                    loan_types.push(None);
+                    borrowing.push(false);
+                    index
+                }
                 LocalStorage::Register(index) => lower_index(routine, *index)?,
                 LocalStorage::Cell(_) => {
                     let ty = storage_type(&local.ty, shapes);
@@ -89,8 +106,14 @@ impl Places {
                 .flat_map(|block| block.operations.iter().map(|inst| &inst.op))
         };
         let mut addresses = vec![None; function.registers.len()];
+        let mut global_addresses: Vec<Option<GlobalId>> = vec![None; function.registers.len()];
         for op in ops() {
             if let Op::Address(dst, slot) = *op
+                && (slot.global || (is_main && globals.pointee(slot.index).is_some()))
+            {
+                global_addresses[dst] = Some(GlobalId(lower_index(routine, slot.index)?));
+                registers[dst] = RegisterType::Unused;
+            } else if let Op::Address(dst, slot) = *op
                 && !slot.global
             {
                 let place = *locals.get(slot.index).ok_or_else(storage_error)?;
@@ -139,6 +162,27 @@ impl Places {
         let mut projected = vec![false; count];
         let mut downstream: Vec<Vec<usize>> = vec![Vec::new(); loan_types.len()];
         let mut origins: Vec<(usize, LoanOrigin)> = Vec::new();
+        // A borrow of a module-level variable is exclusive when it is written
+        // through or lent out mutably.
+        let mut moved_mut = vec![false; count];
+        for op in &all_ops {
+            if let Op::Move(dst, src) = op
+                && matches!(loan_types[*dst], Some((LoanAccess::Exclusive, _)))
+            {
+                moved_mut[*src] = true;
+            }
+        }
+        for (dst, global) in global_addresses.iter().enumerate() {
+            let Some(global) = *global else { continue };
+            let pointee = globals.pointee(global.index()).ok_or_else(storage_error)?;
+            let access = if written[dst] || moved_mut[dst] {
+                LoanAccess::Exclusive
+            } else {
+                LoanAccess::Shared
+            };
+            loan_types[dst] = Some((access, pointee));
+            origins.push((dst, LoanOrigin::Global(global)));
+        }
         let mut elements: Vec<Option<ElementPlace>> = vec![None; count];
         for op in &all_ops {
             let (dst, base, value) = match op {
@@ -230,6 +274,7 @@ impl Places {
             payload_copies,
             elements,
             projected,
+            global_addresses,
         };
         if loan_types.iter().any(Option::is_some) {
             let mut aliases = vec![Vec::new(); loan_types.len()];
@@ -319,6 +364,11 @@ impl Places {
             .get(index)?
             .as_ref()
             .map(|place| (place.array, &*place.indices, place.writable))
+    }
+
+    /// The module-level variable an address refers to.
+    pub fn global_address(&self, index: usize) -> Option<GlobalId> {
+        self.global_addresses.get(index).copied().flatten()
     }
 
     /// Whether the address is a loan on a projection chain.

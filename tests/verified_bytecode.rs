@@ -36,6 +36,7 @@ fn module(functions: Vec<FunctionImage>) -> ModuleImage {
         entry: FunctionId(0),
         shapes: Box::new([]),
         signatures: Box::new([]),
+        globals: Box::new([]),
         functions: functions.into_boxed_slice(),
     }
 }

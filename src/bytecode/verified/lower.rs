@@ -2,7 +2,7 @@ use super::{
     BooleanOp, CallSite, CallSiteId, CallTarget, FORMAT_VERSION, FloatOp, FunctionId,
     FunctionImage, HostBindingId, Instruction, InstructionId, IntegerOp, ModuleImage,
     OperandListId, OutputId, OutputPiece, OutputTemplate, Register, RegisterType, Scalar,
-    ScalarHostBinding, ScalarType, TextId, TextOp, VerifiedModule, VerifyError,
+    ScalarHostBinding, ScalarType, TextId, TextOp, ValueType, VerifiedModule, VerifyError,
     cfg::{self, Block, Exit, Located, Statement},
     encode, layout, lifetimes,
     loans::Places,
@@ -142,6 +142,7 @@ impl VerifiedModule {
         let mut routines = vec![routine];
         let mut functions = Vec::new();
         let mut shapes = Shapes::default();
+        let globals = Globals::collect(checked, &mut shapes)?;
         while let Some(&id) = routines.get(functions.len()) {
             let function = checked
                 .get(id)
@@ -151,18 +152,24 @@ impl VerifiedModule {
                     routine: id,
                     diagnostic: Box::new(diagnostic.clone()),
                 })?;
-            functions.push(lower_function(function, id, &mut shapes, |target| {
-                if let Some(&binding) = host_ids.get(&target) {
-                    return Ok(CallTarget::Bound(binding));
-                }
-                if let Some(&candidate) = ids.get(&target) {
-                    return Ok(CallTarget::Direct(candidate));
-                }
-                let next = lower_index(id, routines.len()).map(FunctionId)?;
-                routines.push(target);
-                ids.insert(target, next);
-                Ok(CallTarget::Direct(next))
-            })?);
+            functions.push(lower_function(
+                function,
+                id,
+                &mut shapes,
+                &globals,
+                |target| {
+                    if let Some(&binding) = host_ids.get(&target) {
+                        return Ok(CallTarget::Bound(binding));
+                    }
+                    if let Some(&candidate) = ids.get(&target) {
+                        return Ok(CallTarget::Direct(candidate));
+                    }
+                    let next = lower_index(id, routines.len()).map(FunctionId)?;
+                    routines.push(target);
+                    ids.insert(target, next);
+                    Ok(CallTarget::Direct(next))
+                },
+            )?);
         }
         let (shapes, signatures) = shapes.into_parts();
         ModuleImage {
@@ -170,6 +177,7 @@ impl VerifiedModule {
             entry,
             shapes,
             signatures,
+            globals: globals.types.clone().into_boxed_slice(),
             functions: functions.into_boxed_slice(),
         }
         .verify_with_host_bindings(host_bindings)
@@ -205,6 +213,66 @@ fn lower_integer(op: Operator) -> Option<IntegerOp> {
         Operator::NotEqual => IntegerOp::NotEqual,
         _ => return None,
     })
+}
+
+/// Module-level variables: the cell locals of `<main>` that other routines
+/// reach through global slots. A variable keeps the index it has among
+/// `<main>`'s locals.
+#[derive(Default)]
+pub(super) struct Globals {
+    types: Vec<ValueType>,
+    present: Vec<bool>,
+}
+
+impl Globals {
+    fn collect(checked: &[Routine], shapes: &mut Shapes) -> Result<Self, LowerError> {
+        let mut globals = Self::default();
+        let Some(Ok(main)) = checked.first().map(Routine::checked) else {
+            return Ok(globals);
+        };
+        if &*main.name != "<main>" {
+            return Ok(globals);
+        }
+        let mut used = std::collections::BTreeSet::new();
+        for routine in checked {
+            let Ok(function) = routine.checked() else {
+                continue;
+            };
+            for record in &function.code {
+                if let Op::Address(_, slot) = record.op
+                    && slot.global
+                {
+                    used.insert(slot.index);
+                }
+            }
+        }
+        let Some(&last) = used.last() else {
+            return Ok(globals);
+        };
+        // Unreferenced indices keep a placeholder type that nothing borrows.
+        globals.types = vec![ValueType::Scalar(ScalarType::I64); last + 1];
+        globals.present = vec![false; last + 1];
+        for index in used {
+            let local = main
+                .locals
+                .get(index)
+                .ok_or(LowerError::UnsupportedStorage { routine: 0 })?;
+            globals.types[index] = shapes
+                .value(&local.ty)
+                .ok_or(LowerError::UnsupportedStorage { routine: 0 })?;
+            globals.present[index] = true;
+        }
+        Ok(globals)
+    }
+
+    /// The declared type of the variable at this index of `<main>`'s locals.
+    pub(super) fn pointee(&self, index: usize) -> Option<ValueType> {
+        self.present
+            .get(index)
+            .copied()
+            .unwrap_or(false)
+            .then(|| self.types[index])
+    }
 }
 
 fn lower_float(op: Operator) -> Option<FloatOp> {
@@ -303,6 +371,7 @@ fn lower_function(
     function: &Function,
     routine: usize,
     shapes: &mut Shapes,
+    globals: &Globals,
     mut call_target: impl FnMut(usize) -> Result<CallTarget, LowerError>,
 ) -> Result<FunctionImage, LowerError> {
     let signature_error = || LowerError::UnsupportedSignature { routine };
@@ -314,7 +383,7 @@ fn lower_function(
         ref ty => Some(shapes.value(ty).ok_or_else(signature_error)?),
     };
     let reachable = cfg::reachable(&function.code, routine, result.is_some())?;
-    let places = Places::collect(function, routine, &reachable, shapes)?;
+    let places = Places::collect(function, routine, &reachable, shapes, globals)?;
     let context = Context {
         routine,
         places: &places,
@@ -456,6 +525,9 @@ fn lower_operation(
         Op::Move(dst, src) if places.address(*src).is_some() => {
             let owner = places.address(*src).ok_or_else(unsupported)?;
             Instruction::Borrow(register(*dst)?, owner)
+        }
+        Op::Address(dst, _) if let Some(global) = places.global_address(*dst) => {
+            Instruction::BorrowGlobal(register(*dst)?, global)
         }
         Op::LiteralString(dst, text) => {
             let index = sites

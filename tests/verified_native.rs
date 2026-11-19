@@ -483,6 +483,7 @@ fn recovery_preserves_the_taken_statement_edge_at_a_shared_pc() {
         entry: FunctionId(0),
         shapes: Box::new([]),
         signatures: Box::new([]),
+        globals: Box::new([]),
         functions: Box::new([FunctionImage {
             registers: Box::new([ScalarType::Bool.into()]),
             parameters: Box::new([condition]),

@@ -152,6 +152,7 @@ mod malformed {
             entry: FunctionId(0),
             shapes: Box::new([]),
             signatures: Box::new([]),
+            globals: Box::new([]),
             functions: Box::new([FunctionImage {
                 registers: registers.into(),
                 parameters: Box::new([]),

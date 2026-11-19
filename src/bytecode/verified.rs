@@ -32,12 +32,12 @@ pub use run::{
 };
 pub use sdk::SdkCompileError;
 
-/// Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 15;
+pub const FORMAT_VERSION: u32 = 16;
 
 macro_rules! index {
     ($name:ident) => {
@@ -62,6 +62,7 @@ index!(ShapeId);
 index!(OperandListId);
 index!(TextId);
 index!(SignatureId);
+index!(GlobalId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScalarType {
@@ -157,6 +158,8 @@ pub enum LoanOrigin {
     Parameter {
         register: Register,
     },
+    /// A module-level variable that lives as long as the activation.
+    Global(GlobalId),
 }
 
 /// A logical register's verifier-visible storage and provenance.
@@ -375,6 +378,8 @@ pub enum Instruction {
     Borrow(Register, Register),
     ReadLoan(Register, Register),
     WriteLoan(Register, Register),
+    /// Borrow a module-level variable.
+    BorrowGlobal(Register, GlobalId),
     /// Borrow one field of a tuple, from an owner or another loan.
     LoanField(Register, Register, u32),
     /// Borrow the payload of a variant. Fails when another variant is held.
@@ -513,6 +518,7 @@ impl Instruction {
                 ([Some(src), None], &[], Some(dst))
             }
             WriteLoan(loan, value) => ([Some(loan), Some(value)], &[], None),
+            BorrowGlobal(dst, _) => ([None, None], &[], Some(dst)),
             LoanField(dst, src, _) | LoanPayload(dst, src, _) => {
                 ([Some(src), None], &[], Some(dst))
             }
@@ -614,6 +620,8 @@ pub struct ModuleImage {
     pub entry: FunctionId,
     pub shapes: Box<[Shape]>,
     pub signatures: Box<[Signature]>,
+    /// The types of module-level variables, by `GlobalId`.
+    pub globals: Box<[ValueType]>,
     pub functions: Box<[FunctionImage]>,
 }
 
@@ -624,6 +632,7 @@ pub struct VerifiedFunction {
     parameters: Box<[Register]>,
     shapes: Arc<[Shape]>,
     signatures: Arc<[Signature]>,
+    globals: Arc<[ValueType]>,
     result: Option<ValueType>,
     calls: Box<[CallSite]>,
     lists: Box<[Box<[Register]>]>,
@@ -943,6 +952,7 @@ pub struct VerifiedModule {
     entry: FunctionId,
     functions: Arc<[VerifiedFunction]>,
     shapes: Arc<[Shape]>,
+    globals: Arc<[ValueType]>,
     host_bindings: Arc<[ScalarHostBinding]>,
 }
 
@@ -1028,6 +1038,7 @@ pub enum InvalidBytecode {
     ExpectedArray(Register),
     ExpectedText(Register),
     UnknownText(TextId),
+    UnknownGlobal(GlobalId),
     UnknownSignature(SignatureId),
     ExpectedFunction(Register),
     /// A closure that borrows cannot be stored, passed or returned by value.
@@ -1143,6 +1154,7 @@ impl ModuleImage {
                 }
             }
         }
+        let globals: Arc<[ValueType]> = self.globals.into();
         let signatures: Arc<[Signature]> = self.signatures.into();
         let shapes: Arc<[Shape]> = self.shapes.into();
         for signature in signatures.iter() {
@@ -1180,6 +1192,7 @@ impl ModuleImage {
             functions.push(VerifiedFunction {
                 shapes: shapes.clone(),
                 signatures: signatures.clone(),
+                globals: globals.clone(),
                 registers: image.registers,
                 parameters: image.parameters,
                 result: image.result,
@@ -1204,6 +1217,7 @@ impl ModuleImage {
         Ok(VerifiedModule {
             entry: self.entry,
             shapes,
+            globals,
             functions: functions.into(),
             host_bindings: host_bindings.into(),
         })
@@ -1244,6 +1258,11 @@ impl VerifiedFunction {
                 LoanOrigin::Local(owner) => {
                     self.owned_type(owner).map_err(|kind| error(None, kind))?;
                     borrowers.entry(owner).or_default().push(index);
+                }
+                LoanOrigin::Global(global) => {
+                    if self.globals.get(global.index()).is_none() {
+                        return Err(error(None, InvalidBytecode::UnknownGlobal(global)));
+                    }
                 }
                 LoanOrigin::Parameter { register } => {
                     let valid = self.parameters.contains(&register)
@@ -1718,6 +1737,27 @@ impl VerifiedFunction {
                     return Err(InvalidBytecode::ExpectedExclusiveLoan(loan));
                 }
                 self.require_value(value, ty)
+            }
+            Instruction::BorrowGlobal(dst, global) => {
+                let declared = *self
+                    .globals
+                    .get(global.index())
+                    .ok_or(InvalidBytecode::UnknownGlobal(global))?;
+                let (_, origin, pointee) = self.loan_type(dst)?;
+                if origin != LoanOrigin::Global(global) {
+                    return Err(InvalidBytecode::LoanOwnerMismatch {
+                        loan: dst,
+                        owner: dst,
+                    });
+                }
+                if pointee != declared {
+                    return Err(InvalidBytecode::ValueType {
+                        register: dst,
+                        expected: declared,
+                        actual: pointee,
+                    });
+                }
+                Ok(())
             }
             Instruction::LoanField(dst, src, field) => {
                 let (container, ..) = self.projection_base(src)?;

@@ -81,6 +81,16 @@ impl fmt::Display for VerifiedModule {
                         value_name(pointee),
                         register.0
                     )?,
+                    RegisterType::Loan {
+                        access,
+                        origin: LoanOrigin::Global(global),
+                        pointee,
+                    } => write!(
+                        f,
+                        "  r{index}: {access:?} {} loan of global g{}",
+                        value_name(pointee),
+                        global.0
+                    )?,
                     RegisterType::BorrowingFunction {
                         signature,
                         access,
@@ -226,6 +236,9 @@ impl fmt::Display for VerifiedModule {
                     Instruction::TextMid(dst, text, list) => {
                         write!(f, "r{} = text.mid r{}", dst.0, text.0)?;
                         write_list(f, &function.lists()[list.index()])?;
+                    }
+                    Instruction::BorrowGlobal(dst, global) => {
+                        write!(f, "r{} = borrow.global g{}", dst.0, global.0)?;
                     }
                     Instruction::LoanField(dst, src, field) => {
                         write!(f, "r{} = loan.field r{}.{field}", dst.0, src.0)?;

@@ -203,6 +203,7 @@ mod images {
             entry: FunctionId(0),
             shapes: Box::new([]),
             signatures: Box::new([signature]),
+            globals: Box::new([]),
             functions: Box::new([entry, callee()]),
         }
         .verify()
