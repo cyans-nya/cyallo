@@ -1,9 +1,9 @@
 use super::{
     BooleanOp, CallSite, CallSiteId, CallTarget, Extremum, FORMAT_VERSION, FloatOp, FunctionId,
-    FunctionImage, HostBindingId, Instruction, InstructionId, IntegerOp, ModuleImage,
-    OperandListId, OutputId, OutputPiece, OutputTemplate, Register, RegisterType, Scalar,
-    ScalarHostBinding, ScalarType, TextId, TextMapOp, TextOp, TextTestOp, ValueType,
-    VerifiedModule, VerifyError,
+    FunctionImage, HostBindingId, Implementation, ImplementationId, Instruction, InstructionId,
+    IntegerOp, LoanAccess, ModuleImage, OperandListId, OutputId, OutputPiece, OutputTemplate,
+    Register, RegisterType, Scalar, ScalarHostBinding, ScalarType, TextId, TextMapOp, TextOp,
+    TextTestOp, TraitId, ValueType, VerifiedModule, VerifyError,
     cfg::{self, Block, Exit, Located, Statement},
     encode, layout, lifetimes,
     loans::Places,
@@ -14,7 +14,7 @@ use crate::{
     ir::{Function, Op, Program, Routine},
 };
 use cyallo_ast::{ConstantValue, Literal, MemoryKind, NumberKind, Operator};
-use cyallo_ir::{enums::Projection, intrinsic::Intrinsic, lookup::Operation};
+use cyallo_ir::{enums::Projection, intrinsic::Intrinsic, lookup::Operation, services::Metadata};
 use std::{collections::HashMap, fmt, sync::Arc};
 
 #[derive(Debug)]
@@ -125,11 +125,15 @@ impl VerifiedModule {
     /// indices belong to the supplied linked program. Unreferenced bodies stay
     /// deferred. Unsupported operations fail before any execution starts.
     pub fn lower(program: &Program, routine: usize) -> Result<Self, LowerError> {
-        Self::lower_checked(program.functions(), routine)
+        Self::lower_checked(program.functions(), routine, Some(program.services.clone()))
     }
 
-    pub(super) fn lower_checked(checked: &[Routine], routine: usize) -> Result<Self, LowerError> {
-        Self::lower_with_hosts(checked, routine, &HashMap::new(), Vec::new())
+    pub(super) fn lower_checked(
+        checked: &[Routine],
+        routine: usize,
+        services: Option<Arc<Metadata>>,
+    ) -> Result<Self, LowerError> {
+        Self::lower_with_hosts(checked, routine, &HashMap::new(), Vec::new(), services)
     }
 
     pub(super) fn lower_with_hosts(
@@ -137,13 +141,38 @@ impl VerifiedModule {
         routine: usize,
         host_ids: &HashMap<usize, HostBindingId>,
         host_bindings: Vec<ScalarHostBinding>,
+        services: Option<Arc<Metadata>>,
     ) -> Result<Self, LowerError> {
         let entry = FunctionId(0);
         let mut ids = HashMap::from([(routine, entry)]);
         let mut routines = vec![routine];
         let mut functions = Vec::new();
-        let mut shapes = Shapes::default();
+        // How a routine receives its parameter at a position: shared or
+        // exclusive access, when it is a reference.
+        let param_access = |callee: usize, position: usize| -> Option<LoanAccess> {
+            let function = checked.get(callee)?.checked().ok()?;
+            match function.locals.get(position)?.ty {
+                Type::Reference { mutable, .. } => Some(if mutable {
+                    LoanAccess::Exclusive
+                } else {
+                    LoanAccess::Shared
+                }),
+                _ => None,
+            }
+        };
+        let mut shapes = Shapes::new(services.clone());
         let globals = Globals::collect(checked, &mut shapes)?;
+        let implementations = Implementations::collect(checked, services.as_deref(), &mut shapes)?;
+        // Every method of an implementation can be called through an object.
+        for draft in &implementations.drafts {
+            for &method in &draft.routines {
+                if let std::collections::hash_map::Entry::Vacant(slot) = ids.entry(method) {
+                    let next = lower_index(method, routines.len()).map(FunctionId)?;
+                    routines.push(method);
+                    slot.insert(next);
+                }
+            }
+        }
         while let Some(&id) = routines.get(functions.len()) {
             let function = checked
                 .get(id)
@@ -158,6 +187,8 @@ impl VerifiedModule {
                 id,
                 &mut shapes,
                 &globals,
+                &implementations,
+                &param_access,
                 |target| {
                     if let Some(&binding) = host_ids.get(&target) {
                         return Ok(CallTarget::Bound(binding));
@@ -172,10 +203,30 @@ impl VerifiedModule {
                 },
             )?);
         }
+        let table = implementations
+            .drafts
+            .iter()
+            .map(|draft| {
+                Ok(Implementation {
+                    trait_id: draft.trait_id,
+                    receiver: draft.receiver,
+                    methods: draft
+                        .routines
+                        .iter()
+                        .map(|method| {
+                            ids.get(method)
+                                .copied()
+                                .ok_or(LowerError::UnknownRoutine(*method))
+                        })
+                        .collect::<Result<Box<[_]>, _>>()?,
+                })
+            })
+            .collect::<Result<Box<[_]>, LowerError>>()?;
         let super::shapes::Tables {
             shapes,
             signatures,
             managed,
+            traits,
         } = shapes.into_parts();
         ModuleImage {
             version: FORMAT_VERSION,
@@ -184,6 +235,8 @@ impl VerifiedModule {
             signatures,
             globals: globals.types.clone().into_boxed_slice(),
             managed,
+            traits,
+            implementations: table,
             functions: functions.into_boxed_slice(),
         }
         .verify_with_host_bindings(host_bindings)
@@ -219,6 +272,68 @@ fn lower_integer(op: Operator) -> Option<IntegerOp> {
         Operator::NotEqual => IntegerOp::NotEqual,
         _ => return None,
     })
+}
+
+/// An implementation a trait box names, before its routines are numbered.
+struct ImplementationDraft {
+    trait_id: TraitId,
+    receiver: ValueType,
+    routines: Vec<usize>,
+}
+
+/// The implementations that some routine boxes a value for, numbered in the
+/// order of the declared implementations.
+#[derive(Default)]
+pub(super) struct Implementations {
+    ids: HashMap<usize, ImplementationId>,
+    drafts: Vec<ImplementationDraft>,
+}
+
+impl Implementations {
+    fn collect(
+        checked: &[Routine],
+        services: Option<&Metadata>,
+        shapes: &mut Shapes,
+    ) -> Result<Self, LowerError> {
+        let mut used = std::collections::BTreeSet::new();
+        for routine in checked {
+            let Ok(function) = routine.checked() else {
+                continue;
+            };
+            for record in &function.code {
+                if let Op::TraitBox(_, _, implementation) = record.op {
+                    used.insert(implementation);
+                }
+            }
+        }
+        let mut found = Self::default();
+        let Some(services) = services else {
+            return Ok(found);
+        };
+        for declared in used {
+            let unsupported = LowerError::UnsupportedStorage { routine: 0 };
+            let implementation = services
+                .implementations
+                .get(declared)
+                .ok_or(LowerError::UnsupportedStorage { routine: 0 })?;
+            let trait_id = shapes
+                .trait_of(implementation.trait_id)
+                .ok_or(LowerError::UnsupportedStorage { routine: 0 })?;
+            let receiver = shapes.value(&implementation.receiver).ok_or(unsupported)?;
+            let id = ImplementationId(lower_index(0, found.drafts.len())?);
+            found.ids.insert(declared, id);
+            found.drafts.push(ImplementationDraft {
+                trait_id,
+                receiver,
+                routines: implementation.methods.clone(),
+            });
+        }
+        Ok(found)
+    }
+
+    fn id(&self, declared: usize) -> Option<ImplementationId> {
+        self.ids.get(&declared).copied()
+    }
 }
 
 /// Module-level variables: the cell locals of `<main>` that other routines
@@ -390,6 +505,8 @@ fn lower_function(
     routine: usize,
     shapes: &mut Shapes,
     globals: &Globals,
+    implementations: &Implementations,
+    param_access: &dyn Fn(usize, usize) -> Option<LoanAccess>,
     mut call_target: impl FnMut(usize) -> Result<CallTarget, LowerError>,
 ) -> Result<FunctionImage, LowerError> {
     let signature_error = || LowerError::UnsupportedSignature { routine };
@@ -401,11 +518,12 @@ fn lower_function(
         ref ty => Some(shapes.value(ty).ok_or_else(signature_error)?),
     };
     let reachable = cfg::reachable(&function.code, routine, result.is_some())?;
-    let places = Places::collect(function, routine, &reachable, shapes, globals)?;
+    let places = Places::collect(function, routine, &reachable, shapes, globals, param_access)?;
     let context = Context {
         routine,
         places: &places,
         shapes,
+        implementations,
     };
     let register = |index| places.register(index);
     let parameters: Box<[_]> = places
@@ -461,7 +579,8 @@ fn lower_function(
                             .registers
                             .get(args[0])
                             .is_some_and(|kind| !context.register_needs_drop(*kind)) => {}
-                Op::Address(dst, _) if places.address(dst).is_some() => {}
+                Op::Address(dst, _)
+                    if places.address(dst).is_some() && places.borrowed_address(dst).is_none() => {}
                 // The unit value of a statement-position match has no storage.
                 Op::Aggregate(dst, ref fields)
                     if fields.is_empty() && matches!(function.registers[dst], Type::Void) => {}
@@ -559,6 +678,7 @@ struct Context<'a> {
     routine: usize,
     places: &'a Places,
     shapes: &'a Shapes,
+    implementations: &'a Implementations,
 }
 
 fn lower_operation(
@@ -573,6 +693,7 @@ fn lower_operation(
         routine,
         places,
         shapes,
+        implementations,
     } = *context;
     let register = |index| places.register(index);
     let unsupported = || LowerError::UnsupportedOperation {
@@ -653,8 +774,33 @@ fn lower_operation(
         Op::ManagedAddress(dst, handle) => {
             Instruction::GcBorrow(register(*dst)?, register(*handle)?)
         }
+        Op::Address(dst, _) if let Some(owner) = places.borrowed_address(*dst) => {
+            Instruction::Borrow(register(*dst)?, owner)
+        }
         Op::Address(dst, _) if let Some(global) = places.global_address(*dst) => {
             Instruction::BorrowGlobal(register(*dst)?, global)
+        }
+        Op::TraitBox(dst, value, implementation) => Instruction::TraitBox(
+            register(*dst)?,
+            register(*value)?,
+            implementations
+                .id(*implementation)
+                .ok_or_else(unsupported)?,
+        ),
+        Op::TraitCall(dst, object, method, args) => {
+            let site = CallSiteId(lower_index(routine, sites.calls.len())?);
+            sites.calls.push(CallSite {
+                target: CallTarget::Method {
+                    object: register(*object)?,
+                    method: lower_index(routine, *method)?,
+                },
+                arguments: args
+                    .iter()
+                    .map(|&arg| register(arg))
+                    .collect::<Result<Box<[_]>, _>>()?,
+                destination: dst.map(register).transpose()?,
+            });
+            Instruction::Call(site)
         }
         Op::LiteralString(dst, text) => {
             let text = intern_text(routine, sites, text)?;

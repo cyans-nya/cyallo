@@ -135,6 +135,8 @@ mod images {
             signatures: Box::new([]),
             globals: globals.into(),
             managed: Box::new([]),
+            traits: Box::new([]),
+            implementations: Box::new([]),
             functions: Box::new([FunctionImage {
                 registers: Box::new([RegisterType::Loan {
                     access: LoanAccess::Exclusive,

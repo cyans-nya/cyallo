@@ -120,6 +120,7 @@ impl fmt::Display for VerifiedModule {
                         signature.0
                     )?,
                     RegisterType::Gc(managed) => write!(f, "  r{index}: gc m{}", managed.0)?,
+                    RegisterType::Object(id) => write!(f, "  r{index}: dyn trait{}", id.0)?,
                     RegisterType::Rc(managed) => write!(f, "  r{index}: rc m{}", managed.0)?,
                     RegisterType::Weak(managed) => write!(f, "  r{index}: weak m{}", managed.0)?,
                     RegisterType::Text => write!(f, "  r{index}: text")?,
@@ -192,6 +193,9 @@ impl fmt::Display for VerifiedModule {
                             CallTarget::Bound(id) => write!(f, "call.bound host{}(", id.0)?,
                             CallTarget::Closure(callee) => {
                                 write!(f, "call.closure r{}(", callee.0)?
+                            }
+                            CallTarget::Method { object, method } => {
+                                write!(f, "call.method r{}#{method}(", object.0)?;
                             }
                             CallTarget::Output(id) => write!(
                                 f,
@@ -314,6 +318,13 @@ impl fmt::Display for VerifiedModule {
                     }
                     Instruction::IntegerToCount(dst, src) => {
                         write!(f, "r{} = u64.from.i64 r{}", dst.0, src.0)?;
+                    }
+                    Instruction::TraitBox(dst, value, implementation) => {
+                        write!(
+                            f,
+                            "r{} = trait.box r{}, impl{}",
+                            dst.0, value.0, implementation.0
+                        )?;
                     }
                     Instruction::Abs(dst, src) => {
                         write!(f, "r{} = i64.checked.abs r{}", dst.0, src.0)?
@@ -448,6 +459,7 @@ fn value_name(ty: ValueType) -> String {
         ValueType::Scalar(ty) => type_name(ty).to_owned(),
         ValueType::Text => "text".to_owned(),
         ValueType::Gc(managed) => format!("gc m{}", managed.0),
+        ValueType::Object(id) => format!("dyn trait{}", id.0),
         ValueType::Rc(managed) => format!("rc m{}", managed.0),
         ValueType::Weak(managed) => format!("weak m{}", managed.0),
         ValueType::Function(signature) => format!("fn sig{}", signature.0),

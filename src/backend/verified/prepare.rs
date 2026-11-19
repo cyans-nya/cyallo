@@ -490,6 +490,7 @@ fn legalize(
         | Instruction::TextTest(..)
         | Instruction::TextReplace(..)
         | Instruction::ToText(..)
+        | Instruction::TraitBox(..)
         | Instruction::Abs(..)
         | Instruction::CountToInteger(..)
         | Instruction::IntegerToCount(..)

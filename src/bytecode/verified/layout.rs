@@ -206,6 +206,8 @@ mod tests {
             signatures: Box::new([]),
             globals: Box::new([]),
             managed: Box::new([]),
+            traits: Box::new([]),
+            implementations: Box::new([]),
             functions: Box::new([FunctionImage {
                 registers: Box::new(registers),
                 parameters: Box::new([condition]),

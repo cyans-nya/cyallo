@@ -168,6 +168,8 @@ mod images {
             signatures: Box::new([]),
             globals: Box::new([]),
             managed: managed.into(),
+            traits: Box::new([]),
+            implementations: Box::new([]),
             functions: Box::new([FunctionImage {
                 registers: registers.into(),
                 parameters: Box::new([]),

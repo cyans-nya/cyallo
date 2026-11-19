@@ -46,6 +46,8 @@ fn verify(
         signatures: Box::new([]),
         globals: Box::new([]),
         managed: Box::new([]),
+        traits: Box::new([]),
+        implementations: Box::new([]),
         functions: Box::new([image(registers, parameters, result, instructions)]),
     }
     .verify()
@@ -392,6 +394,8 @@ fn verifier_rejects_conflicting_arguments_even_if_they_copy_the_same_loan() {
         signatures: Box::new([]),
         globals: Box::new([]),
         managed: Box::new([]),
+        traits: Box::new([]),
+        implementations: Box::new([]),
         functions: Box::new([caller, callee]),
     }
     .verify()

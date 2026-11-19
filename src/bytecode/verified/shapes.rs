@@ -2,22 +2,30 @@
 //! complete checked type, so two enums with the same structure but different
 //! declarations stay distinct and the verifier compares them by identity.
 
-use super::{ManagedId, ScalarType, Shape, ShapeId, Signature, SignatureId, ValueType, array_len};
+use super::{
+    LoanAccess, ManagedId, Method, ScalarType, Shape, ShapeId, Signature, SignatureId,
+    TraitDescription, TraitId, ValueType, array_len,
+};
 use crate::Type;
 use cyallo_ast::{
     EnumEncoding, EnumIdentity, Locality, MemoryKind, NumberKind, StorageKind, VariantId,
 };
-use std::collections::HashMap;
+use cyallo_ir::services::{Metadata, Receiver};
+use std::{collections::HashMap, sync::Arc};
 
 /// The module-level tables an interner produced.
 pub(super) struct Tables {
     pub shapes: Box<[Shape]>,
     pub signatures: Box<[Signature]>,
     pub managed: Box<[ValueType]>,
+    pub traits: Box<[TraitDescription]>,
 }
 
-#[derive(Default)]
 pub(super) struct Shapes {
+    /// The declared traits, for objects of a trait.
+    services: Option<Arc<Metadata>>,
+    traits: Vec<TraitDescription>,
+    trait_ids: HashMap<Box<str>, TraitId>,
     by_type: HashMap<Type, ShapeId>,
     shapes: Vec<Shape>,
     /// Variant declarations of each enum shape, in variant-index order.
@@ -35,6 +43,83 @@ pub(super) struct Shapes {
 }
 
 impl Shapes {
+    pub fn new(services: Option<Arc<Metadata>>) -> Self {
+        Self {
+            services,
+            traits: Vec::new(),
+            trait_ids: HashMap::new(),
+            by_type: HashMap::new(),
+            shapes: Vec::new(),
+            variants: HashMap::new(),
+            signatures: Vec::new(),
+            managed: Vec::new(),
+            enum_ids: HashMap::new(),
+            encodings: HashMap::new(),
+            structural: HashMap::new(),
+            record_names: HashMap::new(),
+        }
+    }
+
+    /// The trait an object type names, described once.
+    fn trait_object(&mut self, name: &str) -> Option<ValueType> {
+        if let Some(&id) = self.trait_ids.get(name) {
+            return Some(ValueType::Object(id));
+        }
+        let services = self.services.clone()?;
+        let declared = services
+            .traits
+            .iter()
+            .find(|candidate| &*candidate.name == name)?;
+        // Reserve the number first: a method may mention the trait itself.
+        let id = TraitId(u32::try_from(self.traits.len()).ok()?);
+        self.traits.push(TraitDescription {
+            methods: Box::new([]),
+        });
+        self.trait_ids.insert(name.into(), id);
+        let methods = declared
+            .methods
+            .iter()
+            .map(|method| {
+                let receiver = match method.receiver {
+                    Receiver::Shared => LoanAccess::Shared,
+                    Receiver::Mutable => LoanAccess::Exclusive,
+                    Receiver::Value => return None,
+                };
+                if method.params.iter().any(|&(_, by_reference)| by_reference) {
+                    return None;
+                }
+                let parameters = method
+                    .params
+                    .iter()
+                    .map(|(ty, _)| self.value(ty))
+                    .collect::<Option<Box<[_]>>>()?;
+                let result = match &method.result {
+                    Type::Void => None,
+                    other => Some(self.value(other)?),
+                };
+                Some(Method {
+                    receiver,
+                    parameters,
+                    result,
+                })
+            })
+            .collect::<Option<Box<[_]>>>();
+        let Some(methods) = methods else {
+            self.trait_ids.remove(name);
+            return None;
+        };
+        self.traits[id.index()] = TraitDescription { methods };
+        Some(ValueType::Object(id))
+    }
+
+    /// The `Object` type of a declared trait, by its index in the metadata.
+    pub fn trait_of(&mut self, declared: usize) -> Option<TraitId> {
+        let name = self.services.as_ref()?.traits.get(declared)?.name.clone();
+        match self.trait_object(&name)? {
+            ValueType::Object(id) => Some(id),
+            _ => None,
+        }
+    }
     /// The verified type of a checked type, or `None` while it has no verified
     /// representation. Components are interned first, which numbers them below
     /// the composite that contains them.
@@ -47,6 +132,7 @@ impl Shapes {
             Type::Numeric(NumberKind::F64) => ScalarType::F64.into(),
             Type::String => ValueType::Text,
             Type::Boolean => ScalarType::Bool.into(),
+            Type::TraitObject(name) => self.trait_object(name)?,
             Type::Function(_, parameters, result) => {
                 if parameters.iter().any(|&(_, by_reference)| by_reference) {
                     return None;
@@ -313,9 +399,11 @@ impl Shapes {
                 Some(Shape::Slice { .. }) => false,
                 None => false,
             },
-            ValueType::Scalar(_) | ValueType::Text | ValueType::Function(_) | ValueType::Gc(_) => {
-                false
-            }
+            ValueType::Scalar(_)
+            | ValueType::Text
+            | ValueType::Function(_)
+            | ValueType::Gc(_)
+            | ValueType::Object(_) => false,
         }
     }
 
@@ -360,6 +448,7 @@ impl Shapes {
             shapes: self.shapes.into_boxed_slice(),
             signatures: self.signatures.into_boxed_slice(),
             managed: self.managed.into_boxed_slice(),
+            traits: self.traits.into_boxed_slice(),
         }
     }
 }

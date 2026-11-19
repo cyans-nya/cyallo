@@ -25,6 +25,8 @@ pub(super) struct Places {
     projected: Vec<bool>,
     /// Addresses of module-level variables.
     global_addresses: Vec<Option<GlobalId>>,
+    /// Addresses of locals that a call receives as a borrow of the local.
+    borrowed_addresses: Vec<Option<Register>>,
 }
 
 /// An element of a local array reached through checked indices.
@@ -43,6 +45,7 @@ impl Places {
         blocks: &[CheckedBlock<'_>],
         shapes: &mut Shapes,
         globals: &Globals,
+        param_access: &dyn Fn(usize, usize) -> Option<LoanAccess>,
     ) -> Result<Self, LowerError> {
         let is_main = &*function.name == "<main>";
         let mut registers: Vec<_> = function
@@ -182,6 +185,27 @@ impl Places {
         let mut projected = vec![false; count];
         let mut downstream: Vec<Vec<usize>> = vec![Vec::new(); loan_types.len()];
         let mut origins: Vec<(usize, LoanOrigin)> = Vec::new();
+        // A local's address handed to a routine that takes a reference is an
+        // implicit borrow of the local.
+        let mut borrowed_addresses: Vec<Option<Register>> = vec![None; count];
+        for op in &all_ops {
+            if let Op::Call(_, callee, args) = op {
+                for (position, &arg) in args.iter().enumerate() {
+                    let (Some(owner), Some(access)) =
+                        (addresses[arg], param_access(*callee, position))
+                    else {
+                        continue;
+                    };
+                    let Some(pointee) = places_value(&registers, owner) else {
+                        continue;
+                    };
+                    loan_types[arg] = Some((access, pointee));
+                    registers[arg] = RegisterType::Unused;
+                    origins.push((arg, LoanOrigin::Local(owner)));
+                    borrowed_addresses[arg] = Some(owner);
+                }
+            }
+        }
         // A borrow of a module-level variable is exclusive when it is written
         // through or lent out mutably.
         let mut moved_mut = vec![false; count];
@@ -341,6 +365,7 @@ impl Places {
             elements,
             projected,
             global_addresses,
+            borrowed_addresses,
         };
         if loan_types.iter().any(Option::is_some) {
             let mut aliases = vec![Vec::new(); loan_types.len()];
@@ -432,6 +457,11 @@ impl Places {
             .map(|place| (place.array, &*place.indices, place.writable))
     }
 
+    /// The local an address borrows when a routine receives it as a reference.
+    pub fn borrowed_address(&self, index: usize) -> Option<Register> {
+        self.borrowed_addresses.get(index).copied().flatten()
+    }
+
     /// The module-level variable an address refers to.
     pub fn global_address(&self, index: usize) -> Option<GlobalId> {
         self.global_addresses.get(index).copied().flatten()
@@ -472,6 +502,11 @@ impl Places {
             Some(_) => lower_index(self.routine, index).map(Register),
         }
     }
+}
+
+/// The value type held by a register of the function, if it holds a value.
+fn places_value(registers: &[RegisterType], register: Register) -> Option<ValueType> {
+    registers.get(register.index())?.value()
 }
 
 fn storage_type(ty: &Type, shapes: &mut Shapes) -> RegisterType {

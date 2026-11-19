@@ -33,12 +33,12 @@ pub use run::{
 };
 pub use sdk::SdkCompileError;
 
-/// Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 21;
+pub const FORMAT_VERSION: u32 = 22;
 
 macro_rules! index {
     ($name:ident) => {
@@ -65,6 +65,8 @@ index!(TextId);
 index!(SignatureId);
 index!(GlobalId);
 index!(ManagedId);
+index!(TraitId);
+index!(ImplementationId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScalarType {
@@ -91,6 +93,31 @@ pub enum ValueType {
     Rc(ManagedId),
     /// A weak observer of a counted object.
     Weak(ManagedId),
+    /// A shared, erased object that implements the trait.
+    Object(TraitId),
+}
+
+/// A method a trait declares: what its receiver may do and its other types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Method {
+    pub receiver: LoanAccess,
+    pub parameters: Box<[ValueType]>,
+    pub result: Option<ValueType>,
+}
+
+/// The methods an object of the trait can be asked to run, in call order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraitDescription {
+    pub methods: Box<[Method]>,
+}
+
+/// One type's implementation of a trait. The routines take a loan of the
+/// receiver first and then the method's own parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Implementation {
+    pub trait_id: TraitId,
+    pub receiver: ValueType,
+    pub methods: Box<[FunctionId]>,
 }
 
 /// A callable's parameter and result types, without its captures.
@@ -123,7 +150,8 @@ impl ValueType {
             | Self::Function(_)
             | Self::Gc(_)
             | Self::Rc(_)
-            | Self::Weak(_) => None,
+            | Self::Weak(_)
+            | Self::Object(_) => None,
         }
     }
 }
@@ -221,6 +249,8 @@ pub enum RegisterType {
     Rc(ManagedId),
     /// A weak observer of a counted object.
     Weak(ManagedId),
+    /// A shared, erased object that implements a trait.
+    Object(TraitId),
     /// A closure that captured loans. It behaves like a loan on their root:
     /// the root stays live and borrowed while it lives, and the value cannot
     /// be stored, passed or returned by value.
@@ -249,6 +279,7 @@ impl From<ValueType> for RegisterType {
             ValueType::Gc(managed) => Self::Gc(managed),
             ValueType::Rc(managed) => Self::Rc(managed),
             ValueType::Weak(managed) => Self::Weak(managed),
+            ValueType::Object(id) => Self::Object(id),
         }
     }
 }
@@ -282,6 +313,7 @@ impl RegisterType {
             Self::Gc(managed) => ValueType::Gc(managed),
             Self::Rc(managed) => ValueType::Rc(managed),
             Self::Weak(managed) => ValueType::Weak(managed),
+            Self::Object(id) => ValueType::Object(id),
             _ => return None,
         })
     }
@@ -483,6 +515,8 @@ pub enum Instruction {
     /// Move the payload of the variant out of the enum, which becomes
     /// uninitialized. Fails on any other variant.
     EnumTake(Register, Register, u32),
+    /// Erase a value into a shared object that implements a trait.
+    TraitBox(Register, Register, ImplementationId),
     /// Allocate a heap object holding a copy of the value.
     GcNew(Register, Register),
     /// Borrow the heap object a handle refers to.
@@ -606,6 +640,12 @@ pub enum CallTarget {
     Bound(HostBindingId),
     /// The closure held by the register. Its captures precede the arguments.
     Closure(Register),
+    /// A method of the object held by the register. The routine receives a
+    /// loan of the object's receiver before the arguments.
+    Method {
+        object: Register,
+        method: u32,
+    },
     /// Write one line of text. The template lives in the owning function.
     Output(OutputId),
 }
@@ -699,6 +739,7 @@ impl Instruction {
             SliceOf(dst, src) | SliceLength(dst, src) | Sum(dst, src) => {
                 ([Some(src), None], &[], Some(dst))
             }
+            TraitBox(dst, value, _) => ([Some(value), None], &[], Some(dst)),
             GcNew(dst, value) | GcBorrow(dst, value) | RcNew(dst, value) | Move(dst, value) => {
                 ([Some(value), None], &[], Some(dst))
             }
@@ -726,7 +767,10 @@ impl Instruction {
             Call(site) => {
                 let call = &calls[site.index()];
                 let callee = match call.target {
-                    CallTarget::Closure(register) => Some(register),
+                    CallTarget::Closure(register)
+                    | CallTarget::Method {
+                        object: register, ..
+                    } => Some(register),
                     _ => None,
                 };
                 ([callee, None], &call.arguments, call.destination)
@@ -814,6 +858,8 @@ pub struct ModuleImage {
     pub globals: Box<[ValueType]>,
     /// What each managed type points at, by `ManagedId`.
     pub managed: Box<[ValueType]>,
+    pub traits: Box<[TraitDescription]>,
+    pub implementations: Box<[Implementation]>,
     pub functions: Box<[FunctionImage]>,
 }
 
@@ -826,6 +872,8 @@ pub struct VerifiedFunction {
     signatures: Arc<[Signature]>,
     globals: Arc<[ValueType]>,
     managed: Arc<[ValueType]>,
+    traits: Arc<[TraitDescription]>,
+    implementations: Arc<[Implementation]>,
     result: Option<ValueType>,
     calls: Box<[CallSite]>,
     lists: Box<[Box<[Register]>]>,
@@ -973,6 +1021,7 @@ impl VerifiedFunction {
             RegisterType::Gc(managed) => Ok(ValueType::Gc(managed)),
             RegisterType::Rc(managed) => Ok(ValueType::Rc(managed)),
             RegisterType::Weak(managed) => Ok(ValueType::Weak(managed)),
+            RegisterType::Object(id) => Ok(ValueType::Object(id)),
             RegisterType::BorrowingFunction { .. } => {
                 Err(InvalidBytecode::EscapingBorrow(register))
             }
@@ -1280,6 +1329,7 @@ pub struct VerifiedModule {
     functions: Arc<[VerifiedFunction]>,
     shapes: Arc<[Shape]>,
     globals: Arc<[ValueType]>,
+    implementations: Arc<[Implementation]>,
     host_bindings: Arc<[ScalarHostBinding]>,
 }
 
@@ -1371,6 +1421,14 @@ pub enum InvalidBytecode {
     ExpectedText(Register),
     UnknownText(TextId),
     UnknownGlobal(GlobalId),
+    UnknownTrait(TraitId),
+    UnknownImplementation(ImplementationId),
+    UnknownMethod {
+        object: Register,
+        method: u32,
+    },
+    /// A routine does not take the receiver and parameters its trait declares.
+    ImplementationMismatch(ImplementationId),
     UnknownManaged(ManagedId),
     ShapeCycle(ShapeId),
     ExpectedHandle(Register),
@@ -1482,6 +1540,9 @@ impl ModuleImage {
                     ValueType::Composite(id) if id.index() >= self.shapes.len() => {
                         return Err(image_error(InvalidBytecode::UnknownShape(id)));
                     }
+                    ValueType::Object(id) if id.index() >= self.traits.len() => {
+                        return Err(image_error(InvalidBytecode::UnknownTrait(id)));
+                    }
                     _ => {}
                 }
             }
@@ -1491,6 +1552,8 @@ impl ModuleImage {
         if let Some(shape) = first_shape_cycle(&self.shapes) {
             return Err(image_error(InvalidBytecode::ShapeCycle(shape)));
         }
+        let traits: Arc<[TraitDescription]> = self.traits.into();
+        let implementations: Arc<[Implementation]> = self.implementations.into();
         let managed: Arc<[ValueType]> = self.managed.into();
         let globals: Arc<[ValueType]> = self.globals.into();
         let signatures: Arc<[Signature]> = self.signatures.into();
@@ -1532,6 +1595,8 @@ impl ModuleImage {
                 signatures: signatures.clone(),
                 globals: globals.clone(),
                 managed: managed.clone(),
+                traits: traits.clone(),
+                implementations: implementations.clone(),
                 registers: image.registers,
                 parameters: image.parameters,
                 result: image.result,
@@ -1546,6 +1611,44 @@ impl ModuleImage {
                 storage_entries: Box::new([]),
             });
         }
+        for (index, implementation) in implementations.iter().enumerate() {
+            let id = ImplementationId(
+                u32::try_from(index)
+                    .map_err(|_| image_error(InvalidBytecode::FunctionIdOverflow))?,
+            );
+            let mismatch = || image_error(InvalidBytecode::ImplementationMismatch(id));
+            let description = traits.get(implementation.trait_id.index()).ok_or_else(|| {
+                image_error(InvalidBytecode::UnknownTrait(implementation.trait_id))
+            })?;
+            if implementation.methods.len() != description.methods.len() {
+                return Err(mismatch());
+            }
+            for (&target, method) in implementation
+                .methods
+                .iter()
+                .zip(description.methods.iter())
+            {
+                let callee = functions
+                    .get(target.index())
+                    .ok_or_else(|| image_error(InvalidBytecode::UnknownFunction(target)))?;
+                let Some((&receiver, rest)) = callee.parameters.split_first() else {
+                    return Err(mismatch());
+                };
+                let receiver_ok = matches!(
+                    callee.registers.get(receiver.index()),
+                    Some(RegisterType::Loan { access, origin: LoanOrigin::Parameter { .. }, pointee })
+                        if *access == method.receiver && *pointee == implementation.receiver
+                );
+                let parameters_ok =
+                    rest.len() == method.parameters.len()
+                        && rest.iter().zip(method.parameters.iter()).all(
+                            |(&parameter, &expected)| callee.value_type(parameter) == Ok(expected),
+                        );
+                if !receiver_ok || !parameters_ok || callee.result != method.result {
+                    return Err(mismatch());
+                }
+            }
+        }
         for index in 0..functions.len() {
             let id = function_id(index).map_err(image_error)?;
             let (frame, storage_entries) =
@@ -1557,6 +1660,7 @@ impl ModuleImage {
             entry: self.entry,
             shapes,
             globals,
+            implementations,
             functions: functions.into(),
             host_bindings: host_bindings.into(),
         })
@@ -1688,6 +1792,11 @@ impl VerifiedFunction {
             if let RegisterType::Function(signature) = kind {
                 self.signature(signature)
                     .map_err(|kind| error(None, kind))?;
+            }
+            if let RegisterType::Object(id) = kind
+                && self.traits.get(id.index()).is_none()
+            {
+                return Err(error(None, InvalidBytecode::UnknownTrait(id)));
             }
             if let RegisterType::Gc(managed)
             | RegisterType::Rc(managed)
@@ -1901,6 +2010,24 @@ impl VerifiedFunction {
                 )?;
                 Some(binding.result.into())
             }
+            CallTarget::Method { object, method } => {
+                let RegisterType::Object(trait_id) = self.register_kind(object)? else {
+                    return Err(InvalidBytecode::ExpectedHandle(object));
+                };
+                let description = self
+                    .traits
+                    .get(trait_id.index())
+                    .ok_or(InvalidBytecode::UnknownTrait(trait_id))?;
+                let declared = description
+                    .methods
+                    .get(method as usize)
+                    .ok_or(InvalidBytecode::UnknownMethod { object, method })?;
+                self.verify_arguments(
+                    &call.arguments,
+                    declared.parameters.iter().map(|&ty| Ok(ty)),
+                )?;
+                declared.result
+            }
             CallTarget::Closure(callee) => {
                 let (RegisterType::Function(id)
                 | RegisterType::BorrowingFunction { signature: id, .. }) =
@@ -1966,6 +2093,7 @@ impl VerifiedFunction {
                 }
                 RegisterType::Gc(managed) => self.require_value(arg, ValueType::Gc(managed))?,
                 RegisterType::Rc(managed) => self.require_value(arg, ValueType::Rc(managed))?,
+                RegisterType::Object(id) => self.require_value(arg, ValueType::Object(id))?,
                 RegisterType::Weak(managed) => self.require_value(arg, ValueType::Weak(managed))?,
                 RegisterType::Composite(shape) => {
                     self.require_value(arg, ValueType::Composite(shape))?;
@@ -2351,6 +2479,19 @@ impl VerifiedFunction {
                     });
                 }
                 self.require_type(dst, ScalarType::Bool)
+            }
+            Instruction::TraitBox(dst, value, implementation) => {
+                let RegisterType::Object(trait_id) = self.register_kind(dst)? else {
+                    return Err(InvalidBytecode::ExpectedHandle(dst));
+                };
+                let declared = self
+                    .implementations
+                    .get(implementation.index())
+                    .ok_or(InvalidBytecode::UnknownImplementation(implementation))?;
+                if declared.trait_id != trait_id {
+                    return Err(InvalidBytecode::ImplementationMismatch(implementation));
+                }
+                self.require_value(value, declared.receiver)
             }
             Instruction::GcNew(dst, value) => {
                 let RegisterType::Gc(managed) = self.register_kind(dst)? else {

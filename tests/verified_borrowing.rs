@@ -174,6 +174,8 @@ mod images {
             }]),
             globals: Box::new([]),
             managed: Box::new([]),
+            traits: Box::new([]),
+            implementations: Box::new([]),
             functions: Box::new([function(registers, vec![], result, vec![], code), routine()]),
         }
         .verify()
@@ -226,6 +228,8 @@ mod images {
             }]),
             globals: Box::new([]),
             managed: Box::new([]),
+            traits: Box::new([]),
+            implementations: Box::new([]),
             functions: Box::new([
                 function(vec![], vec![], None, vec![], vec![Return(None)]),
                 routine(),
@@ -285,6 +289,8 @@ mod images {
             }]),
             globals: Box::new([]),
             managed: Box::new([]),
+            traits: Box::new([]),
+            implementations: Box::new([]),
             functions: Box::new([
                 function(
                     registers(borrowing(LoanOrigin::Local(COUNT))),

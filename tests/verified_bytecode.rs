@@ -38,6 +38,8 @@ fn module(functions: Vec<FunctionImage>) -> ModuleImage {
         signatures: Box::new([]),
         globals: Box::new([]),
         managed: Box::new([]),
+        traits: Box::new([]),
+        implementations: Box::new([]),
         functions: functions.into_boxed_slice(),
     }
 }

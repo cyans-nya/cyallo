@@ -205,6 +205,8 @@ mod images {
             signatures: Box::new([signature]),
             globals: Box::new([]),
             managed: Box::new([]),
+            traits: Box::new([]),
+            implementations: Box::new([]),
             functions: Box::new([entry, callee()]),
         }
         .verify()

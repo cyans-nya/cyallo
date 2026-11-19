@@ -1,7 +1,7 @@
 use super::{
-    BooleanOp, CallSiteId, Extremum, FloatOp, FunctionId, GlobalId, Instruction, InstructionId,
-    IntegerOp, InvalidBytecode, OperandListId, Register, Scalar, TextId, TextMapOp, TextOp,
-    TextTestOp,
+    BooleanOp, CallSiteId, Extremum, FloatOp, FunctionId, GlobalId, ImplementationId, Instruction,
+    InstructionId, IntegerOp, InvalidBytecode, OperandListId, Register, Scalar, TextId, TextMapOp,
+    TextOp, TextTestOp,
 };
 
 // The low half of the header is the opcode and the high half is the total
@@ -145,6 +145,7 @@ opcodes! {
     ParseInteger = 113, 3;
     CountToInteger = 114, 3;
     IntegerToCount = 115, 3;
+    TraitBox = 116, 4;
 }
 
 impl TextOp {
@@ -296,6 +297,9 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
             Instruction::ParseInteger(dst, text) => (Opcode::ParseInteger, [dst.0, text.0, 0], 2),
             Instruction::CountToInteger(dst, src) => (Opcode::CountToInteger, [dst.0, src.0, 0], 2),
             Instruction::IntegerToCount(dst, src) => (Opcode::IntegerToCount, [dst.0, src.0, 0], 2),
+            Instruction::TraitBox(dst, value, implementation) => {
+                (Opcode::TraitBox, [dst.0, value.0, implementation.0], 3)
+            }
             Instruction::Abs(dst, src) => (Opcode::Abs, [dst.0, src.0, 0], 2),
             Instruction::Extremum(op, dst, lhs, rhs) => {
                 let opcode = match op {
@@ -497,6 +501,7 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::ParseInteger => Instruction::ParseInteger(reg(0), reg(1)),
             Opcode::CountToInteger => Instruction::CountToInteger(reg(0), reg(1)),
             Opcode::IntegerToCount => Instruction::IntegerToCount(reg(0), reg(1)),
+            Opcode::TraitBox => Instruction::TraitBox(reg(0), reg(1), ImplementationId(values[2])),
             Opcode::Abs => Instruction::Abs(reg(0), reg(1)),
             Opcode::Min => Instruction::Extremum(Extremum::Min, reg(0), reg(1), reg(2)),
             Opcode::Max => Instruction::Extremum(Extremum::Max, reg(0), reg(1), reg(2)),

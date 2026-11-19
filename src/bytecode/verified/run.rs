@@ -327,6 +327,11 @@ enum FrameValue {
     Weak(usize),
     /// The hole a value was moved out of.
     Moved,
+    /// A shared object, erased to the trait the implementation belongs to.
+    Object {
+        heap: usize,
+        implementation: u32,
+    },
 }
 
 /// A routine and the values it captured by copy or move. The captures become
@@ -529,6 +534,7 @@ impl Memory {
                 | FrameValue::Loan(_)
                 | FrameValue::Closure(_)
                 | FrameValue::Handle(_)
+                | FrameValue::Object { .. }
                 | FrameValue::Moved => {}
             }
         }
@@ -635,7 +641,7 @@ fn trace(value: &FrameValue, marks: &mut [bool], pending: &mut Vec<usize>) {
     let mut stack = vec![value];
     while let Some(value) = stack.pop() {
         match value {
-            FrameValue::Handle(object) => mark(*object),
+            FrameValue::Handle(object) | FrameValue::Object { heap: object, .. } => mark(*object),
             FrameValue::Loan(place) => {
                 if let Root::Heap(object) = place.root {
                     mark(object);
@@ -860,6 +866,7 @@ impl Frame {
             | FrameValue::Handle(_)
             | FrameValue::Rc(_)
             | FrameValue::Weak(_)
+            | FrameValue::Object { .. }
             | FrameValue::Moved => {
                 unreachable!("verified scalar operand")
             }
@@ -876,6 +883,7 @@ impl Frame {
             | FrameValue::Handle(_)
             | FrameValue::Rc(_)
             | FrameValue::Weak(_)
+            | FrameValue::Object { .. }
             | FrameValue::Moved => {
                 unreachable!("verified loan operand")
             }
@@ -1230,6 +1238,25 @@ impl VerifiedModule {
                     window: None,
                 };
                 frame.set_value(layout, loan, FrameValue::Loan(place));
+            }
+            Instruction::TraitBox(dst, value, implementation) => {
+                let value = frame.value(layout, value);
+                if memory.heap.should_collect() {
+                    memory.collect(stack);
+                }
+                let heap = memory.heap.allocate(value).ok_or(RunError::HeapExhausted {
+                    function,
+                    instruction: from,
+                    span: body.spans[pc],
+                })?;
+                stack[depth - 1].set_value(
+                    layout,
+                    dst,
+                    FrameValue::Object {
+                        heap,
+                        implementation: implementation.0,
+                    },
+                );
             }
             Instruction::GcNew(dst, value) => {
                 let value = frame.value(layout, value);
@@ -1818,6 +1845,31 @@ impl VerifiedModule {
                             .cloned()
                             .chain(call.arguments.iter().map(|&reg| frame.value(layout, reg)));
                         let next = Frame::new(closure.function, target, values, call.destination);
+                        stack.push(next);
+                    }
+                    CallTarget::Method { object, method } => {
+                        if depth == max_frames {
+                            return Err(RunError::FrameLimit);
+                        }
+                        let FrameValue::Object {
+                            heap,
+                            implementation,
+                        } = frame.value(layout, object)
+                        else {
+                            unreachable!("verified object operand");
+                        };
+                        let target =
+                            self.implementations[implementation as usize].methods[method as usize];
+                        let callee = &self.functions[target.index()];
+                        // The routine borrows the receiver the object holds.
+                        let receiver = FrameValue::Loan(BorrowedPlace {
+                            root: Root::Heap(heap),
+                            path: Box::new([]),
+                            window: None,
+                        });
+                        let values = std::iter::once(receiver)
+                            .chain(call.arguments.iter().map(|&reg| frame.value(layout, reg)));
+                        let next = Frame::new(target, callee, values, call.destination);
                         stack.push(next);
                     }
                     CallTarget::Bound(binding) => self.call_bound(
@@ -2486,6 +2538,7 @@ fn spell(value: &FrameValue, style: TextStyle) -> String {
             | FrameValue::Handle(_)
             | FrameValue::Rc(_)
             | FrameValue::Weak(_)
+            | FrameValue::Object { .. }
             | FrameValue::Moved,
         ) => unreachable!("verified text operand is a scalar or string"),
     }

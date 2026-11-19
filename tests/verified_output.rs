@@ -154,6 +154,8 @@ mod malformed {
             signatures: Box::new([]),
             globals: Box::new([]),
             managed: Box::new([]),
+            traits: Box::new([]),
+            implementations: Box::new([]),
             functions: Box::new([FunctionImage {
                 registers: registers.into(),
                 parameters: Box::new([]),
