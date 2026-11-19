@@ -348,6 +348,10 @@ enum Composite {
     },
     /// Row-major elements. A declared element stays uninitialized until stored.
     Array(Box<[Option<FrameValue>]>),
+    /// A growable sequence of initialized elements.
+    Vec(Vec<FrameValue>),
+    /// A mutable cell.
+    Cell(Box<FrameValue>),
 }
 
 /// Frames above this index may move as the stack grows. The owning logical
@@ -368,6 +372,8 @@ struct Window {
     len: usize,
 }
 
+/// Most elements a vector may hold.
+const MAX_VEC_ELEMENTS: usize = 1 << 22;
 /// Most objects the heap may hold after a collection.
 const MAX_HEAP_OBJECTS: usize = 1 << 22;
 /// Live objects at which the first collection runs.
@@ -516,6 +522,8 @@ impl Memory {
                 FrameValue::Composite(Composite::Array(elements)) => {
                     pending.extend(elements.into_vec().into_iter().flatten());
                 }
+                FrameValue::Composite(Composite::Vec(items)) => pending.extend(items),
+                FrameValue::Composite(Composite::Cell(inner)) => pending.push(*inner),
                 FrameValue::Scalar(_)
                 | FrameValue::Text(_)
                 | FrameValue::Loan(_)
@@ -591,6 +599,8 @@ fn trace(value: &FrameValue, marks: &mut [bool], pending: &mut Vec<usize>) {
             FrameValue::Composite(Composite::Array(elements)) => {
                 stack.extend(elements.iter().flatten());
             }
+            FrameValue::Composite(Composite::Vec(items)) => stack.extend(items.iter()),
+            FrameValue::Composite(Composite::Cell(inner)) => stack.push(inner),
             FrameValue::Closure(closure) => stack.extend(closure.captures.iter()),
             FrameValue::Scalar(_)
             | FrameValue::Text(_)
@@ -658,6 +668,77 @@ fn read_place(value: &FrameValue, path: &[Step]) -> Result<FrameValue, PlaceFaul
                 None => Err(PlaceFault::UninitializedElement),
             }
         }
+        (Step::Offset(offset), FrameValue::Composite(Composite::Vec(items))) => {
+            read_place(&items[*offset], rest)
+        }
+        _ => unreachable!("verified projection path"),
+    }
+}
+
+fn place_ref<'a>(value: &'a FrameValue, path: &[Step]) -> Result<&'a FrameValue, PlaceFault> {
+    let Some((step, rest)) = path.split_first() else {
+        return match value {
+            FrameValue::Moved => Err(PlaceFault::MovedOut),
+            value => Ok(value),
+        };
+    };
+    match (step, value) {
+        (Step::Field(index), FrameValue::Composite(Composite::Tuple(fields))) => {
+            place_ref(&fields[*index as usize], rest)
+        }
+        (
+            Step::Payload(variant),
+            FrameValue::Composite(Composite::Enum {
+                variant: held,
+                payload,
+            }),
+        ) => match payload {
+            Some(payload) if held == variant => place_ref(payload, rest),
+            _ => Err(PlaceFault::OtherVariant),
+        },
+        (Step::Offset(offset), FrameValue::Composite(Composite::Array(elements))) => {
+            match &elements[*offset] {
+                Some(element) => place_ref(element, rest),
+                None => Err(PlaceFault::UninitializedElement),
+            }
+        }
+        (Step::Offset(offset), FrameValue::Composite(Composite::Vec(items))) => {
+            place_ref(&items[*offset], rest)
+        }
+        _ => unreachable!("verified projection path"),
+    }
+}
+
+fn place_mut<'a>(
+    value: &'a mut FrameValue,
+    path: &[Step],
+) -> Result<&'a mut FrameValue, PlaceFault> {
+    let Some((step, rest)) = path.split_first() else {
+        return Ok(value);
+    };
+    match (step, value) {
+        (Step::Field(index), FrameValue::Composite(Composite::Tuple(fields))) => {
+            place_mut(&mut fields[*index as usize], rest)
+        }
+        (
+            Step::Payload(variant),
+            FrameValue::Composite(Composite::Enum {
+                variant: held,
+                payload,
+            }),
+        ) => match payload {
+            Some(payload) if held == variant => place_mut(payload, rest),
+            _ => Err(PlaceFault::OtherVariant),
+        },
+        (Step::Offset(offset), FrameValue::Composite(Composite::Array(elements))) => {
+            match &mut elements[*offset] {
+                Some(element) => place_mut(element, rest),
+                None => Err(PlaceFault::UninitializedElement),
+            }
+        }
+        (Step::Offset(offset), FrameValue::Composite(Composite::Vec(items))) => {
+            place_mut(&mut items[*offset], rest)
+        }
         _ => unreachable!("verified projection path"),
     }
 }
@@ -681,6 +762,9 @@ fn write_place(value: &mut FrameValue, path: &[Step], new: FrameValue) -> Result
             Some(payload) if held == variant => write_place(payload, rest, new),
             _ => Err(PlaceFault::OtherVariant),
         },
+        (Step::Offset(offset), FrameValue::Composite(Composite::Vec(items))) => {
+            write_place(&mut items[*offset], rest, new)
+        }
         (Step::Offset(offset), FrameValue::Composite(Composite::Array(elements))) => {
             let element = &mut elements[*offset];
             match (rest.is_empty(), element) {
@@ -1289,24 +1373,151 @@ impl VerifiedModule {
                     .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
                 stack[depth - 1].set_value(layout, dst, FrameValue::Loan(place));
             }
+            Instruction::RangeNew(dst, start, end)
+            | Instruction::RangeInclusive(dst, start, end) => {
+                let (Scalar::I64(start), Scalar::I64(end)) =
+                    (frame.get(layout, start), frame.get(layout, end))
+                else {
+                    unreachable!("verified integer operands");
+                };
+                let end = if matches!(body.instructions[pc], Instruction::RangeInclusive(..)) {
+                    end.checked_add(1).ok_or(RunError::IntegerOverflow {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    })?
+                } else {
+                    end
+                };
+                let bounds = [start, end]
+                    .into_iter()
+                    .map(|bound| FrameValue::Scalar(Scalar::I64(bound)))
+                    .collect();
+                frame.set_value(layout, dst, FrameValue::Composite(Composite::Tuple(bounds)));
+            }
+            Instruction::VecFrom(dst, range) => {
+                let Composite::Tuple(bounds) = frame.composite(layout, range) else {
+                    unreachable!("verified range operand");
+                };
+                let [
+                    FrameValue::Scalar(Scalar::I64(start)),
+                    FrameValue::Scalar(Scalar::I64(end)),
+                ] = bounds.as_ref()
+                else {
+                    unreachable!("verified integer range");
+                };
+                let count = end.saturating_sub(*start).max(0);
+                let count = usize::try_from(count).unwrap_or(usize::MAX);
+                if count > MAX_VEC_ELEMENTS {
+                    return Err(RunError::HeapExhausted {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    });
+                }
+                let items = (*start..*end)
+                    .map(|value| FrameValue::Scalar(Scalar::I64(value)))
+                    .collect();
+                frame.set_value(layout, dst, FrameValue::Composite(Composite::Vec(items)));
+            }
+            Instruction::VecNew(dst, list) => {
+                let items = body.lists[list.index()]
+                    .iter()
+                    .map(|&item| frame.value(layout, item))
+                    .collect();
+                frame.set_value(layout, dst, FrameValue::Composite(Composite::Vec(items)));
+            }
+            Instruction::VecPush(target, value) => {
+                let value = frame.value(layout, value);
+                let container = self
+                    .container_mut(stack, memory, body, target)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let FrameValue::Composite(Composite::Vec(items)) = container else {
+                    unreachable!("verified vector operand");
+                };
+                if items.len() >= MAX_VEC_ELEMENTS {
+                    return Err(RunError::HeapExhausted {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    });
+                }
+                items.push(value);
+            }
+            Instruction::VecLength(dst, vector) => {
+                let held = self
+                    .container_ref(stack, memory, body, vector)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?
+                    .ok_or(RunError::UninitializedGlobal {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    })?;
+                let FrameValue::Composite(Composite::Vec(items)) = held else {
+                    unreachable!("verified vector operand");
+                };
+                let length = u64::try_from(items.len()).unwrap_or(u64::MAX);
+                stack[depth - 1].set(layout, dst, Scalar::U64(length));
+            }
+            Instruction::CellNew(dst, value) => {
+                let value = frame.value(layout, value);
+                frame.set_value(
+                    layout,
+                    dst,
+                    FrameValue::Composite(Composite::Cell(Box::new(value))),
+                );
+            }
+            Instruction::CellRead(dst, cell) => {
+                let held = self
+                    .container_ref(stack, memory, body, cell)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?
+                    .ok_or(RunError::UninitializedGlobal {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    })?;
+                let FrameValue::Composite(Composite::Cell(inner)) = held else {
+                    unreachable!("verified cell operand");
+                };
+                let value = (**inner).clone();
+                stack[depth - 1].set_value(layout, dst, value);
+            }
+            Instruction::CellWrite(cell, value) => {
+                let value = frame.value(layout, value);
+                let container = self
+                    .container_mut(stack, memory, body, cell)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let FrameValue::Composite(Composite::Cell(inner)) = container else {
+                    unreachable!("verified cell operand");
+                };
+                **inner = value;
+            }
+            Instruction::CellReplace(dst, cell, value) => {
+                let value = frame.value(layout, value);
+                let container = self
+                    .container_mut(stack, memory, body, cell)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let FrameValue::Composite(Composite::Cell(inner)) = container else {
+                    unreachable!("verified cell operand");
+                };
+                let old = std::mem::replace(&mut **inner, value);
+                stack[depth - 1].set_value(layout, dst, old);
+            }
             Instruction::SliceOf(dst, src) => {
                 let mut place = place_of(body, frame, layout, depth, src);
-                let window = if body.projects_from_slice(src) {
-                    place.window
-                } else {
-                    let len = array_len(body.projected_array_bounds(src));
-                    len.map(|len| Window { start: 0, len })
-                };
+                let window = self
+                    .sequence_window(stack, memory, body, src)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
                 place.window = window;
-                frame.set_value(layout, dst, FrameValue::Loan(place));
+                stack[depth - 1].set_value(layout, dst, FrameValue::Loan(place));
             }
             Instruction::SliceLength(dst, src) => {
-                let length = match sequence_window(body, frame, layout, src) {
-                    Some(window) => window.len,
-                    None => 0,
-                };
+                let window = self
+                    .sequence_window(stack, memory, body, src)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let length = window.map_or(0, |window| window.len);
                 let length = i64::try_from(length).unwrap_or(i64::MAX);
-                frame.set(layout, dst, Scalar::I64(length));
+                stack[depth - 1].set(layout, dst, Scalar::I64(length));
             }
             Instruction::Sum(dst, src) => {
                 let elements = self
@@ -1329,11 +1540,16 @@ impl VerifiedModule {
                 }
                 stack[depth - 1].set(layout, dst, Scalar::I64(total));
             }
-            Instruction::LoanElement(dst, src, list) if body.projects_from_slice(src) => {
-                let Scalar::I64(index) = frame.get(layout, body.lists[list.index()][0]) else {
+            Instruction::LoanElement(dst, src, list)
+                if body.projects_from_slice(src) || body.projects_from_vec(src) =>
+            {
+                let Scalar::I64(index) = stack[depth - 1].get(layout, body.lists[list.index()][0])
+                else {
                     unreachable!("verified integer index");
                 };
-                let window = sequence_window(body, frame, layout, src);
+                let window = self
+                    .sequence_window(stack, memory, body, src)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
                 let offset = window.and_then(|window| {
                     usize::try_from(index)
                         .ok()
@@ -1345,8 +1561,15 @@ impl VerifiedModule {
                     instruction: from,
                     span: body.spans[pc],
                 })?;
-                let place = project_base(body, frame, layout, depth, src, Step::Offset(offset));
-                frame.set_value(layout, dst, FrameValue::Loan(place));
+                let place = project_base(
+                    body,
+                    &stack[depth - 1],
+                    layout,
+                    depth,
+                    src,
+                    Step::Offset(offset),
+                );
+                stack[depth - 1].set_value(layout, dst, FrameValue::Loan(place));
             }
             Instruction::LoanElement(dst, src, list) => {
                 let offset =
@@ -1713,6 +1936,49 @@ impl VerifiedModule {
                     FrameValue::Composite(Composite::Array(elements)),
                 );
             }
+            Instruction::ArrayLoad(dst, array, list) if body.is_vec(array) => {
+                let Scalar::I64(index) = frame.get(layout, body.lists[list.index()][0]) else {
+                    unreachable!("verified integer index");
+                };
+                let Composite::Vec(items) = frame.composite(layout, array) else {
+                    unreachable!("verified vector operand");
+                };
+                let value = usize::try_from(index)
+                    .ok()
+                    .and_then(|index| items.get(index))
+                    .cloned()
+                    .ok_or(RunError::IndexOutOfBounds {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    })?;
+                frame.set_value(layout, dst, value);
+            }
+            Instruction::ArrayStore(array, list, value) if body.is_vec(array) => {
+                let Scalar::I64(index) = frame.get(layout, body.lists[list.index()][0]) else {
+                    unreachable!("verified integer index");
+                };
+                let value = frame.value(layout, value);
+                let Composite::Vec(items) = frame.composite_mut(layout, array) else {
+                    unreachable!("verified vector operand");
+                };
+                let slot = usize::try_from(index)
+                    .ok()
+                    .and_then(|index| items.get_mut(index))
+                    .ok_or(RunError::IndexOutOfBounds {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    })?;
+                *slot = value;
+            }
+            Instruction::ArrayLength(dst, array) if body.is_vec(array) => {
+                let Composite::Vec(items) = frame.composite(layout, array) else {
+                    unreachable!("verified vector operand");
+                };
+                let length = i64::try_from(items.len()).unwrap_or(i64::MAX);
+                frame.set(layout, dst, Scalar::I64(length));
+            }
             Instruction::ArrayLoad(dst, array, list) => {
                 let offset = element_offset(frame, layout, body.array_bounds(array).1, list, body)
                     .ok_or(RunError::IndexOutOfBounds {
@@ -1772,6 +2038,90 @@ impl VerifiedModule {
         Ok(StepOutcome::Continue)
     }
 
+    /// The value an operand's place holds, borrowed in place. `None` when a
+    /// module variable is not assigned yet.
+    fn container_ref<'a>(
+        &self,
+        stack: &'a [Frame],
+        memory: &'a Memory,
+        body: &VerifiedFunction,
+        source: Register,
+    ) -> Result<Option<&'a FrameValue>, PlaceFault> {
+        let Some(frame) = stack.last() else {
+            unreachable!("active execution has a frame");
+        };
+        let layout = body.frame_layout();
+        let place = place_of(body, frame, layout, stack.len(), source);
+        let root = match place.root {
+            Root::Frame { frame, register } => {
+                let owner = &stack[frame];
+                let owner_layout = self.functions[owner.function.index()].frame_layout();
+                owner.slots[slot(owner_layout, register)].as_ref()
+            }
+            Root::Global(global) => memory.globals[global.index()].as_ref(),
+            Root::Heap(object) => memory.heap.slots[object].as_ref(),
+            Root::Counted(block) => memory.counted[block]
+                .as_ref()
+                .and_then(|block| block.payload.as_ref()),
+        };
+        match root {
+            Some(root) => place_ref(root, &place.path).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Like [`Self::container_ref`], for mutation.
+    fn container_mut<'a>(
+        &self,
+        stack: &'a mut [Frame],
+        memory: &'a mut Memory,
+        body: &VerifiedFunction,
+        source: Register,
+    ) -> Result<&'a mut FrameValue, PlaceFault> {
+        let depth = stack.len();
+        let place = {
+            let Some(frame) = stack.last() else {
+                unreachable!("active execution has a frame");
+            };
+            place_of(body, frame, body.frame_layout(), depth, source)
+        };
+        let root = self.root_slot(stack, memory, &place.root);
+        match root {
+            Some(root) => place_mut(root, &place.path),
+            None => Err(PlaceFault::UninitializedElement),
+        }
+    }
+
+    /// The window a sequence operand covers: its slice window, or all of the
+    /// array or vector it is.
+    fn sequence_window(
+        &self,
+        stack: &[Frame],
+        memory: &Memory,
+        body: &VerifiedFunction,
+        source: Register,
+    ) -> Result<Option<Window>, PlaceFault> {
+        let Some(frame) = stack.last() else {
+            unreachable!("active execution has a frame");
+        };
+        if body.projects_from_slice(source) {
+            return Ok(frame.loan(body.frame_layout(), source).window);
+        }
+        if body.projects_from_vec(source) {
+            let held = self
+                .container_ref(stack, memory, body, source)?
+                .ok_or(PlaceFault::UninitializedElement)?;
+            let FrameValue::Composite(Composite::Vec(items)) = held else {
+                unreachable!("verified vector operand");
+            };
+            return Ok(Some(Window {
+                start: 0,
+                len: items.len(),
+            }));
+        }
+        Ok(array_len(body.projected_array_bounds(source)).map(|len| Window { start: 0, len }))
+    }
+
     /// The elements of the array or slice an operand stands for.
     fn sequence_elements(
         &self,
@@ -1784,18 +2134,20 @@ impl VerifiedModule {
             unreachable!("active execution has a frame");
         };
         let layout = body.frame_layout();
-        let window = sequence_window(body, frame, layout, source);
+        let _ = (frame, layout);
+        let window = self.sequence_window(stack, memory, body, source)?;
         let held = self
             .held_value(stack, memory, body, source)?
             .ok_or(PlaceFault::UninitializedElement)?;
-        let FrameValue::Composite(Composite::Array(elements)) = held else {
-            unreachable!("verified sequence operand");
+        let elements: Vec<Option<FrameValue>> = match held {
+            FrameValue::Composite(Composite::Array(elements)) => elements.into_vec(),
+            FrameValue::Composite(Composite::Vec(items)) => items.into_iter().map(Some).collect(),
+            _ => unreachable!("verified sequence operand"),
         };
         let Some(window) = window else {
-            return Ok(elements.into_vec());
+            return Ok(elements);
         };
         Ok(elements
-            .into_vec()
             .into_iter()
             .skip(window.start)
             .take(window.len)
@@ -2122,20 +2474,6 @@ fn place_of(
             window: None,
         }
     }
-}
-
-/// The elements a sequence operand covers: its slice window, or all of the
-/// array it is.
-fn sequence_window(
-    body: &VerifiedFunction,
-    frame: &Frame,
-    layout: &FrameLayout,
-    source: Register,
-) -> Option<Window> {
-    if body.projects_from_slice(source) {
-        return frame.loan(layout, source).window;
-    }
-    array_len(body.projected_array_bounds(source)).map(|len| Window { start: 0, len })
 }
 
 /// The borrowed place of a projection: the base loan's place, or the owning

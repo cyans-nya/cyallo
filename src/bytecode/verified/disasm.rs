@@ -36,6 +36,12 @@ impl fmt::Display for VerifiedModule {
                         value_name(*element)
                     )?;
                 }
+                Shape::Vec { element } => {
+                    writeln!(f, "shape{id} = vec of {}", value_name(*element))?;
+                }
+                Shape::Cell { element } => {
+                    writeln!(f, "shape{id} = cell of {}", value_name(*element))?;
+                }
                 Shape::Slice { element } => {
                     writeln!(f, "shape{id} = slice of {}", value_name(*element))?;
                 }
@@ -257,6 +263,37 @@ impl fmt::Display for VerifiedModule {
                         write_list(f, &function.lists()[list.index()])?;
                     }
                     Instruction::Move(dst, src) => write!(f, "r{} = move r{}", dst.0, src.0)?,
+                    Instruction::RangeNew(dst, start, end) => {
+                        write!(f, "r{} = range r{}, r{}", dst.0, start.0, end.0)?;
+                    }
+                    Instruction::RangeInclusive(dst, start, end) => {
+                        write!(f, "r{} = range.inclusive r{}, r{}", dst.0, start.0, end.0)?;
+                    }
+                    Instruction::VecFrom(dst, range) => {
+                        write!(f, "r{} = vec.from r{}", dst.0, range.0)?
+                    }
+                    Instruction::VecNew(dst, list) => {
+                        write!(f, "r{} = vec.new", dst.0)?;
+                        write_list(f, &function.lists()[list.index()])?;
+                    }
+                    Instruction::VecPush(target, value) => {
+                        write!(f, "vec.push r{}, r{}", target.0, value.0)?;
+                    }
+                    Instruction::VecLength(dst, vector) => {
+                        write!(f, "r{} = vec.len r{}", dst.0, vector.0)?;
+                    }
+                    Instruction::CellNew(dst, value) => {
+                        write!(f, "r{} = cell.new r{}", dst.0, value.0)?
+                    }
+                    Instruction::CellRead(dst, cell) => {
+                        write!(f, "r{} = cell.read r{}", dst.0, cell.0)?
+                    }
+                    Instruction::CellWrite(cell, value) => {
+                        write!(f, "cell.write r{}, r{}", cell.0, value.0)?;
+                    }
+                    Instruction::CellReplace(dst, cell, value) => {
+                        write!(f, "r{} = cell.replace r{}, r{}", dst.0, cell.0, value.0)?;
+                    }
                     Instruction::SliceOf(dst, src) => {
                         write!(f, "r{} = slice.of r{}", dst.0, src.0)?
                     }

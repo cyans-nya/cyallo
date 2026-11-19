@@ -119,6 +119,16 @@ opcodes! {
     SliceOf = 88, 3;
     SliceLength = 89, 3;
     Sum = 90, 3;
+    RangeNew = 91, 4;
+    RangeInclusive = 92, 4;
+    VecFrom = 93, 3;
+    VecNew = 94, 3;
+    VecPush = 95, 3;
+    VecLength = 96, 3;
+    CellNew = 97, 3;
+    CellRead = 98, 3;
+    CellWrite = 99, 3;
+    CellReplace = 100, 4;
 }
 
 impl TextOp {
@@ -230,6 +240,22 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
             }
             Instruction::TextMid(dst, text, list) => (Opcode::TextMid, [dst.0, text.0, list.0], 3),
             Instruction::Move(dst, src) => (Opcode::Move, [dst.0, src.0, 0], 2),
+            Instruction::RangeNew(dst, start, end) => {
+                (Opcode::RangeNew, [dst.0, start.0, end.0], 3)
+            }
+            Instruction::RangeInclusive(dst, start, end) => {
+                (Opcode::RangeInclusive, [dst.0, start.0, end.0], 3)
+            }
+            Instruction::VecFrom(dst, range) => (Opcode::VecFrom, [dst.0, range.0, 0], 2),
+            Instruction::VecNew(dst, list) => (Opcode::VecNew, [dst.0, list.0, 0], 2),
+            Instruction::VecPush(target, value) => (Opcode::VecPush, [target.0, value.0, 0], 2),
+            Instruction::VecLength(dst, vector) => (Opcode::VecLength, [dst.0, vector.0, 0], 2),
+            Instruction::CellNew(dst, value) => (Opcode::CellNew, [dst.0, value.0, 0], 2),
+            Instruction::CellRead(dst, cell) => (Opcode::CellRead, [dst.0, cell.0, 0], 2),
+            Instruction::CellWrite(cell, value) => (Opcode::CellWrite, [cell.0, value.0, 0], 2),
+            Instruction::CellReplace(dst, cell, value) => {
+                (Opcode::CellReplace, [dst.0, cell.0, value.0], 3)
+            }
             Instruction::SliceOf(dst, src) => (Opcode::SliceOf, [dst.0, src.0, 0], 2),
             Instruction::SliceLength(dst, src) => (Opcode::SliceLength, [dst.0, src.0, 0], 2),
             Instruction::Sum(dst, src) => (Opcode::Sum, [dst.0, src.0, 0], 2),
@@ -395,6 +421,16 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::TextRight => Instruction::TextRight(reg(0), reg(1), reg(2)),
             Opcode::TextMid => Instruction::TextMid(reg(0), reg(1), list(2)),
             Opcode::Move => Instruction::Move(reg(0), reg(1)),
+            Opcode::RangeNew => Instruction::RangeNew(reg(0), reg(1), reg(2)),
+            Opcode::RangeInclusive => Instruction::RangeInclusive(reg(0), reg(1), reg(2)),
+            Opcode::VecFrom => Instruction::VecFrom(reg(0), reg(1)),
+            Opcode::VecNew => Instruction::VecNew(reg(0), list(1)),
+            Opcode::VecPush => Instruction::VecPush(reg(0), reg(1)),
+            Opcode::VecLength => Instruction::VecLength(reg(0), reg(1)),
+            Opcode::CellNew => Instruction::CellNew(reg(0), reg(1)),
+            Opcode::CellRead => Instruction::CellRead(reg(0), reg(1)),
+            Opcode::CellWrite => Instruction::CellWrite(reg(0), reg(1)),
+            Opcode::CellReplace => Instruction::CellReplace(reg(0), reg(1), reg(2)),
             Opcode::SliceOf => Instruction::SliceOf(reg(0), reg(1)),
             Opcode::SliceLength => Instruction::SliceLength(reg(0), reg(1)),
             Opcode::Sum => Instruction::Sum(reg(0), reg(1)),

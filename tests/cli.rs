@@ -685,6 +685,11 @@ fn verified_engine_matches_the_interpreter_on_supported_programs() {
         "examples/enums/recursive.ya",
         "examples/rc-ownership.ya",
         "examples/enums/ownership.ya",
+        "examples/mergesort.ya",
+        "examples/quicksort.ya",
+        "examples/knapsack.ya",
+        "examples/gc-cycles.ya",
+        "examples/gc-sharing.ya",
     ] {
         let run = |engine| cli(&["run", example, "--engine", engine]).output().unwrap();
         let verified = run("verified");

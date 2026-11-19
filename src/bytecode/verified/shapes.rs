@@ -4,11 +4,10 @@
 
 use super::{ManagedId, ScalarType, Shape, ShapeId, Signature, SignatureId, ValueType, array_len};
 use crate::Type;
-use cyallo_ast::{EnumEncoding, EnumIdentity, Locality, MemoryKind, NumberKind, VariantId};
+use cyallo_ast::{
+    EnumEncoding, EnumIdentity, Locality, MemoryKind, NumberKind, StorageKind, VariantId,
+};
 use std::collections::HashMap;
-
-/// The suffix of the standard weak reference's declared name.
-const WEAK_NAME_SUFFIX: &str = "$Type$Weak";
 
 /// The module-level tables an interner produced.
 pub(super) struct Tables {
@@ -31,8 +30,8 @@ pub(super) struct Shapes {
     encodings: HashMap<ShapeId, Vec<EnumEncoding>>,
     /// Tuples and arrays are structural: equal components, equal shape.
     structural: HashMap<Shape, ShapeId>,
-    /// Records are nominal: the same name with equal field types.
-    records: HashMap<(Box<str>, Box<[ValueType]>), ShapeId>,
+    /// Records are nominal: one shape per declared name.
+    record_names: HashMap<Box<str>, ShapeId>,
 }
 
 impl Shapes {
@@ -68,27 +67,36 @@ impl Shapes {
                 };
                 ValueType::Function(SignatureId(u32::try_from(index).ok()?))
             }
-            Type::Record(_, fields) | Type::AnonymousRecord(fields) if !fields.is_empty() => {
+            Type::Record(name, fields) if !fields.is_empty() => {
                 if let Some(&id) = self.by_type.get(ty) {
                     return Some(ValueType::Composite(id));
                 }
-                let name: Box<str> = match ty {
-                    Type::Record(name, _) => name.clone(),
-                    _ => "".into(),
+                if let Some(&id) = self.record_names.get(name) {
+                    return Some(ValueType::Composite(id));
+                }
+                // The shape's number is reserved first so that a handle inside
+                // its fields can refer back to the record by name.
+                let id = self.intern(ty, Shape::Tuple(Box::new([])), None)?;
+                self.record_names.insert(name.clone(), id);
+                let fields = fields
+                    .iter()
+                    .map(|(_, field)| self.value(field))
+                    .collect::<Option<Box<[_]>>>();
+                let Some(fields) = fields else {
+                    self.by_type.remove(ty);
+                    self.record_names.remove(name);
+                    return None;
                 };
+                self.shapes[id.index()] = Shape::Tuple(fields);
+                ValueType::Composite(id)
+            }
+            Type::RecordRef(name) => ValueType::Composite(*self.record_names.get(name)?),
+            Type::AnonymousRecord(fields) if !fields.is_empty() => {
                 let fields = fields
                     .iter()
                     .map(|(_, field)| self.value(field))
                     .collect::<Option<Box<[_]>>>()?;
-                // The same record can be spelled with a handle written out or
-                // as a reference back to an enum. Both are one shape.
-                if let Some(&id) = self.records.get(&(name.clone(), fields.clone())) {
-                    self.by_type.insert(ty.clone(), id);
-                    return Some(ValueType::Composite(id));
-                }
-                let id = self.intern(ty, Shape::Tuple(fields.clone()), None)?;
-                self.records.insert((name, fields), id);
-                ValueType::Composite(id)
+                self.structural_shape(Shape::Tuple(fields))?
             }
             Type::Tuple(items) if !items.is_empty() => {
                 if let Some(&id) = self.by_type.get(ty) {
@@ -164,9 +172,7 @@ impl Shapes {
                 ValueType::Composite(id)
             }
             Type::EnumRef(identity, _) => ValueType::Composite(*self.enum_ids.get(&**identity)?),
-            Type::Opaque(name, arguments, _) if name.ends_with(WEAK_NAME_SUFFIX) => {
-                // The standard weak reference is spelled by name until opaque
-                // types come from provider bindings.
+            Type::Opaque(_, arguments, traits) if traits.weak() => {
                 let [owner] = arguments.as_slice() else {
                     return None;
                 };
@@ -174,6 +180,25 @@ impl Shapes {
                     return None;
                 };
                 ValueType::Weak(managed)
+            }
+            // A growable collection, a mutable cell and a range are described
+            // by the traits and kinds their declarations carry.
+            Type::Opaque(_, arguments, traits)
+                if traits.collection() && !traits.double_ended() && arguments.len() == 1 =>
+            {
+                let element = self.value(&arguments[0])?;
+                self.structural_shape(Shape::Vec { element })?
+            }
+            Type::Opaque(_, arguments, traits) if traits.deref() && arguments.len() == 1 => {
+                let element = self.value(&arguments[0])?;
+                self.structural_shape(Shape::Cell { element })?
+            }
+            Type::Storage(StorageKind::Range, element) => {
+                let bound = self.value(element)?;
+                if bound != ValueType::Scalar(ScalarType::I64) {
+                    return None;
+                }
+                self.structural_shape(Shape::Tuple(Box::new([bound, bound])))?
             }
             Type::Managed {
                 kind: kind @ (MemoryKind::Gc | MemoryKind::Rc),
@@ -197,6 +222,16 @@ impl Shapes {
             }
             _ => return None,
         })
+    }
+
+    /// The composite type of a structural shape, interned once.
+    fn structural_shape(&mut self, shape: Shape) -> Option<ValueType> {
+        if let Some(&id) = self.structural.get(&shape) {
+            return Some(ValueType::Composite(id));
+        }
+        let id = self.push_shape(shape.clone())?;
+        self.structural.insert(shape, id);
+        Some(ValueType::Composite(id))
     }
 
     /// Add a shape that no checked type names.
@@ -267,6 +302,7 @@ impl Shapes {
                     .flatten()
                     .any(|&payload| self.needs_drop(payload)),
                 Some(Shape::Array { element, .. }) => self.needs_drop(*element),
+                Some(Shape::Vec { element } | Shape::Cell { element }) => self.needs_drop(*element),
                 // A view owns nothing.
                 Some(Shape::Slice { .. }) => false,
                 None => false,

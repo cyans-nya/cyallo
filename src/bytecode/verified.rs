@@ -33,12 +33,12 @@ pub use run::{
 };
 pub use sdk::SdkCompileError;
 
-/// Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 19;
+pub const FORMAT_VERSION: u32 = 20;
 
 macro_rules! index {
     ($name:ident) => {
@@ -143,10 +143,17 @@ pub enum Shape {
         element: ValueType,
         bounds: Box<[(i64, i64)]>,
     },
+    /// A growable sequence of initialized elements, indexed from zero.
+    Vec { element: ValueType },
+    /// A mutable cell: one value that can be replaced through a shared loan.
+    Cell { element: ValueType },
     /// A window onto the elements of an array. It has no storage of its own:
     /// it exists only as the pointee of a loan.
     Slice { element: ValueType },
 }
+
+/// A 64-bit signed integer value.
+const I64: ValueType = ValueType::Scalar(ScalarType::I64);
 
 /// An array's element type and per-dimension inclusive bounds.
 type ArrayShape<'a> = (ValueType, &'a [(i64, i64)]);
@@ -457,6 +464,26 @@ pub enum Instruction {
     GcNew(Register, Register),
     /// Borrow the heap object a handle refers to.
     GcBorrow(Register, Register),
+    /// A half-open integer range.
+    RangeNew(Register, Register, Register),
+    /// A closed integer range, stored half-open. The end must not overflow.
+    RangeInclusive(Register, Register, Register),
+    /// A vector of the integers in a range.
+    VecFrom(Register, Register),
+    /// A vector of the listed elements.
+    VecNew(Register, OperandListId),
+    /// Append to the vector held by an owner or behind an exclusive loan.
+    VecPush(Register, Register),
+    /// Number of elements in a vector.
+    VecLength(Register, Register),
+    /// A cell holding the value.
+    CellNew(Register, Register),
+    /// A copy of the value a cell holds.
+    CellRead(Register, Register),
+    /// Replace the value a cell holds, through any loan to the cell.
+    CellWrite(Register, Register),
+    /// Replace the value a cell holds and return the old one.
+    CellReplace(Register, Register, Register),
     /// View the elements of an array, or of another slice, through a loan.
     SliceOf(Register, Register),
     /// Number of elements in an array or slice.
@@ -604,6 +631,17 @@ impl Instruction {
             }
             WriteLoan(loan, value) => ([Some(loan), Some(value)], &[], None),
             BorrowGlobal(dst, _) => ([None, None], &[], Some(dst)),
+            RangeNew(dst, start, end) | RangeInclusive(dst, start, end) => {
+                ([Some(start), Some(end)], &[], Some(dst))
+            }
+            VecFrom(dst, src) | VecLength(dst, src) | CellNew(dst, src) | CellRead(dst, src) => {
+                ([Some(src), None], &[], Some(dst))
+            }
+            VecNew(dst, list) => ([None, None], &lists[list.index()], Some(dst)),
+            VecPush(target, value) | CellWrite(target, value) => {
+                ([Some(target), Some(value)], &[], None)
+            }
+            CellReplace(dst, cell, value) => ([Some(cell), Some(value)], &[], Some(dst)),
             SliceOf(dst, src) | SliceLength(dst, src) | Sum(dst, src) => {
                 ([Some(src), None], &[], Some(dst))
             }
@@ -961,6 +999,24 @@ impl VerifiedFunction {
         }
     }
 
+    /// Whether a verified register holds a vector.
+    fn is_vec(&self, register: Register) -> bool {
+        matches!(
+            self.register_kind(register),
+            Ok(RegisterType::Composite(shape))
+                if matches!(self.shapes.get(shape.index()), Some(Shape::Vec { .. }))
+        )
+    }
+
+    /// Whether a verified projection starts from a vector.
+    fn projects_from_vec(&self, source: Register) -> bool {
+        matches!(
+            self.projection_base(source),
+            Ok((ValueType::Composite(shape), ..))
+                if matches!(self.shapes.get(shape.index()), Some(Shape::Vec { .. }))
+        )
+    }
+
     /// Bounds of a verified array register.
     fn array_bounds(&self, register: Register) -> ArrayShape<'_> {
         match self.array_shape(register) {
@@ -998,6 +1054,7 @@ impl VerifiedFunction {
             Shape::Array { element, bounds } if matches!(bounds.as_ref(), [(0, _)]) => {
                 Ok((*element, false))
             }
+            Shape::Vec { element } => Ok((*element, false)),
             Shape::Slice { element } => Ok((*element, true)),
             _ => Err(InvalidBytecode::SliceSource(register)),
         }
@@ -1006,6 +1063,43 @@ impl VerifiedFunction {
     /// Whether a verified projection starts from a slice.
     fn projects_from_slice(&self, source: Register) -> bool {
         matches!(self.sequence(source), Ok((_, true)))
+    }
+
+    /// The element type of an array or vector, and the bounds an array's
+    /// indices must lie in. A vector takes one zero-based index.
+    fn indexed(&self, register: Register) -> Result<(ValueType, Vec<(i64, i64)>), InvalidBytecode> {
+        let RegisterType::Composite(id) = self.register_kind(register)? else {
+            return Err(InvalidBytecode::ExpectedArray(register));
+        };
+        match self.shape(id)? {
+            Shape::Array { element, bounds } => Ok((*element, bounds.to_vec())),
+            Shape::Vec { element } => Ok((*element, vec![(0, 0)])),
+            _ => Err(InvalidBytecode::ExpectedArray(register)),
+        }
+    }
+
+    /// The element type of the vector an owner holds or a loan points at.
+    fn vec_element(&self, register: Register) -> Result<ValueType, InvalidBytecode> {
+        let (container, ..) = self.projection_base(register)?;
+        let ValueType::Composite(shape) = container else {
+            return Err(InvalidBytecode::ExpectedVec(register));
+        };
+        match self.shape(shape)? {
+            Shape::Vec { element } => Ok(*element),
+            _ => Err(InvalidBytecode::ExpectedVec(register)),
+        }
+    }
+
+    /// The element type of the cell an owner holds or a loan points at.
+    fn cell_element(&self, register: Register) -> Result<ValueType, InvalidBytecode> {
+        let (container, ..) = self.projection_base(register)?;
+        let ValueType::Composite(shape) = container else {
+            return Err(InvalidBytecode::ExpectedCell(register));
+        };
+        match self.shape(shape)? {
+            Shape::Cell { element } => Ok(*element),
+            _ => Err(InvalidBytecode::ExpectedCell(register)),
+        }
     }
 
     fn array_shape(&self, register: Register) -> Result<ArrayShape<'_>, InvalidBytecode> {
@@ -1189,6 +1283,8 @@ pub enum InvalidBytecode {
     ExpectedArray(Register),
     /// A slice exists only behind a loan.
     UnsizedValue(Register),
+    ExpectedVec(Register),
+    ExpectedCell(Register),
     SliceSource(Register),
     ExpectedText(Register),
     UnknownText(TextId),
@@ -1389,7 +1485,10 @@ fn shape_components(shape: &Shape) -> Vec<ValueType> {
     match shape {
         Shape::Tuple(fields) => fields.to_vec(),
         Shape::Enum(variants) => variants.iter().copied().flatten().collect(),
-        Shape::Array { element, .. } | Shape::Slice { element } => vec![*element],
+        Shape::Array { element, .. }
+        | Shape::Slice { element }
+        | Shape::Vec { element }
+        | Shape::Cell { element } => vec![*element],
     }
 }
 
@@ -2021,8 +2120,8 @@ impl VerifiedFunction {
                         self.require_indices(src, bounds, list)?;
                         self.require_projection(dst, src, *element)
                     }
-                    // A slice is indexed from zero by one integer.
-                    Shape::Slice { element } => {
+                    // A slice or vector is indexed from zero by one integer.
+                    Shape::Slice { element } | Shape::Vec { element } => {
                         self.require_indices(src, &[(0, 0)], list)?;
                         self.require_projection(dst, src, *element)
                     }
@@ -2360,17 +2459,67 @@ impl VerifiedFunction {
                     .try_for_each(|&item| self.require_value(item, element))
             }
             Instruction::ArrayLoad(dst, array, list) => {
-                let (element, bounds) = self.array_shape(array)?;
-                self.require_indices(array, bounds, list)?;
+                let (element, bounds) = self.indexed(array)?;
+                self.require_indices(array, &bounds, list)?;
                 self.require_value(dst, element)
             }
             Instruction::ArrayStore(array, list, value) => {
-                let (element, bounds) = self.array_shape(array)?;
-                self.require_indices(array, bounds, list)?;
+                let (element, bounds) = self.indexed(array)?;
+                self.require_indices(array, &bounds, list)?;
                 self.require_value(value, element)
             }
+            Instruction::RangeNew(dst, start, end)
+            | Instruction::RangeInclusive(dst, start, end) => {
+                self.require_type(start, ScalarType::I64)?;
+                self.require_type(end, ScalarType::I64)?;
+                if self.tuple_fields(dst)? != [I64, I64] {
+                    return Err(InvalidBytecode::ExpectedTuple(dst));
+                }
+                Ok(())
+            }
+            Instruction::VecFrom(dst, range) => {
+                if self.vec_element(dst)? != I64 || self.tuple_fields(range)? != [I64, I64] {
+                    return Err(InvalidBytecode::ExpectedVec(dst));
+                }
+                Ok(())
+            }
+            Instruction::VecNew(dst, list) => {
+                let element = self.vec_element(dst)?;
+                self.operand_list(list)?
+                    .iter()
+                    .try_for_each(|&item| self.require_value(item, element))
+            }
+            Instruction::VecPush(target, value) => {
+                let element = self.vec_element(target)?;
+                let (_, access, _) = self.projection_base(target)?;
+                if self.register_kind(target)?.is_loan() && access != LoanAccess::Exclusive {
+                    return Err(InvalidBytecode::ExpectedExclusiveLoan(target));
+                }
+                self.require_value(value, element)
+            }
+            Instruction::VecLength(dst, vector) => {
+                self.vec_element(vector)?;
+                self.require_type(dst, ScalarType::U64)
+            }
+            Instruction::CellNew(dst, value) => {
+                let element = self.cell_element(dst)?;
+                self.require_value(value, element)
+            }
+            Instruction::CellRead(dst, cell) => {
+                let element = self.cell_element(cell)?;
+                self.require_value(dst, element)
+            }
+            Instruction::CellWrite(cell, value) => {
+                let element = self.cell_element(cell)?;
+                self.require_value(value, element)
+            }
+            Instruction::CellReplace(dst, cell, value) => {
+                let element = self.cell_element(cell)?;
+                self.require_value(value, element)?;
+                self.require_value(dst, element)
+            }
             Instruction::ArrayLength(dst, array) => {
-                let (_, bounds) = self.array_shape(array)?;
+                let (_, bounds) = self.indexed(array)?;
                 if bounds.len() != 1 {
                     return Err(InvalidBytecode::ArrayRank {
                         register: array,

@@ -573,6 +573,44 @@ fn lower_operation(
             let owner = places.address(*src).ok_or_else(unsupported)?;
             Instruction::Borrow(register(*dst)?, owner)
         }
+        Op::Lookup(dst, Operation::Range(inclusive), args) if args.len() == 2 => {
+            let (dst, start, end) = (register(*dst)?, register(args[0])?, register(args[1])?);
+            if *inclusive {
+                Instruction::RangeInclusive(dst, start, end)
+            } else {
+                Instruction::RangeNew(dst, start, end)
+            }
+        }
+        Op::Lookup(dst, Operation::CollectionFrom(false), args) if args.len() == 1 => {
+            Instruction::VecFrom(register(*dst)?, register(args[0])?)
+        }
+        Op::Lookup(dst, Operation::CollectionLiteral(false), args) => {
+            let list = new_list(routine, sites, args.iter().map(|&item| register(item)))?;
+            Instruction::VecNew(register(*dst)?, list)
+        }
+        Op::Lookup(_, Operation::CollectionPush(false), args) if args.len() == 2 => {
+            let target = enum_place(places, args[0]).ok_or_else(unsupported)?;
+            Instruction::VecPush(target, register(args[1])?)
+        }
+        Op::Lookup(dst, Operation::CollectionLength, args) if args.len() == 1 => {
+            let vector = enum_place(places, args[0]).ok_or_else(unsupported)?;
+            Instruction::VecLength(register(*dst)?, vector)
+        }
+        Op::Lookup(dst, Operation::CellNew, args) if args.len() == 1 => {
+            Instruction::CellNew(register(*dst)?, register(args[0])?)
+        }
+        Op::Lookup(dst, Operation::CellRead, args) if args.len() == 1 => {
+            let cell = enum_place(places, args[0]).ok_or_else(unsupported)?;
+            Instruction::CellRead(register(*dst)?, cell)
+        }
+        Op::Lookup(_, Operation::CellWrite, args) if args.len() == 2 => {
+            let cell = enum_place(places, args[0]).ok_or_else(unsupported)?;
+            Instruction::CellWrite(cell, register(args[1])?)
+        }
+        Op::Lookup(dst, Operation::CellReplace, args) if args.len() == 2 => {
+            let cell = enum_place(places, args[0]).ok_or_else(unsupported)?;
+            Instruction::CellReplace(register(*dst)?, cell, register(args[1])?)
+        }
         Op::Lookup(dst, Operation::Slice(_), args) if args.len() == 1 => {
             Instruction::SliceOf(register(*dst)?, register(args[0])?)
         }
