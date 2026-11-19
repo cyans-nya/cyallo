@@ -238,6 +238,38 @@ pub enum RunError {
     },
 }
 
+impl RunError {
+    /// The source span of the failing instruction, when the failure has one.
+    pub fn span(&self) -> Option<Span> {
+        match self {
+            Self::IntegerOverflow { span, .. }
+            | Self::DivisionByZero { span, .. }
+            | Self::ZeroStep { span, .. }
+            | Self::Deadlock { span, .. }
+            | Self::NotTransferable { span, .. }
+            | Self::TaskLimit { span, .. }
+            | Self::ChannelLimit { span, .. }
+            | Self::Generator { span, .. }
+            | Self::Service { span, .. }
+            | Self::Object { span, .. }
+            | Self::Path { span, .. }
+            | Self::AllocationRejected { span, .. }
+            | Self::InputExhausted { span, .. }
+            | Self::InputInvalid { span, .. }
+            | Self::EnumVariant { span, .. }
+            | Self::MovedValue { span, .. }
+            | Self::HeapExhausted { span, .. }
+            | Self::UninitializedGlobal { span, .. }
+            | Self::IndexOutOfBounds { span, .. }
+            | Self::UninitializedElement { span, .. }
+            | Self::Text { span, .. }
+            | Self::ConversionOutOfRange { span, .. }
+            | Self::ReachedTrap { span, .. } => Some(*span),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for RunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1876,6 +1908,8 @@ pub struct Activation {
     stalled: usize,
     /// Instructions the running task may still run before a turn passes.
     quantum: usize,
+    /// The last resume stopped on an input instruction that has no line yet.
+    awaiting_input: bool,
     memory: Memory,
     limits: ExecutionLimits,
     instructions_executed: usize,
@@ -1938,6 +1972,8 @@ enum StepOutcome {
     Continue,
     /// The instruction could not finish yet and will be tried again.
     Blocked,
+    /// An input instruction found no line and the source waits for one.
+    AwaitInput,
     /// A native function is called through an erased value: the arguments with
     /// their types, and the register that receives the erased result.
     NativeCall {
@@ -2134,6 +2170,7 @@ impl VerifiedModule {
             input: InputSource::default(),
             stalled: 0,
             quantum: QUANTUM,
+            awaiting_input: false,
             memory: Memory::new(self.globals.len()),
             limits,
             instructions_executed,
@@ -2197,6 +2234,7 @@ impl VerifiedModule {
             input: InputSource::default(),
             stalled: 0,
             quantum: QUANTUM,
+            awaiting_input: false,
             memory: Memory::new(self.globals.len()),
             limits,
             instructions_executed: 0,
@@ -2683,7 +2721,14 @@ impl VerifiedModule {
                         }
                     }
                 };
-                let line = input.next_line().ok_or_else(|| read_error(true))?;
+                let line = match input.next_line() {
+                    Some(line) => line,
+                    None if input.waits => {
+                        stack[depth - 1].pc -= 1;
+                        return Ok(StepOutcome::AwaitInput);
+                    }
+                    None => return Err(read_error(true)),
+                };
                 let value = read_input(&line, kind).ok_or_else(|| read_error(false))?;
                 if matches!(body.instructions[pc], Instruction::Input(..)) {
                     frame.set_value(layout, target, value);
@@ -4956,11 +5001,27 @@ impl fmt::Debug for OutputSink {
 
 /// Supplies input lines, without their terminators. A line is consumed
 /// exactly once, when its input instruction executes; `None` is the end of input.
-pub struct InputSource(Box<dyn FnMut() -> Option<String> + Send>);
+pub struct InputSource {
+    next: Box<dyn FnMut() -> Option<String> + Send>,
+    /// When no line is left, wait for more instead of failing.
+    waits: bool,
+}
 
 impl InputSource {
     pub fn new(next: impl FnMut() -> Option<String> + Send + 'static) -> Self {
-        Self(Box::new(next))
+        Self {
+            next: Box::new(next),
+            waits: false,
+        }
+    }
+
+    /// Like [`Self::new`], but an empty source is not the end of input: the
+    /// activation pauses on the input instruction until a line is available.
+    pub fn waiting(next: impl FnMut() -> Option<String> + Send + 'static) -> Self {
+        Self {
+            next: Box::new(next),
+            waits: true,
+        }
     }
 
     /// Read lines from standard input.
@@ -4985,7 +5046,7 @@ impl InputSource {
     }
 
     fn next_line(&mut self) -> Option<String> {
-        (self.0)()
+        (self.next)()
     }
 }
 
@@ -5293,6 +5354,11 @@ impl Activation {
         }
     }
 
+    /// Whether the last slice stopped on an input instruction with no line.
+    pub fn awaiting_input(&self) -> bool {
+        self.awaiting_input
+    }
+
     /// Replace the origin of input lines. Set before the first slice.
     pub fn set_input(&mut self, source: InputSource) {
         self.input = source;
@@ -5304,6 +5370,14 @@ impl Activation {
     }
 
     /// Instructions started across all slices, including a failing instruction.
+    /// Frames on the running task's stack.
+    pub fn depth(&self) -> usize {
+        match &self.state {
+            ExecutionState::Active(stack) => stack.len(),
+            _ => 0,
+        }
+    }
+
     pub fn instructions_executed(&self) -> usize {
         self.instructions_executed
     }
@@ -5570,6 +5644,7 @@ impl Activation {
         let ExecutionState::Active(stack) = &mut self.state else {
             return self.status();
         };
+        self.awaiting_input = false;
         let available = self.limits.fuel - self.instructions_executed;
         for _ in 0..budget.min(available) {
             self.instructions_executed += 1;
@@ -5647,6 +5722,12 @@ impl Activation {
                     } else {
                         self.module.rotate(stack, &mut self.memory, false);
                     }
+                }
+                Ok(StepOutcome::AwaitInput) => {
+                    // Nothing ran: give the instruction back to the budget.
+                    self.instructions_executed -= 1;
+                    self.awaiting_input = true;
+                    return self.status();
                 }
                 Ok(StepOutcome::Load { .. } | StepOutcome::NativeCall { .. }) => {
                     unreachable!("a load or call was just performed")

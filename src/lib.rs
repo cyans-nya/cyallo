@@ -37,6 +37,7 @@ pub mod metrics;
 pub use cyallo_ir::osr;
 pub mod repl;
 pub mod runtime;
+pub mod vm;
 pub use compiler::{
     CompileOptions, Dialect, compile, compile_for_execution, compile_snapshot,
     compile_snapshot_for_execution, compile_with_core_package, compile_with_import_policy,

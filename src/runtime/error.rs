@@ -60,6 +60,15 @@ pub enum RuntimeError {
     Engine(EngineError),
     /// The VM met a state the type checker should have excluded.
     Invariant(Invariant),
+    /// A failure of the verified interpreter that has no older counterpart.
+    Verified(VerifiedFailure),
+}
+
+/// A failure of the verified interpreter: a diagnostic code and its message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifiedFailure {
+    pub code: &'static str,
+    pub message: Box<str>,
 }
 impl RuntimeError {
     /// Stable diagnostic code for each failure family.
@@ -84,6 +93,7 @@ impl RuntimeError {
             Self::DeferredCheck(diagnostic) => diagnostic.code,
             Self::Engine(_) => "R900",
             Self::Invariant(_) => "R901",
+            Self::Verified(failure) => failure.code,
         }
     }
 }
@@ -113,6 +123,7 @@ impl fmt::Display for RuntimeError {
             Self::DeferredCheck(diagnostic) => f.write_str(&diagnostic.message),
             Self::Engine(error) => error.fmt(f),
             Self::Invariant(error) => write!(f, "internal error: {error}"),
+            Self::Verified(failure) => f.write_str(&failure.message),
         }
     }
 }

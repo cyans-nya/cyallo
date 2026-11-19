@@ -26,6 +26,7 @@ pub use error::{
     AllocatorError, ArithmeticError, BoundsError, EngineError, GcError, GeneratorError,
     IdentitySpace, InputError, Invariant, LookupError, OwnershipError, ResourceLimit, RuntimeError,
     RuntimeFailure, ServiceError, TextError, UninitializedRead, UnwrapError, ValueKind,
+    VerifiedFailure,
 };
 pub use lookup::LookupStats;
 use native::{NativeSlot, NativeStorage, NativeView};
