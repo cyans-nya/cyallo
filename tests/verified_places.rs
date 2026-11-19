@@ -145,6 +145,7 @@ mod images {
             shapes: Box::new([pair()]),
             signatures: Box::new([]),
             globals: Box::new([]),
+            managed: Box::new([]),
             functions: Box::new([FunctionImage {
                 registers: registers.into(),
                 parameters: Box::new([]),

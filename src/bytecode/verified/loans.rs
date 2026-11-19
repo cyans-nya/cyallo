@@ -140,7 +140,15 @@ impl Places {
         for op in &all_ops {
             match op {
                 Op::Store(addr, _) => written[*addr] = true,
-                Op::Move(_, addr) if projects[*addr] => written[*addr] = true,
+                Op::Move(dst, addr)
+                    if projects[*addr]
+                        && matches!(
+                            function.registers[*dst],
+                            Type::Reference { mutable: true, .. }
+                        ) =>
+                {
+                    written[*addr] = true;
+                }
                 _ => {}
             }
         }
@@ -182,6 +190,23 @@ impl Places {
             };
             loan_types[dst] = Some((access, pointee));
             origins.push((dst, LoanOrigin::Global(global)));
+        }
+        // The address of a heap object is a place rooted at the object its
+        // handle names, as exclusive as its uses require.
+        for op in &all_ops {
+            if let Op::ManagedAddress(dst, handle) = op
+                && let RegisterType::Gc(managed) = registers[*handle]
+                && let Some(pointee) = shapes.managed_pointee(managed)
+            {
+                let access = if written[*dst] || moved_mut[*dst] {
+                    LoanAccess::Exclusive
+                } else {
+                    LoanAccess::Shared
+                };
+                loan_types[*dst] = Some((access, pointee));
+                registers[*dst] = RegisterType::Unused;
+                origins.push((*dst, LoanOrigin::Heap(managed)));
+            }
         }
         let mut elements: Vec<Option<ElementPlace>> = vec![None; count];
         for op in &all_ops {

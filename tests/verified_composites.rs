@@ -160,6 +160,7 @@ mod images {
             shapes: shapes.into(),
             signatures: Box::new([]),
             globals: Box::new([]),
+            managed: Box::new([]),
             functions: Box::new([FunctionImage {
                 registers: registers.into(),
                 parameters: Box::new([]),
@@ -274,7 +275,7 @@ mod images {
         let code = vec![Return(None)];
         assert!(matches!(
             kind(image(vec![shape], vec![], vec![], code)),
-            InvalidBytecode::ShapeReference(_)
+            InvalidBytecode::ShapeCycle(_)
         ));
     }
 

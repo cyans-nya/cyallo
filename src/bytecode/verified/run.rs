@@ -72,6 +72,11 @@ pub enum RunError {
         instruction: InstructionId,
         span: Span,
     },
+    HeapExhausted {
+        function: FunctionId,
+        instruction: InstructionId,
+        span: Span,
+    },
     UninitializedGlobal {
         function: FunctionId,
         instruction: InstructionId,
@@ -172,6 +177,15 @@ impl fmt::Display for RunError {
             } => write!(
                 f,
                 "enum payload read of another variant in function {} at instruction {}",
+                function.0, instruction.0
+            ),
+            Self::HeapExhausted {
+                function,
+                instruction,
+                ..
+            } => write!(
+                f,
+                "the heap is full in function {} at instruction {}",
                 function.0, instruction.0
             ),
             Self::UninitializedGlobal {
@@ -281,6 +295,8 @@ enum FrameValue {
     Text(Arc<str>),
     Composite(Composite),
     Closure(Arc<Closure>),
+    /// A traced reference to the heap object at this index.
+    Handle(usize),
 }
 
 /// A routine and the values it captured by copy or move. The captures become
@@ -313,6 +329,143 @@ struct BorrowedPlace {
     path: Box<[Step]>,
 }
 
+/// Most objects the heap may hold after a collection.
+const MAX_HEAP_OBJECTS: usize = 1 << 22;
+/// Live objects at which the first collection runs.
+const INITIAL_COLLECTION_THRESHOLD: usize = 256;
+
+/// Occupancy of an activation's heap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeapStats {
+    pub live: usize,
+    pub peak: usize,
+    pub collections: usize,
+}
+
+/// A mark-sweep heap of objects that handles refer to. Handles are indices,
+/// so a collection never moves what a handle means.
+#[derive(Debug)]
+struct Heap {
+    slots: Vec<Option<FrameValue>>,
+    free: Vec<usize>,
+    live: usize,
+    peak: usize,
+    collections: usize,
+    threshold: usize,
+    stress: bool,
+}
+
+impl Heap {
+    fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            free: Vec::new(),
+            live: 0,
+            peak: 0,
+            collections: 0,
+            threshold: INITIAL_COLLECTION_THRESHOLD,
+            stress: false,
+        }
+    }
+
+    fn should_collect(&self) -> bool {
+        self.stress || self.live >= self.threshold
+    }
+
+    /// Store a value, or `None` when the heap is at its limit.
+    fn allocate(&mut self, value: FrameValue) -> Option<usize> {
+        if self.live >= MAX_HEAP_OBJECTS {
+            return None;
+        }
+        let index = match self.free.pop() {
+            Some(index) => {
+                self.slots[index] = Some(value);
+                index
+            }
+            None => {
+                self.slots.push(Some(value));
+                self.slots.len() - 1
+            }
+        };
+        self.live += 1;
+        self.peak = self.peak.max(self.live);
+        Some(index)
+    }
+}
+
+/// Everything an activation owns outside its frames.
+#[derive(Debug)]
+struct Memory {
+    /// Module-level variables. They start uninitialized.
+    globals: Vec<Option<FrameValue>>,
+    heap: Heap,
+}
+
+impl Memory {
+    fn new(globals: usize) -> Self {
+        Self {
+            globals: vec![None; globals],
+            heap: Heap::new(),
+        }
+    }
+
+    /// Free every object that no frame, variable or live object reaches.
+    fn collect(&mut self, stack: &[Frame]) {
+        let mut marks = vec![false; self.heap.slots.len()];
+        let mut pending = Vec::new();
+        for value in stack
+            .iter()
+            .flat_map(|frame| frame.slots.iter().flatten())
+            .chain(self.globals.iter().flatten())
+        {
+            trace(value, &mut marks, &mut pending);
+        }
+        while let Some(object) = pending.pop() {
+            if let Some(value) = &self.heap.slots[object] {
+                trace(value, &mut marks, &mut pending);
+            }
+        }
+        for (index, marked) in marks.iter().enumerate() {
+            if !marked && self.heap.slots[index].take().is_some() {
+                self.heap.free.push(index);
+                self.heap.live -= 1;
+            }
+        }
+        self.heap.collections += 1;
+        self.heap.threshold = INITIAL_COLLECTION_THRESHOLD.max(self.heap.live * 2);
+    }
+}
+
+/// Mark every object a value refers to. Objects found are queued so their own
+/// contents are visited once.
+fn trace(value: &FrameValue, marks: &mut [bool], pending: &mut Vec<usize>) {
+    let mut mark = |object: usize| {
+        if !std::mem::replace(&mut marks[object], true) {
+            pending.push(object);
+        }
+    };
+    let mut stack = vec![value];
+    while let Some(value) = stack.pop() {
+        match value {
+            FrameValue::Handle(object) => mark(*object),
+            FrameValue::Loan(place) => {
+                if let Root::Heap(object) = place.root {
+                    mark(object);
+                }
+            }
+            FrameValue::Composite(Composite::Tuple(fields)) => stack.extend(fields.iter()),
+            FrameValue::Composite(Composite::Enum { payload, .. }) => {
+                stack.extend(payload.as_deref());
+            }
+            FrameValue::Composite(Composite::Array(elements)) => {
+                stack.extend(elements.iter().flatten());
+            }
+            FrameValue::Closure(closure) => stack.extend(closure.captures.iter()),
+            FrameValue::Scalar(_) | FrameValue::Text(_) => {}
+        }
+    }
+}
+
 /// What a borrowed place starts from.
 #[derive(Debug, Clone, Copy)]
 enum Root {
@@ -320,6 +473,8 @@ enum Root {
     Frame { frame: usize, register: Register },
     /// A module-level variable.
     Global(GlobalId),
+    /// The heap object at this index.
+    Heap(usize),
 }
 
 /// One projection step into a composite value.
@@ -427,7 +582,8 @@ impl Frame {
             FrameValue::Loan(_)
             | FrameValue::Text(_)
             | FrameValue::Composite(_)
-            | FrameValue::Closure(_) => {
+            | FrameValue::Closure(_)
+            | FrameValue::Handle(_) => {
                 unreachable!("verified scalar operand")
             }
         }
@@ -439,7 +595,8 @@ impl Frame {
             FrameValue::Scalar(_)
             | FrameValue::Text(_)
             | FrameValue::Composite(_)
-            | FrameValue::Closure(_) => {
+            | FrameValue::Closure(_)
+            | FrameValue::Handle(_) => {
                 unreachable!("verified loan operand")
             }
         }
@@ -513,8 +670,7 @@ fn instruction_id(pc: usize) -> InstructionId {
 pub struct Activation {
     module: VerifiedModule,
     output: OutputSink,
-    /// Module-level variables. They start uninitialized.
-    globals: Vec<Option<FrameValue>>,
+    memory: Memory,
     limits: ExecutionLimits,
     instructions_executed: usize,
     state: ExecutionState,
@@ -666,7 +822,7 @@ impl VerifiedModule {
         Ok(Activation {
             module: self.clone(),
             output: OutputSink::default(),
-            globals: vec![None; self.globals.len()],
+            memory: Memory::new(self.globals.len()),
             limits,
             instructions_executed,
             state: ExecutionState::Active(frames),
@@ -717,7 +873,7 @@ impl VerifiedModule {
         Ok(Activation {
             module: self.clone(),
             output: OutputSink::default(),
-            globals: vec![None; self.globals.len()],
+            memory: Memory::new(self.globals.len()),
             limits,
             instructions_executed: 0,
             state: ExecutionState::Active(vec![entry]),
@@ -753,7 +909,7 @@ impl VerifiedModule {
     fn step(
         &self,
         stack: &mut Vec<Frame>,
-        globals: &mut [Option<FrameValue>],
+        memory: &mut Memory,
         max_frames: usize,
         output: &mut OutputSink,
     ) -> Result<StepOutcome, RunError> {
@@ -785,6 +941,28 @@ impl VerifiedModule {
                 };
                 frame.set_value(layout, loan, FrameValue::Loan(place));
             }
+            Instruction::GcNew(dst, value) => {
+                let value = frame.value(layout, value);
+                if memory.heap.should_collect() {
+                    memory.collect(stack);
+                }
+                let handle = memory.heap.allocate(value).ok_or(RunError::HeapExhausted {
+                    function,
+                    instruction: from,
+                    span: body.spans[pc],
+                })?;
+                stack[depth - 1].set_value(layout, dst, FrameValue::Handle(handle));
+            }
+            Instruction::GcBorrow(dst, handle) => {
+                let FrameValue::Handle(object) = frame.value(layout, handle) else {
+                    unreachable!("verified handle operand");
+                };
+                let place = BorrowedPlace {
+                    root: Root::Heap(object),
+                    path: Box::new([]),
+                };
+                frame.set_value(layout, dst, FrameValue::Loan(place));
+            }
             Instruction::BorrowGlobal(dst, global) => {
                 let place = BorrowedPlace {
                     root: Root::Global(global),
@@ -800,7 +978,7 @@ impl VerifiedModule {
                     span: body.spans[pc],
                 };
                 let root = self
-                    .root_value(stack, globals, &place.root)
+                    .root_value(stack, memory, &place.root)
                     .ok_or(uninitialized)?;
                 let value = read_place(&root, &place.path)
                     .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
@@ -809,7 +987,7 @@ impl VerifiedModule {
             Instruction::WriteLoan(loan, value) => {
                 let place = frame.loan(layout, loan);
                 let value = frame.value(layout, value);
-                let slot = self.root_slot(stack, globals, &place.root);
+                let slot = self.root_slot(stack, memory, &place.root);
                 match (slot, place.path.is_empty()) {
                     (slot, true) => *slot = Some(value),
                     (Some(root), false) => write_place(root, &place.path, value)
@@ -830,7 +1008,7 @@ impl VerifiedModule {
             Instruction::LoanPayload(dst, src, variant) => {
                 let place = project_base(body, frame, layout, depth, src, Step::Payload(variant));
                 // The variant must be held when the borrow is taken.
-                let root = self.root_value(stack, globals, &place.root).ok_or(
+                let root = self.root_value(stack, memory, &place.root).ok_or(
                     RunError::UninitializedGlobal {
                         function,
                         instruction: from,
@@ -989,11 +1167,28 @@ impl VerifiedModule {
                 );
             }
             Instruction::EnumIs(dst, src, variant) => {
-                let Composite::Enum { variant: held, .. } = frame.composite(layout, src) else {
-                    unreachable!("verified enum operand");
+                let is = if matches!(body.registers()[src.index()], RegisterType::Loan { .. }) {
+                    let place = frame.loan(layout, src);
+                    let root = self.root_value(stack, memory, &place.root).ok_or(
+                        RunError::UninitializedGlobal {
+                            function,
+                            instruction: from,
+                            span: body.spans[pc],
+                        },
+                    )?;
+                    let held = read_place(&root, &place.path)
+                        .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                    let FrameValue::Composite(Composite::Enum { variant: held, .. }) = held else {
+                        unreachable!("verified enum operand");
+                    };
+                    held == variant
+                } else {
+                    let Composite::Enum { variant: held, .. } = frame.composite(layout, src) else {
+                        unreachable!("verified enum operand");
+                    };
+                    *held == variant
                 };
-                let is = *held == variant;
-                frame.set(layout, dst, Scalar::Bool(is));
+                stack[depth - 1].set(layout, dst, Scalar::Bool(is));
             }
             Instruction::EnumPayload(dst, src, variant) => {
                 let Composite::Enum {
@@ -1250,26 +1445,22 @@ impl VerifiedModule {
 
     /// A copy of the value at a place's root, or `None` when a global has
     /// not been assigned yet.
-    fn root_value(
-        &self,
-        stack: &[Frame],
-        globals: &[Option<FrameValue>],
-        root: &Root,
-    ) -> Option<FrameValue> {
+    fn root_value(&self, stack: &[Frame], memory: &Memory, root: &Root) -> Option<FrameValue> {
         match *root {
             Root::Frame { frame, register } => {
                 let owner = &stack[frame];
                 let layout = self.functions[owner.function.index()].frame_layout();
                 Some(owner.value(layout, register))
             }
-            Root::Global(global) => globals[global.index()].clone(),
+            Root::Global(global) => memory.globals[global.index()].clone(),
+            Root::Heap(object) => memory.heap.slots[object].clone(),
         }
     }
 
     fn root_slot<'a>(
         &self,
         stack: &'a mut [Frame],
-        globals: &'a mut [Option<FrameValue>],
+        memory: &'a mut Memory,
         root: &Root,
     ) -> &'a mut Option<FrameValue> {
         match *root {
@@ -1278,7 +1469,8 @@ impl VerifiedModule {
                 let layout = self.functions[owner.function.index()].frame_layout();
                 owner.slot_mut(layout, register)
             }
-            Root::Global(global) => &mut globals[global.index()],
+            Root::Global(global) => &mut memory.globals[global.index()],
+            Root::Heap(object) => &mut memory.heap.slots[object],
         }
     }
 
@@ -1388,7 +1580,13 @@ fn render_output(template: &OutputTemplate, arguments: &[FrameValue]) -> String 
                 (TextStyle::Plain, FrameValue::Scalar(Scalar::Bool(value))) => {
                     line.push_str(if *value { "true" } else { "false" });
                 }
-                (_, FrameValue::Loan(_) | FrameValue::Composite(_) | FrameValue::Closure(_)) => {
+                (
+                    _,
+                    FrameValue::Loan(_)
+                    | FrameValue::Composite(_)
+                    | FrameValue::Closure(_)
+                    | FrameValue::Handle(_),
+                ) => {
                     unreachable!("verified output argument is a scalar or text")
                 }
             },
@@ -1398,6 +1596,21 @@ fn render_output(template: &OutputTemplate, arguments: &[FrameValue]) -> String 
 }
 
 impl Activation {
+    /// Collect before every allocation, to expose a handle that is not
+    /// reachable from a root. Set before the first slice.
+    pub fn set_gc_stress(&mut self, stress: bool) {
+        self.memory.heap.stress = stress;
+    }
+
+    /// Heap occupancy so far.
+    pub fn heap_stats(&self) -> HeapStats {
+        HeapStats {
+            live: self.memory.heap.live,
+            peak: self.memory.heap.peak,
+            collections: self.memory.heap.collections,
+        }
+    }
+
     /// Replace the destination of output lines. Set before the first slice.
     pub fn set_output(&mut self, sink: OutputSink) {
         self.output = sink;
@@ -1452,7 +1665,7 @@ impl Activation {
             self.instructions_executed += 1;
             self.state = match self.module.step(
                 stack,
-                &mut self.globals,
+                &mut self.memory,
                 self.limits.frames,
                 &mut self.output,
             ) {

@@ -12,8 +12,8 @@ use crate::{
     Diagnostic, Span, Type,
     ir::{Function, Op, Program, Routine},
 };
-use cyallo_ast::{Literal, Operator};
-use cyallo_ir::{enums::Projection, intrinsic::Intrinsic};
+use cyallo_ast::{Literal, MemoryKind, Operator};
+use cyallo_ir::{enums::Projection, intrinsic::Intrinsic, lookup::Operation};
 use std::{collections::HashMap, fmt, sync::Arc};
 
 #[derive(Debug)]
@@ -171,13 +171,18 @@ impl VerifiedModule {
                 },
             )?);
         }
-        let (shapes, signatures) = shapes.into_parts();
+        let super::shapes::Tables {
+            shapes,
+            signatures,
+            managed,
+        } = shapes.into_parts();
         ModuleImage {
             version: FORMAT_VERSION,
             entry,
             shapes,
             signatures,
             globals: globals.types.clone().into_boxed_slice(),
+            managed,
             functions: functions.into_boxed_slice(),
         }
         .verify_with_host_bindings(host_bindings)
@@ -525,6 +530,12 @@ fn lower_operation(
         Op::Move(dst, src) if places.address(*src).is_some() => {
             let owner = places.address(*src).ok_or_else(unsupported)?;
             Instruction::Borrow(register(*dst)?, owner)
+        }
+        Op::Lookup(dst, Operation::ManagedNew(MemoryKind::Gc, false), args) if args.len() == 1 => {
+            Instruction::GcNew(register(*dst)?, register(args[0])?)
+        }
+        Op::ManagedAddress(dst, handle) => {
+            Instruction::GcBorrow(register(*dst)?, register(*handle)?)
         }
         Op::Address(dst, _) if let Some(global) = places.global_address(*dst) => {
             Instruction::BorrowGlobal(register(*dst)?, global)

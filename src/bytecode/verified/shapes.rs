@@ -2,10 +2,17 @@
 //! complete checked type, so two enums with the same structure but different
 //! declarations stay distinct and the verifier compares them by identity.
 
-use super::{ScalarType, Shape, ShapeId, Signature, SignatureId, ValueType, array_len};
+use super::{ManagedId, ScalarType, Shape, ShapeId, Signature, SignatureId, ValueType, array_len};
 use crate::Type;
-use cyallo_ast::VariantId;
+use cyallo_ast::{EnumIdentity, Locality, MemoryKind, VariantId};
 use std::collections::HashMap;
+
+/// The module-level tables an interner produced.
+pub(super) struct Tables {
+    pub shapes: Box<[Shape]>,
+    pub signatures: Box<[Signature]>,
+    pub managed: Box<[ValueType]>,
+}
 
 #[derive(Default)]
 pub(super) struct Shapes {
@@ -14,6 +21,13 @@ pub(super) struct Shapes {
     /// Variant declarations of each enum shape, in variant-index order.
     variants: HashMap<ShapeId, Vec<VariantId>>,
     signatures: Vec<Signature>,
+    managed: Vec<ValueType>,
+    /// Enums being interned or interned, for references back to them.
+    enum_ids: HashMap<EnumIdentity, ShapeId>,
+    /// Tuples and arrays are structural: equal components, equal shape.
+    structural: HashMap<Shape, ShapeId>,
+    /// Records are nominal: the same name with equal field types.
+    records: HashMap<(Box<str>, Box<[ValueType]>), ShapeId>,
 }
 
 impl Shapes {
@@ -52,11 +66,23 @@ impl Shapes {
                 if let Some(&id) = self.by_type.get(ty) {
                     return Some(ValueType::Composite(id));
                 }
+                let name: Box<str> = match ty {
+                    Type::Record(name, _) => name.clone(),
+                    _ => "".into(),
+                };
                 let fields = fields
                     .iter()
                     .map(|(_, field)| self.value(field))
                     .collect::<Option<Box<[_]>>>()?;
-                ValueType::Composite(self.intern(ty, Shape::Tuple(fields), None)?)
+                // The same record can be spelled with a handle written out or
+                // as a reference back to an enum. Both are one shape.
+                if let Some(&id) = self.records.get(&(name.clone(), fields.clone())) {
+                    self.by_type.insert(ty.clone(), id);
+                    return Some(ValueType::Composite(id));
+                }
+                let id = self.intern(ty, Shape::Tuple(fields.clone()), None)?;
+                self.records.insert((name, fields), id);
+                ValueType::Composite(id)
             }
             Type::Tuple(items) if !items.is_empty() => {
                 if let Some(&id) = self.by_type.get(ty) {
@@ -66,7 +92,13 @@ impl Shapes {
                     .iter()
                     .map(|item| self.value(item))
                     .collect::<Option<Box<[_]>>>()?;
-                ValueType::Composite(self.intern(ty, Shape::Tuple(fields), None)?)
+                if let Some(&id) = self.structural.get(&Shape::Tuple(fields.clone())) {
+                    self.by_type.insert(ty.clone(), id);
+                    return Some(ValueType::Composite(id));
+                }
+                let id = self.intern(ty, Shape::Tuple(fields.clone()), None)?;
+                self.structural.insert(Shape::Tuple(fields), id);
+                ValueType::Composite(id)
             }
             Type::Array(bounds, element) if array_len(bounds).is_some() => {
                 if let Some(&id) = self.by_type.get(ty) {
@@ -77,12 +109,30 @@ impl Shapes {
                     element,
                     bounds: bounds.as_slice().into(),
                 };
-                ValueType::Composite(self.intern(ty, shape, None)?)
+                if let Some(&id) = self.structural.get(&shape) {
+                    self.by_type.insert(ty.clone(), id);
+                    return Some(ValueType::Composite(id));
+                }
+                let id = self.intern(ty, shape.clone(), None)?;
+                self.structural.insert(shape, id);
+                ValueType::Composite(id)
             }
             Type::Enum(definition) if !definition.open => {
                 if let Some(&id) = self.by_type.get(ty) {
                     return Some(ValueType::Composite(id));
                 }
+                if let Some(&id) = self.enum_ids.get(&definition.identity) {
+                    return Some(ValueType::Composite(id));
+                }
+                // The shape's number is reserved first so that a handle inside
+                // its payloads can refer back to it.
+                let declarations: Vec<_> = definition
+                    .variants
+                    .iter()
+                    .map(|variant| variant.declaration)
+                    .collect();
+                let id = self.intern(ty, Shape::Tuple(Box::new([])), Some(declarations))?;
+                self.enum_ids.insert(definition.identity.clone(), id);
                 let payloads = definition
                     .variants
                     .iter()
@@ -90,13 +140,31 @@ impl Shapes {
                         None => Some(None),
                         Some(payload) => self.value(payload).map(Some),
                     })
-                    .collect::<Option<Box<[_]>>>()?;
-                let declarations = definition
-                    .variants
-                    .iter()
-                    .map(|variant| variant.declaration)
-                    .collect();
-                ValueType::Composite(self.intern(ty, Shape::Enum(payloads), Some(declarations))?)
+                    .collect::<Option<Box<[_]>>>();
+                let Some(payloads) = payloads else {
+                    self.by_type.remove(ty);
+                    self.enum_ids.remove(&definition.identity);
+                    return None;
+                };
+                self.shapes[id.index()] = Shape::Enum(payloads);
+                ValueType::Composite(id)
+            }
+            Type::EnumRef(identity, _) => ValueType::Composite(*self.enum_ids.get(&**identity)?),
+            Type::Managed {
+                kind: MemoryKind::Gc,
+                locality: Locality::Local,
+                pointee,
+                ..
+            } => {
+                let pointee = self.value(pointee)?;
+                let index = match self.managed.iter().position(|known| *known == pointee) {
+                    Some(index) => index,
+                    None => {
+                        self.managed.push(pointee);
+                        self.managed.len() - 1
+                    }
+                };
+                ValueType::Gc(ManagedId(u32::try_from(index).ok()?))
             }
             _ => return None,
         })
@@ -136,14 +204,20 @@ impl Shapes {
         }
     }
 
+    /// What a handle of this managed type points at.
+    pub fn managed_pointee(&self, managed: ManagedId) -> Option<ValueType> {
+        self.managed.get(managed.index()).copied()
+    }
+
     pub fn is_array(&self, shape: ShapeId) -> bool {
         matches!(self.shapes.get(shape.index()), Some(Shape::Array { .. }))
     }
 
-    pub fn into_parts(self) -> (Box<[Shape]>, Box<[Signature]>) {
-        (
-            self.shapes.into_boxed_slice(),
-            self.signatures.into_boxed_slice(),
-        )
+    pub fn into_parts(self) -> Tables {
+        Tables {
+            shapes: self.shapes.into_boxed_slice(),
+            signatures: self.signatures.into_boxed_slice(),
+            managed: self.managed.into_boxed_slice(),
+        }
     }
 }

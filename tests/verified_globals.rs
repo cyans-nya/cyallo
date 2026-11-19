@@ -134,6 +134,7 @@ mod images {
             shapes: Box::new([]),
             signatures: Box::new([]),
             globals: globals.into(),
+            managed: Box::new([]),
             functions: Box::new([FunctionImage {
                 registers: Box::new([RegisterType::Loan {
                     access: LoanAccess::Exclusive,

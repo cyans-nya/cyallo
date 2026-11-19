@@ -506,7 +506,7 @@ fn main() -> color_eyre::Result<()> {
         Command::Run {
             engine: Engine::Verified,
             ..
-        } => run_verified(&program)?,
+        } => run_verified(&program, runtime.gc.stress)?,
         Command::Run { engine, .. } => {
             if !run(
                 program,
@@ -544,6 +544,8 @@ fn main() -> color_eyre::Result<()> {
 
     Ok(())
 }
+/// Instructions per slice of a verified run.
+const VERIFIED_SLICE: usize = 1_000_000;
 /// Entry routine of a linked program.
 const ENTRY_ROUTINE: usize = 0;
 /// Fuel and call depth of a verified run.
@@ -554,13 +556,23 @@ const VERIFIED_LIMITS: cyallo::bytecode::verified::ExecutionLimits =
     };
 /// Run the entry routine in the verified interpreter. A program that uses an
 /// operation it cannot execute stops before running, with the reason.
-fn run_verified(program: &cyallo::ir::Program) -> color_eyre::Result<()> {
+fn run_verified(program: &cyallo::ir::Program, gc_stress: bool) -> color_eyre::Result<()> {
+    use cyallo::bytecode::verified::ExecutionStatus;
     let module = cyallo::bytecode::verified::VerifiedModule::lower(program, ENTRY_ROUTINE)?;
-    if let Err(error) = module.run(&[], VERIFIED_LIMITS) {
-        eprintln!("{error}");
-        std::process::exit(1);
+    let mut activation = module
+        .start(&[], VERIFIED_LIMITS)
+        .map_err(|error| color_eyre::eyre::eyre!(error))?;
+    activation.set_gc_stress(gc_stress);
+    loop {
+        match activation.resume(VERIFIED_SLICE) {
+            ExecutionStatus::Paused(_) => {}
+            ExecutionStatus::Returned(_) => return Ok(()),
+            ExecutionStatus::Failed(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
     }
-    Ok(())
 }
 /// Instruction budget per run slice while the live view is on.
 const LIVE_SLICE: usize = 50_000;

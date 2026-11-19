@@ -173,6 +173,7 @@ mod images {
                 result: None,
             }]),
             globals: Box::new([]),
+            managed: Box::new([]),
             functions: Box::new([function(registers, vec![], result, vec![], code), routine()]),
         }
         .verify()
@@ -224,6 +225,7 @@ mod images {
                 result: None,
             }]),
             globals: Box::new([]),
+            managed: Box::new([]),
             functions: Box::new([
                 function(vec![], vec![], None, vec![], vec![Return(None)]),
                 routine(),
@@ -282,6 +284,7 @@ mod images {
                 result: None,
             }]),
             globals: Box::new([]),
+            managed: Box::new([]),
             functions: Box::new([
                 function(
                     registers(borrowing(LoanOrigin::Local(COUNT))),

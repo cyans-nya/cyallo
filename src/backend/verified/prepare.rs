@@ -471,6 +471,8 @@ fn legalize(
         | Instruction::TextMid(..)
         | Instruction::Closure(..)
         | Instruction::BorrowGlobal(..)
+        | Instruction::GcNew(..)
+        | Instruction::GcBorrow(..)
         | Instruction::LoanField(..)
         | Instruction::LoanPayload(..)
         | Instruction::LoanElement(..)

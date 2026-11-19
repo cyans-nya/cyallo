@@ -204,6 +204,7 @@ mod images {
             shapes: Box::new([]),
             signatures: Box::new([signature]),
             globals: Box::new([]),
+            managed: Box::new([]),
             functions: Box::new([entry, callee()]),
         }
         .verify()

@@ -682,6 +682,7 @@ fn verified_engine_matches_the_interpreter_on_supported_programs() {
         "examples/strings.psc",
         "examples/composites.ya",
         "examples/hot-loop.ya",
+        "examples/enums/recursive.ya",
     ] {
         let run = |engine| cli(&["run", example, "--engine", engine]).output().unwrap();
         let verified = run("verified");

@@ -28,16 +28,17 @@ pub use lower::LowerError;
 pub(crate) use run::ScalarFrameSnapshot;
 pub use run::ScalarRecoveryError;
 pub use run::{
-    Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, OutputSink, RunError,
+    Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, HeapStats, OutputSink,
+    RunError,
 };
 pub use sdk::SdkCompileError;
 
-/// Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 16;
+pub const FORMAT_VERSION: u32 = 17;
 
 macro_rules! index {
     ($name:ident) => {
@@ -63,6 +64,7 @@ index!(OperandListId);
 index!(TextId);
 index!(SignatureId);
 index!(GlobalId);
+index!(ManagedId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScalarType {
@@ -80,6 +82,8 @@ pub enum ValueType {
     Composite(ShapeId),
     /// A closure with this call signature.
     Function(SignatureId),
+    /// A traced reference to a heap object of the managed type.
+    Gc(ManagedId),
 }
 
 /// A callable's parameter and result types, without its captures.
@@ -99,7 +103,7 @@ impl ValueType {
     pub fn scalar(self) -> Option<ScalarType> {
         match self {
             Self::Scalar(ty) => Some(ty),
-            Self::Text | Self::Composite(_) | Self::Function(_) => None,
+            Self::Text | Self::Composite(_) | Self::Function(_) | Self::Gc(_) => None,
         }
     }
 }
@@ -107,7 +111,7 @@ impl ValueType {
 /// Composite layout-independent structure. A composite register owns its
 /// complete value; storage opens and closes with the register. Components
 /// reference lower-numbered shapes, so a shape cannot contain itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Shape {
     /// Fields in declaration order.
     Tuple(Box<[ValueType]>),
@@ -160,6 +164,8 @@ pub enum LoanOrigin {
     },
     /// A module-level variable that lives as long as the activation.
     Global(GlobalId),
+    /// A heap object reached through a handle of this managed type.
+    Heap(ManagedId),
 }
 
 /// A logical register's verifier-visible storage and provenance.
@@ -179,6 +185,8 @@ pub enum RegisterType {
     Composite(ShapeId),
     /// A closure: a routine and its captured values.
     Function(SignatureId),
+    /// A traced reference to a heap object.
+    Gc(ManagedId),
     /// A closure that captured loans. It behaves like a loan on their root:
     /// the root stays live and borrowed while it lives, and the value cannot
     /// be stored, passed or returned by value.
@@ -204,6 +212,7 @@ impl From<ValueType> for RegisterType {
             ValueType::Text => Self::Text,
             ValueType::Composite(shape) => Self::Composite(shape),
             ValueType::Function(signature) => Self::Function(signature),
+            ValueType::Gc(managed) => Self::Gc(managed),
         }
     }
 }
@@ -378,6 +387,10 @@ pub enum Instruction {
     Borrow(Register, Register),
     ReadLoan(Register, Register),
     WriteLoan(Register, Register),
+    /// Allocate a heap object holding a copy of the value.
+    GcNew(Register, Register),
+    /// Borrow the heap object a handle refers to.
+    GcBorrow(Register, Register),
     /// Borrow a module-level variable.
     BorrowGlobal(Register, GlobalId),
     /// Borrow one field of a tuple, from an owner or another loan.
@@ -519,6 +532,7 @@ impl Instruction {
             }
             WriteLoan(loan, value) => ([Some(loan), Some(value)], &[], None),
             BorrowGlobal(dst, _) => ([None, None], &[], Some(dst)),
+            GcNew(dst, value) | GcBorrow(dst, value) => ([Some(value), None], &[], Some(dst)),
             LoanField(dst, src, _) | LoanPayload(dst, src, _) => {
                 ([Some(src), None], &[], Some(dst))
             }
@@ -622,6 +636,8 @@ pub struct ModuleImage {
     pub signatures: Box<[Signature]>,
     /// The types of module-level variables, by `GlobalId`.
     pub globals: Box<[ValueType]>,
+    /// What each managed type points at, by `ManagedId`.
+    pub managed: Box<[ValueType]>,
     pub functions: Box<[FunctionImage]>,
 }
 
@@ -633,6 +649,7 @@ pub struct VerifiedFunction {
     shapes: Arc<[Shape]>,
     signatures: Arc<[Signature]>,
     globals: Arc<[ValueType]>,
+    managed: Arc<[ValueType]>,
     result: Option<ValueType>,
     calls: Box<[CallSite]>,
     lists: Box<[Box<[Register]>]>,
@@ -777,6 +794,7 @@ impl VerifiedFunction {
             RegisterType::Text => Ok(ValueType::Text),
             RegisterType::Composite(shape) => Ok(ValueType::Composite(shape)),
             RegisterType::Function(signature) => Ok(ValueType::Function(signature)),
+            RegisterType::Gc(managed) => Ok(ValueType::Gc(managed)),
             RegisterType::BorrowingFunction { .. } => {
                 Err(InvalidBytecode::EscapingBorrow(register))
             }
@@ -1039,6 +1057,9 @@ pub enum InvalidBytecode {
     ExpectedText(Register),
     UnknownText(TextId),
     UnknownGlobal(GlobalId),
+    UnknownManaged(ManagedId),
+    ShapeCycle(ShapeId),
+    ExpectedHandle(Register),
     UnknownSignature(SignatureId),
     ExpectedFunction(Register),
     /// A closure that borrows cannot be stored, passed or returned by value.
@@ -1134,26 +1155,29 @@ impl ModuleImage {
                     index as u32,
                 ))));
             }
-            let components: &mut dyn Iterator<Item = ValueType> = match shape {
-                Shape::Tuple(fields) => &mut fields.iter().copied(),
-                Shape::Enum(variants) => &mut variants.iter().copied().flatten(),
-                Shape::Array { element, .. } => &mut std::iter::once(*element),
-            };
-            for component in components {
-                if let ValueType::Function(signature) = component
-                    && signature.index() >= self.signatures.len()
-                {
-                    return Err(image_error(InvalidBytecode::UnknownSignature(signature)));
-                }
-                if let ValueType::Composite(id) = component
-                    && id.index() >= index
-                {
-                    return Err(image_error(InvalidBytecode::ShapeReference(ShapeId(
-                        index as u32,
-                    ))));
+            for component in shape_components(shape) {
+                match component {
+                    ValueType::Function(signature)
+                        if signature.index() >= self.signatures.len() =>
+                    {
+                        return Err(image_error(InvalidBytecode::UnknownSignature(signature)));
+                    }
+                    ValueType::Gc(managed) if managed.index() >= self.managed.len() => {
+                        return Err(image_error(InvalidBytecode::UnknownManaged(managed)));
+                    }
+                    ValueType::Composite(id) if id.index() >= self.shapes.len() => {
+                        return Err(image_error(InvalidBytecode::UnknownShape(id)));
+                    }
+                    _ => {}
                 }
             }
         }
+        // A composite cannot contain itself by value. A handle is an
+        // indirection, so recursion through one is fine.
+        if let Some(shape) = first_shape_cycle(&self.shapes) {
+            return Err(image_error(InvalidBytecode::ShapeCycle(shape)));
+        }
+        let managed: Arc<[ValueType]> = self.managed.into();
         let globals: Arc<[ValueType]> = self.globals.into();
         let signatures: Arc<[Signature]> = self.signatures.into();
         let shapes: Arc<[Shape]> = self.shapes.into();
@@ -1193,6 +1217,7 @@ impl ModuleImage {
                 shapes: shapes.clone(),
                 signatures: signatures.clone(),
                 globals: globals.clone(),
+                managed: managed.clone(),
                 registers: image.registers,
                 parameters: image.parameters,
                 result: image.result,
@@ -1222,6 +1247,55 @@ impl ModuleImage {
             host_bindings: host_bindings.into(),
         })
     }
+}
+
+fn shape_components(shape: &Shape) -> Vec<ValueType> {
+    match shape {
+        Shape::Tuple(fields) => fields.to_vec(),
+        Shape::Enum(variants) => variants.iter().copied().flatten().collect(),
+        Shape::Array { element, .. } => vec![*element],
+    }
+}
+
+/// A shape on a cycle of by-value containment, if there is one.
+fn first_shape_cycle(shapes: &[Shape]) -> Option<ShapeId> {
+    // 0 = unvisited, 1 = on the current path, 2 = finished.
+    let mut state = vec![0u8; shapes.len()];
+    for start in 0..shapes.len() {
+        if state[start] != 0 {
+            continue;
+        }
+        let mut stack = vec![(start, shape_children(&shapes[start]), 0usize)];
+        state[start] = 1;
+        while let Some((node, children, next)) = stack.last_mut() {
+            let node = *node;
+            if let Some(&child) = children.get(*next) {
+                *next += 1;
+                match state[child] {
+                    1 => return u32::try_from(child).ok().map(ShapeId),
+                    0 => {
+                        state[child] = 1;
+                        stack.push((child, shape_children(&shapes[child]), 0));
+                    }
+                    _ => {}
+                }
+            } else {
+                state[node] = 2;
+                stack.pop();
+            }
+        }
+    }
+    None
+}
+
+fn shape_children(shape: &Shape) -> Vec<usize> {
+    shape_components(shape)
+        .into_iter()
+        .filter_map(|component| match component {
+            ValueType::Composite(id) => Some(id.index()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn function_id(index: usize) -> Result<FunctionId, InvalidBytecode> {
@@ -1264,6 +1338,11 @@ impl VerifiedFunction {
                         return Err(error(None, InvalidBytecode::UnknownGlobal(global)));
                     }
                 }
+                LoanOrigin::Heap(managed) => {
+                    if self.managed.get(managed.index()).is_none() {
+                        return Err(error(None, InvalidBytecode::UnknownManaged(managed)));
+                    }
+                }
                 LoanOrigin::Parameter { register } => {
                     let valid = self.parameters.contains(&register)
                         && matches!(
@@ -1290,11 +1369,21 @@ impl VerifiedFunction {
                 self.signature(signature)
                     .map_err(|kind| error(None, kind))?;
             }
+            if let RegisterType::Gc(managed) = kind
+                && self.managed.get(managed.index()).is_none()
+            {
+                return Err(error(None, InvalidBytecode::UnknownManaged(managed)));
+            }
         }
         if is_entry
             && matches!(
                 self.result,
-                Some(ValueType::Composite(_) | ValueType::Text | ValueType::Function(_))
+                Some(
+                    ValueType::Composite(_)
+                        | ValueType::Text
+                        | ValueType::Function(_)
+                        | ValueType::Gc(_)
+                )
             )
         {
             return Err(error(None, InvalidBytecode::EntryResultNotScalar));
@@ -1306,9 +1395,15 @@ impl VerifiedFunction {
                 .map_err(|kind| error(None, kind))?
             {
                 RegisterType::Scalar(_) => {}
-                RegisterType::Text | RegisterType::Composite(_) | RegisterType::Function(_)
+                RegisterType::Text
+                | RegisterType::Composite(_)
+                | RegisterType::Function(_)
+                | RegisterType::Gc(_)
                     if !is_entry => {}
-                RegisterType::Text | RegisterType::Composite(_) | RegisterType::Function(_) => {
+                RegisterType::Text
+                | RegisterType::Composite(_)
+                | RegisterType::Function(_)
+                | RegisterType::Gc(_) => {
                     return Err(error(
                         None,
                         InvalidBytecode::EntryParameterNotScalar(register),
@@ -1568,6 +1663,7 @@ impl VerifiedFunction {
                 RegisterType::Function(signature) => {
                     self.require_value(arg, ValueType::Function(signature))?;
                 }
+                RegisterType::Gc(managed) => self.require_value(arg, ValueType::Gc(managed))?,
                 RegisterType::Composite(shape) => {
                     self.require_value(arg, ValueType::Composite(shape))?;
                 }
@@ -1855,8 +1951,55 @@ impl VerifiedFunction {
                 self.require_value(payload, ty)
             }
             Instruction::EnumIs(dst, src, variant) => {
-                self.variant_payload(src, variant)?;
+                // The enum is held by the register or behind a loan.
+                let (container, ..) = self.projection_base(src)?;
+                let ValueType::Composite(shape) = container else {
+                    return Err(InvalidBytecode::ExpectedEnum(src));
+                };
+                let Shape::Enum(variants) = self.shape(shape)? else {
+                    return Err(InvalidBytecode::ExpectedEnum(src));
+                };
+                if variants.get(variant as usize).is_none() {
+                    return Err(InvalidBytecode::UnknownVariant {
+                        register: src,
+                        variant,
+                    });
+                }
                 self.require_type(dst, ScalarType::Bool)
+            }
+            Instruction::GcNew(dst, value) => {
+                let RegisterType::Gc(managed) = self.register_kind(dst)? else {
+                    return Err(InvalidBytecode::ExpectedHandle(dst));
+                };
+                let pointee = *self
+                    .managed
+                    .get(managed.index())
+                    .ok_or(InvalidBytecode::UnknownManaged(managed))?;
+                self.require_value(value, pointee)
+            }
+            Instruction::GcBorrow(dst, handle) => {
+                let RegisterType::Gc(managed) = self.register_kind(handle)? else {
+                    return Err(InvalidBytecode::ExpectedHandle(handle));
+                };
+                let declared = *self
+                    .managed
+                    .get(managed.index())
+                    .ok_or(InvalidBytecode::UnknownManaged(managed))?;
+                let (_, origin, pointee) = self.loan_type(dst)?;
+                if origin != LoanOrigin::Heap(managed) {
+                    return Err(InvalidBytecode::LoanOwnerMismatch {
+                        loan: dst,
+                        owner: handle,
+                    });
+                }
+                if pointee != declared {
+                    return Err(InvalidBytecode::ValueType {
+                        register: dst,
+                        expected: declared,
+                        actual: pointee,
+                    });
+                }
+                Ok(())
             }
             Instruction::EnumPayload(dst, src, variant) => {
                 let Some(ty) = self.variant_payload(src, variant)? else {

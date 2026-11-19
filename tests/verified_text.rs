@@ -221,6 +221,7 @@ mod images {
             shapes: shapes.into(),
             signatures: Box::new([]),
             globals: Box::new([]),
+            managed: Box::new([]),
             functions: Box::new([FunctionImage {
                 registers: registers.into(),
                 parameters: Box::new([]),

@@ -104,6 +104,8 @@ opcodes! {
     LoanPayload = 73, 4;
     LoanElement = 74, 4;
     BorrowGlobal = 75, 3;
+    GcNew = 76, 3;
+    GcBorrow = 77, 3;
 }
 
 impl TextOp {
@@ -209,6 +211,8 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
                 (Opcode::TextRight, [dst.0, text.0, count.0], 3)
             }
             Instruction::TextMid(dst, text, list) => (Opcode::TextMid, [dst.0, text.0, list.0], 3),
+            Instruction::GcNew(dst, value) => (Opcode::GcNew, [dst.0, value.0, 0], 2),
+            Instruction::GcBorrow(dst, handle) => (Opcode::GcBorrow, [dst.0, handle.0, 0], 2),
             Instruction::BorrowGlobal(dst, global) => {
                 (Opcode::BorrowGlobal, [dst.0, global.0, 0], 2)
             }
@@ -354,6 +358,8 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::TextLeft => Instruction::TextLeft(reg(0), reg(1), reg(2)),
             Opcode::TextRight => Instruction::TextRight(reg(0), reg(1), reg(2)),
             Opcode::TextMid => Instruction::TextMid(reg(0), reg(1), list(2)),
+            Opcode::GcNew => Instruction::GcNew(reg(0), reg(1)),
+            Opcode::GcBorrow => Instruction::GcBorrow(reg(0), reg(1)),
             Opcode::BorrowGlobal => Instruction::BorrowGlobal(reg(0), GlobalId(values[1])),
             Opcode::LoanField => Instruction::LoanField(reg(0), reg(1), values[2]),
             Opcode::LoanPayload => Instruction::LoanPayload(reg(0), reg(1), values[2]),

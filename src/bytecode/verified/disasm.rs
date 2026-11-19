@@ -83,6 +83,16 @@ impl fmt::Display for VerifiedModule {
                     )?,
                     RegisterType::Loan {
                         access,
+                        origin: LoanOrigin::Heap(managed),
+                        pointee,
+                    } => write!(
+                        f,
+                        "  r{index}: {access:?} {} loan of heap m{}",
+                        value_name(pointee),
+                        managed.0
+                    )?,
+                    RegisterType::Loan {
+                        access,
                         origin: LoanOrigin::Global(global),
                         pointee,
                     } => write!(
@@ -100,6 +110,7 @@ impl fmt::Display for VerifiedModule {
                         "  r{index}: {access:?} borrowing fn sig{} from {origin:?}",
                         signature.0
                     )?,
+                    RegisterType::Gc(managed) => write!(f, "  r{index}: gc m{}", managed.0)?,
                     RegisterType::Text => write!(f, "  r{index}: text")?,
                     RegisterType::Function(signature) => {
                         write!(f, "  r{index}: fn sig{}", signature.0)?
@@ -237,6 +248,12 @@ impl fmt::Display for VerifiedModule {
                         write!(f, "r{} = text.mid r{}", dst.0, text.0)?;
                         write_list(f, &function.lists()[list.index()])?;
                     }
+                    Instruction::GcNew(dst, value) => {
+                        write!(f, "r{} = gc.new r{}", dst.0, value.0)?
+                    }
+                    Instruction::GcBorrow(dst, handle) => {
+                        write!(f, "r{} = gc.borrow r{}", dst.0, handle.0)?;
+                    }
                     Instruction::BorrowGlobal(dst, global) => {
                         write!(f, "r{} = borrow.global g{}", dst.0, global.0)?;
                     }
@@ -328,6 +345,7 @@ fn value_name(ty: ValueType) -> String {
     match ty {
         ValueType::Scalar(ty) => type_name(ty).to_owned(),
         ValueType::Text => "text".to_owned(),
+        ValueType::Gc(managed) => format!("gc m{}", managed.0),
         ValueType::Function(signature) => format!("fn sig{}", signature.0),
         ValueType::Composite(shape) => format!("shape{}", shape.0),
     }
