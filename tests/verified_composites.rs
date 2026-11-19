@@ -103,18 +103,19 @@ std::io::print(total)
 }
 
 #[test]
-fn an_entry_routine_cannot_return_a_composite() {
+fn a_routine_returning_a_composite_can_be_inspected_but_not_started() {
     let program = compile("fn make() -> Option<i64> { return Option::Some(1) }\n").unwrap();
     let entry = program
         .functions()
         .iter()
         .position(|function| function.name.as_ref() == "make")
         .unwrap();
-    let error = VerifiedModule::lower(&program, entry).unwrap_err();
-    assert!(
-        error.to_string().contains("EntryResultNotScalar"),
-        "{error}"
-    );
+    let module = VerifiedModule::lower(&program, entry).unwrap();
+    assert!(module.disassemble().contains("enum.wrap"));
+    assert!(matches!(
+        module.start(&[], LIMITS),
+        Err(RunError::EntryResultNotScalar)
+    ));
 }
 
 #[test]

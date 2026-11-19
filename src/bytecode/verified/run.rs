@@ -52,6 +52,12 @@ pub enum RunError {
     },
     FuelExhausted,
     FrameLimit,
+    /// The entry routine returns a value an activation cannot hand back.
+    EntryResultNotScalar,
+    /// The entry routine takes a parameter that is not a scalar.
+    EntryParameterNotScalar {
+        index: usize,
+    },
     IntegerOverflow {
         function: FunctionId,
         instruction: InstructionId,
@@ -148,6 +154,10 @@ impl fmt::Display for RunError {
             } => write!(f, "argument {index} expects {expected:?}, got {actual:?}"),
             Self::FuelExhausted => f.write_str("scalar bytecode exhausted its total fuel"),
             Self::FrameLimit => f.write_str("scalar bytecode exhausted its call frame limit"),
+            Self::EntryResultNotScalar => f.write_str("the entry routine does not return a scalar"),
+            Self::EntryParameterNotScalar { index } => {
+                write!(f, "entry parameter {index} is not a scalar")
+            }
             Self::IntegerOverflow {
                 function,
                 instruction,
@@ -967,6 +977,15 @@ impl VerifiedModule {
         limits: ExecutionLimits,
     ) -> Result<Activation, RunError> {
         let entry = &self.functions[self.entry.index()];
+        // An activation hands back at most a scalar, and takes only scalars.
+        if matches!(entry.result, Some(result) if result.scalar().is_none()) {
+            return Err(RunError::EntryResultNotScalar);
+        }
+        if let Some(index) = entry.parameters.iter().position(|&register| {
+            !matches!(entry.registers[register.index()], RegisterType::Scalar(_))
+        }) {
+            return Err(RunError::EntryParameterNotScalar { index });
+        }
         if arguments.len() != entry.parameters.len() {
             return Err(RunError::ArgumentCount {
                 expected: entry.parameters.len(),

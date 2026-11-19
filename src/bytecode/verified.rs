@@ -1188,8 +1188,6 @@ pub enum InvalidBytecode {
         expected: ValueType,
         actual: ValueType,
     },
-    EntryResultNotScalar,
-    EntryParameterNotScalar(Register),
     OutputArgument {
         output: OutputId,
         index: usize,
@@ -1478,50 +1476,23 @@ impl VerifiedFunction {
                 return Err(error(None, InvalidBytecode::UnknownManaged(managed)));
             }
         }
-        if is_entry
-            && matches!(
-                self.result,
-                Some(
-                    ValueType::Composite(_)
-                        | ValueType::Text
-                        | ValueType::Function(_)
-                        | ValueType::Gc(_)
-                        | ValueType::Rc(_)
-                        | ValueType::Weak(_)
-                )
-            )
-        {
-            return Err(error(None, InvalidBytecode::EntryResultNotScalar));
-        }
         let mut parameters = vec![StorageState::Dead; self.registers.len()];
         for &register in &self.parameters {
             match self
                 .register_kind(register)
                 .map_err(|kind| error(None, kind))?
             {
-                RegisterType::Scalar(_) => {}
-                RegisterType::Text
+                RegisterType::Scalar(_)
+                | RegisterType::Text
                 | RegisterType::Composite(_)
                 | RegisterType::Function(_)
                 | RegisterType::Gc(_)
                 | RegisterType::Rc(_)
-                | RegisterType::Weak(_)
-                    if !is_entry => {}
-                RegisterType::Text
-                | RegisterType::Composite(_)
-                | RegisterType::Function(_)
-                | RegisterType::Gc(_)
-                | RegisterType::Rc(_)
-                | RegisterType::Weak(_) => {
-                    return Err(error(
-                        None,
-                        InvalidBytecode::EntryParameterNotScalar(register),
-                    ));
-                }
+                | RegisterType::Weak(_) => {}
                 RegisterType::Loan {
                     origin: LoanOrigin::Parameter { register: origin },
                     ..
-                } if !is_entry && register == origin => {}
+                } if register == origin => {}
                 _ => return Err(error(None, InvalidBytecode::InvalidLoanParameter(register))),
             }
             if std::mem::replace(&mut parameters[register.index()], StorageState::Initialized)
