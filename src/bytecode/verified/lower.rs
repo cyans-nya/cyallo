@@ -1,8 +1,9 @@
 use super::{
-    BooleanOp, CallSite, CallSiteId, CallTarget, FORMAT_VERSION, FloatOp, FunctionId,
+    BooleanOp, CallSite, CallSiteId, CallTarget, Extremum, FORMAT_VERSION, FloatOp, FunctionId,
     FunctionImage, HostBindingId, Instruction, InstructionId, IntegerOp, ModuleImage,
     OperandListId, OutputId, OutputPiece, OutputTemplate, Register, RegisterType, Scalar,
-    ScalarHostBinding, ScalarType, TextId, TextOp, ValueType, VerifiedModule, VerifyError,
+    ScalarHostBinding, ScalarType, TextId, TextMapOp, TextOp, TextTestOp, ValueType,
+    VerifiedModule, VerifyError,
     cfg::{self, Block, Exit, Located, Statement},
     encode, layout, lifetimes,
     loans::Places,
@@ -12,7 +13,7 @@ use crate::{
     Diagnostic, Span, Type,
     ir::{Function, Op, Program, Routine},
 };
-use cyallo_ast::{Literal, MemoryKind, Operator};
+use cyallo_ast::{ConstantValue, Literal, MemoryKind, NumberKind, Operator};
 use cyallo_ir::{enums::Projection, intrinsic::Intrinsic, lookup::Operation};
 use std::{collections::HashMap, fmt, sync::Arc};
 
@@ -322,6 +323,18 @@ fn is_text_builtin(intrinsic: Intrinsic) -> bool {
     )
 }
 
+/// The number of a string constant of the function, adding it when new.
+fn intern_text(routine: usize, sites: &mut Sites, text: &Arc<str>) -> Result<TextId, LowerError> {
+    let index = match sites.texts.iter().position(|known| known == text) {
+        Some(index) => index,
+        None => {
+            sites.texts.push(text.clone());
+            sites.texts.len() - 1
+        }
+    };
+    Ok(TextId(lower_index(routine, index)?))
+}
+
 /// Append an operand list and name it.
 fn new_list(
     routine: usize,
@@ -520,6 +533,14 @@ impl Context<'_> {
         self.shapes.option_variants(shape)
     }
 
+    /// The `Ok` and `Err` variants of a result held by this register.
+    fn result_variants(&self, register: Register) -> Option<(u32, u32)> {
+        let RegisterType::Composite(shape) = *self.places.registers.get(register.index())? else {
+            return None;
+        };
+        self.shapes.result_variants(shape)
+    }
+
     /// Whether the payload of this variant changes counts when released.
     fn payload_needs_drop(&self, register: Register, variant: u32) -> bool {
         let Some(RegisterType::Composite(shape)) = self.places.registers.get(register.index())
@@ -636,15 +657,107 @@ fn lower_operation(
             Instruction::BorrowGlobal(register(*dst)?, global)
         }
         Op::LiteralString(dst, text) => {
-            let index = sites
-                .texts
-                .iter()
-                .position(|known| known == text)
-                .unwrap_or(sites.texts.len());
-            if index == sites.texts.len() {
-                sites.texts.push(text.clone());
+            let text = intern_text(routine, sites, text)?;
+            Instruction::TextConstant(register(*dst)?, text)
+        }
+        Op::Frozen(dst, value) => match value.as_ref() {
+            ConstantValue::String(text) => {
+                let text = intern_text(routine, sites, text)?;
+                Instruction::TextConstant(register(*dst)?, text)
             }
-            Instruction::TextConstant(register(*dst)?, TextId(lower_index(routine, index)?))
+            ConstantValue::Integer(value) => {
+                Instruction::Constant(register(*dst)?, Scalar::I64(*value))
+            }
+            ConstantValue::Real(value) => {
+                Instruction::Constant(register(*dst)?, Scalar::from_f64(*value))
+            }
+            ConstantValue::Boolean(value) => {
+                Instruction::Constant(register(*dst)?, Scalar::Bool(*value))
+            }
+            _ => return Err(unsupported()),
+        },
+        Op::Lookup(dst, Operation::CloneValue, args) if args.len() == 1 => {
+            let source = enum_place(places, args[0]).ok_or_else(unsupported)?;
+            Instruction::Clone(register(*dst)?, source)
+        }
+        Op::Builtin(
+            dst,
+            intrinsic @ (Intrinsic::Trim | Intrinsic::Upper | Intrinsic::Lower),
+            args,
+        ) if args.len() == 1 => {
+            let op = match intrinsic {
+                Intrinsic::Trim => TextMapOp::Trim,
+                Intrinsic::Upper => TextMapOp::Upper,
+                _ => TextMapOp::Lower,
+            };
+            Instruction::TextMap(op, register(*dst)?, register(args[0])?)
+        }
+        Op::Builtin(
+            dst,
+            intrinsic @ (Intrinsic::Contains | Intrinsic::StartsWith | Intrinsic::EndsWith),
+            args,
+        ) if args.len() == 2 => {
+            let op = match intrinsic {
+                Intrinsic::Contains => TextTestOp::Contains,
+                Intrinsic::StartsWith => TextTestOp::StartsWith,
+                _ => TextTestOp::EndsWith,
+            };
+            Instruction::TextTest(op, register(*dst)?, register(args[0])?, register(args[1])?)
+        }
+        Op::Builtin(dst, Intrinsic::Replace, args) if args.len() == 3 => {
+            let list = new_list(routine, sites, args[1..].iter().map(|&arg| register(arg)))?;
+            Instruction::TextReplace(register(*dst)?, register(args[0])?, list)
+        }
+        Op::Lookup(dst, Operation::Parse(NumberKind::I64), args) if args.len() == 1 => {
+            Instruction::ParseInteger(register(*dst)?, register(args[0])?)
+        }
+        Op::Lookup(
+            dst,
+            operation @ (Operation::IsOk
+            | Operation::IsErr
+            | Operation::UnwrapOk
+            | Operation::UnwrapErr),
+            args,
+        ) if args.len() == 1 => {
+            let result = register(args[0])?;
+            let (ok, err) = context.result_variants(result).ok_or_else(unsupported)?;
+            let variant = match operation {
+                Operation::IsOk | Operation::UnwrapOk => ok,
+                _ => err,
+            };
+            match operation {
+                Operation::IsOk | Operation::IsErr => {
+                    Instruction::EnumIs(register(*dst)?, result, variant)
+                }
+                _ if context.payload_needs_drop(result, variant) => {
+                    Instruction::EnumTake(register(*dst)?, result, variant)
+                }
+                _ => Instruction::EnumPayload(register(*dst)?, result, variant),
+            }
+        }
+        Op::Builtin(dst, Intrinsic::StringFrom, args) if args.len() == 1 => {
+            Instruction::ToText(register(*dst)?, register(args[0])?)
+        }
+        Op::Builtin(dst, Intrinsic::Abs | Intrinsic::NumAbs, args)
+            if args.len() == 1 && places.scalar(args[0]) == Some(ScalarType::I64) =>
+        {
+            Instruction::Abs(register(*dst)?, register(args[0])?)
+        }
+        Op::Builtin(
+            dst,
+            intrinsic @ (Intrinsic::Min | Intrinsic::Max | Intrinsic::NumMin | Intrinsic::NumMax),
+            args,
+        ) if args.len() == 2
+            && args
+                .iter()
+                .all(|&arg| places.scalar(arg) == Some(ScalarType::I64)) =>
+        {
+            let op = if matches!(intrinsic, Intrinsic::Min | Intrinsic::NumMin) {
+                Extremum::Min
+            } else {
+                Extremum::Max
+            };
+            Instruction::Extremum(op, register(*dst)?, register(args[0])?, register(args[1])?)
         }
         Op::ArrayLiteral(dst, items) => {
             let list = new_list(routine, sites, items.iter().map(|&item| register(item)))?;
@@ -877,6 +990,15 @@ fn lower_operation(
                 | (Intrinsic::CastI64, Some(ScalarType::I64)) => Instruction::Copy(dst, source),
                 (Intrinsic::CastI64, Some(ScalarType::F64)) => {
                     Instruction::FloatToInteger(dst, source)
+                }
+                (Intrinsic::CastI64, Some(ScalarType::U64)) => {
+                    Instruction::CountToInteger(dst, source)
+                }
+                (Intrinsic::CastUsize | Intrinsic::CastU64, Some(ScalarType::I64)) => {
+                    Instruction::IntegerToCount(dst, source)
+                }
+                (Intrinsic::CastUsize | Intrinsic::CastU64, Some(ScalarType::U64)) => {
+                    Instruction::Copy(dst, source)
                 }
                 _ => return Err(unsupported()),
             }

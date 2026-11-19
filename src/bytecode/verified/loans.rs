@@ -128,6 +128,7 @@ impl Places {
         // a loan. An address that is written through, or reborrowed, needs a
         // real loan, and so does every address it is projected from.
         let mut written = vec![false; count];
+        let mut lent = vec![false; count];
         let mut projects = vec![false; count];
         for op in &all_ops {
             match op {
@@ -149,14 +150,15 @@ impl Places {
                 {
                     written[*addr] = true;
                 }
-                Op::Move(dst, addr)
-                    if projects[*addr]
-                        && matches!(
-                            function.registers[*dst],
-                            Type::Reference { mutable: true, .. }
-                        ) =>
-                {
-                    written[*addr] = true;
+                Op::Move(dst, addr) if projects[*addr] && loan_types[*dst].is_some() => {
+                    // A reference to a projected place needs a real loan.
+                    lent[*addr] = true;
+                    if matches!(
+                        function.registers[*dst],
+                        Type::Reference { mutable: true, .. }
+                    ) {
+                        written[*addr] = true;
+                    }
                 }
                 _ => {}
             }
@@ -166,9 +168,10 @@ impl Places {
                 Op::Field(dst, base, _)
                 | Op::Index(dst, base, ..)
                 | Op::EnumPayload(dst, base, _, Projection::Address, _)
-                    if written[*dst] =>
+                    if written[*dst] || lent[*dst] =>
                 {
-                    written[*base] = true;
+                    written[*base] |= written[*dst];
+                    lent[*base] |= lent[*dst];
                 }
                 _ => {}
             }
@@ -259,7 +262,20 @@ impl Places {
                     }
                     None => None,
                 };
-                if let Some(array) = array {
+                if let Some(array) = array
+                    && lent[dst]
+                {
+                    // A reference to an element borrows the array.
+                    projected[dst] = true;
+                    let access = if written[dst] {
+                        LoanAccess::Exclusive
+                    } else {
+                        LoanAccess::Shared
+                    };
+                    loan_types[dst] = Some((access, value));
+                    registers[dst] = RegisterType::Unused;
+                    origins.push((dst, LoanOrigin::Local(array)));
+                } else if let Some(array) = array {
                     elements[dst] = Some(ElementPlace {
                         array,
                         indices: indices.as_slice().into(),
@@ -269,11 +285,17 @@ impl Places {
                     loan_types[dst] = None;
                 }
             } else if let Some(owner) = base_local
-                && written[dst]
+                && (written[dst] || lent[dst])
             {
-                // A write through a local's field or payload borrows the local.
+                // A write through, or a reference to, a local's field or payload
+                // borrows the local.
                 projected[dst] = true;
-                loan_types[dst] = Some((LoanAccess::Exclusive, value));
+                let access = if written[dst] {
+                    LoanAccess::Exclusive
+                } else {
+                    LoanAccess::Shared
+                };
+                loan_types[dst] = Some((access, value));
                 registers[dst] = RegisterType::Unused;
                 origins.push((dst, LoanOrigin::Local(owner)));
             } else if base_local.is_some() || payload_copies[base] {

@@ -1,6 +1,7 @@
 use super::{
-    BooleanOp, CallSiteId, FloatOp, FunctionId, GlobalId, Instruction, InstructionId, IntegerOp,
-    InvalidBytecode, OperandListId, Register, Scalar, TextId, TextOp,
+    BooleanOp, CallSiteId, Extremum, FloatOp, FunctionId, GlobalId, Instruction, InstructionId,
+    IntegerOp, InvalidBytecode, OperandListId, Register, Scalar, TextId, TextMapOp, TextOp,
+    TextTestOp,
 };
 
 // The low half of the header is the opcode and the high half is the total
@@ -129,6 +130,21 @@ opcodes! {
     CellRead = 98, 3;
     CellWrite = 99, 3;
     CellReplace = 100, 4;
+    Clone = 101, 3;
+    TextTrim = 102, 3;
+    TextUpper = 103, 3;
+    TextLower = 104, 3;
+    TextContains = 105, 4;
+    TextStartsWith = 106, 4;
+    TextEndsWith = 107, 4;
+    TextReplace = 108, 4;
+    ToText = 109, 3;
+    Abs = 110, 3;
+    Min = 111, 4;
+    Max = 112, 4;
+    ParseInteger = 113, 3;
+    CountToInteger = 114, 3;
+    IntegerToCount = 115, 3;
 }
 
 impl TextOp {
@@ -255,6 +271,38 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
             Instruction::CellWrite(cell, value) => (Opcode::CellWrite, [cell.0, value.0, 0], 2),
             Instruction::CellReplace(dst, cell, value) => {
                 (Opcode::CellReplace, [dst.0, cell.0, value.0], 3)
+            }
+            Instruction::Clone(dst, src) => (Opcode::Clone, [dst.0, src.0, 0], 2),
+            Instruction::TextMap(op, dst, src) => {
+                let opcode = match op {
+                    TextMapOp::Trim => Opcode::TextTrim,
+                    TextMapOp::Upper => Opcode::TextUpper,
+                    TextMapOp::Lower => Opcode::TextLower,
+                };
+                (opcode, [dst.0, src.0, 0], 2)
+            }
+            Instruction::TextTest(op, dst, text, other) => {
+                let opcode = match op {
+                    TextTestOp::Contains => Opcode::TextContains,
+                    TextTestOp::StartsWith => Opcode::TextStartsWith,
+                    TextTestOp::EndsWith => Opcode::TextEndsWith,
+                };
+                (opcode, [dst.0, text.0, other.0], 3)
+            }
+            Instruction::TextReplace(dst, text, list) => {
+                (Opcode::TextReplace, [dst.0, text.0, list.0], 3)
+            }
+            Instruction::ToText(dst, src) => (Opcode::ToText, [dst.0, src.0, 0], 2),
+            Instruction::ParseInteger(dst, text) => (Opcode::ParseInteger, [dst.0, text.0, 0], 2),
+            Instruction::CountToInteger(dst, src) => (Opcode::CountToInteger, [dst.0, src.0, 0], 2),
+            Instruction::IntegerToCount(dst, src) => (Opcode::IntegerToCount, [dst.0, src.0, 0], 2),
+            Instruction::Abs(dst, src) => (Opcode::Abs, [dst.0, src.0, 0], 2),
+            Instruction::Extremum(op, dst, lhs, rhs) => {
+                let opcode = match op {
+                    Extremum::Min => Opcode::Min,
+                    Extremum::Max => Opcode::Max,
+                };
+                (opcode, [dst.0, lhs.0, rhs.0], 3)
             }
             Instruction::SliceOf(dst, src) => (Opcode::SliceOf, [dst.0, src.0, 0], 2),
             Instruction::SliceLength(dst, src) => (Opcode::SliceLength, [dst.0, src.0, 0], 2),
@@ -431,6 +479,27 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::CellRead => Instruction::CellRead(reg(0), reg(1)),
             Opcode::CellWrite => Instruction::CellWrite(reg(0), reg(1)),
             Opcode::CellReplace => Instruction::CellReplace(reg(0), reg(1), reg(2)),
+            Opcode::Clone => Instruction::Clone(reg(0), reg(1)),
+            Opcode::TextTrim => Instruction::TextMap(TextMapOp::Trim, reg(0), reg(1)),
+            Opcode::TextUpper => Instruction::TextMap(TextMapOp::Upper, reg(0), reg(1)),
+            Opcode::TextLower => Instruction::TextMap(TextMapOp::Lower, reg(0), reg(1)),
+            Opcode::TextContains => {
+                Instruction::TextTest(TextTestOp::Contains, reg(0), reg(1), reg(2))
+            }
+            Opcode::TextStartsWith => {
+                Instruction::TextTest(TextTestOp::StartsWith, reg(0), reg(1), reg(2))
+            }
+            Opcode::TextEndsWith => {
+                Instruction::TextTest(TextTestOp::EndsWith, reg(0), reg(1), reg(2))
+            }
+            Opcode::TextReplace => Instruction::TextReplace(reg(0), reg(1), list(2)),
+            Opcode::ToText => Instruction::ToText(reg(0), reg(1)),
+            Opcode::ParseInteger => Instruction::ParseInteger(reg(0), reg(1)),
+            Opcode::CountToInteger => Instruction::CountToInteger(reg(0), reg(1)),
+            Opcode::IntegerToCount => Instruction::IntegerToCount(reg(0), reg(1)),
+            Opcode::Abs => Instruction::Abs(reg(0), reg(1)),
+            Opcode::Min => Instruction::Extremum(Extremum::Min, reg(0), reg(1), reg(2)),
+            Opcode::Max => Instruction::Extremum(Extremum::Max, reg(0), reg(1), reg(2)),
             Opcode::SliceOf => Instruction::SliceOf(reg(0), reg(1)),
             Opcode::SliceLength => Instruction::SliceLength(reg(0), reg(1)),
             Opcode::Sum => Instruction::Sum(reg(0), reg(1)),

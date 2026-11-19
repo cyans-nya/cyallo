@@ -1,8 +1,8 @@
 use super::{
-    BooleanOp, CallSite, CallTarget, FloatOp, FrameLayout, FunctionId, GlobalId, HostBindingId,
-    HostFailure, Instruction, InstructionId, IntegerOp, OutputPiece, OutputTemplate, Register,
-    RegisterType, Scalar, ScalarType, StatementArrival, StatementBoundary, TextFailure, TextOp,
-    TextStyle, VerifiedFunction, VerifiedModule, array_len,
+    BooleanOp, CallSite, CallTarget, Extremum, FloatOp, FrameLayout, FunctionId, GlobalId,
+    HostBindingId, HostFailure, Instruction, InstructionId, IntegerOp, OutputPiece, OutputTemplate,
+    Register, RegisterType, Scalar, ScalarType, StatementArrival, StatementBoundary, TextFailure,
+    TextMapOp, TextOp, TextStyle, TextTestOp, VerifiedFunction, VerifiedModule, array_len,
 };
 use crate::{
     Span,
@@ -539,6 +539,55 @@ impl Memory {
         if block.strong == 0 && block.weak == 0 {
             self.counted[index] = None;
             self.free_counted.push(index);
+        }
+    }
+
+    /// A copy of a value. A counted owner or weak reference inside gains one,
+    /// and a handle keeps its identity.
+    fn clone_value(&mut self, value: &FrameValue) -> FrameValue {
+        match value {
+            FrameValue::Rc(block) => {
+                self.block(*block).strong += 1;
+                FrameValue::Rc(*block)
+            }
+            FrameValue::Weak(block) => {
+                self.block(*block).weak += 1;
+                FrameValue::Weak(*block)
+            }
+            FrameValue::Composite(Composite::Tuple(fields)) => FrameValue::Composite(
+                Composite::Tuple(fields.iter().map(|field| self.clone_value(field)).collect()),
+            ),
+            FrameValue::Composite(Composite::Enum { variant, payload }) => {
+                FrameValue::Composite(Composite::Enum {
+                    variant: *variant,
+                    payload: payload
+                        .as_deref()
+                        .map(|payload| Box::new(self.clone_value(payload))),
+                })
+            }
+            FrameValue::Composite(Composite::Array(elements)) => {
+                FrameValue::Composite(Composite::Array(
+                    elements
+                        .iter()
+                        .map(|element| element.as_ref().map(|element| self.clone_value(element)))
+                        .collect(),
+                ))
+            }
+            FrameValue::Composite(Composite::Vec(items)) => FrameValue::Composite(Composite::Vec(
+                items.iter().map(|item| self.clone_value(item)).collect(),
+            )),
+            FrameValue::Composite(Composite::Cell(inner)) => {
+                FrameValue::Composite(Composite::Cell(Box::new(self.clone_value(inner))))
+            }
+            FrameValue::Closure(closure) => FrameValue::Closure(Arc::new(Closure {
+                function: closure.function,
+                captures: closure
+                    .captures
+                    .iter()
+                    .map(|capture| self.clone_value(capture))
+                    .collect(),
+            })),
+            other => other.clone(),
         }
     }
 
@@ -1372,6 +1421,117 @@ impl VerifiedModule {
                 read_place(&root, &place.path)
                     .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
                 stack[depth - 1].set_value(layout, dst, FrameValue::Loan(place));
+            }
+            Instruction::Clone(dst, src) => {
+                let held = self
+                    .held_value(stack, memory, body, src)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?
+                    .ok_or(RunError::UninitializedGlobal {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    })?;
+                let copy = memory.clone_value(&held);
+                stack[depth - 1].set_value(layout, dst, copy);
+            }
+            Instruction::TextMap(op, dst, src) => {
+                let text = frame.text(layout, src);
+                let mapped = match op {
+                    TextMapOp::Trim => text.trim().to_owned(),
+                    TextMapOp::Upper => text.to_uppercase(),
+                    TextMapOp::Lower => text.to_lowercase(),
+                };
+                frame.set_value(layout, dst, FrameValue::Text(mapped.into()));
+            }
+            Instruction::TextTest(op, dst, text, other) => {
+                let (text, other) = (frame.text(layout, text), frame.text(layout, other));
+                let result = match op {
+                    TextTestOp::Contains => text.contains(&**other),
+                    TextTestOp::StartsWith => text.starts_with(&**other),
+                    TextTestOp::EndsWith => text.ends_with(&**other),
+                };
+                frame.set(layout, dst, Scalar::Bool(result));
+            }
+            Instruction::TextReplace(dst, text, list) => {
+                let [from_text, to_text] = body.lists[list.index()][..] else {
+                    unreachable!("verified two-entry list");
+                };
+                let replaced = frame.text(layout, text).replace(
+                    &**frame.text(layout, from_text),
+                    frame.text(layout, to_text),
+                );
+                frame.set_value(layout, dst, FrameValue::Text(replaced.into()));
+            }
+            Instruction::ToText(dst, src) => {
+                let spelled = spell(&frame.value(layout, src), TextStyle::Plain);
+                frame.set_value(layout, dst, FrameValue::Text(spelled.into()));
+            }
+            Instruction::ParseInteger(dst, text) => {
+                let (ok, err) = body.parse_variants_runtime(dst);
+                let parsed = frame
+                    .text(layout, text)
+                    .parse::<i128>()
+                    .ok()
+                    .and_then(|value| i64::try_from(value).ok());
+                let value = match parsed {
+                    Some(value) => Composite::Enum {
+                        variant: ok,
+                        payload: Some(Box::new(FrameValue::Scalar(Scalar::I64(value)))),
+                    },
+                    None => Composite::Enum {
+                        variant: err,
+                        payload: Some(Box::new(FrameValue::Composite(Composite::Enum {
+                            variant: 0,
+                            payload: None,
+                        }))),
+                    },
+                };
+                frame.set_value(layout, dst, FrameValue::Composite(value));
+            }
+            Instruction::CountToInteger(dst, src) => {
+                let Scalar::U64(value) = frame.get(layout, src) else {
+                    unreachable!("verified count operand");
+                };
+                let value = i64::try_from(value).map_err(|_| RunError::ConversionOutOfRange {
+                    function,
+                    instruction: from,
+                    span: body.spans[pc],
+                })?;
+                frame.set(layout, dst, Scalar::I64(value));
+            }
+            Instruction::IntegerToCount(dst, src) => {
+                let Scalar::I64(value) = frame.get(layout, src) else {
+                    unreachable!("verified integer operand");
+                };
+                let value = u64::try_from(value).map_err(|_| RunError::ConversionOutOfRange {
+                    function,
+                    instruction: from,
+                    span: body.spans[pc],
+                })?;
+                frame.set(layout, dst, Scalar::U64(value));
+            }
+            Instruction::Abs(dst, src) => {
+                let Scalar::I64(value) = frame.get(layout, src) else {
+                    unreachable!("verified integer operand");
+                };
+                let value = value.checked_abs().ok_or(RunError::IntegerOverflow {
+                    function,
+                    instruction: from,
+                    span: body.spans[pc],
+                })?;
+                frame.set(layout, dst, Scalar::I64(value));
+            }
+            Instruction::Extremum(op, dst, lhs, rhs) => {
+                let (Scalar::I64(lhs), Scalar::I64(rhs)) =
+                    (frame.get(layout, lhs), frame.get(layout, rhs))
+                else {
+                    unreachable!("verified integer operands");
+                };
+                let value = match op {
+                    Extremum::Min => lhs.min(rhs),
+                    Extremum::Max => lhs.max(rhs),
+                };
+                frame.set(layout, dst, Scalar::I64(value));
             }
             Instruction::RangeNew(dst, start, end)
             | Instruction::RangeInclusive(dst, start, end) => {
@@ -2305,37 +2465,40 @@ impl fmt::Debug for OutputSink {
     }
 }
 
+/// How a scalar or string is written in text.
+fn spell(value: &FrameValue, style: TextStyle) -> String {
+    match (style, value) {
+        (_, FrameValue::Text(text)) => text.to_string(),
+        (_, FrameValue::Scalar(Scalar::I64(value))) => value.to_string(),
+        (_, FrameValue::Scalar(Scalar::U64(value))) => value.to_string(),
+        (_, FrameValue::Scalar(Scalar::F64(bits))) => f64::from_bits(*bits).to_string(),
+        (TextStyle::Caie, FrameValue::Scalar(Scalar::Bool(value))) => {
+            if *value { "TRUE" } else { "FALSE" }.to_owned()
+        }
+        (TextStyle::Plain, FrameValue::Scalar(Scalar::Bool(value))) => {
+            if *value { "true" } else { "false" }.to_owned()
+        }
+        (
+            _,
+            FrameValue::Loan(_)
+            | FrameValue::Composite(_)
+            | FrameValue::Closure(_)
+            | FrameValue::Handle(_)
+            | FrameValue::Rc(_)
+            | FrameValue::Weak(_)
+            | FrameValue::Moved,
+        ) => unreachable!("verified text operand is a scalar or string"),
+    }
+}
+
 fn render_output(template: &OutputTemplate, arguments: &[FrameValue]) -> String {
     let mut line = String::new();
     for piece in template.pieces.iter() {
         match piece {
             OutputPiece::Text(text) => line.push_str(text),
-            OutputPiece::Argument(index) => match (template.style, &arguments[*index]) {
-                (_, FrameValue::Text(text)) => line.push_str(text),
-                (_, FrameValue::Scalar(Scalar::I64(value))) => line.push_str(&value.to_string()),
-                (_, FrameValue::Scalar(Scalar::U64(value))) => line.push_str(&value.to_string()),
-                (_, FrameValue::Scalar(Scalar::F64(bits))) => {
-                    line.push_str(&f64::from_bits(*bits).to_string());
-                }
-                (TextStyle::Caie, FrameValue::Scalar(Scalar::Bool(value))) => {
-                    line.push_str(if *value { "TRUE" } else { "FALSE" });
-                }
-                (TextStyle::Plain, FrameValue::Scalar(Scalar::Bool(value))) => {
-                    line.push_str(if *value { "true" } else { "false" });
-                }
-                (
-                    _,
-                    FrameValue::Loan(_)
-                    | FrameValue::Composite(_)
-                    | FrameValue::Closure(_)
-                    | FrameValue::Handle(_)
-                    | FrameValue::Rc(_)
-                    | FrameValue::Weak(_)
-                    | FrameValue::Moved,
-                ) => {
-                    unreachable!("verified output argument is a scalar or text")
-                }
-            },
+            OutputPiece::Argument(index) => {
+                line.push_str(&spell(&arguments[*index], template.style))
+            }
         }
     }
     line

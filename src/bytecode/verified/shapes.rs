@@ -43,6 +43,8 @@ impl Shapes {
             Type::Integer => ScalarType::I64.into(),
             Type::Real => ScalarType::F64.into(),
             Type::Numeric(NumberKind::Usize | NumberKind::U64) => ScalarType::U64.into(),
+            Type::Numeric(NumberKind::I64) => ScalarType::I64.into(),
+            Type::Numeric(NumberKind::F64) => ScalarType::F64.into(),
             Type::String => ValueType::Text,
             Type::Boolean => ScalarType::Bool.into(),
             Type::Function(_, parameters, result) => {
@@ -193,6 +195,10 @@ impl Shapes {
                 let element = self.value(&arguments[0])?;
                 self.structural_shape(Shape::Cell { element })?
             }
+            // A failure that carries no data is one unit variant.
+            Type::Storage(StorageKind::ParseError, _) => {
+                self.structural_shape(Shape::Enum(Box::new([None])))?
+            }
             Type::Storage(StorageKind::Range, element) => {
                 let bound = self.value(element)?;
                 if bound != ValueType::Scalar(ScalarType::I64) {
@@ -319,6 +325,18 @@ impl Shapes {
             Shape::Enum(variants) => variants.get(variant as usize).copied().flatten(),
             _ => None,
         }
+    }
+
+    /// The `Ok` and `Err` variants of a result-shaped enum.
+    pub fn result_variants(&self, shape: ShapeId) -> Option<(u32, u32)> {
+        let encodings = self.encodings.get(&shape)?;
+        let ok = encodings
+            .iter()
+            .position(|e| *e == EnumEncoding::ResultOk)?;
+        let err = encodings
+            .iter()
+            .position(|e| *e == EnumEncoding::ResultErr)?;
+        Some((u32::try_from(ok).ok()?, u32::try_from(err).ok()?))
     }
 
     /// The `Some` and `None` variants of an option-shaped enum.

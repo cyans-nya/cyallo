@@ -690,6 +690,15 @@ fn verified_engine_matches_the_interpreter_on_supported_programs() {
         "examples/knapsack.ya",
         "examples/gc-cycles.ya",
         "examples/gc-sharing.ya",
+        "examples/modern.ya",
+        "examples/tour.ya",
+        "examples/generics.ya",
+        "examples/parser.ya",
+        "examples/postfix-dereference.ya",
+        "examples/enums/patterns.ya",
+        "examples/enums/result.ya",
+        "examples/gc-rc.ya",
+        "examples/dfs.ya",
     ] {
         let run = |engine| cli(&["run", example, "--engine", engine]).output().unwrap();
         let verified = run("verified");

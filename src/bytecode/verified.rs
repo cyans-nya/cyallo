@@ -33,12 +33,12 @@ pub use run::{
 };
 pub use sdk::SdkCompileError;
 
-/// Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 20;
+pub const FORMAT_VERSION: u32 = 21;
 
 macro_rules! index {
     ($name:ident) => {
@@ -422,6 +422,29 @@ pub enum TextFailure {
     RangeOutOfBounds,
 }
 
+/// A string transformation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextMapOp {
+    /// Remove leading and trailing white space.
+    Trim,
+    Upper,
+    Lower,
+}
+
+/// A test of one string against another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextTestOp {
+    Contains,
+    StartsWith,
+    EndsWith,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Extremum {
+    Min,
+    Max,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BooleanOp {
     Equal,
@@ -484,6 +507,26 @@ pub enum Instruction {
     CellWrite(Register, Register),
     /// Replace the value a cell holds and return the old one.
     CellReplace(Register, Register, Register),
+    /// A copy of the value an owner holds or a loan points at. Counted owners
+    /// inside gain an owner and handles keep their identity.
+    Clone(Register, Register),
+    TextMap(TextMapOp, Register, Register),
+    TextTest(TextTestOp, Register, Register, Register),
+    /// Replace every occurrence of the first string of the list by the second.
+    TextReplace(Register, Register, OperandListId),
+    /// The text spelling of a scalar or string, as `print` writes it.
+    ToText(Register, Register),
+    /// Checked absolute value.
+    Abs(Register, Register),
+    /// A count as a signed integer; a count above the maximum fails.
+    CountToInteger(Register, Register),
+    /// A signed integer as a count; a negative value fails.
+    IntegerToCount(Register, Register),
+    /// Parse the text as a decimal 64-bit integer, with no surrounding white
+    /// space. The result is a two-variant enum: one carries the integer, the
+    /// other a payload-free error.
+    ParseInteger(Register, Register),
+    Extremum(Extremum, Register, Register, Register),
     /// View the elements of an array, or of another slice, through a loan.
     SliceOf(Register, Register),
     /// Number of elements in an array or slice.
@@ -631,6 +674,17 @@ impl Instruction {
             }
             WriteLoan(loan, value) => ([Some(loan), Some(value)], &[], None),
             BorrowGlobal(dst, _) => ([None, None], &[], Some(dst)),
+            Clone(dst, src)
+            | TextMap(_, dst, src)
+            | ToText(dst, src)
+            | Abs(dst, src)
+            | CountToInteger(dst, src)
+            | IntegerToCount(dst, src)
+            | ParseInteger(dst, src) => ([Some(src), None], &[], Some(dst)),
+            TextTest(_, dst, lhs, rhs) | Extremum(_, dst, lhs, rhs) => {
+                ([Some(lhs), Some(rhs)], &[], Some(dst))
+            }
+            TextReplace(dst, text, list) => ([Some(text), None], &lists[list.index()], Some(dst)),
             RangeNew(dst, start, end) | RangeInclusive(dst, start, end) => {
                 ([Some(start), Some(end)], &[], Some(dst))
             }
@@ -964,6 +1018,34 @@ impl VerifiedFunction {
         match self.shape(id)? {
             Shape::Tuple(fields) => Ok(fields),
             _ => Err(InvalidBytecode::ExpectedTuple(register)),
+        }
+    }
+
+    /// The variant that carries the parsed integer and the one that carries
+    /// the error, of a result-shaped enum. The error has no payload data.
+    fn parse_variants(&self, register: Register) -> Result<(u32, u32), InvalidBytecode> {
+        let variants = self.enum_variants(register)?;
+        let [first, second] = variants else {
+            return Err(InvalidBytecode::ExpectedEnum(register));
+        };
+        let unit_enum = |ty: Option<ValueType>| {
+            matches!(ty, Some(ValueType::Composite(shape))
+                if matches!(self.shapes.get(shape.index()), Some(Shape::Enum(v)) if v.len() == 1 && v[0].is_none()))
+        };
+        if *first == Some(I64) && unit_enum(*second) {
+            Ok((0, 1))
+        } else if *second == Some(I64) && unit_enum(*first) {
+            Ok((1, 0))
+        } else {
+            Err(InvalidBytecode::ExpectedEnum(register))
+        }
+    }
+
+    /// [`Self::parse_variants`] for a verified register.
+    fn parse_variants_runtime(&self, register: Register) -> (u32, u32) {
+        match self.parse_variants(register) {
+            Ok(variants) => variants,
+            Err(_) => unreachable!("verified result register"),
         }
     }
 
@@ -2127,6 +2209,58 @@ impl VerifiedFunction {
                     }
                     _ => Err(InvalidBytecode::ExpectedArray(src)),
                 }
+            }
+            Instruction::Clone(dst, src) => {
+                let (held, ..) = self.projection_base(src)?;
+                self.require_value(dst, held)
+            }
+            Instruction::TextMap(_, dst, src) => {
+                self.require_text(src)?;
+                self.require_text(dst)
+            }
+            Instruction::TextTest(_, dst, text, other) => {
+                self.require_text(text)?;
+                self.require_text(other)?;
+                self.require_type(dst, ScalarType::Bool)
+            }
+            Instruction::TextReplace(dst, text, list) => {
+                self.require_text(text)?;
+                let [from, to] = self.operand_list(list)? else {
+                    return Err(InvalidBytecode::ArgumentCount {
+                        expected: 2,
+                        actual: self.operand_list(list)?.len(),
+                    });
+                };
+                self.require_text(*from)?;
+                self.require_text(*to)?;
+                self.require_text(dst)
+            }
+            Instruction::ToText(dst, src) => {
+                if self.register_kind(src)? != RegisterType::Text {
+                    self.register_type(src)?;
+                }
+                self.require_text(dst)
+            }
+            Instruction::ParseInteger(dst, text) => {
+                self.require_text(text)?;
+                self.parse_variants(dst).map(|_| ())
+            }
+            Instruction::CountToInteger(dst, src) => {
+                self.require_type(src, ScalarType::U64)?;
+                self.require_type(dst, ScalarType::I64)
+            }
+            Instruction::IntegerToCount(dst, src) => {
+                self.require_type(src, ScalarType::I64)?;
+                self.require_type(dst, ScalarType::U64)
+            }
+            Instruction::Abs(dst, src) => {
+                self.require_type(src, ScalarType::I64)?;
+                self.require_type(dst, ScalarType::I64)
+            }
+            Instruction::Extremum(_, dst, lhs, rhs) => {
+                self.require_type(lhs, ScalarType::I64)?;
+                self.require_type(rhs, ScalarType::I64)?;
+                self.require_type(dst, ScalarType::I64)
             }
             Instruction::SliceOf(dst, src) => {
                 let (element, _) = self.sequence(src)?;

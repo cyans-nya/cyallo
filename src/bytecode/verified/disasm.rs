@@ -294,6 +294,33 @@ impl fmt::Display for VerifiedModule {
                     Instruction::CellReplace(dst, cell, value) => {
                         write!(f, "r{} = cell.replace r{}, r{}", dst.0, cell.0, value.0)?;
                     }
+                    Instruction::Clone(dst, src) => write!(f, "r{} = clone r{}", dst.0, src.0)?,
+                    Instruction::TextMap(op, dst, src) => {
+                        write!(f, "r{} = text.{op:?} r{}", dst.0, src.0)?;
+                    }
+                    Instruction::TextTest(op, dst, text, other) => {
+                        write!(f, "r{} = text.{op:?} r{}, r{}", dst.0, text.0, other.0)?;
+                    }
+                    Instruction::TextReplace(dst, text, list) => {
+                        write!(f, "r{} = text.replace r{}", dst.0, text.0)?;
+                        write_list(f, &function.lists()[list.index()])?;
+                    }
+                    Instruction::ToText(dst, src) => write!(f, "r{} = to.text r{}", dst.0, src.0)?,
+                    Instruction::ParseInteger(dst, text) => {
+                        write!(f, "r{} = parse.i64 r{}", dst.0, text.0)?;
+                    }
+                    Instruction::CountToInteger(dst, src) => {
+                        write!(f, "r{} = i64.from.u64 r{}", dst.0, src.0)?;
+                    }
+                    Instruction::IntegerToCount(dst, src) => {
+                        write!(f, "r{} = u64.from.i64 r{}", dst.0, src.0)?;
+                    }
+                    Instruction::Abs(dst, src) => {
+                        write!(f, "r{} = i64.checked.abs r{}", dst.0, src.0)?
+                    }
+                    Instruction::Extremum(op, dst, lhs, rhs) => {
+                        write!(f, "r{} = i64.{op:?} r{}, r{}", dst.0, lhs.0, rhs.0)?;
+                    }
                     Instruction::SliceOf(dst, src) => {
                         write!(f, "r{} = slice.of r{}", dst.0, src.0)?
                     }
