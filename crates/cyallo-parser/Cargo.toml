@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 cyallo-compile-jobs = { path = "../cyallo-compile-jobs" }
 cyallo-ast = { path = "../cyallo-ast" }
+cyallo-startup-profile = { path = "../cyallo-startup-profile" }

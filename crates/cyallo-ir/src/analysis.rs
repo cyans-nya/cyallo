@@ -451,25 +451,48 @@ fn blank_routine(f: &cyallo_ast::Function) -> ir::Function {
 impl DeferredBody {
     pub fn analyze(&self) -> ir::Function {
         let c = &self.context;
+        let _analysis = cyallo_startup_profile::stage(cyallo_startup_profile::Stage::BodyAnalysis);
+        cyallo_startup_profile::count(cyallo_startup_profile::Counter::BodiesChecked, 1);
         let result = (|| {
-            let function = lower_routine(
-                &self.function,
-                &c.globals,
-                &c.signatures,
-                &c.routine_types,
-                c.options,
-                &c.services,
-                &c.source_names,
-            )?;
+            let function = {
+                let _lower =
+                    cyallo_startup_profile::stage(cyallo_startup_profile::Stage::BodyLower);
+                lower_routine(
+                    &self.function,
+                    &c.globals,
+                    &c.signatures,
+                    &c.routine_types,
+                    c.options,
+                    &c.services,
+                    &c.source_names,
+                )?
+            };
+            cyallo_startup_profile::count(
+                cyallo_startup_profile::Counter::CheckedInstructions,
+                function.code.len(),
+            );
             // Check local purity against declaration contracts without forcing
             // cold callees. Every callee must pass its own check before entry.
-            let mut functions = c.headers.clone();
+            let mut functions = {
+                let _clone =
+                    cyallo_startup_profile::stage(cyallo_startup_profile::Stage::HeaderClone);
+                cyallo_startup_profile::count(cyallo_startup_profile::Counter::HeaderClones, 1);
+                cyallo_startup_profile::count(
+                    cyallo_startup_profile::Counter::HeaderElementsCloned,
+                    c.headers.len(),
+                );
+                c.headers.clone()
+            };
             let mut main = blank_routine(&self.function);
             main.name = "<main>".into();
             main.locals = c.globals.clone();
             functions.insert(0, main);
             functions[self.index] = function;
-            crate::effects::analyze_one(&mut functions, self.index, &c.services)?;
+            {
+                let _effects =
+                    cyallo_startup_profile::stage(cyallo_startup_profile::Stage::BodyEffects);
+                crate::effects::analyze_one(&mut functions, self.index, &c.services)?;
+            }
             let mut function = functions.swap_remove(self.index);
             if function.code.iter().any(|i| matches!(i.op, Op::Call(..))) {
                 function.effects.transitive_complete = false;
@@ -478,7 +501,11 @@ impl DeferredBody {
                 function.effects.may_diverge = true;
             }
             conservative_calls(&mut function);
-            finish_lowering(&mut function, false);
+            {
+                let _finish =
+                    cyallo_startup_profile::stage(cyallo_startup_profile::Stage::BodyFinish);
+                finish_lowering(&mut function, false);
+            }
             Ok::<_, Diagnostic>(function)
         })();
         result.unwrap_or_else(|error| {

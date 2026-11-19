@@ -1,0 +1,9 @@
+[package]
+name = "cyallo-startup-profile"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# Without this feature every function is an empty inline no-op, so the
+# instrumentation costs nothing in shipping builds.
+enabled = []

@@ -112,11 +112,17 @@ impl SourceTrees {
     }
 
     pub(crate) fn materialize(&self, entry: usize) -> Result<Vec<Ast>, ast::Diagnostic> {
+        let _materialize =
+            cyallo_startup_profile::stage(cyallo_startup_profile::Stage::Materialize);
         let mut files = self
             .files
             .iter()
             .map(ArchivedSyntax::materialize)
             .collect::<Result<Vec<_>, _>>()?;
+        cyallo_startup_profile::count(
+            cyallo_startup_profile::Counter::BodiesMaterialized,
+            files.iter().map(|f| f.functions.len()).sum(),
+        );
         files[entry]
             .modules
             .extend(self.packages.iter().map(|package| (**package).clone()));
