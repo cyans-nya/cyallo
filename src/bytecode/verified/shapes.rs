@@ -199,6 +199,13 @@ impl Shapes {
         })
     }
 
+    /// Add a shape that no checked type names.
+    fn push_shape(&mut self, shape: Shape) -> Option<ShapeId> {
+        let id = ShapeId(u32::try_from(self.shapes.len()).ok()?);
+        self.shapes.push(shape);
+        Some(id)
+    }
+
     fn intern(
         &mut self,
         ty: &Type,
@@ -228,6 +235,16 @@ impl Shapes {
     /// pointed at like the closure it is.
     pub fn pointee(&mut self, ty: &Type) -> Option<ValueType> {
         match ty {
+            Type::Slice(element) => {
+                let element = self.value(element)?;
+                let shape = Shape::Slice { element };
+                if let Some(&id) = self.structural.get(&shape) {
+                    return Some(ValueType::Composite(id));
+                }
+                let id = self.push_shape(shape.clone())?;
+                self.structural.insert(shape, id);
+                Some(ValueType::Composite(id))
+            }
             Type::Borrowed(inner) if matches!(**inner, Type::Function(..)) => self.value(inner),
             other => self.value(other),
         }
@@ -250,6 +267,8 @@ impl Shapes {
                     .flatten()
                     .any(|&payload| self.needs_drop(payload)),
                 Some(Shape::Array { element, .. }) => self.needs_drop(*element),
+                // A view owns nothing.
+                Some(Shape::Slice { .. }) => false,
                 None => false,
             },
             ValueType::Scalar(_) | ValueType::Text | ValueType::Function(_) | ValueType::Gc(_) => {

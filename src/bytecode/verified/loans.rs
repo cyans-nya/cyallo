@@ -10,7 +10,7 @@ use crate::{
     Type,
     ir::{Function, LocalStorage, Op},
 };
-use cyallo_ir::enums::Projection;
+use cyallo_ir::{enums::Projection, lookup::Operation};
 
 pub(super) struct Places {
     routine: usize,
@@ -199,6 +199,16 @@ impl Places {
             };
             loan_types[dst] = Some((access, pointee));
             origins.push((dst, LoanOrigin::Global(global)));
+        }
+        // A slice views the array its source loan borrows, with its root.
+        for op in &all_ops {
+            if let Op::Lookup(dst, Operation::Slice(_), args) = op
+                && let [source] = args.as_slice()
+                && loan_types[*source].is_some()
+                && loan_types[*dst].is_some()
+            {
+                downstream[*source].push(*dst);
+            }
         }
         // The address of a heap object is a place rooted at the object its
         // handle names, as exclusive as its uses require.

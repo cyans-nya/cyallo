@@ -573,6 +573,21 @@ fn lower_operation(
             let owner = places.address(*src).ok_or_else(unsupported)?;
             Instruction::Borrow(register(*dst)?, owner)
         }
+        Op::Lookup(dst, Operation::Slice(_), args) if args.len() == 1 => {
+            Instruction::SliceOf(register(*dst)?, register(args[0])?)
+        }
+        Op::Builtin(dst, Intrinsic::ArraySum, args) if args.len() == 1 => {
+            Instruction::Sum(register(*dst)?, register(args[0])?)
+        }
+        Op::Builtin(dst, Intrinsic::Length | Intrinsic::ArrayLength, args)
+            if args.len() == 1
+                && matches!(
+                    places.registers.get(args[0]),
+                    Some(RegisterType::Loan { .. })
+                ) =>
+        {
+            Instruction::SliceLength(register(*dst)?, register(args[0])?)
+        }
         Op::Lookup(dst, Operation::ManagedNew(MemoryKind::Gc, false), args) if args.len() == 1 => {
             Instruction::GcNew(register(*dst)?, register(args[0])?)
         }

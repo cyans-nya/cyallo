@@ -357,6 +357,15 @@ struct BorrowedPlace {
     root: Root,
     /// Projections from the owning register to the borrowed place.
     path: Box<[Step]>,
+    /// The elements a slice covers, when the place is viewed as a slice.
+    window: Option<Window>,
+}
+
+/// A run of elements of an array: where it starts and how many it spans.
+#[derive(Debug, Clone, Copy)]
+struct Window {
+    start: usize,
+    len: usize,
 }
 
 /// Most objects the heap may hold after a collection.
@@ -1085,6 +1094,7 @@ impl VerifiedModule {
                         register: owner,
                     },
                     path: Box::new([]),
+                    window: None,
                 };
                 frame.set_value(layout, loan, FrameValue::Loan(place));
             }
@@ -1109,6 +1119,7 @@ impl VerifiedModule {
                 let place = BorrowedPlace {
                     root,
                     path: Box::new([]),
+                    window: None,
                 };
                 frame.set_value(layout, dst, FrameValue::Loan(place));
             }
@@ -1225,6 +1236,7 @@ impl VerifiedModule {
                 let place = BorrowedPlace {
                     root: Root::Global(global),
                     path: Box::new([]),
+                    window: None,
                 };
                 frame.set_value(layout, dst, FrameValue::Loan(place));
             }
@@ -1276,6 +1288,65 @@ impl VerifiedModule {
                 read_place(&root, &place.path)
                     .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
                 stack[depth - 1].set_value(layout, dst, FrameValue::Loan(place));
+            }
+            Instruction::SliceOf(dst, src) => {
+                let mut place = place_of(body, frame, layout, depth, src);
+                let window = if body.projects_from_slice(src) {
+                    place.window
+                } else {
+                    let len = array_len(body.projected_array_bounds(src));
+                    len.map(|len| Window { start: 0, len })
+                };
+                place.window = window;
+                frame.set_value(layout, dst, FrameValue::Loan(place));
+            }
+            Instruction::SliceLength(dst, src) => {
+                let length = match sequence_window(body, frame, layout, src) {
+                    Some(window) => window.len,
+                    None => 0,
+                };
+                let length = i64::try_from(length).unwrap_or(i64::MAX);
+                frame.set(layout, dst, Scalar::I64(length));
+            }
+            Instruction::Sum(dst, src) => {
+                let elements = self
+                    .sequence_elements(stack, memory, body, src)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let mut total = 0i64;
+                for element in elements {
+                    let Some(FrameValue::Scalar(Scalar::I64(value))) = element else {
+                        return Err(RunError::UninitializedElement {
+                            function,
+                            instruction: from,
+                            span: body.spans[pc],
+                        });
+                    };
+                    total = total.checked_add(value).ok_or(RunError::IntegerOverflow {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    })?;
+                }
+                stack[depth - 1].set(layout, dst, Scalar::I64(total));
+            }
+            Instruction::LoanElement(dst, src, list) if body.projects_from_slice(src) => {
+                let Scalar::I64(index) = frame.get(layout, body.lists[list.index()][0]) else {
+                    unreachable!("verified integer index");
+                };
+                let window = sequence_window(body, frame, layout, src);
+                let offset = window.and_then(|window| {
+                    usize::try_from(index)
+                        .ok()
+                        .filter(|&index| index < window.len)
+                        .map(|index| window.start + index)
+                });
+                let offset = offset.ok_or(RunError::IndexOutOfBounds {
+                    function,
+                    instruction: from,
+                    span: body.spans[pc],
+                })?;
+                let place = project_base(body, frame, layout, depth, src, Step::Offset(offset));
+                frame.set_value(layout, dst, FrameValue::Loan(place));
             }
             Instruction::LoanElement(dst, src, list) => {
                 let offset =
@@ -1701,6 +1772,36 @@ impl VerifiedModule {
         Ok(StepOutcome::Continue)
     }
 
+    /// The elements of the array or slice an operand stands for.
+    fn sequence_elements(
+        &self,
+        stack: &[Frame],
+        memory: &Memory,
+        body: &VerifiedFunction,
+        source: Register,
+    ) -> Result<Vec<Option<FrameValue>>, PlaceFault> {
+        let Some(frame) = stack.last() else {
+            unreachable!("active execution has a frame");
+        };
+        let layout = body.frame_layout();
+        let window = sequence_window(body, frame, layout, source);
+        let held = self
+            .held_value(stack, memory, body, source)?
+            .ok_or(PlaceFault::UninitializedElement)?;
+        let FrameValue::Composite(Composite::Array(elements)) = held else {
+            unreachable!("verified sequence operand");
+        };
+        let Some(window) = window else {
+            return Ok(elements.into_vec());
+        };
+        Ok(elements
+            .into_vec()
+            .into_iter()
+            .skip(window.start)
+            .take(window.len)
+            .collect())
+    }
+
     /// What a counted operand holds: the register's own value, or the value
     /// behind its loan. `None` when a module variable is not assigned yet.
     fn held_value(
@@ -2001,6 +2102,42 @@ fn place_error(
     }
 }
 
+/// The place a register stands for: its loan's place, or the register itself.
+fn place_of(
+    body: &VerifiedFunction,
+    frame: &Frame,
+    layout: &FrameLayout,
+    depth: usize,
+    source: Register,
+) -> BorrowedPlace {
+    if matches!(body.registers()[source.index()], RegisterType::Loan { .. }) {
+        frame.loan(layout, source)
+    } else {
+        BorrowedPlace {
+            root: Root::Frame {
+                frame: depth - 1,
+                register: source,
+            },
+            path: Box::new([]),
+            window: None,
+        }
+    }
+}
+
+/// The elements a sequence operand covers: its slice window, or all of the
+/// array it is.
+fn sequence_window(
+    body: &VerifiedFunction,
+    frame: &Frame,
+    layout: &FrameLayout,
+    source: Register,
+) -> Option<Window> {
+    if body.projects_from_slice(source) {
+        return frame.loan(layout, source).window;
+    }
+    array_len(body.projected_array_bounds(source)).map(|len| Window { start: 0, len })
+}
+
 /// The borrowed place of a projection: the base loan's place, or the owning
 /// register itself, extended by one step.
 fn project_base(
@@ -2020,11 +2157,13 @@ fn project_base(
                 register: source,
             },
             path: Box::new([]),
+            window: None,
         }
     };
     let mut path = place.path.into_vec();
     path.push(step);
     place.path = path.into_boxed_slice();
+    place.window = None;
     place
 }
 

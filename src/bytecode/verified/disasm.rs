@@ -36,6 +36,9 @@ impl fmt::Display for VerifiedModule {
                         value_name(*element)
                     )?;
                 }
+                Shape::Slice { element } => {
+                    writeln!(f, "shape{id} = slice of {}", value_name(*element))?;
+                }
                 Shape::Enum(variants) => {
                     let variants: Vec<_> = variants
                         .iter()
@@ -254,6 +257,13 @@ impl fmt::Display for VerifiedModule {
                         write_list(f, &function.lists()[list.index()])?;
                     }
                     Instruction::Move(dst, src) => write!(f, "r{} = move r{}", dst.0, src.0)?,
+                    Instruction::SliceOf(dst, src) => {
+                        write!(f, "r{} = slice.of r{}", dst.0, src.0)?
+                    }
+                    Instruction::SliceLength(dst, src) => {
+                        write!(f, "r{} = slice.len r{}", dst.0, src.0)?;
+                    }
+                    Instruction::Sum(dst, src) => write!(f, "r{} = sum r{}", dst.0, src.0)?,
                     Instruction::MoveOut(dst, loan) => {
                         write!(f, "r{} = move.out r{}", dst.0, loan.0)?;
                     }

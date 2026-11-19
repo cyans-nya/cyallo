@@ -116,6 +116,9 @@ opcodes! {
     EnumTake = 85, 4;
     ConstantU64 = 86, 4;
     MoveOut = 87, 3;
+    SliceOf = 88, 3;
+    SliceLength = 89, 3;
+    Sum = 90, 3;
 }
 
 impl TextOp {
@@ -227,6 +230,9 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
             }
             Instruction::TextMid(dst, text, list) => (Opcode::TextMid, [dst.0, text.0, list.0], 3),
             Instruction::Move(dst, src) => (Opcode::Move, [dst.0, src.0, 0], 2),
+            Instruction::SliceOf(dst, src) => (Opcode::SliceOf, [dst.0, src.0, 0], 2),
+            Instruction::SliceLength(dst, src) => (Opcode::SliceLength, [dst.0, src.0, 0], 2),
+            Instruction::Sum(dst, src) => (Opcode::Sum, [dst.0, src.0, 0], 2),
             Instruction::MoveOut(dst, loan) => (Opcode::MoveOut, [dst.0, loan.0, 0], 2),
             Instruction::Drop(reg) => (Opcode::Drop, [reg.0, 0, 0], 1),
             Instruction::RcNew(dst, value) => (Opcode::RcNew, [dst.0, value.0, 0], 2),
@@ -389,6 +395,9 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::TextRight => Instruction::TextRight(reg(0), reg(1), reg(2)),
             Opcode::TextMid => Instruction::TextMid(reg(0), reg(1), list(2)),
             Opcode::Move => Instruction::Move(reg(0), reg(1)),
+            Opcode::SliceOf => Instruction::SliceOf(reg(0), reg(1)),
+            Opcode::SliceLength => Instruction::SliceLength(reg(0), reg(1)),
+            Opcode::Sum => Instruction::Sum(reg(0), reg(1)),
             Opcode::MoveOut => Instruction::MoveOut(reg(0), reg(1)),
             Opcode::Drop => Instruction::Drop(reg(0)),
             Opcode::RcNew => Instruction::RcNew(reg(0), reg(1)),

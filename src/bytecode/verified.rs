@@ -33,12 +33,12 @@ pub use run::{
 };
 pub use sdk::SdkCompileError;
 
-/// Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 18;
+pub const FORMAT_VERSION: u32 = 19;
 
 macro_rules! index {
     ($name:ident) => {
@@ -143,6 +143,9 @@ pub enum Shape {
         element: ValueType,
         bounds: Box<[(i64, i64)]>,
     },
+    /// A window onto the elements of an array. It has no storage of its own:
+    /// it exists only as the pointee of a loan.
+    Slice { element: ValueType },
 }
 
 /// An array's element type and per-dimension inclusive bounds.
@@ -454,6 +457,12 @@ pub enum Instruction {
     GcNew(Register, Register),
     /// Borrow the heap object a handle refers to.
     GcBorrow(Register, Register),
+    /// View the elements of an array, or of another slice, through a loan.
+    SliceOf(Register, Register),
+    /// Number of elements in an array or slice.
+    SliceLength(Register, Register),
+    /// Checked sum of the integer elements of an array or slice.
+    Sum(Register, Register),
     /// Borrow a module-level variable.
     BorrowGlobal(Register, GlobalId),
     /// Borrow one field of a tuple, from an owner or another loan.
@@ -595,6 +604,9 @@ impl Instruction {
             }
             WriteLoan(loan, value) => ([Some(loan), Some(value)], &[], None),
             BorrowGlobal(dst, _) => ([None, None], &[], Some(dst)),
+            SliceOf(dst, src) | SliceLength(dst, src) | Sum(dst, src) => {
+                ([Some(src), None], &[], Some(dst))
+            }
             GcNew(dst, value) | GcBorrow(dst, value) | RcNew(dst, value) | Move(dst, value) => {
                 ([Some(value), None], &[], Some(dst))
             }
@@ -974,6 +986,28 @@ impl VerifiedFunction {
         }
     }
 
+    /// The element type of an array or slice held by the register or behind
+    /// its loan, and whether it is a slice. An array viewed as a slice must
+    /// be one-dimensional and start at zero.
+    fn sequence(&self, register: Register) -> Result<(ValueType, bool), InvalidBytecode> {
+        let (container, ..) = self.projection_base(register)?;
+        let ValueType::Composite(shape) = container else {
+            return Err(InvalidBytecode::ExpectedArray(register));
+        };
+        match self.shape(shape)? {
+            Shape::Array { element, bounds } if matches!(bounds.as_ref(), [(0, _)]) => {
+                Ok((*element, false))
+            }
+            Shape::Slice { element } => Ok((*element, true)),
+            _ => Err(InvalidBytecode::SliceSource(register)),
+        }
+    }
+
+    /// Whether a verified projection starts from a slice.
+    fn projects_from_slice(&self, source: Register) -> bool {
+        matches!(self.sequence(source), Ok((_, true)))
+    }
+
     fn array_shape(&self, register: Register) -> Result<ArrayShape<'_>, InvalidBytecode> {
         let RegisterType::Composite(id) = self.register_kind(register)? else {
             return Err(InvalidBytecode::ExpectedArray(register));
@@ -1153,6 +1187,9 @@ pub enum InvalidBytecode {
     UnknownList(OperandListId),
     ExpectedTuple(Register),
     ExpectedArray(Register),
+    /// A slice exists only behind a loan.
+    UnsizedValue(Register),
+    SliceSource(Register),
     ExpectedText(Register),
     UnknownText(TextId),
     UnknownGlobal(GlobalId),
@@ -1334,7 +1371,7 @@ impl ModuleImage {
         for index in 0..functions.len() {
             let id = function_id(index).map_err(image_error)?;
             let (frame, storage_entries) =
-                functions[index].verify(id, id == self.entry, &functions, &host_bindings)?;
+                functions[index].verify(id, &functions, &host_bindings)?;
             functions[index].frame = frame;
             functions[index].storage_entries = storage_entries;
         }
@@ -1352,7 +1389,7 @@ fn shape_components(shape: &Shape) -> Vec<ValueType> {
     match shape {
         Shape::Tuple(fields) => fields.to_vec(),
         Shape::Enum(variants) => variants.iter().copied().flatten().collect(),
-        Shape::Array { element, .. } => vec![*element],
+        Shape::Array { element, .. } | Shape::Slice { element } => vec![*element],
     }
 }
 
@@ -1407,7 +1444,6 @@ impl VerifiedFunction {
     fn verify(
         &self,
         id: FunctionId,
-        is_entry: bool,
         functions: &[Self],
         host_bindings: &[ScalarHostBinding],
     ) -> Result<(FrameLayout, Box<[StorageEntry]>), VerifyError> {
@@ -1460,9 +1496,13 @@ impl VerifiedFunction {
                 }
             }
         }
-        for &kind in self.registers.iter() {
+        for (index, &kind) in self.registers.iter().enumerate() {
             if let RegisterType::Composite(shape) = kind {
-                self.shape(shape).map_err(|kind| error(None, kind))?;
+                let shape_data = self.shape(shape).map_err(|kind| error(None, kind))?;
+                if matches!(shape_data, Shape::Slice { .. }) {
+                    let register = Register(u32::try_from(index).unwrap_or(u32::MAX));
+                    return Err(error(None, InvalidBytecode::UnsizedValue(register)));
+                }
             }
             if let RegisterType::Function(signature) = kind {
                 self.signature(signature)
@@ -1976,11 +2016,41 @@ impl VerifiedFunction {
                 let ValueType::Composite(shape) = container else {
                     return Err(InvalidBytecode::ExpectedArray(src));
                 };
-                let Shape::Array { element, bounds } = self.shape(shape)? else {
-                    return Err(InvalidBytecode::ExpectedArray(src));
+                match self.shape(shape)? {
+                    Shape::Array { element, bounds } => {
+                        self.require_indices(src, bounds, list)?;
+                        self.require_projection(dst, src, *element)
+                    }
+                    // A slice is indexed from zero by one integer.
+                    Shape::Slice { element } => {
+                        self.require_indices(src, &[(0, 0)], list)?;
+                        self.require_projection(dst, src, *element)
+                    }
+                    _ => Err(InvalidBytecode::ExpectedArray(src)),
+                }
+            }
+            Instruction::SliceOf(dst, src) => {
+                let (element, _) = self.sequence(src)?;
+                let (_, _, pointee) = self.loan_type(dst)?;
+                let ValueType::Composite(shape) = pointee else {
+                    return Err(InvalidBytecode::SliceSource(dst));
                 };
-                self.require_indices(src, bounds, list)?;
-                self.require_projection(dst, src, *element)
+                match self.shape(shape)? {
+                    Shape::Slice { element: viewed } if *viewed == element => {}
+                    _ => return Err(InvalidBytecode::SliceSource(dst)),
+                }
+                self.require_projection(dst, src, pointee)
+            }
+            Instruction::SliceLength(dst, src) => {
+                self.sequence(src)?;
+                self.require_type(dst, ScalarType::I64)
+            }
+            Instruction::Sum(dst, src) => {
+                let (element, _) = self.sequence(src)?;
+                if element != ValueType::Scalar(ScalarType::I64) {
+                    return Err(InvalidBytecode::SliceSource(src));
+                }
+                self.require_type(dst, ScalarType::I64)
             }
             Instruction::Integer(op, dst, lhs, rhs) => {
                 self.require_type(lhs, ScalarType::I64)?;
