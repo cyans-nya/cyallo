@@ -23,7 +23,7 @@ pub enum ExecutionMode {
 #[derive(Debug)]
 pub enum Dispatch {
     Native(NativeActivation),
-    Interpreter(Activation),
+    Interpreter(Box<Activation>),
 }
 
 impl CodeStore {
@@ -40,7 +40,7 @@ impl CodeStore {
         }
         self.module()
             .start(arguments, limits)
-            .map(Dispatch::Interpreter)
+            .map(|activation| Dispatch::Interpreter(Box::new(activation)))
             .map_err(NativeRunError::Guest)
     }
 }
@@ -485,6 +485,7 @@ fn decode(ty: ScalarType, word: u64) -> Result<Scalar, NativeRunError> {
     match (ty, word) {
         (ScalarType::I64, word) => Ok(Scalar::I64(i64::from_ne_bytes(word.to_ne_bytes()))),
         (ScalarType::F64, word) => Ok(Scalar::F64(word)),
+        (ScalarType::U64, word) => Ok(Scalar::U64(word)),
         (ScalarType::Bool, 0) => Ok(Scalar::Bool(false)),
         (ScalarType::Bool, 1) => Ok(Scalar::Bool(true)),
         (ScalarType::Bool, word) => Err(NativeRunError::InvalidBoolean(word)),

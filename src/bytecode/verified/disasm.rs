@@ -111,6 +111,8 @@ impl fmt::Display for VerifiedModule {
                         signature.0
                     )?,
                     RegisterType::Gc(managed) => write!(f, "  r{index}: gc m{}", managed.0)?,
+                    RegisterType::Rc(managed) => write!(f, "  r{index}: rc m{}", managed.0)?,
+                    RegisterType::Weak(managed) => write!(f, "  r{index}: weak m{}", managed.0)?,
                     RegisterType::Text => write!(f, "  r{index}: text")?,
                     RegisterType::Function(signature) => {
                         write!(f, "  r{index}: fn sig{}", signature.0)?
@@ -137,6 +139,9 @@ impl fmt::Display for VerifiedModule {
                     Instruction::StorageDead(reg) => write!(f, "storage.dead r{}", reg.0)?,
                     Instruction::Constant(reg, Scalar::I64(value)) => {
                         write!(f, "r{} = const.i64 {value}", reg.0)?;
+                    }
+                    Instruction::Constant(reg, Scalar::U64(value)) => {
+                        write!(f, "r{} = const.u64 {value}", reg.0)?;
                     }
                     Instruction::Constant(reg, Scalar::F64(bits)) => {
                         write!(f, "r{} = const.f64 {}", reg.0, f64::from_bits(bits))?;
@@ -248,6 +253,29 @@ impl fmt::Display for VerifiedModule {
                         write!(f, "r{} = text.mid r{}", dst.0, text.0)?;
                         write_list(f, &function.lists()[list.index()])?;
                     }
+                    Instruction::Move(dst, src) => write!(f, "r{} = move r{}", dst.0, src.0)?,
+                    Instruction::MoveOut(dst, loan) => {
+                        write!(f, "r{} = move.out r{}", dst.0, loan.0)?;
+                    }
+                    Instruction::Drop(reg) => write!(f, "drop r{}", reg.0)?,
+                    Instruction::RcNew(dst, value) => {
+                        write!(f, "r{} = rc.new r{}", dst.0, value.0)?
+                    }
+                    Instruction::RcClone(dst, src) => {
+                        write!(f, "r{} = rc.clone r{}", dst.0, src.0)?
+                    }
+                    Instruction::RcDowngrade(dst, src) => {
+                        write!(f, "r{} = rc.downgrade r{}", dst.0, src.0)?;
+                    }
+                    Instruction::RcUpgrade(dst, src) => {
+                        write!(f, "r{} = rc.upgrade r{}", dst.0, src.0)?;
+                    }
+                    Instruction::RcStrongCount(dst, src) => {
+                        write!(f, "r{} = rc.strong r{}", dst.0, src.0)?;
+                    }
+                    Instruction::EnumTake(dst, src, variant) => {
+                        write!(f, "r{} = enum.take r{}, #{variant}", dst.0, src.0)?;
+                    }
                     Instruction::GcNew(dst, value) => {
                         write!(f, "r{} = gc.new r{}", dst.0, value.0)?
                     }
@@ -346,6 +374,8 @@ fn value_name(ty: ValueType) -> String {
         ValueType::Scalar(ty) => type_name(ty).to_owned(),
         ValueType::Text => "text".to_owned(),
         ValueType::Gc(managed) => format!("gc m{}", managed.0),
+        ValueType::Rc(managed) => format!("rc m{}", managed.0),
+        ValueType::Weak(managed) => format!("weak m{}", managed.0),
         ValueType::Function(signature) => format!("fn sig{}", signature.0),
         ValueType::Composite(shape) => format!("shape{}", shape.0),
     }
@@ -354,6 +384,7 @@ fn value_name(ty: ValueType) -> String {
 fn type_name(ty: ScalarType) -> &'static str {
     match ty {
         ScalarType::I64 => "i64",
+        ScalarType::U64 => "u64",
         ScalarType::F64 => "f64",
         ScalarType::Bool => "bool",
     }

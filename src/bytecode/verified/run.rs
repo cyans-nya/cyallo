@@ -72,6 +72,11 @@ pub enum RunError {
         instruction: InstructionId,
         span: Span,
     },
+    MovedValue {
+        function: FunctionId,
+        instruction: InstructionId,
+        span: Span,
+    },
     HeapExhausted {
         function: FunctionId,
         instruction: InstructionId,
@@ -177,6 +182,15 @@ impl fmt::Display for RunError {
             } => write!(
                 f,
                 "enum payload read of another variant in function {} at instruction {}",
+                function.0, instruction.0
+            ),
+            Self::MovedValue {
+                function,
+                instruction,
+                ..
+            } => write!(
+                f,
+                "read of a moved-out value in function {} at instruction {}",
                 function.0, instruction.0
             ),
             Self::HeapExhausted {
@@ -297,6 +311,12 @@ enum FrameValue {
     Closure(Arc<Closure>),
     /// A traced reference to the heap object at this index.
     Handle(usize),
+    /// A strong owner of the counted object at this index.
+    Rc(usize),
+    /// A weak reference to the counted object at this index.
+    Weak(usize),
+    /// The hole a value was moved out of.
+    Moved,
 }
 
 /// A routine and the values it captured by copy or move. The captures become
@@ -340,6 +360,8 @@ pub struct HeapStats {
     pub live: usize,
     pub peak: usize,
     pub collections: usize,
+    /// Counted objects that still have an owner or a weak reference.
+    pub counted: usize,
 }
 
 /// A mark-sweep heap of objects that handles refer to. Handles are indices,
@@ -399,6 +421,18 @@ struct Memory {
     /// Module-level variables. They start uninitialized.
     globals: Vec<Option<FrameValue>>,
     heap: Heap,
+    /// Counted objects, by index. A freed block leaves a hole.
+    counted: Vec<Option<CountedBlock>>,
+    free_counted: Vec<usize>,
+}
+
+/// A counted object: its owners, its weak references and its payload, which
+/// is gone once the last owner is released.
+#[derive(Debug)]
+struct CountedBlock {
+    strong: usize,
+    weak: usize,
+    payload: Option<FrameValue>,
 }
 
 impl Memory {
@@ -406,6 +440,78 @@ impl Memory {
         Self {
             globals: vec![None; globals],
             heap: Heap::new(),
+            counted: Vec::new(),
+            free_counted: Vec::new(),
+        }
+    }
+
+    fn new_counted(&mut self, payload: FrameValue) -> usize {
+        let block = CountedBlock {
+            strong: 1,
+            weak: 0,
+            payload: Some(payload),
+        };
+        match self.free_counted.pop() {
+            Some(index) => {
+                self.counted[index] = Some(block);
+                index
+            }
+            None => {
+                self.counted.push(Some(block));
+                self.counted.len() - 1
+            }
+        }
+    }
+
+    fn block(&mut self, index: usize) -> &mut CountedBlock {
+        match self.counted[index].as_mut() {
+            Some(block) => block,
+            None => unreachable!("a value refers to a freed counted object"),
+        }
+    }
+
+    /// Release what a value owns. Counts fall, a payload is destroyed with its
+    /// last owner, and the block is freed once nothing refers to it.
+    fn drop_value(&mut self, value: FrameValue) {
+        let mut pending = vec![value];
+        while let Some(value) = pending.pop() {
+            match value {
+                FrameValue::Rc(index) => {
+                    let block = self.block(index);
+                    block.strong -= 1;
+                    if block.strong == 0 {
+                        pending.extend(block.payload.take());
+                        self.free_if_unused(index);
+                    }
+                }
+                FrameValue::Weak(index) => {
+                    self.block(index).weak -= 1;
+                    self.free_if_unused(index);
+                }
+                FrameValue::Composite(Composite::Tuple(fields)) => {
+                    pending.extend(fields.into_vec())
+                }
+                FrameValue::Composite(Composite::Enum { payload, .. }) => {
+                    pending.extend(payload.map(|payload| *payload));
+                }
+                FrameValue::Composite(Composite::Array(elements)) => {
+                    pending.extend(elements.into_vec().into_iter().flatten());
+                }
+                FrameValue::Scalar(_)
+                | FrameValue::Text(_)
+                | FrameValue::Loan(_)
+                | FrameValue::Closure(_)
+                | FrameValue::Handle(_)
+                | FrameValue::Moved => {}
+            }
+        }
+    }
+
+    fn free_if_unused(&mut self, index: usize) {
+        let block = self.block(index);
+        if block.strong == 0 && block.weak == 0 {
+            self.counted[index] = None;
+            self.free_counted.push(index);
         }
     }
 
@@ -417,6 +523,12 @@ impl Memory {
             .iter()
             .flat_map(|frame| frame.slots.iter().flatten())
             .chain(self.globals.iter().flatten())
+            .chain(
+                self.counted
+                    .iter()
+                    .flatten()
+                    .filter_map(|block| block.payload.as_ref()),
+            )
         {
             trace(value, &mut marks, &mut pending);
         }
@@ -461,7 +573,11 @@ fn trace(value: &FrameValue, marks: &mut [bool], pending: &mut Vec<usize>) {
                 stack.extend(elements.iter().flatten());
             }
             FrameValue::Closure(closure) => stack.extend(closure.captures.iter()),
-            FrameValue::Scalar(_) | FrameValue::Text(_) => {}
+            FrameValue::Scalar(_)
+            | FrameValue::Text(_)
+            | FrameValue::Rc(_)
+            | FrameValue::Weak(_)
+            | FrameValue::Moved => {}
         }
     }
 }
@@ -475,6 +591,8 @@ enum Root {
     Global(GlobalId),
     /// The heap object at this index.
     Heap(usize),
+    /// The payload of the counted object at this index.
+    Counted(usize),
 }
 
 /// One projection step into a composite value.
@@ -491,11 +609,15 @@ enum Step {
 enum PlaceFault {
     OtherVariant,
     UninitializedElement,
+    MovedOut,
 }
 
 fn read_place(value: &FrameValue, path: &[Step]) -> Result<FrameValue, PlaceFault> {
     let Some((step, rest)) = path.split_first() else {
-        return Ok(value.clone());
+        return match value {
+            FrameValue::Moved => Err(PlaceFault::MovedOut),
+            value => Ok(value.clone()),
+        };
     };
     match (step, value) {
         (Step::Field(index), FrameValue::Composite(Composite::Tuple(fields))) => {
@@ -583,7 +705,10 @@ impl Frame {
             | FrameValue::Text(_)
             | FrameValue::Composite(_)
             | FrameValue::Closure(_)
-            | FrameValue::Handle(_) => {
+            | FrameValue::Handle(_)
+            | FrameValue::Rc(_)
+            | FrameValue::Weak(_)
+            | FrameValue::Moved => {
                 unreachable!("verified scalar operand")
             }
         }
@@ -596,7 +721,10 @@ impl Frame {
             | FrameValue::Text(_)
             | FrameValue::Composite(_)
             | FrameValue::Closure(_)
-            | FrameValue::Handle(_) => {
+            | FrameValue::Handle(_)
+            | FrameValue::Rc(_)
+            | FrameValue::Weak(_)
+            | FrameValue::Moved => {
                 unreachable!("verified loan operand")
             }
         }
@@ -954,14 +1082,125 @@ impl VerifiedModule {
                 stack[depth - 1].set_value(layout, dst, FrameValue::Handle(handle));
             }
             Instruction::GcBorrow(dst, handle) => {
-                let FrameValue::Handle(object) = frame.value(layout, handle) else {
-                    unreachable!("verified handle operand");
+                let root = match frame.value(layout, handle) {
+                    FrameValue::Handle(object) => Root::Heap(object),
+                    FrameValue::Rc(block) => Root::Counted(block),
+                    _ => unreachable!("verified handle operand"),
                 };
                 let place = BorrowedPlace {
-                    root: Root::Heap(object),
+                    root,
                     path: Box::new([]),
                 };
                 frame.set_value(layout, dst, FrameValue::Loan(place));
+            }
+            Instruction::Move(dst, src) => {
+                let value = frame.slot_mut(layout, src).take();
+                let Some(value) = value else {
+                    unreachable!("verified move source is initialized");
+                };
+                frame.set_value(layout, dst, value);
+            }
+            Instruction::Drop(reg) => {
+                // A value that was already moved out leaves nothing to release.
+                if let Some(value) = frame.slot_mut(layout, reg).take() {
+                    memory.drop_value(value);
+                }
+            }
+            Instruction::MoveOut(dst, loan) => {
+                let place = frame.loan(layout, loan);
+                let uninitialized = RunError::UninitializedGlobal {
+                    function,
+                    instruction: from,
+                    span: body.spans[pc],
+                };
+                let root = self
+                    .root_value(stack, memory, &place.root)
+                    .ok_or(uninitialized)?;
+                let value = read_place(&root, &place.path)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let slot = self.root_slot(stack, memory, &place.root);
+                match (slot, place.path.is_empty()) {
+                    (slot, true) => *slot = Some(FrameValue::Moved),
+                    (Some(root), false) => {
+                        write_place(root, &place.path, FrameValue::Moved)
+                            .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                    }
+                    (None, false) => unreachable!("a place was read from this root"),
+                }
+                stack[depth - 1].set_value(layout, dst, value);
+            }
+            Instruction::RcNew(dst, value) => {
+                let value = frame.value(layout, value);
+                let block = memory.new_counted(value);
+                frame.set_value(layout, dst, FrameValue::Rc(block));
+            }
+            Instruction::RcClone(dst, src)
+            | Instruction::RcDowngrade(dst, src)
+            | Instruction::RcStrongCount(dst, src) => {
+                let held = self
+                    .held_value(stack, memory, body, src)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let Some(FrameValue::Rc(block)) = held else {
+                    unreachable!("verified counted operand");
+                };
+                let counts = memory.block(block);
+                let result = match body.instructions[pc] {
+                    Instruction::RcClone(..) => {
+                        counts.strong += 1;
+                        FrameValue::Rc(block)
+                    }
+                    Instruction::RcDowngrade(..) => {
+                        counts.weak += 1;
+                        FrameValue::Weak(block)
+                    }
+                    _ => FrameValue::Scalar(Scalar::U64(
+                        u64::try_from(counts.strong).unwrap_or(u64::MAX),
+                    )),
+                };
+                stack[depth - 1].set_value(layout, dst, result);
+            }
+            Instruction::RcUpgrade(dst, src) => {
+                let held = self
+                    .held_value(stack, memory, body, src)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let Some(FrameValue::Weak(block)) = held else {
+                    unreachable!("verified weak operand");
+                };
+                let (some, none) = body.option_variants(dst);
+                let counts = memory.block(block);
+                let value = if counts.strong > 0 {
+                    counts.strong += 1;
+                    Composite::Enum {
+                        variant: some,
+                        payload: Some(Box::new(FrameValue::Rc(block))),
+                    }
+                } else {
+                    Composite::Enum {
+                        variant: none,
+                        payload: None,
+                    }
+                };
+                stack[depth - 1].set_value(layout, dst, FrameValue::Composite(value));
+            }
+            Instruction::EnumTake(dst, src, variant) => {
+                let Composite::Enum { variant: held, .. } = frame.composite(layout, src) else {
+                    unreachable!("verified enum operand");
+                };
+                if *held != variant {
+                    return Err(RunError::EnumVariant {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    });
+                }
+                let Some(FrameValue::Composite(Composite::Enum {
+                    payload: Some(payload),
+                    ..
+                })) = frame.slot_mut(layout, src).take()
+                else {
+                    unreachable!("verified enum carries a payload");
+                };
+                frame.set_value(layout, dst, *payload);
             }
             Instruction::BorrowGlobal(dst, global) => {
                 let place = BorrowedPlace {
@@ -1443,6 +1682,30 @@ impl VerifiedModule {
         Ok(StepOutcome::Continue)
     }
 
+    /// What a counted operand holds: the register's own value, or the value
+    /// behind its loan. `None` when a module variable is not assigned yet.
+    fn held_value(
+        &self,
+        stack: &[Frame],
+        memory: &Memory,
+        body: &VerifiedFunction,
+        source: Register,
+    ) -> Result<Option<FrameValue>, PlaceFault> {
+        let Some(frame) = stack.last() else {
+            unreachable!("active execution has a frame");
+        };
+        let layout = body.frame_layout();
+        if matches!(body.registers()[source.index()], RegisterType::Loan { .. }) {
+            let place = frame.loan(layout, source);
+            match self.root_value(stack, memory, &place.root) {
+                Some(root) => read_place(&root, &place.path).map(Some),
+                None => Ok(None),
+            }
+        } else {
+            Ok(Some(frame.value(layout, source)))
+        }
+    }
+
     /// A copy of the value at a place's root, or `None` when a global has
     /// not been assigned yet.
     fn root_value(&self, stack: &[Frame], memory: &Memory, root: &Root) -> Option<FrameValue> {
@@ -1454,6 +1717,9 @@ impl VerifiedModule {
             }
             Root::Global(global) => memory.globals[global.index()].clone(),
             Root::Heap(object) => memory.heap.slots[object].clone(),
+            Root::Counted(block) => memory.counted[block]
+                .as_ref()
+                .and_then(|block| block.payload.clone()),
         }
     }
 
@@ -1471,6 +1737,10 @@ impl VerifiedModule {
             }
             Root::Global(global) => &mut memory.globals[global.index()],
             Root::Heap(object) => &mut memory.heap.slots[object],
+            Root::Counted(block) => match memory.counted[block].as_mut() {
+                Some(block) => &mut block.payload,
+                None => unreachable!("a loan outlived its counted object"),
+            },
         }
     }
 
@@ -1571,6 +1841,7 @@ fn render_output(template: &OutputTemplate, arguments: &[FrameValue]) -> String 
             OutputPiece::Argument(index) => match (template.style, &arguments[*index]) {
                 (_, FrameValue::Text(text)) => line.push_str(text),
                 (_, FrameValue::Scalar(Scalar::I64(value))) => line.push_str(&value.to_string()),
+                (_, FrameValue::Scalar(Scalar::U64(value))) => line.push_str(&value.to_string()),
                 (_, FrameValue::Scalar(Scalar::F64(bits))) => {
                     line.push_str(&f64::from_bits(*bits).to_string());
                 }
@@ -1585,7 +1856,10 @@ fn render_output(template: &OutputTemplate, arguments: &[FrameValue]) -> String 
                     FrameValue::Loan(_)
                     | FrameValue::Composite(_)
                     | FrameValue::Closure(_)
-                    | FrameValue::Handle(_),
+                    | FrameValue::Handle(_)
+                    | FrameValue::Rc(_)
+                    | FrameValue::Weak(_)
+                    | FrameValue::Moved,
                 ) => {
                     unreachable!("verified output argument is a scalar or text")
                 }
@@ -1608,6 +1882,7 @@ impl Activation {
             live: self.memory.heap.live,
             peak: self.memory.heap.peak,
             collections: self.memory.heap.collections,
+            counted: self.memory.counted.iter().flatten().count(),
         }
     }
 
@@ -1690,6 +1965,11 @@ fn place_error(
 ) -> RunError {
     match fault {
         PlaceFault::OtherVariant => RunError::EnumVariant {
+            function,
+            instruction,
+            span,
+        },
+        PlaceFault::MovedOut => RunError::MovedValue {
             function,
             instruction,
             span,

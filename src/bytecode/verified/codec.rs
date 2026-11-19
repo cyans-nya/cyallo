@@ -106,6 +106,16 @@ opcodes! {
     BorrowGlobal = 75, 3;
     GcNew = 76, 3;
     GcBorrow = 77, 3;
+    Move = 78, 3;
+    Drop = 79, 2;
+    RcNew = 80, 3;
+    RcClone = 81, 3;
+    RcDowngrade = 82, 3;
+    RcUpgrade = 83, 3;
+    RcStrongCount = 84, 3;
+    EnumTake = 85, 4;
+    ConstantU64 = 86, 4;
+    MoveOut = 87, 3;
 }
 
 impl TextOp {
@@ -177,6 +187,11 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
             Instruction::Constant(dst, Scalar::Bool(value)) => {
                 (Opcode::ConstantBool, [dst.0, u32::from(value), 0], 2)
             }
+            Instruction::Constant(dst, Scalar::U64(value)) => (
+                Opcode::ConstantU64,
+                [dst.0, value as u32, (value >> u32::BITS) as u32],
+                3,
+            ),
             Instruction::Constant(dst, Scalar::F64(bits)) => (
                 Opcode::ConstantF64,
                 [dst.0, bits as u32, (bits >> u32::BITS) as u32],
@@ -211,6 +226,17 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
                 (Opcode::TextRight, [dst.0, text.0, count.0], 3)
             }
             Instruction::TextMid(dst, text, list) => (Opcode::TextMid, [dst.0, text.0, list.0], 3),
+            Instruction::Move(dst, src) => (Opcode::Move, [dst.0, src.0, 0], 2),
+            Instruction::MoveOut(dst, loan) => (Opcode::MoveOut, [dst.0, loan.0, 0], 2),
+            Instruction::Drop(reg) => (Opcode::Drop, [reg.0, 0, 0], 1),
+            Instruction::RcNew(dst, value) => (Opcode::RcNew, [dst.0, value.0, 0], 2),
+            Instruction::RcClone(dst, src) => (Opcode::RcClone, [dst.0, src.0, 0], 2),
+            Instruction::RcDowngrade(dst, src) => (Opcode::RcDowngrade, [dst.0, src.0, 0], 2),
+            Instruction::RcUpgrade(dst, src) => (Opcode::RcUpgrade, [dst.0, src.0, 0], 2),
+            Instruction::RcStrongCount(dst, src) => (Opcode::RcStrongCount, [dst.0, src.0, 0], 2),
+            Instruction::EnumTake(dst, src, variant) => {
+                (Opcode::EnumTake, [dst.0, src.0, variant], 3)
+            }
             Instruction::GcNew(dst, value) => (Opcode::GcNew, [dst.0, value.0, 0], 2),
             Instruction::GcBorrow(dst, handle) => (Opcode::GcBorrow, [dst.0, handle.0, 0], 2),
             Instruction::BorrowGlobal(dst, global) => {
@@ -328,6 +354,10 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::Branch => Instruction::Branch(reg(0), target(1), target(2)),
             Opcode::Call => Instruction::Call(CallSiteId(values[0])),
             Opcode::CheckStep => Instruction::CheckStep(reg(0)),
+            Opcode::ConstantU64 => {
+                let value = u64::from(values[1]) | (u64::from(values[2]) << u32::BITS);
+                Instruction::Constant(reg(0), Scalar::U64(value))
+            }
             Opcode::ConstantF64 => {
                 let bits = u64::from(values[1]) | (u64::from(values[2]) << u32::BITS);
                 Instruction::Constant(reg(0), Scalar::F64(bits))
@@ -358,6 +388,15 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::TextLeft => Instruction::TextLeft(reg(0), reg(1), reg(2)),
             Opcode::TextRight => Instruction::TextRight(reg(0), reg(1), reg(2)),
             Opcode::TextMid => Instruction::TextMid(reg(0), reg(1), list(2)),
+            Opcode::Move => Instruction::Move(reg(0), reg(1)),
+            Opcode::MoveOut => Instruction::MoveOut(reg(0), reg(1)),
+            Opcode::Drop => Instruction::Drop(reg(0)),
+            Opcode::RcNew => Instruction::RcNew(reg(0), reg(1)),
+            Opcode::RcClone => Instruction::RcClone(reg(0), reg(1)),
+            Opcode::RcDowngrade => Instruction::RcDowngrade(reg(0), reg(1)),
+            Opcode::RcUpgrade => Instruction::RcUpgrade(reg(0), reg(1)),
+            Opcode::RcStrongCount => Instruction::RcStrongCount(reg(0), reg(1)),
+            Opcode::EnumTake => Instruction::EnumTake(reg(0), reg(1), values[2]),
             Opcode::GcNew => Instruction::GcNew(reg(0), reg(1)),
             Opcode::GcBorrow => Instruction::GcBorrow(reg(0), reg(1)),
             Opcode::BorrowGlobal => Instruction::BorrowGlobal(reg(0), GlobalId(values[1])),

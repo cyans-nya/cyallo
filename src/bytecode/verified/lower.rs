@@ -437,8 +437,17 @@ fn lower_function(
                 }),
                 Op::Nop => {}
                 Op::Index(dst, ..) if places.element(dst).is_some() => {}
-                // None of the values in this slice has a destructor to run.
-                Op::Drop(addr) if places.address(addr).is_some() => {}
+                // A value with no counted owners has nothing to release.
+                Op::Drop(addr)
+                    if places
+                        .address(addr)
+                        .is_some_and(|place| !context.needs_drop(place)) => {}
+                Op::Lookup(_, Operation::DropValue, ref args)
+                    if args.len() == 1
+                        && places
+                            .registers
+                            .get(args[0])
+                            .is_some_and(|kind| !context.register_needs_drop(*kind)) => {}
                 Op::Address(dst, _) if places.address(dst).is_some() => {}
                 // The unit value of a statement-position match has no storage.
                 Op::Aggregate(dst, ref fields)
@@ -488,6 +497,39 @@ struct Sites {
     calls: Vec<CallSite>,
     lists: Vec<Box<[Register]>>,
     outputs: Vec<OutputTemplate>,
+}
+
+impl Context<'_> {
+    /// Whether the value in this register changes counts when released.
+    fn needs_drop(&self, register: Register) -> bool {
+        self.places
+            .registers
+            .get(register.index())
+            .is_some_and(|kind| self.register_needs_drop(*kind))
+    }
+
+    fn register_needs_drop(&self, kind: RegisterType) -> bool {
+        kind.value().is_some_and(|ty| self.shapes.needs_drop(ty))
+    }
+
+    /// The `Some` and `None` variants of an option held by this register.
+    fn option_variants(&self, register: Register) -> Option<(u32, u32)> {
+        let RegisterType::Composite(shape) = *self.places.registers.get(register.index())? else {
+            return None;
+        };
+        self.shapes.option_variants(shape)
+    }
+
+    /// Whether the payload of this variant changes counts when released.
+    fn payload_needs_drop(&self, register: Register, variant: u32) -> bool {
+        let Some(RegisterType::Composite(shape)) = self.places.registers.get(register.index())
+        else {
+            return false;
+        };
+        self.shapes
+            .variant_payload(*shape, variant)
+            .is_some_and(|payload| self.shapes.needs_drop(payload))
+    }
 }
 
 /// Read-only facts about the function being lowered.
@@ -589,7 +631,16 @@ fn lower_operation(
             Instruction::LoanPayload(register(*dst)?, base, index)
         }
         Op::Take(dst, addr) if places.is_projected(*addr) => {
-            Instruction::ReadLoan(register(*dst)?, register(*addr)?)
+            let place = register(*addr)?;
+            let owner = matches!(
+                places.registers[place.index()],
+                RegisterType::Loan { pointee, .. } if shapes.needs_drop(pointee)
+            );
+            if owner {
+                Instruction::MoveOut(register(*dst)?, place)
+            } else {
+                Instruction::ReadLoan(register(*dst)?, place)
+            }
         }
         Op::Field(dst, base, field) if places.is_payload_copy(*dst) => {
             let base = enum_place(places, *base).ok_or_else(unsupported)?;
@@ -625,16 +676,67 @@ fn lower_operation(
         }
         Op::Take(dst, addr) if places.address(*addr).is_some() => {
             let place = places.address(*addr).ok_or_else(unsupported)?;
-            Instruction::Copy(register(*dst)?, place)
+            // Taking an owner empties its local.
+            if context.needs_drop(place) {
+                Instruction::Move(register(*dst)?, place)
+            } else {
+                Instruction::Copy(register(*dst)?, place)
+            }
+        }
+        Op::Drop(addr) if places.address(*addr).is_some() => {
+            Instruction::Drop(places.address(*addr).ok_or_else(unsupported)?)
+        }
+        Op::Lookup(dst, Operation::ManagedNew(MemoryKind::Rc, false), args) if args.len() == 1 => {
+            Instruction::RcNew(register(*dst)?, register(args[0])?)
+        }
+        Op::Lookup(dst, Operation::RcClone, args) if args.len() == 1 => {
+            Instruction::RcClone(register(*dst)?, register(args[0])?)
+        }
+        Op::Lookup(dst, Operation::RcDowngrade, args) if args.len() == 1 => {
+            Instruction::RcDowngrade(register(*dst)?, register(args[0])?)
+        }
+        Op::Lookup(dst, Operation::RcUpgrade, args) if args.len() == 1 => {
+            Instruction::RcUpgrade(register(*dst)?, register(args[0])?)
+        }
+        Op::Lookup(dst, Operation::RcStrongCount, args) if args.len() == 1 => {
+            Instruction::RcStrongCount(register(*dst)?, register(args[0])?)
+        }
+        Op::Lookup(_, Operation::DropValue, args) if args.len() == 1 => {
+            Instruction::Drop(register(args[0])?)
+        }
+        Op::Lookup(
+            dst,
+            operation @ (Operation::Unwrap | Operation::IsNone | Operation::IsSome),
+            args,
+        ) if args.len() == 1 => {
+            let option = register(args[0])?;
+            let (some, none) = context.option_variants(option).ok_or_else(unsupported)?;
+            match operation {
+                Operation::IsNone => Instruction::EnumIs(register(*dst)?, option, none),
+                Operation::IsSome => Instruction::EnumIs(register(*dst)?, option, some),
+                _ if context.payload_needs_drop(option, some) => {
+                    Instruction::EnumTake(register(*dst)?, option, some)
+                }
+                _ => Instruction::EnumPayload(register(*dst)?, option, some),
+            }
         }
         Op::Load(dst, addr) => match places.address(*addr) {
             Some(place) => Instruction::Copy(register(*dst)?, place),
             None => Instruction::ReadLoan(register(*dst)?, register(*addr)?),
         },
         Op::Store(addr, src) => match places.address(*addr) {
+            Some(place) if context.needs_drop(place) => Instruction::Move(place, register(*src)?),
             Some(place) => Instruction::Copy(place, register(*src)?),
             None => Instruction::WriteLoan(register(*addr)?, register(*src)?),
         },
+        Op::Move(dst, src) | Op::FrameStore(dst, src)
+            if places
+                .registers
+                .get(*dst)
+                .is_some_and(|kind| context.register_needs_drop(*kind)) =>
+        {
+            Instruction::Move(register(*dst)?, register(*src)?)
+        }
         Op::Move(dst, src) | Op::FrameLoad(dst, src) | Op::FrameStore(dst, src) => {
             Instruction::Copy(register(*dst)?, register(*src)?)
         }

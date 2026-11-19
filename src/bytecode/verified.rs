@@ -33,12 +33,12 @@ pub use run::{
 };
 pub use sdk::SdkCompileError;
 
-/// Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 17;
+pub const FORMAT_VERSION: u32 = 18;
 
 macro_rules! index {
     ($name:ident) => {
@@ -69,6 +69,9 @@ index!(ManagedId);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScalarType {
     I64,
+    /// An unsigned 64-bit count, such as `usize`. Only counts, copies and
+    /// output are supported.
+    U64,
     F64,
     Bool,
 }
@@ -84,6 +87,10 @@ pub enum ValueType {
     Function(SignatureId),
     /// A traced reference to a heap object of the managed type.
     Gc(ManagedId),
+    /// A counted owner of an object of the managed type.
+    Rc(ManagedId),
+    /// A weak observer of a counted object.
+    Weak(ManagedId),
 }
 
 /// A callable's parameter and result types, without its captures.
@@ -100,10 +107,23 @@ impl From<ScalarType> for ValueType {
 }
 
 impl ValueType {
+    /// The managed type a handle, owner or weak reference points at.
+    pub fn managed(self) -> Option<ManagedId> {
+        match self {
+            Self::Gc(id) | Self::Rc(id) | Self::Weak(id) => Some(id),
+            _ => None,
+        }
+    }
+
     pub fn scalar(self) -> Option<ScalarType> {
         match self {
             Self::Scalar(ty) => Some(ty),
-            Self::Text | Self::Composite(_) | Self::Function(_) | Self::Gc(_) => None,
+            Self::Text
+            | Self::Composite(_)
+            | Self::Function(_)
+            | Self::Gc(_)
+            | Self::Rc(_)
+            | Self::Weak(_) => None,
         }
     }
 }
@@ -187,6 +207,10 @@ pub enum RegisterType {
     Function(SignatureId),
     /// A traced reference to a heap object.
     Gc(ManagedId),
+    /// A counted owner.
+    Rc(ManagedId),
+    /// A weak observer of a counted object.
+    Weak(ManagedId),
     /// A closure that captured loans. It behaves like a loan on their root:
     /// the root stays live and borrowed while it lives, and the value cannot
     /// be stored, passed or returned by value.
@@ -213,6 +237,8 @@ impl From<ValueType> for RegisterType {
             ValueType::Composite(shape) => Self::Composite(shape),
             ValueType::Function(signature) => Self::Function(signature),
             ValueType::Gc(managed) => Self::Gc(managed),
+            ValueType::Rc(managed) => Self::Rc(managed),
+            ValueType::Weak(managed) => Self::Weak(managed),
         }
     }
 }
@@ -236,6 +262,20 @@ impl RegisterType {
         matches!(self, Self::Loan { .. } | Self::BorrowingFunction { .. })
     }
 
+    /// The value type a register holds, if it holds a value.
+    pub fn value(self) -> Option<ValueType> {
+        Some(match self {
+            Self::Scalar(ty) => ValueType::Scalar(ty),
+            Self::Text => ValueType::Text,
+            Self::Composite(shape) => ValueType::Composite(shape),
+            Self::Function(signature) => ValueType::Function(signature),
+            Self::Gc(managed) => ValueType::Gc(managed),
+            Self::Rc(managed) => ValueType::Rc(managed),
+            Self::Weak(managed) => ValueType::Weak(managed),
+            _ => return None,
+        })
+    }
+
     /// The access of a loan or a borrowing closure.
     fn loan_access(self) -> Option<LoanAccess> {
         match self {
@@ -256,6 +296,7 @@ impl RegisterType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scalar {
     I64(i64),
+    U64(u64),
     /// IEEE-754 binary64 bits, so values compare and hash bitwise.
     F64(u64),
     Bool(bool),
@@ -276,6 +317,7 @@ impl Scalar {
     pub(crate) fn ty(self) -> ScalarType {
         match self {
             Self::I64(_) => ScalarType::I64,
+            Self::U64(_) => ScalarType::U64,
             Self::F64(_) => ScalarType::F64,
             Self::Bool(_) => ScalarType::Bool,
         }
@@ -387,6 +429,27 @@ pub enum Instruction {
     Borrow(Register, Register),
     ReadLoan(Register, Register),
     WriteLoan(Register, Register),
+    /// Move the value from the source, which becomes uninitialized.
+    Move(Register, Register),
+    /// Release the value's counted owners and weak references, leaving the
+    /// register uninitialized. Nothing happens if it was already moved out.
+    Drop(Register),
+    /// Move the value out of the borrowed place, leaving a hole that later
+    /// drops skip. The loan must be exclusive.
+    MoveOut(Register, Register),
+    /// Allocate a counted object owning the value, with one strong owner.
+    RcNew(Register, Register),
+    /// A new strong owner of the object a loan's owner refers to.
+    RcClone(Register, Register),
+    /// A weak reference to the object an owner refers to.
+    RcDowngrade(Register, Register),
+    /// A new strong owner if the object is alive, in an option-shaped enum.
+    RcUpgrade(Register, Register),
+    /// The strong count of the object an owner refers to.
+    RcStrongCount(Register, Register),
+    /// Move the payload of the variant out of the enum, which becomes
+    /// uninitialized. Fails on any other variant.
+    EnumTake(Register, Register, u32),
     /// Allocate a heap object holding a copy of the value.
     GcNew(Register, Register),
     /// Borrow the heap object a handle refers to.
@@ -532,7 +595,16 @@ impl Instruction {
             }
             WriteLoan(loan, value) => ([Some(loan), Some(value)], &[], None),
             BorrowGlobal(dst, _) => ([None, None], &[], Some(dst)),
-            GcNew(dst, value) | GcBorrow(dst, value) => ([Some(value), None], &[], Some(dst)),
+            GcNew(dst, value) | GcBorrow(dst, value) | RcNew(dst, value) | Move(dst, value) => {
+                ([Some(value), None], &[], Some(dst))
+            }
+            RcClone(dst, src)
+            | RcDowngrade(dst, src)
+            | RcUpgrade(dst, src)
+            | RcStrongCount(dst, src)
+            | EnumTake(dst, src, _) => ([Some(src), None], &[], Some(dst)),
+            Drop(reg) => ([Some(reg), None], &[], None),
+            MoveOut(dst, loan) => ([Some(loan), None], &[], Some(dst)),
             LoanField(dst, src, _) | LoanPayload(dst, src, _) => {
                 ([Some(src), None], &[], Some(dst))
             }
@@ -795,6 +867,8 @@ impl VerifiedFunction {
             RegisterType::Composite(shape) => Ok(ValueType::Composite(shape)),
             RegisterType::Function(signature) => Ok(ValueType::Function(signature)),
             RegisterType::Gc(managed) => Ok(ValueType::Gc(managed)),
+            RegisterType::Rc(managed) => Ok(ValueType::Rc(managed)),
+            RegisterType::Weak(managed) => Ok(ValueType::Weak(managed)),
             RegisterType::BorrowingFunction { .. } => {
                 Err(InvalidBytecode::EscapingBorrow(register))
             }
@@ -843,6 +917,20 @@ impl VerifiedFunction {
         }
     }
 
+    /// The variants of a verified option-shaped enum holding a counted owner:
+    /// the one that carries it, then the empty one.
+    fn option_variants(&self, register: Register) -> (u32, u32) {
+        let variants = match self.enum_variants(register) {
+            Ok(variants) => variants,
+            Err(_) => unreachable!("verified enum register"),
+        };
+        let index = |found: Option<usize>| found.and_then(|i| u32::try_from(i).ok()).unwrap_or(0);
+        (
+            index(variants.iter().position(Option::is_some)),
+            index(variants.iter().position(Option::is_none)),
+        )
+    }
+
     /// Bounds of the array that a verified projection starts from.
     fn projected_array_bounds(&self, source: Register) -> &[(i64, i64)] {
         let array = self
@@ -873,6 +961,17 @@ impl VerifiedFunction {
         self.signatures
             .get(id.index())
             .ok_or(InvalidBytecode::UnknownSignature(id))
+    }
+
+    /// The managed type a counted operand refers to: an owner when `strong`,
+    /// otherwise a weak reference. The operand is held by a register or
+    /// behind a loan.
+    fn counted_source(&self, source: Register, strong: bool) -> Result<ManagedId, InvalidBytecode> {
+        let (held, ..) = self.projection_base(source)?;
+        match (held, strong) {
+            (ValueType::Rc(managed), true) | (ValueType::Weak(managed), false) => Ok(managed),
+            _ => Err(InvalidBytecode::ExpectedHandle(source)),
+        }
     }
 
     fn array_shape(&self, register: Register) -> Result<ArrayShape<'_>, InvalidBytecode> {
@@ -1162,7 +1261,9 @@ impl ModuleImage {
                     {
                         return Err(image_error(InvalidBytecode::UnknownSignature(signature)));
                     }
-                    ValueType::Gc(managed) if managed.index() >= self.managed.len() => {
+                    ValueType::Gc(managed) | ValueType::Rc(managed) | ValueType::Weak(managed)
+                        if managed.index() >= self.managed.len() =>
+                    {
                         return Err(image_error(InvalidBytecode::UnknownManaged(managed)));
                     }
                     ValueType::Composite(id) if id.index() >= self.shapes.len() => {
@@ -1369,7 +1470,9 @@ impl VerifiedFunction {
                 self.signature(signature)
                     .map_err(|kind| error(None, kind))?;
             }
-            if let RegisterType::Gc(managed) = kind
+            if let RegisterType::Gc(managed)
+            | RegisterType::Rc(managed)
+            | RegisterType::Weak(managed) = kind
                 && self.managed.get(managed.index()).is_none()
             {
                 return Err(error(None, InvalidBytecode::UnknownManaged(managed)));
@@ -1383,6 +1486,8 @@ impl VerifiedFunction {
                         | ValueType::Text
                         | ValueType::Function(_)
                         | ValueType::Gc(_)
+                        | ValueType::Rc(_)
+                        | ValueType::Weak(_)
                 )
             )
         {
@@ -1399,11 +1504,15 @@ impl VerifiedFunction {
                 | RegisterType::Composite(_)
                 | RegisterType::Function(_)
                 | RegisterType::Gc(_)
+                | RegisterType::Rc(_)
+                | RegisterType::Weak(_)
                     if !is_entry => {}
                 RegisterType::Text
                 | RegisterType::Composite(_)
                 | RegisterType::Function(_)
-                | RegisterType::Gc(_) => {
+                | RegisterType::Gc(_)
+                | RegisterType::Rc(_)
+                | RegisterType::Weak(_) => {
                     return Err(error(
                         None,
                         InvalidBytecode::EntryParameterNotScalar(register),
@@ -1664,6 +1773,8 @@ impl VerifiedFunction {
                     self.require_value(arg, ValueType::Function(signature))?;
                 }
                 RegisterType::Gc(managed) => self.require_value(arg, ValueType::Gc(managed))?,
+                RegisterType::Rc(managed) => self.require_value(arg, ValueType::Rc(managed))?,
+                RegisterType::Weak(managed) => self.require_value(arg, ValueType::Weak(managed))?,
                 RegisterType::Composite(shape) => {
                     self.require_value(arg, ValueType::Composite(shape))?;
                 }
@@ -1978,7 +2089,9 @@ impl VerifiedFunction {
                 self.require_value(value, pointee)
             }
             Instruction::GcBorrow(dst, handle) => {
-                let RegisterType::Gc(managed) = self.register_kind(handle)? else {
+                let (RegisterType::Gc(managed) | RegisterType::Rc(managed)) =
+                    self.register_kind(handle)?
+                else {
                     return Err(InvalidBytecode::ExpectedHandle(handle));
                 };
                 let declared = *self
@@ -2000,6 +2113,68 @@ impl VerifiedFunction {
                     });
                 }
                 Ok(())
+            }
+            Instruction::Move(dst, src) => {
+                let (a, b) = (self.register_kind(dst)?, self.register_kind(src)?);
+                if a != b || a.is_loan() {
+                    return Err(InvalidBytecode::IncompatibleRegisters {
+                        destination: dst,
+                        source: src,
+                    });
+                }
+                Ok(())
+            }
+            Instruction::Drop(reg) => self.value_type(reg).map(|_| ()),
+            Instruction::MoveOut(dst, loan) => {
+                let (access, _, pointee) = self.loan_type(loan)?;
+                if access != LoanAccess::Exclusive {
+                    return Err(InvalidBytecode::ExpectedExclusiveLoan(loan));
+                }
+                self.require_value(dst, pointee)
+            }
+            Instruction::RcNew(dst, value) => {
+                let RegisterType::Rc(managed) = self.register_kind(dst)? else {
+                    return Err(InvalidBytecode::ExpectedHandle(dst));
+                };
+                let pointee = *self
+                    .managed
+                    .get(managed.index())
+                    .ok_or(InvalidBytecode::UnknownManaged(managed))?;
+                self.require_value(value, pointee)
+            }
+            Instruction::RcClone(dst, src) => {
+                let managed = self.counted_source(src, true)?;
+                self.require_value(dst, ValueType::Rc(managed))
+            }
+            Instruction::RcDowngrade(dst, src) => {
+                let managed = self.counted_source(src, true)?;
+                self.require_value(dst, ValueType::Weak(managed))
+            }
+            Instruction::RcStrongCount(dst, src) => {
+                self.counted_source(src, true)?;
+                self.require_type(dst, ScalarType::U64)
+            }
+            Instruction::RcUpgrade(dst, src) => {
+                let managed = self.counted_source(src, false)?;
+                let variants = self.enum_variants(dst)?;
+                let counted = Some(ValueType::Rc(managed));
+                let valid = variants.len() == 2
+                    && variants.iter().filter(|v| v.is_none()).count() == 1
+                    && variants.contains(&counted);
+                if valid {
+                    Ok(())
+                } else {
+                    Err(InvalidBytecode::ExpectedEnum(dst))
+                }
+            }
+            Instruction::EnumTake(dst, src, variant) => {
+                let Some(ty) = self.variant_payload(src, variant)? else {
+                    return Err(InvalidBytecode::UnknownVariant {
+                        register: src,
+                        variant,
+                    });
+                };
+                self.require_value(dst, ty)
             }
             Instruction::EnumPayload(dst, src, variant) => {
                 let Some(ty) = self.variant_payload(src, variant)? else {
@@ -2246,6 +2421,10 @@ impl VerifiedFunction {
             }
         }
         for reg in access.reads(&self.registers) {
+            // A drop of a value that was already moved out releases nothing.
+            if inst == Instruction::Drop(reg) && state[reg.index()] != Dead {
+                continue;
+            }
             match state[reg.index()] {
                 Dead => return Err(InvalidBytecode::DeadStorageAccess(reg)),
                 Uninitialized | MaybeInitialized => {
@@ -2287,6 +2466,13 @@ impl VerifiedFunction {
         };
         if let Some((reg, new)) = change {
             state[reg.index()] = new;
+        }
+        // A move, a drop or a take leaves its source without a value.
+        if let Instruction::Move(_, source)
+        | Instruction::Drop(source)
+        | Instruction::EnumTake(_, source, _) = inst
+        {
+            state[source.index()] = Uninitialized;
         }
     }
 }

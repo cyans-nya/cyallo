@@ -140,6 +140,15 @@ impl Places {
         for op in &all_ops {
             match op {
                 Op::Store(addr, _) => written[*addr] = true,
+                // Taking an owner out of a projected place empties that place.
+                Op::Take(_, addr)
+                    if projects[*addr]
+                        && shapes
+                            .value(&function.registers[*addr])
+                            .is_some_and(|ty| shapes.needs_drop(ty)) =>
+                {
+                    written[*addr] = true;
+                }
                 Op::Move(dst, addr)
                     if projects[*addr]
                         && matches!(
@@ -195,7 +204,7 @@ impl Places {
         // handle names, as exclusive as its uses require.
         for op in &all_ops {
             if let Op::ManagedAddress(dst, handle) = op
-                && let RegisterType::Gc(managed) = registers[*handle]
+                && let RegisterType::Gc(managed) | RegisterType::Rc(managed) = registers[*handle]
                 && let Some(pointee) = shapes.managed_pointee(managed)
             {
                 let access = if written[*dst] || moved_mut[*dst] {

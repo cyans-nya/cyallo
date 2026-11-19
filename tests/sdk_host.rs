@@ -171,7 +171,7 @@ fn discarded_bound_result_still_runs_and_validates_the_callback() {
             Ok(Scalar::I64(_)) => {
                 assert_eq!(status, ExecutionStatus::Returned(Some(Scalar::I64(21))))
             }
-            Ok(Scalar::Bool(_) | Scalar::F64(_)) => assert!(matches!(
+            Ok(Scalar::Bool(_) | Scalar::F64(_) | Scalar::U64(_)) => assert!(matches!(
                 status,
                 ExecutionStatus::Failed(RunError::BoundResultType { .. })
             )),

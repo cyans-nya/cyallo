@@ -245,6 +245,7 @@ impl Lower<'_, '_> {
                 let bits = match value {
                     Scalar::I64(n) => n,
                     Scalar::F64(bits) => i64::from_ne_bytes(bits.to_ne_bytes()),
+                    Scalar::U64(value) => i64::from_ne_bytes(value.to_ne_bytes()),
                     Scalar::Bool(b) => i64::from(b),
                 };
                 let value = self.builder.ins().iconst(types::I64, bits);

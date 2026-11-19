@@ -299,7 +299,7 @@ fn home(body: &VerifiedFunction, register: Register) -> Result<NativeHome, Prepa
         return Err(PrepareError::NonScalar(register));
     };
     // Native code handles integer and boolean words only.
-    if ty == ScalarType::F64 {
+    if matches!(ty, ScalarType::F64 | ScalarType::U64) {
         return Err(PrepareError::NonScalar(register));
     }
     let slot = body
@@ -472,6 +472,15 @@ fn legalize(
         | Instruction::Closure(..)
         | Instruction::BorrowGlobal(..)
         | Instruction::GcNew(..)
+        | Instruction::Move(..)
+        | Instruction::Drop(..)
+        | Instruction::MoveOut(..)
+        | Instruction::RcNew(..)
+        | Instruction::RcClone(..)
+        | Instruction::RcDowngrade(..)
+        | Instruction::RcUpgrade(..)
+        | Instruction::RcStrongCount(..)
+        | Instruction::EnumTake(..)
         | Instruction::GcBorrow(..)
         | Instruction::LoanField(..)
         | Instruction::LoanPayload(..)

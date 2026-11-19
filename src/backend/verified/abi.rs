@@ -158,6 +158,7 @@ pub(super) fn scalar_word(value: crate::bytecode::verified::Scalar) -> u64 {
     match value {
         Scalar::I64(value) => u64::from_ne_bytes(value.to_ne_bytes()),
         Scalar::F64(bits) => bits,
+        Scalar::U64(value) => value,
         Scalar::Bool(value) => u64::from(value),
     }
 }

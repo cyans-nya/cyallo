@@ -4,8 +4,11 @@
 
 use super::{ManagedId, ScalarType, Shape, ShapeId, Signature, SignatureId, ValueType, array_len};
 use crate::Type;
-use cyallo_ast::{EnumIdentity, Locality, MemoryKind, VariantId};
+use cyallo_ast::{EnumEncoding, EnumIdentity, Locality, MemoryKind, NumberKind, VariantId};
 use std::collections::HashMap;
+
+/// The suffix of the standard weak reference's declared name.
+const WEAK_NAME_SUFFIX: &str = "$Type$Weak";
 
 /// The module-level tables an interner produced.
 pub(super) struct Tables {
@@ -24,6 +27,8 @@ pub(super) struct Shapes {
     managed: Vec<ValueType>,
     /// Enums being interned or interned, for references back to them.
     enum_ids: HashMap<EnumIdentity, ShapeId>,
+    /// The encoding of each variant of an enum shape.
+    encodings: HashMap<ShapeId, Vec<EnumEncoding>>,
     /// Tuples and arrays are structural: equal components, equal shape.
     structural: HashMap<Shape, ShapeId>,
     /// Records are nominal: the same name with equal field types.
@@ -38,6 +43,7 @@ impl Shapes {
         Some(match ty {
             Type::Integer => ScalarType::I64.into(),
             Type::Real => ScalarType::F64.into(),
+            Type::Numeric(NumberKind::Usize | NumberKind::U64) => ScalarType::U64.into(),
             Type::String => ValueType::Text,
             Type::Boolean => ScalarType::Bool.into(),
             Type::Function(_, parameters, result) => {
@@ -133,6 +139,14 @@ impl Shapes {
                     .collect();
                 let id = self.intern(ty, Shape::Tuple(Box::new([])), Some(declarations))?;
                 self.enum_ids.insert(definition.identity.clone(), id);
+                self.encodings.insert(
+                    id,
+                    definition
+                        .variants
+                        .iter()
+                        .map(|variant| variant.encoding)
+                        .collect(),
+                );
                 let payloads = definition
                     .variants
                     .iter()
@@ -150,8 +164,19 @@ impl Shapes {
                 ValueType::Composite(id)
             }
             Type::EnumRef(identity, _) => ValueType::Composite(*self.enum_ids.get(&**identity)?),
+            Type::Opaque(name, arguments, _) if name.ends_with(WEAK_NAME_SUFFIX) => {
+                // The standard weak reference is spelled by name until opaque
+                // types come from provider bindings.
+                let [owner] = arguments.as_slice() else {
+                    return None;
+                };
+                let ValueType::Rc(managed) = self.value(owner)? else {
+                    return None;
+                };
+                ValueType::Weak(managed)
+            }
             Type::Managed {
-                kind: MemoryKind::Gc,
+                kind: kind @ (MemoryKind::Gc | MemoryKind::Rc),
                 locality: Locality::Local,
                 pointee,
                 ..
@@ -164,7 +189,11 @@ impl Shapes {
                         self.managed.len() - 1
                     }
                 };
-                ValueType::Gc(ManagedId(u32::try_from(index).ok()?))
+                let id = ManagedId(u32::try_from(index).ok()?);
+                match kind {
+                    MemoryKind::Gc => ValueType::Gc(id),
+                    MemoryKind::Rc => ValueType::Rc(id),
+                }
             }
             _ => return None,
         })
@@ -207,6 +236,46 @@ impl Shapes {
     /// What a handle of this managed type points at.
     pub fn managed_pointee(&self, managed: ManagedId) -> Option<ValueType> {
         self.managed.get(managed.index()).copied()
+    }
+
+    /// Whether releasing a value changes counts: it holds an owner or a weak
+    /// reference, directly or inside a composite.
+    pub fn needs_drop(&self, ty: ValueType) -> bool {
+        match ty {
+            ValueType::Rc(_) | ValueType::Weak(_) => true,
+            ValueType::Composite(shape) => match self.shapes.get(shape.index()) {
+                Some(Shape::Tuple(fields)) => fields.iter().any(|&field| self.needs_drop(field)),
+                Some(Shape::Enum(variants)) => variants
+                    .iter()
+                    .flatten()
+                    .any(|&payload| self.needs_drop(payload)),
+                Some(Shape::Array { element, .. }) => self.needs_drop(*element),
+                None => false,
+            },
+            ValueType::Scalar(_) | ValueType::Text | ValueType::Function(_) | ValueType::Gc(_) => {
+                false
+            }
+        }
+    }
+
+    /// What a variant of an enum shape carries.
+    pub fn variant_payload(&self, shape: ShapeId, variant: u32) -> Option<ValueType> {
+        match self.shapes.get(shape.index())? {
+            Shape::Enum(variants) => variants.get(variant as usize).copied().flatten(),
+            _ => None,
+        }
+    }
+
+    /// The `Some` and `None` variants of an option-shaped enum.
+    pub fn option_variants(&self, shape: ShapeId) -> Option<(u32, u32)> {
+        let encodings = self.encodings.get(&shape)?;
+        let some = encodings
+            .iter()
+            .position(|e| *e == EnumEncoding::OptionSome)?;
+        let none = encodings
+            .iter()
+            .position(|e| *e == EnumEncoding::OptionNone)?;
+        Some((u32::try_from(some).ok()?, u32::try_from(none).ok()?))
     }
 
     pub fn is_array(&self, shape: ShapeId) -> bool {
