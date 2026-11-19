@@ -31,13 +31,9 @@ pub fn analyze_modules(
     options: CompileOptions,
     deferred: bool,
 ) -> Result<CheckedProgram> {
-    analyze_modules_cached(
-        source_len,
-        graph,
-        options,
-        deferred,
-        &crate::module_cache::ModuleCache::default(),
-    )
+    // No cache survives this call, so no key could ever match or be looked up:
+    // keys are not computed at all.
+    analyze_modules_with(source_len, graph, options, deferred, None)
 }
 pub fn analyze_modules_cached(
     source_len: usize,
@@ -45,6 +41,15 @@ pub fn analyze_modules_cached(
     options: CompileOptions,
     deferred: bool,
     cache: &crate::module_cache::ModuleCache,
+) -> Result<CheckedProgram> {
+    analyze_modules_with(source_len, graph, options, deferred, Some(cache))
+}
+fn analyze_modules_with(
+    source_len: usize,
+    graph: &mut crate::module_graph::ResolvedProgram,
+    options: CompileOptions,
+    deferred: bool,
+    cache: Option<&crate::module_cache::ModuleCache>,
 ) -> Result<CheckedProgram> {
     let _analysis = stage(Stage::ModuleAnalysis);
     let identity = crate::module_graph::ResolvedProgram {
@@ -214,17 +219,23 @@ pub fn analyze_modules_cached(
                 source_files: identity.source_files.clone(),
                 source_len,
             });
-            let keys = {
-                let _keys = stage(Stage::ModuleKeys);
-                crate::module_cache::keys(
-                    &identity,
-                    asts,
-                    &context.routine_types,
-                    &globals,
-                    &services,
-                )
+            let keys = match cache {
+                Some(_) => {
+                    let _keys = stage(Stage::ModuleKeys);
+                    crate::module_cache::keys(
+                        &identity,
+                        asts,
+                        &context.routine_types,
+                        &globals,
+                        &services,
+                    )
+                }
+                None => vec![],
             };
-            let cached: Vec<_> = keys.iter().map(|key| cache.get(key, &layout)).collect();
+            let cached: Vec<_> = match cache {
+                Some(cache) => keys.iter().map(|key| cache.get(key, &layout)).collect(),
+                None => vec![None; asts.len()],
+            };
             // One wave spans all routine bodies, so a large single module can
             // use every worker while results retain module ownership and order.
             #[derive(Clone, Copy)]
@@ -292,12 +303,14 @@ pub fn analyze_modules_cached(
                         )?;
                         lower.block(&ast.body)?;
                         lower.emit(Op::Return(None));
-                        let mut checked = context.headers.clone();
-                        checked.insert(0, empty_entry(source_len));
-                        checked[0].locals = globals.clone();
-                        checked[id] = lower.function;
-                        crate::effects::analyze_one(&mut checked, id, &services)?;
-                        let mut function = checked.swap_remove(id);
+                        let mut function = lower.function;
+                        crate::effects::analyze_one(
+                            &mut function,
+                            id,
+                            &globals,
+                            &context.headers,
+                            &services,
+                        )?;
                         conservative_calls(&mut function);
                         finish_lowering(&mut function, id == 0);
                         return Ok((module, id, ir::Routine::ready(function)));
@@ -441,7 +454,7 @@ pub fn analyze_modules_cached(
                         initializer,
                         routines,
                     });
-                    if cached[i].is_none() {
+                    if let (Some(cache), None) = (cache, &cached[i]) {
                         cache.insert(keys[i].clone(), unit.clone(), layout.clone());
                     }
                     unit

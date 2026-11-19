@@ -202,3 +202,142 @@ pub fn visit_type(ty: &mut Type, f: &mut impl FnMut(&mut Type)) {
         f(ty);
     });
 }
+
+/// Read-only counterpart of [`visit_block`]: the same statements, expressions and
+/// type positions in the same order, for analyses that only inspect a body and so
+/// need not copy it. Keep the two traversals in step; the tests below compare them.
+pub fn inspect_block(body: &[Stmt], f: &mut impl FnMut(&Expr), t: &mut impl FnMut(&Type, Span)) {
+    crate::with_stack(|| {
+        for s in body {
+            match &s.kind {
+                StmtKind::Declare(_, ty) => t(ty, s.span),
+                StmtKind::Binding(_, ty, _, _, e) => {
+                    if let Some(ty) = ty {
+                        t(ty, s.span);
+                    }
+                    inspect_expr(e, f, t);
+                }
+                StmtKind::Constant(_, e)
+                | StmtKind::Evaluate(e)
+                | StmtKind::Return(e)
+                | StmtKind::Input(e) => inspect_expr(e, f, t),
+                StmtKind::Assign(a, b) | StmtKind::Compound(a, _, b) => {
+                    inspect_expr(a, f, t);
+                    inspect_expr(b, f, t);
+                }
+                StmtKind::Output(es) | StmtKind::Call(_, es) => {
+                    for e in es {
+                        inspect_expr(e, f, t);
+                    }
+                }
+                StmtKind::If(e, a, b) | StmtKind::IfLet(_, e, a, b) => {
+                    inspect_expr(e, f, t);
+                    inspect_block(a, f, t);
+                    inspect_block(b, f, t);
+                }
+                StmtKind::While(e, b) | StmtKind::Repeat(b, e) => {
+                    inspect_expr(e, f, t);
+                    inspect_block(b, f, t);
+                }
+                StmtKind::For(_, a, b, step, body) => {
+                    inspect_expr(a, f, t);
+                    inspect_expr(b, f, t);
+                    if let Some(e) = step {
+                        inspect_expr(e, f, t);
+                    }
+                    inspect_block(body, f, t);
+                }
+                StmtKind::ForIn(_, iterable, body) => {
+                    inspect_expr(iterable, f, t);
+                    inspect_block(body, f, t);
+                }
+                StmtKind::Case(e, arms, b) => {
+                    inspect_expr(e, f, t);
+                    for (label, body) in arms {
+                        inspect_expr(&label.lower, f, t);
+                        if let Some(e) = &label.upper {
+                            inspect_expr(e, f, t);
+                        }
+                        inspect_block(body, f, t);
+                    }
+                    inspect_block(b, f, t);
+                }
+                _ => {}
+            }
+        }
+    })
+}
+fn inspect_expr(e: &Expr, f: &mut impl FnMut(&Expr), t: &mut impl FnMut(&Type, Span)) {
+    crate::with_stack(|| {
+        match &e.kind {
+            ExprKind::EnumConstruct(_, ty, payload) => {
+                t(ty, e.span);
+                if let Some(payload) = payload {
+                    inspect_expr(payload, f, t);
+                }
+            }
+            ExprKind::Match(value, arms) => {
+                inspect_expr(value, f, t);
+                for arm in arms {
+                    if let Some(guard) = &arm.guard {
+                        inspect_expr(guard, f, t);
+                    }
+                    match &arm.body {
+                        MatchBody::Expression(value) => inspect_expr(value, f, t),
+                        MatchBody::Block(body, tail) => {
+                            inspect_block(body, f, t);
+                            if let Some(tail) = tail {
+                                inspect_expr(tail, f, t);
+                            }
+                        }
+                    }
+                }
+            }
+            ExprKind::ManagedNew(_, _, allocator, value) => {
+                if let Some(allocator) = allocator {
+                    inspect_expr(allocator, f, t);
+                }
+                inspect_expr(value, f, t);
+            }
+            ExprKind::ArrayLiteral(es)
+            | ExprKind::IntrinsicCall(_, _, es)
+            | ExprKind::Tuple(es)
+            | ExprKind::Call(_, es)
+            | ExprKind::TypedCollection(_, _, es)
+            | ExprKind::GenericCall(_, _, es) => {
+                for e in es {
+                    inspect_expr(e, f, t);
+                }
+            }
+            ExprKind::AnonymousRecord(fs)
+            | ExprKind::VariantPayload(fs)
+            | ExprKind::Record(_, fs)
+            | ExprKind::GenericRecord(_, _, fs)
+            | ExprKind::ObjectLiteral(_, fs) => {
+                for (_, e) in fs {
+                    inspect_expr(e, f, t);
+                }
+            }
+            ExprKind::DeleteProperty(a)
+            | ExprKind::Yield(a, _)
+            | ExprKind::Parenthesized(a)
+            | ExprKind::Unary(_, a)
+            | ExprKind::Field(a, _)
+            | ExprKind::ExtensionField(a, _, _)
+            | ExprKind::Cast(a, _)
+            | ExprKind::TupleField(a, _) => inspect_expr(a, f, t),
+            ExprKind::Binary(_, a, b) | ExprKind::NativeCoerce(a, b) => {
+                inspect_expr(a, f, t);
+                inspect_expr(b, f, t);
+            }
+            ExprKind::Index(a, es) | ExprKind::Invoke(a, es) => {
+                inspect_expr(a, f, t);
+                for e in es {
+                    inspect_expr(e, f, t);
+                }
+            }
+            _ => {}
+        }
+        f(e)
+    })
+}

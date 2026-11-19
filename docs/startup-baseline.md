@@ -412,3 +412,53 @@ Host, revision and cache state are in the JSON `meta`.
 | call every routine | 0 | all n=1024 b8 m0 | 82.3 | 124.6 | +75.4 | 500.5 | 852.8 | 582.7 |
 | call every routine | 0 | unu n=4096 b8 m0 | 292.0 | 302.7 | +284.7 | 9.6 | 11.1 | 301.5 |
 | call every routine | 0 | all n=4096 b8 m0 | 325.3 | 375.1 | +318.1 | 2571.3 | 4304.9 | 2892.5 |
+
+## Results: cache keys and shared header contracts
+
+Same host, `--jobs 1`, 15 paired rounds for timing (`bench --sweep "call every"`), 7 runs for
+stages (`profile`); "before" is the binary built from the baseline above, "after" this change.
+Medians, milliseconds.
+
+| Metric (n=4096, body 8) | Before | After |
+| --- | ---: | ---: |
+| `unused` first output | 322.4 | **244.4** (−24%) |
+| `unused` `module_keys` stage | 133.3 | **49.4** |
+| `unused` total allocated / peak live (MB) | 896 / 210 | 758 / 159 |
+| `call_all` first output | 355.0 | **264.9** |
+| `call_all` after output (JIT run) | 2480 | **2253** |
+| `call_all` total exit | 2834 | **2520** |
+| `call_all` frontend `body_analysis` stage | 1768.7 | **423.6** |
+| `call_all` `header_clone` stage | 801.4 | **0** |
+| `call_all` `body_effects` stage | 131.3 | **1.5** |
+| `call_all` header elements cloned | 16,793,603 | **0** |
+| `call_all` total allocated / peak live (MB) | 30,815 / 1,695 | 3,863 / 1,272 |
+
+Smaller sizes (first output): `unused` n=256 24.4 → 19.9, n=1024 80.3 → 59.9; `call_all` n=1024
+87.7 → 64.4, after output 488 → 453.
+
+What changed:
+
+- **Module cache keys.** The cache is kept, and a hit is decided exactly as before: a key is
+  equal when the module's normalized AST, typed dependencies, native declarations and
+  permissions are. The costs were: a clone of every body to walk it (now a read-only
+  `inspect_block` traversal, tested against `visit_block`), a clone of the whole AST to
+  relativize spans (now relocated in place and restored from the visited originals), and a
+  SHA-256 input in which the file path string was hashed with *every* span (now a first-use
+  ordinal per span and one id table: 55.7 MB of digest input before). Keys are not
+  computed at all for `analyze_modules`, which owns a cache that dies with the call.
+  Remaining: ~49 ms is SHA-256 itself, which is a software implementation in this build
+  (`compress256` dominates a sample). A hardware digest, or hashing function bodies once at
+  parse time, would remove most of it; neither was attempted here.
+- **Header contracts.** `effects::analyze_one` takes the forced function mutably and the
+  routine headers and globals as shared borrows (`&[Function]`, `&[Local]` from the immutable
+  `DeferredContext`), instead of a mutable vector rebuilt per forced body. It also stops
+  allocating per-routine summary vectors: only the forced routine has outgoing edges, so the only
+  cycle is a direct self-call. Cached diagnostics, recursion (`may_diverge`), procedure-call and
+  effect messages are unchanged (`tests/deferred.rs` adds concurrent shared-result and
+  any-order diagnostic tests). The same call now serves module initializers and the entry.
+  `body_analysis` is now 424 ms at n=4096, of which `body_lower` (396 ms) is next.
+
+Test status: `cargo test --workspace --no-fail-fast` has the same 28 failing tests before and
+after this change (pre-existing at the baseline revision, e.g. `tests/attributes.rs`,
+`tests/effects.rs`, `deferred::declaration_errors_are_eager_and_analysis_is_shared_between_workers`);
+the new tests pass.

@@ -266,10 +266,8 @@ pub fn analyze(
             services: services.clone(),
             headers: ast.functions.iter().map(blank_routine).collect(),
         });
-        let mut checked = context.headers.clone();
-        checked.insert(0, functions.pop().unwrap());
-        crate::effects::analyze_one(&mut checked, 0, &services)?;
-        let mut main = checked.remove(0);
+        let mut main = functions.pop().unwrap();
+        crate::effects::analyze_one(&mut main, 0, &[], &context.headers, &services)?;
         conservative_calls(&mut main);
         finish_lowering(&mut main, true);
         let mut routines = vec![ir::Routine::ready(main)];
@@ -472,28 +470,21 @@ impl DeferredBody {
                 function.code.len(),
             );
             // Check local purity against declaration contracts without forcing
-            // cold callees. Every callee must pass its own check before entry.
-            let mut functions = {
-                let _clone =
-                    cyallo_startup_profile::stage(cyallo_startup_profile::Stage::HeaderClone);
-                cyallo_startup_profile::count(cyallo_startup_profile::Counter::HeaderClones, 1);
-                cyallo_startup_profile::count(
-                    cyallo_startup_profile::Counter::HeaderElementsCloned,
-                    c.headers.len(),
-                );
-                c.headers.clone()
-            };
-            let mut main = blank_routine(&self.function);
-            main.name = "<main>".into();
-            main.locals = c.globals.clone();
-            functions.insert(0, main);
-            functions[self.index] = function;
+            // cold callees. Every callee must pass its own check before entry. The
+            // header contracts are shared and immutable, so concurrent forced bodies
+            // read one table instead of each copying it.
+            let mut function = function;
             {
                 let _effects =
                     cyallo_startup_profile::stage(cyallo_startup_profile::Stage::BodyEffects);
-                crate::effects::analyze_one(&mut functions, self.index, &c.services)?;
+                crate::effects::analyze_one(
+                    &mut function,
+                    self.index,
+                    &c.globals,
+                    &c.headers,
+                    &c.services,
+                )?;
             }
-            let mut function = functions.swap_remove(self.index);
             if function.code.iter().any(|i| matches!(i.op, Op::Call(..))) {
                 function.effects.transitive_complete = false;
                 function.effects.may_allocate = true;

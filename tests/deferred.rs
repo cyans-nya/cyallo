@@ -82,3 +82,62 @@ fn small_loop_gets_compiled_before_its_first_body_instruction() {
     assert_eq!(report.first_call_admissions, 1);
     assert!(!p.functions()[2].is_analyzed());
 }
+#[test]
+fn concurrent_demand_for_one_body_shares_one_result() {
+    // Many routines make the shared header table non-trivial; every demand for one
+    // of them, through clones of the routine and from different threads, must see
+    // the one checked body.
+    let mut source = String::new();
+    for i in 0..64 {
+        source.push_str(&format!("fn r{i}(x: i64) -> i64 {{ return x + {i} }}\n"));
+    }
+    source.push_str("fn target(n: i64) -> i64 {\n if n <= 0 { return 0 }\n return r7(n) + target(n - 1)\n}\n");
+    source.push_str("std::io::print(1)\n");
+    let program = Arc::new(compile_for_execution(&source, CompileOptions::default()).unwrap());
+    let index = program.functions().len() - 1;
+    let routine = program.functions()[index].clone();
+    assert!(!routine.is_analyzed());
+    let barrier = std::sync::Barrier::new(8);
+    let addresses: Vec<usize> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..8)
+            .map(|worker| {
+                let routine = if worker % 2 == 0 {
+                    routine.clone()
+                } else {
+                    program.functions()[index].clone()
+                };
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    routine.checked().unwrap() as *const _ as usize
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
+    });
+    assert!(addresses.windows(2).all(|w| w[0] == w[1]));
+    assert!(routine.is_analyzed());
+    // A direct recursive call is the only cycle and keeps its effect summary.
+    assert!(routine.checked().unwrap().effects.may_diverge);
+    assert!(!program.functions()[1].is_analyzed());
+}
+#[test]
+fn forcing_bodies_in_any_order_reports_the_same_diagnostics() {
+    let source = "proc effect() -> i64 { return 1 }\n\
+                  fn caller() -> i64 { return effect() }\n\
+                  fn fine(x: i64) -> i64 { return x + 1 }\n\
+                  std::io::print(fine(1))\n";
+    let expected = compile(source).unwrap_err();
+    let program = Arc::new(compile_for_execution(source, CompileOptions::default()).unwrap());
+    let forward: Vec<_> = (1..program.functions().len())
+        .map(|i| program.functions()[i].checked().err().cloned())
+        .collect();
+    let program = Arc::new(compile_for_execution(source, CompileOptions::default()).unwrap());
+    let mut backward: Vec<_> = (1..program.functions().len())
+        .rev()
+        .map(|i| program.functions()[i].checked().err().cloned())
+        .collect();
+    backward.reverse();
+    assert_eq!(forward, backward);
+    assert!(forward.iter().flatten().any(|d| *d == expected));
+}
