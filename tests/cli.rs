@@ -757,6 +757,7 @@ fn verified_engine_matches_the_interpreter_on_supported_programs() {
         "examples/concurrency/status-enums.ya",
         "examples/objects/open.ya",
         "examples/objects/native-ic.ya",
+        "examples/modules/static/main.ya",
     ] {
         let run = |engine| cli(&["run", example, "--engine", engine]).output().unwrap();
         let verified = run("verified");

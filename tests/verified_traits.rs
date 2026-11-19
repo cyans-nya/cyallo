@@ -199,6 +199,7 @@ mod images {
     fn method(receiver: LoanAccess) -> Method {
         Method {
             receiver,
+            by_value: false,
             parameters: Box::new([]),
             result: None,
         }

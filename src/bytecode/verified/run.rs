@@ -2725,12 +2725,26 @@ impl VerifiedModule {
                         let target =
                             self.implementations[implementation as usize].methods[method as usize];
                         let callee = &self.functions[target.index()];
-                        // The routine borrows the receiver the object holds.
-                        let receiver = FrameValue::Loan(BorrowedPlace {
-                            root: Root::Heap(heap),
-                            path: Box::new([]),
-                            window: None,
-                        });
+                        let by_value = match body.registers()[object.index()] {
+                            RegisterType::Object(trait_id) => {
+                                body.traits[trait_id.index()].methods[method as usize].by_value
+                            }
+                            _ => unreachable!("verified object operand"),
+                        };
+                        let receiver = if by_value {
+                            // The routine takes a copy of what the object holds.
+                            let Some(held) = memory.heap.slots[heap].clone() else {
+                                unreachable!("an object keeps its value");
+                            };
+                            held
+                        } else {
+                            // The routine borrows the receiver the object holds.
+                            FrameValue::Loan(BorrowedPlace {
+                                root: Root::Heap(heap),
+                                path: Box::new([]),
+                                window: None,
+                            })
+                        };
                         let values = std::iter::once(receiver)
                             .chain(call.arguments.iter().map(|&reg| frame.value(layout, reg)));
                         let next = Frame::new(target, callee, values, call.destination);

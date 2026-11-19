@@ -80,10 +80,10 @@ impl Shapes {
             .methods
             .iter()
             .map(|method| {
-                let receiver = match method.receiver {
-                    Receiver::Shared => LoanAccess::Shared,
-                    Receiver::Mutable => LoanAccess::Exclusive,
-                    Receiver::Value => return None,
+                let (receiver, by_value) = match method.receiver {
+                    Receiver::Shared => (LoanAccess::Shared, false),
+                    Receiver::Mutable => (LoanAccess::Exclusive, false),
+                    Receiver::Value => (LoanAccess::Shared, true),
                 };
                 if method.params.iter().any(|&(_, by_reference)| by_reference) {
                     return None;
@@ -99,6 +99,7 @@ impl Shapes {
                 };
                 Some(Method {
                     receiver,
+                    by_value,
                     parameters,
                     result,
                 })

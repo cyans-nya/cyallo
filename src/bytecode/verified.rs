@@ -33,12 +33,12 @@ pub use run::{
 };
 pub use sdk::SdkCompileError;
 
-/// Version 29 adds open objects and erased values. Version 28 adds tasks and clocks. Version 27 adds channels. Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 30 adds by-value trait receivers. Version 29 adds open objects and erased values. Version 28 adds tasks and clocks. Version 27 adds channels. Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 29;
+pub const FORMAT_VERSION: u32 = 30;
 
 macro_rules! index {
     ($name:ident) => {
@@ -133,6 +133,9 @@ pub enum ValueType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Method {
     pub receiver: LoanAccess,
+    /// The routine takes a copy of the receiver instead of a loan of it, which
+    /// only a receiver that owns nothing allows.
+    pub by_value: bool,
     pub parameters: Box<[ValueType]>,
     pub result: Option<ValueType>,
 }
@@ -2299,11 +2302,16 @@ impl ModuleImage {
                 let Some((&receiver, rest)) = callee.parameters.split_first() else {
                     return Err(mismatch());
                 };
-                let receiver_ok = matches!(
-                    callee.registers.get(receiver.index()),
-                    Some(RegisterType::Loan { access, origin: LoanOrigin::Parameter { .. }, pointee })
-                        if *access == method.receiver && *pointee == implementation.receiver
-                );
+                let receiver_ok = if method.by_value {
+                    callee.value_type(receiver) == Ok(implementation.receiver)
+                        && callee.erasable_type(implementation.receiver)
+                } else {
+                    matches!(
+                        callee.registers.get(receiver.index()),
+                        Some(RegisterType::Loan { access, origin: LoanOrigin::Parameter { .. }, pointee })
+                            if *access == method.receiver && *pointee == implementation.receiver
+                    )
+                };
                 let parameters_ok =
                     rest.len() == method.parameters.len()
                         && rest.iter().zip(method.parameters.iter()).all(
