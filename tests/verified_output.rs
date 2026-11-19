@@ -157,6 +157,7 @@ mod malformed {
             traits: Box::new([]),
             implementations: Box::new([]),
             functions: Box::new([FunctionImage {
+                frozen: Box::new([]),
                 contracts: Box::new([]),
                 generator: None,
                 registers: registers.into(),

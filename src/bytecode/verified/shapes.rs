@@ -254,6 +254,8 @@ impl Shapes {
             }
             // A failure to load a module or to view an object.
             Type::Storage(StorageKind::LoadError | StorageKind::ViewError, _) => ValueType::Failure,
+            // An owned value of any type.
+            Type::Any => ValueType::Any,
             // An object, open or typed, and a value of any type.
             Type::Object(_) => ValueType::OpenObject,
             Type::Dynamic => ValueType::Dynamic,
@@ -553,7 +555,8 @@ impl Shapes {
             | ValueType::Weak(_)
             | ValueType::Generator(_)
             | ValueType::Sender(_)
-            | ValueType::Receiver(_) => true,
+            | ValueType::Receiver(_)
+            | ValueType::Any => true,
             ValueType::Composite(shape) => match self.shapes.get(shape.index()) {
                 Some(Shape::Tuple(fields)) => fields.iter().any(|&field| self.needs_drop(field)),
                 Some(Shape::Enum(variants)) => variants

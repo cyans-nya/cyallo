@@ -1,5 +1,5 @@
 use super::{
-    BooleanOp, CallSite, CallTarget, Contract, DynamicOp, Extremum, FloatOp, FrameLayout,
+    BooleanOp, CallSite, CallTarget, Contract, DynamicOp, Extremum, FloatOp, FrameLayout, Frozen,
     FunctionId, GlobalId, HostBindingId, HostFailure, InputKind, Instruction, InstructionId,
     IntegerOp, OutputPiece, OutputTemplate, Register, RegisterType, Scalar, ScalarType,
     StatementArrival, StatementBoundary, TextFailure, TextMapOp, TextOp, TextStyle, TextTestOp,
@@ -483,6 +483,8 @@ enum FrameValue {
     Dynamic(Box<(ValueType, FrameValue)>),
     /// Why a module could not be loaded or an object not viewed.
     Failure(Arc<FailureData>),
+    /// An owned value with its type: it owns what it holds.
+    Any(Box<(ValueType, FrameValue)>),
     /// A retained reference to a field of a heap record: a place rooted in a
     /// heap object, which the collector keeps alive.
     Location(BorrowedPlace),
@@ -933,6 +935,7 @@ impl Memory {
                     }
                     self.free_channel_if_unused(index);
                 }
+                FrameValue::Any(erased) => pending.push(erased.1),
                 FrameValue::Generator(index) => {
                     self.close_generator(index);
                     self.generators[index] = None;
@@ -1101,6 +1104,9 @@ impl Memory {
                 self.block(*block).weak += 1;
                 FrameValue::Weak(*block)
             }
+            FrameValue::Any(erased) => {
+                FrameValue::Any(Box::new((erased.0, self.clone_value(&erased.1))))
+            }
             FrameValue::Sender(index) => {
                 self.channel(*index).senders += 1;
                 FrameValue::Sender(*index)
@@ -1216,7 +1222,7 @@ fn trace(value: &FrameValue, marks: &mut [bool], pending: &mut Vec<usize>) {
             FrameValue::Properties(data) => {
                 stack.extend(data.properties.iter().map(|property| &property.value.1));
             }
-            FrameValue::Dynamic(erased) => stack.push(&erased.1),
+            FrameValue::Dynamic(erased) | FrameValue::Any(erased) => stack.push(&erased.1),
             FrameValue::Loan(place) | FrameValue::Location(place) => {
                 if let Root::Heap(object) = place.root {
                     mark(object);
@@ -1469,6 +1475,7 @@ impl Frame {
             | FrameValue::Properties(_)
             | FrameValue::Dynamic(_)
             | FrameValue::Failure(_)
+            | FrameValue::Any(_)
             | FrameValue::Moved => {
                 unreachable!("verified scalar operand")
             }
@@ -1498,6 +1505,7 @@ impl Frame {
             | FrameValue::Properties(_)
             | FrameValue::Dynamic(_)
             | FrameValue::Failure(_)
+            | FrameValue::Any(_)
             | FrameValue::Moved => {
                 unreachable!("verified loan operand")
             }
@@ -2328,9 +2336,7 @@ impl VerifiedModule {
                 let step = match body.instructions[pc] {
                     Instruction::PathField(_, _, field) => PathStep::Field(field),
                     Instruction::PathElement(_, _, index) => {
-                        let Scalar::I64(index) = frame.get(layout, index) else {
-                            unreachable!("verified integer index");
-                        };
+                        let index = scalar_index(frame.get(layout, index));
                         let fault = |fault| RunError::Path {
                             function,
                             instruction: from,
@@ -2636,10 +2642,7 @@ impl VerifiedModule {
             Instruction::LoanElement(dst, src, list)
                 if body.projects_from_slice(src) || body.projects_from_vec(src) =>
             {
-                let Scalar::I64(index) = stack[depth - 1].get(layout, body.lists[list.index()][0])
-                else {
-                    unreachable!("verified integer index");
-                };
+                let index = scalar_index(stack[depth - 1].get(layout, body.lists[list.index()][0]));
                 let window = self
                     .sequence_window(stack, memory, body, src)
                     .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
@@ -3367,6 +3370,78 @@ impl VerifiedModule {
                 next.wrap = Some(description.result);
                 stack.push(next);
             }
+            Instruction::Count(op, dst, lhs, rhs) => {
+                let (Scalar::U64(a), Scalar::U64(b)) =
+                    (frame.get(layout, lhs), frame.get(layout, rhs))
+                else {
+                    unreachable!("verified count operands");
+                };
+                let overflow = || RunError::IntegerOverflow {
+                    function,
+                    instruction: from,
+                    span: body.spans[pc],
+                };
+                let result = match op {
+                    IntegerOp::Add => Scalar::U64(a.checked_add(b).ok_or_else(overflow)?),
+                    IntegerOp::Subtract => Scalar::U64(a.checked_sub(b).ok_or_else(overflow)?),
+                    IntegerOp::Multiply => Scalar::U64(a.checked_mul(b).ok_or_else(overflow)?),
+                    IntegerOp::Divide | IntegerOp::Remainder => {
+                        if b == 0 {
+                            return Err(RunError::DivisionByZero {
+                                function,
+                                instruction: from,
+                                span: body.spans[pc],
+                            });
+                        }
+                        Scalar::U64(if op == IntegerOp::Divide {
+                            a / b
+                        } else {
+                            a % b
+                        })
+                    }
+                    IntegerOp::Less => Scalar::Bool(a < b),
+                    IntegerOp::LessEqual => Scalar::Bool(a <= b),
+                    IntegerOp::Greater => Scalar::Bool(a > b),
+                    IntegerOp::GreaterEqual => Scalar::Bool(a >= b),
+                    IntegerOp::Equal => Scalar::Bool(a == b),
+                    IntegerOp::NotEqual => Scalar::Bool(a != b),
+                };
+                frame.set(layout, dst, result);
+            }
+            Instruction::FrozenValue(dst, id) => {
+                fn build(frozen: &Frozen) -> FrameValue {
+                    match frozen {
+                        Frozen::Scalar(scalar) => FrameValue::Scalar(*scalar),
+                        Frozen::Text(text) => FrameValue::Text(text.clone()),
+                        Frozen::Tuple(items) => FrameValue::Composite(Composite::Tuple(
+                            items.iter().map(build).collect(),
+                        )),
+                    }
+                }
+                let value = build(&body.frozen[id.index()]);
+                frame.set_value(layout, dst, value);
+            }
+            Instruction::AnyErase(dst, source) => {
+                let ty = body.registers()[source.index()]
+                    .value()
+                    .unwrap_or(ValueType::Dynamic);
+                let value = frame.value(layout, source);
+                frame.set_value(layout, dst, FrameValue::Any(Box::new((ty, value))));
+            }
+            Instruction::AnyChecked(dst, source) => {
+                let FrameValue::Any(erased) = frame.value(layout, source) else {
+                    unreachable!("verified erased operand");
+                };
+                if body.registers()[dst.index()].value() != Some(erased.0) {
+                    return Err(RunError::Object {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                        fault: ObjectFault::Type,
+                    });
+                }
+                frame.set_value(layout, dst, erased.1);
+            }
             Instruction::ClockNew(dst) => frame.set_value(layout, dst, FrameValue::Clock),
             Instruction::ClockClone(dst, _) => frame.set_value(layout, dst, FrameValue::Clock),
             Instruction::ClockSleep(_, duration) => {
@@ -3933,9 +4008,7 @@ impl VerifiedModule {
                 );
             }
             Instruction::ArrayLoad(dst, array, list) if body.is_vec(array) => {
-                let Scalar::I64(index) = frame.get(layout, body.lists[list.index()][0]) else {
-                    unreachable!("verified integer index");
-                };
+                let index = scalar_index(frame.get(layout, body.lists[list.index()][0]));
                 let Composite::Vec(items) = frame.composite(layout, array) else {
                     unreachable!("verified vector operand");
                 };
@@ -3951,9 +4024,7 @@ impl VerifiedModule {
                 frame.set_value(layout, dst, value);
             }
             Instruction::ArrayStore(array, list, value) if body.is_vec(array) => {
-                let Scalar::I64(index) = frame.get(layout, body.lists[list.index()][0]) else {
-                    unreachable!("verified integer index");
-                };
+                let index = scalar_index(frame.get(layout, body.lists[list.index()][0]));
                 let value = frame.value(layout, value);
                 let Composite::Vec(items) = frame.composite_mut(layout, array) else {
                     unreachable!("verified vector operand");
@@ -4519,6 +4590,16 @@ fn transferable(value: &FrameValue) -> bool {
     }
 }
 
+/// An index operand as a signed integer: counts index too, and one too large
+/// to be an integer is beyond every sequence.
+fn scalar_index(scalar: Scalar) -> i64 {
+    match scalar {
+        Scalar::I64(index) => index,
+        Scalar::U64(index) => i64::try_from(index).unwrap_or(i64::MAX),
+        _ => unreachable!("verified index operand"),
+    }
+}
+
 /// The unit value: a tuple without fields.
 fn unit() -> FrameValue {
     FrameValue::Composite(Composite::Tuple(Box::new([])))
@@ -4628,6 +4709,7 @@ fn spell(value: &FrameValue, style: TextStyle) -> String {
             | FrameValue::Clock
             | FrameValue::Properties(_)
             | FrameValue::Failure(_)
+            | FrameValue::Any(_)
             | FrameValue::Moved,
         ) => unreachable!("verified text operand is a scalar or string"),
     }
@@ -5088,9 +5170,7 @@ fn element_offset(
 ) -> Option<usize> {
     let mut offset = 0usize;
     for (&(lower, upper), &index) in bounds.iter().zip(body.lists[list.index()].iter()) {
-        let Scalar::I64(index) = frame.get(layout, index) else {
-            unreachable!("verified integer index");
-        };
+        let index = scalar_index(frame.get(layout, index));
         if index < lower || index > upper {
             return None;
         }

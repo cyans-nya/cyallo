@@ -33,12 +33,12 @@ pub use run::{
 };
 pub use sdk::SdkCompileError;
 
-/// Version 31 adds run-time module loading. Version 30 adds by-value trait receivers. Version 29 adds open objects and erased values. Version 28 adds tasks and clocks. Version 27 adds channels. Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 32 adds owned erased values, constant aggregates and count arithmetic. Version 31 adds run-time module loading. Version 30 adds by-value trait receivers. Version 29 adds open objects and erased values. Version 28 adds tasks and clocks. Version 27 adds channels. Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 31;
+pub const FORMAT_VERSION: u32 = 32;
 
 macro_rules! index {
     ($name:ident) => {
@@ -60,6 +60,7 @@ index!(CallSiteId);
 index!(HostBindingId);
 index!(OutputId);
 index!(ContractId);
+index!(FrozenId);
 index!(ShapeId);
 index!(OperandListId);
 index!(TextId);
@@ -129,6 +130,9 @@ pub enum ValueType {
     Dynamic,
     /// A failure to load a module or to view an object, with its message.
     Failure,
+    /// An owned value of any type together with its type. Unlike `Dynamic` it
+    /// may own counted values, so it is released and moved like an owner.
+    Any,
 }
 
 /// A method a trait declares: what its receiver may do and its other types.
@@ -164,6 +168,15 @@ pub struct Implementation {
 pub struct Contract {
     pub required: bool,
     pub fields: Box<[(Arc<str>, ValueType)]>,
+}
+
+/// A constant value known when the routine is lowered: scalars, strings and
+/// tuples of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Frozen {
+    Scalar(Scalar),
+    Text(Arc<str>),
+    Tuple(Box<[Frozen]>),
 }
 
 /// An operator on erased values.
@@ -232,7 +245,8 @@ impl ValueType {
             | Self::Clock
             | Self::OpenObject
             | Self::Dynamic
-            | Self::Failure => None,
+            | Self::Failure
+            | Self::Any => None,
         }
     }
 }
@@ -354,6 +368,8 @@ pub enum RegisterType {
     Dynamic,
     /// A failure to load a module or to view an object: a message and what kind.
     Failure,
+    /// An owned erased value.
+    Any,
     /// A closure that captured loans. It behaves like a loan on their root:
     /// the root stays live and borrowed while it lives, and the value cannot
     /// be stored, passed or returned by value.
@@ -394,6 +410,7 @@ impl From<ValueType> for RegisterType {
             ValueType::OpenObject => Self::OpenObject,
             ValueType::Dynamic => Self::Dynamic,
             ValueType::Failure => Self::Failure,
+            ValueType::Any => Self::Any,
         }
     }
 }
@@ -439,6 +456,7 @@ impl RegisterType {
             Self::OpenObject => ValueType::OpenObject,
             Self::Dynamic => ValueType::Dynamic,
             Self::Failure => ValueType::Failure,
+            Self::Any => ValueType::Any,
             _ => return None,
         })
     }
@@ -803,6 +821,15 @@ pub enum Instruction {
     DynamicInvoke(Register, Register, OperandListId),
     /// Wrap the value with its type.
     Erase(Register, Register),
+    /// A constant aggregate.
+    FrozenValue(Register, FrozenId),
+    /// Arithmetic and comparison on counts, checked like integer arithmetic.
+    Count(IntegerOp, Register, Register, Register),
+    /// Move the value into an owned erased value.
+    AnyErase(Register, Register),
+    /// Move the value out of an owned erased value that holds the destination's
+    /// type exactly.
+    AnyChecked(Register, Register),
     /// Read an erased value as the destination's type, which it must have.
     DynamicCast(Register, Register),
     DynamicBinary(DynamicOp, Register, Register, Register),
@@ -1047,6 +1074,11 @@ impl Instruction {
             DynamicInvoke(dst, callee, list) => {
                 ([Some(callee), None], &lists[list.index()], Some(dst))
             }
+            FrozenValue(dst, _) => ([None, None], &[], Some(dst)),
+            Count(_, dst, lhs, rhs) => ([Some(lhs), Some(rhs)], &[], Some(dst)),
+            AnyErase(dst, source) | AnyChecked(dst, source) => {
+                ([Some(source), None], &[], Some(dst))
+            }
             ObjectView(dst, source, _)
             | ObjectTryView(dst, source, _)
             | Erase(dst, source)
@@ -1219,6 +1251,8 @@ impl StorageState {
 /// instruction number, independent of variable-width word offsets.
 #[derive(Debug, Clone)]
 pub struct FunctionImage {
+    /// Constant aggregates, built whole.
+    pub frozen: Box<[Frozen]>,
     /// Property sets that objects are made with and viewed through.
     pub contracts: Box<[Contract]>,
     /// The description of the generator this routine is the body of, if any.
@@ -1257,6 +1291,7 @@ pub struct ModuleImage {
 /// Read-only input for execution and future backend preparation.
 #[derive(Debug)]
 pub struct VerifiedFunction {
+    frozen: Box<[Frozen]>,
     contracts: Box<[Contract]>,
     generator: Option<SignatureId>,
     registers: Box<[RegisterType]>,
@@ -1426,6 +1461,7 @@ impl VerifiedFunction {
             RegisterType::OpenObject => Ok(ValueType::OpenObject),
             RegisterType::Dynamic => Ok(ValueType::Dynamic),
             RegisterType::Failure => Ok(ValueType::Failure),
+            RegisterType::Any => Ok(ValueType::Any),
             RegisterType::BorrowingFunction { .. } => {
                 Err(InvalidBytecode::EscapingBorrow(register))
             }
@@ -1726,6 +1762,20 @@ impl VerifiedFunction {
         }
     }
 
+    /// Whether a constant has the shape of a type.
+    fn frozen_matches(&self, ty: ValueType, frozen: &Frozen) -> bool {
+        match (ty, frozen) {
+            (ValueType::Scalar(expected), Frozen::Scalar(scalar)) => scalar.ty() == expected,
+            (ValueType::Text, Frozen::Text(_)) => true,
+            (ValueType::Composite(shape), Frozen::Tuple(items)) => {
+                matches!(self.shapes.get(shape.index()), Some(Shape::Tuple(fields))
+                    if fields.len() == items.len()
+                        && fields.iter().zip(items.iter()).all(|(&field, item)| self.frozen_matches(field, item)))
+            }
+            _ => false,
+        }
+    }
+
     /// The register holds a size and an alignment.
     fn require_layout(&self, register: Register) -> Result<(), InvalidBytecode> {
         let count = ValueType::Scalar(ScalarType::U64);
@@ -1954,6 +2004,18 @@ impl VerifiedFunction {
     }
 
     /// Every register of the list is an integer index, one per dimension.
+    /// An index is an integer or a count.
+    fn require_index(&self, register: Register) -> Result<(), InvalidBytecode> {
+        match self.register_type(register)? {
+            ScalarType::I64 | ScalarType::U64 => Ok(()),
+            actual => Err(InvalidBytecode::RegisterType {
+                register,
+                expected: ScalarType::I64,
+                actual,
+            }),
+        }
+    }
+
     fn require_indices(
         &self,
         array: Register,
@@ -1970,7 +2032,7 @@ impl VerifiedFunction {
         }
         indices
             .iter()
-            .try_for_each(|&index| self.require_type(index, ScalarType::I64))
+            .try_for_each(|&index| self.require_index(index))
     }
 
     fn enum_variants(&self, register: Register) -> Result<&[Option<ValueType>], InvalidBytecode> {
@@ -2153,6 +2215,7 @@ pub enum InvalidBytecode {
     },
     ExpectedGenerator(Register),
     ExpectedChannelEnd(Register),
+    UnknownFrozen(FrozenId),
     ExpectedObject(Register),
     ExpectedDynamic(Register),
     NotErasable(Register),
@@ -2404,6 +2467,7 @@ impl ModuleImage {
                 managed: managed.clone(),
                 traits: traits.clone(),
                 implementations: implementations.clone(),
+                frozen: image.frozen,
                 contracts: image.contracts,
                 generator: image.generator,
                 registers: image.registers,
@@ -2664,7 +2728,10 @@ impl VerifiedFunction {
                 | RegisterType::Clock
                 | RegisterType::OpenObject
                 | RegisterType::Dynamic
-                | RegisterType::Failure => {}
+                | RegisterType::Failure
+                | RegisterType::Any
+                | RegisterType::Object(_)
+                | RegisterType::Generator(_) => {}
                 RegisterType::Loan {
                     origin: LoanOrigin::Parameter { register: origin },
                     ..
@@ -2986,6 +3053,7 @@ impl VerifiedFunction {
                 RegisterType::OpenObject => self.require_value(arg, ValueType::OpenObject)?,
                 RegisterType::Dynamic => self.require_value(arg, ValueType::Dynamic)?,
                 RegisterType::Failure => self.require_value(arg, ValueType::Failure)?,
+                RegisterType::Any => self.require_value(arg, ValueType::Any)?,
                 RegisterType::Weak(managed) => self.require_value(arg, ValueType::Weak(managed))?,
                 RegisterType::Composite(shape) => {
                     self.require_value(arg, ValueType::Composite(shape))?;
@@ -3358,6 +3426,34 @@ impl VerifiedFunction {
                 }
                 Ok(())
             }
+            Instruction::Count(op, dst, lhs, rhs) => {
+                self.require_type(lhs, ScalarType::U64)?;
+                self.require_type(rhs, ScalarType::U64)?;
+                let result = match op.result() {
+                    ScalarType::I64 => ScalarType::U64,
+                    other => other,
+                };
+                self.require_type(dst, result)
+            }
+            Instruction::FrozenValue(dst, id) => {
+                let frozen = self
+                    .frozen
+                    .get(id.index())
+                    .ok_or(InvalidBytecode::UnknownFrozen(id))?;
+                if self.frozen_matches(self.value_type(dst)?, frozen) {
+                    Ok(())
+                } else {
+                    Err(InvalidBytecode::ExpectedTuple(dst))
+                }
+            }
+            Instruction::AnyErase(dst, source) => {
+                self.require_value(dst, ValueType::Any)?;
+                self.value_type(source).map(|_| ())
+            }
+            Instruction::AnyChecked(dst, source) => {
+                self.require_value(source, ValueType::Any)?;
+                self.value_type(dst).map(|_| ())
+            }
             Instruction::Erase(dst, source) => {
                 self.require_value(dst, ValueType::Dynamic)?;
                 self.require_erasable(source)
@@ -3637,7 +3733,7 @@ impl VerifiedFunction {
             Instruction::PathElement(dst, src, index) => {
                 self.require_value(dst, ValueType::Path)?;
                 self.require_value(src, ValueType::Path)?;
-                self.require_type(index, ScalarType::I64)
+                self.require_index(index)
             }
             Instruction::Input(dst, kind) => self.require_value(dst, kind.value_type()),
             Instruction::InputLoan(loan, kind) => {

@@ -1,7 +1,7 @@
 use super::{
-    BooleanOp, CallSiteId, ChannelVariants, ContractId, DynamicOp, Extremum, FloatOp, FunctionId,
-    GlobalId, ImplementationId, InputKind, Instruction, InstructionId, IntegerOp, InvalidBytecode,
-    OperandListId, Register, Scalar, TextId, TextMapOp, TextOp, TextTestOp,
+    BooleanOp, CallSiteId, ChannelVariants, ContractId, DynamicOp, Extremum, FloatOp, FrozenId,
+    FunctionId, GlobalId, ImplementationId, InputKind, Instruction, InstructionId, IntegerOp,
+    InvalidBytecode, OperandListId, Register, Scalar, TextId, TextMapOp, TextOp, TextTestOp,
 };
 
 // The low half of the header is the opcode and the high half is the total
@@ -215,6 +215,20 @@ opcodes! {
     FailureFlag = 183, 4;
     FailureMessage = 184, 3;
     DynamicInvoke = 185, 4;
+    AnyErase = 186, 3;
+    AnyChecked = 187, 3;
+    FrozenValue = 188, 3;
+    CountAdd = 189, 4;
+    CountSubtract = 190, 4;
+    CountMultiply = 191, 4;
+    CountDivide = 192, 4;
+    CountRemainder = 193, 4;
+    CountLess = 194, 4;
+    CountLessEqual = 195, 4;
+    CountGreater = 196, 4;
+    CountGreaterEqual = 197, 4;
+    CountEqual = 198, 4;
+    CountNotEqual = 199, 4;
 }
 
 impl TextOp {
@@ -541,6 +555,10 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
                 (Opcode::DynamicInvoke, [dst.0, callee.0, list.0], 3)
             }
             Instruction::ObjectFreeze(object) => (Opcode::ObjectFreeze, [object.0, 0, 0], 1),
+            Instruction::Count(op, dst, lhs, rhs) => (count_opcode(op), [dst.0, lhs.0, rhs.0], 3),
+            Instruction::FrozenValue(dst, id) => (Opcode::FrozenValue, [dst.0, id.0, 0], 2),
+            Instruction::AnyErase(dst, source) => (Opcode::AnyErase, [dst.0, source.0, 0], 2),
+            Instruction::AnyChecked(dst, source) => (Opcode::AnyChecked, [dst.0, source.0, 0], 2),
             Instruction::Erase(dst, source) => (Opcode::Erase, [dst.0, source.0, 0], 2),
             Instruction::DynamicCast(dst, source) => (Opcode::DynamicCast, [dst.0, source.0, 0], 2),
             Instruction::DynamicBinary(op, dst, lhs, rhs) => {
@@ -789,6 +807,32 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::FailureMessage => Instruction::FailureMessage(reg(0), reg(1)),
             Opcode::DynamicInvoke => Instruction::DynamicInvoke(reg(0), reg(1), list(2)),
             Opcode::ObjectFreeze => Instruction::ObjectFreeze(reg(0)),
+            Opcode::CountAdd => Instruction::Count(IntegerOp::Add, reg(0), reg(1), reg(2)),
+            Opcode::CountSubtract => {
+                Instruction::Count(IntegerOp::Subtract, reg(0), reg(1), reg(2))
+            }
+            Opcode::CountMultiply => {
+                Instruction::Count(IntegerOp::Multiply, reg(0), reg(1), reg(2))
+            }
+            Opcode::CountDivide => Instruction::Count(IntegerOp::Divide, reg(0), reg(1), reg(2)),
+            Opcode::CountRemainder => {
+                Instruction::Count(IntegerOp::Remainder, reg(0), reg(1), reg(2))
+            }
+            Opcode::CountLess => Instruction::Count(IntegerOp::Less, reg(0), reg(1), reg(2)),
+            Opcode::CountLessEqual => {
+                Instruction::Count(IntegerOp::LessEqual, reg(0), reg(1), reg(2))
+            }
+            Opcode::CountGreater => Instruction::Count(IntegerOp::Greater, reg(0), reg(1), reg(2)),
+            Opcode::CountGreaterEqual => {
+                Instruction::Count(IntegerOp::GreaterEqual, reg(0), reg(1), reg(2))
+            }
+            Opcode::CountEqual => Instruction::Count(IntegerOp::Equal, reg(0), reg(1), reg(2)),
+            Opcode::CountNotEqual => {
+                Instruction::Count(IntegerOp::NotEqual, reg(0), reg(1), reg(2))
+            }
+            Opcode::FrozenValue => Instruction::FrozenValue(reg(0), FrozenId(values[1])),
+            Opcode::AnyErase => Instruction::AnyErase(reg(0), reg(1)),
+            Opcode::AnyChecked => Instruction::AnyChecked(reg(0), reg(1)),
             Opcode::Erase => Instruction::Erase(reg(0), reg(1)),
             Opcode::DynamicCast => Instruction::DynamicCast(reg(0), reg(1)),
             Opcode::DynamicNegate => Instruction::DynamicUnary(DynamicOp::Negate, reg(0), reg(1)),
@@ -884,5 +928,21 @@ fn dynamic_opcode(op: DynamicOp) -> Opcode {
         DynamicOp::Or => Opcode::DynamicOr,
         DynamicOp::Negate => Opcode::DynamicNegate,
         DynamicOp::Not => Opcode::DynamicNot,
+    }
+}
+
+fn count_opcode(op: IntegerOp) -> Opcode {
+    match op {
+        IntegerOp::Add => Opcode::CountAdd,
+        IntegerOp::Subtract => Opcode::CountSubtract,
+        IntegerOp::Multiply => Opcode::CountMultiply,
+        IntegerOp::Divide => Opcode::CountDivide,
+        IntegerOp::Remainder => Opcode::CountRemainder,
+        IntegerOp::Less => Opcode::CountLess,
+        IntegerOp::LessEqual => Opcode::CountLessEqual,
+        IntegerOp::Greater => Opcode::CountGreater,
+        IntegerOp::GreaterEqual => Opcode::CountGreaterEqual,
+        IntegerOp::Equal => Opcode::CountEqual,
+        IntegerOp::NotEqual => Opcode::CountNotEqual,
     }
 }

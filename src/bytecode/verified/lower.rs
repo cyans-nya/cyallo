@@ -1,10 +1,10 @@
 use super::{
     BooleanOp, CallSite, CallSiteId, CallTarget, ChannelVariants, Contract, ContractId, DynamicOp,
-    Extremum, FORMAT_VERSION, FloatOp, FunctionId, FunctionImage, HostBindingId, Implementation,
-    ImplementationId, InputKind, Instruction, InstructionId, IntegerOp, LoanAccess, ModuleImage,
-    OperandListId, OutputId, OutputPiece, OutputTemplate, Register, RegisterType, Scalar,
-    ScalarHostBinding, ScalarType, TextId, TextMapOp, TextOp, TextTestOp, TraitId, ValueType,
-    VerifiedModule, VerifyError,
+    Extremum, FORMAT_VERSION, FloatOp, Frozen, FrozenId, FunctionId, FunctionImage, HostBindingId,
+    Implementation, ImplementationId, InputKind, Instruction, InstructionId, IntegerOp, LoanAccess,
+    ModuleImage, OperandListId, OutputId, OutputPiece, OutputTemplate, Register, RegisterType,
+    Scalar, ScalarHostBinding, ScalarType, TextId, TextMapOp, TextOp, TextTestOp, TraitId,
+    ValueType, VerifiedModule, VerifyError,
     cfg::{self, Block, Exit, Located, Statement},
     encode, layout, lifetimes,
     loans::Places,
@@ -484,6 +484,20 @@ fn lower_dynamic(
             _ => return None,
         })
     })()
+}
+
+/// A constant aggregate as the verified image holds it.
+fn freeze(value: &ConstantValue) -> Option<Frozen> {
+    Some(match value {
+        ConstantValue::String(text) => Frozen::Text(text.clone()),
+        ConstantValue::Integer(value) => Frozen::Scalar(Scalar::I64(*value)),
+        ConstantValue::Real(value) => Frozen::Scalar(Scalar::from_f64(*value)),
+        ConstantValue::Boolean(value) => Frozen::Scalar(Scalar::Bool(*value)),
+        ConstantValue::Array(items) => {
+            Frozen::Tuple(items.iter().map(freeze).collect::<Option<Box<[_]>>>()?)
+        }
+        _ => return None,
+    })
 }
 
 fn is_channel_operation(operation: ConcurrentOperation) -> bool {
@@ -1071,6 +1085,7 @@ fn lower_function(
                 }),
             }
         }
+        sink_borrows(&mut lowered.operations, &sites);
         blocks.push(lowered);
     }
     release_owned_at_returns(&mut blocks, &parameters, &places, &context, &sites);
@@ -1084,6 +1099,7 @@ fn lower_function(
     );
     let body = layout::assign(prologue, blocks, routine)?;
     Ok(FunctionImage {
+        frozen: sites.frozen.into_boxed_slice(),
         contracts: sites.contracts.into_boxed_slice(),
         generator,
         registers,
@@ -1097,6 +1113,45 @@ fn lower_function(
         spans: body.spans,
         statements: body.statements,
     })
+}
+
+/// The checked IR may borrow a temporary's slot before the value is stored
+/// into it (a method call on a computed receiver borrows first). A loan of
+/// storage that holds nothing yet is not valid, so each borrow of a local waits
+/// until just before the first instruction that uses the loan, by which time
+/// the value is there. Only moves later within the block are made.
+fn sink_borrows(operations: &mut Vec<Located<Instruction>>, sites: &Sites) {
+    let mut index = 0;
+    while index < operations.len() {
+        let Instruction::Borrow(loan, owner) = operations[index].value else {
+            index += 1;
+            continue;
+        };
+        // The borrow moves only if the owner is written before the loan is
+        // used, and the loan itself is not written in between.
+        let mut owner_written = false;
+        let mut first_use = None;
+        for (later, operation) in operations.iter().enumerate().skip(index + 1) {
+            let access = operation.value.register_access(&sites.calls, &sites.lists);
+            if access.operands().any(|register| register == loan)
+                || access.arguments.contains(&loan)
+            {
+                first_use = Some(later);
+                break;
+            }
+            if access.write == Some(loan) {
+                break;
+            }
+            owner_written |= access.write == Some(owner);
+        }
+        match first_use {
+            Some(target) if owner_written && target > index + 1 => {
+                let borrow = operations.remove(index);
+                operations.insert(target - 1, borrow);
+            }
+            _ => index += 1,
+        }
+    }
 }
 
 /// Release the owners a routine still holds when it returns. The checked IR
@@ -1181,6 +1236,7 @@ fn release_owned_at_returns(
 /// Call sites and output templates built while lowering one function.
 #[derive(Default)]
 struct Sites {
+    frozen: Vec<Frozen>,
     contracts: Vec<Contract>,
     texts: Vec<Arc<str>>,
     calls: Vec<CallSite>,
@@ -1398,6 +1454,12 @@ fn lower_operation(
             ConstantValue::Boolean(value) => {
                 Instruction::Constant(register(*dst)?, Scalar::Bool(*value))
             }
+            ConstantValue::Array(_) => {
+                let frozen = freeze(value).ok_or_else(unsupported)?;
+                sites.frozen.push(frozen);
+                let id = FrozenId(lower_index(routine, sites.frozen.len() - 1)?);
+                Instruction::FrozenValue(register(*dst)?, id)
+            }
             _ => return Err(unsupported()),
         },
         Op::Lookup(dst, Operation::CloneValue, args) if args.len() == 1 => {
@@ -1465,6 +1527,12 @@ fn lower_operation(
                 Some(RegisterType::Gc(_)) => Instruction::Copy(register(*dst)?, source),
                 _ => return Err(unsupported()),
             }
+        }
+        Op::Lookup(dst, Operation::Erase, args) if args.len() == 1 => {
+            Instruction::AnyErase(register(*dst)?, register(args[0])?)
+        }
+        Op::Lookup(dst, Operation::Checked, args) if args.len() == 1 => {
+            Instruction::AnyChecked(register(*dst)?, register(args[0])?)
         }
         Op::Lookup(dst, Operation::ModuleLoad, args) if args.len() == 1 => {
             Instruction::ModuleLoad(register(*dst)?, register(args[0])?)
@@ -1778,7 +1846,9 @@ fn lower_operation(
             dst,
             operation @ (Operation::Unwrap | Operation::IsNone | Operation::IsSome),
             args,
-        ) if args.len() == 1 => {
+            // `or_fail(message)` unwraps too; the failure reports the variant
+            // and not the message.
+        ) if args.len() == 1 || (args.len() == 2 && matches!(operation, Operation::Unwrap)) => {
             let option = register(args[0])?;
             let (some, none) = context.option_variants(option).ok_or_else(unsupported)?;
             match operation {
@@ -1840,6 +1910,9 @@ fn lower_operation(
                 }
                 (Some(ScalarType::I64), Some(ScalarType::I64)) => {
                     Instruction::Integer(lower_integer(*op).ok_or_else(unsupported)?, dst, lhs, rhs)
+                }
+                (Some(ScalarType::U64), Some(ScalarType::U64)) => {
+                    Instruction::Count(lower_integer(*op).ok_or_else(unsupported)?, dst, lhs, rhs)
                 }
                 (Some(ScalarType::F64), Some(ScalarType::F64)) => {
                     Instruction::Float(lower_float(*op).ok_or_else(unsupported)?, dst, lhs, rhs)

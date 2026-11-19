@@ -17,6 +17,7 @@ fn image(
     instructions: &[Instruction],
 ) -> FunctionImage {
     FunctionImage {
+        frozen: Box::new([]),
         contracts: Box::new([]),
         generator: None,
         registers: registers.iter().copied().map(Into::into).collect(),

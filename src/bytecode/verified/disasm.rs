@@ -126,6 +126,7 @@ impl fmt::Display for VerifiedModule {
                     RegisterType::OpenObject => write!(f, "  r{index}: object")?,
                     RegisterType::Dynamic => write!(f, "  r{index}: dynamic")?,
                     RegisterType::Failure => write!(f, "  r{index}: failure")?,
+                    RegisterType::Any => write!(f, "  r{index}: any")?,
                     RegisterType::Task(id) => write!(f, "  r{index}: task managed{}", id.0)?,
                     RegisterType::Clock => write!(f, "  r{index}: clock")?,
                     RegisterType::Sender(id) => write!(f, "  r{index}: sender managed{}", id.0)?,
@@ -569,6 +570,18 @@ impl fmt::Display for VerifiedModule {
                         write_list(f, &function.lists()[list.index()])?;
                     }
                     Instruction::ObjectFreeze(object) => write!(f, "object.freeze r{}", object.0)?,
+                    Instruction::Count(op, dst, lhs, rhs) => {
+                        write!(f, "r{} = count.{op:?} r{}, r{}", dst.0, lhs.0, rhs.0)?
+                    }
+                    Instruction::FrozenValue(dst, id) => {
+                        write!(f, "r{} = frozen f{}", dst.0, id.0)?
+                    }
+                    Instruction::AnyErase(dst, source) => {
+                        write!(f, "r{} = any.erase r{}", dst.0, source.0)?
+                    }
+                    Instruction::AnyChecked(dst, source) => {
+                        write!(f, "r{} = any.checked r{}", dst.0, source.0)?
+                    }
                     Instruction::Erase(dst, source) => {
                         write!(f, "r{} = erase r{}", dst.0, source.0)?
                     }
@@ -644,6 +657,7 @@ fn value_name(ty: ValueType) -> String {
         ValueType::OpenObject => "object".to_owned(),
         ValueType::Dynamic => "dynamic".to_owned(),
         ValueType::Failure => "failure".to_owned(),
+        ValueType::Any => "any".to_owned(),
         ValueType::Task(id) => format!("task managed{}", id.0),
         ValueType::Clock => "clock".to_owned(),
         ValueType::Sender(id) => format!("sender managed{}", id.0),
