@@ -14,7 +14,12 @@ use crate::{
     ir::{Function, Op, Program, Routine},
 };
 use cyallo_ast::{ConstantValue, Literal, MemoryKind, NumberKind, Operator};
-use cyallo_ir::{enums::Projection, intrinsic::Intrinsic, lookup::Operation, services::Metadata};
+use cyallo_ir::{
+    enums::Projection,
+    intrinsic::Intrinsic,
+    lookup::{Operation, ResumeInput},
+    services::Metadata,
+};
 use std::{collections::HashMap, fmt, sync::Arc};
 
 #[derive(Debug)]
@@ -557,9 +562,16 @@ fn lower_function(
     mut call_target: impl FnMut(usize) -> Result<CallTarget, LowerError>,
 ) -> Result<FunctionImage, LowerError> {
     let signature_error = || LowerError::UnsupportedSignature { routine };
-    if function.generator.is_some() || function.params.iter().any(|&by_ref| by_ref) {
+    if function.params.iter().any(|&by_ref| by_ref) {
         return Err(signature_error());
     }
+    let generator = match &function.generator {
+        None => None,
+        Some(ty) => match shapes.value(ty) {
+            Some(ValueType::Generator(description)) => Some(description),
+            _ => return Err(signature_error()),
+        },
+    };
     let result = match function.result {
         Type::Void => None,
         ref ty => Some(shapes.value(ty).ok_or_else(signature_error)?),
@@ -656,6 +668,7 @@ fn lower_function(
     );
     let body = layout::assign(prologue, blocks, routine)?;
     Ok(FunctionImage {
+        generator,
         registers,
         parameters,
         result,
@@ -743,6 +756,11 @@ fn lower_operation(
         implementations,
     } = *context;
     let register = |index| places.register(index);
+    // A generator operand is a local's address or a loan of one.
+    let generator = |index| match places.address(index) {
+        Some(place) => Ok(place),
+        None => places.register(index),
+    };
     let unsupported = || LowerError::UnsupportedOperation {
         routine,
         instruction,
@@ -916,6 +934,46 @@ fn lower_operation(
         }
         Op::Lookup(_, Operation::LocationStore, args) if args.len() == 2 => {
             Instruction::LocationStore(register(args[0])?, register(args[1])?)
+        }
+        Op::Yield(dst, value) => Instruction::Yield(register(*dst)?, register(*value)?),
+        Op::Lookup(dst, Operation::GeneratorStart, args) if args.len() == 1 => {
+            Instruction::GeneratorStart(register(*dst)?, generator(args[0])?)
+        }
+        Op::Lookup(dst, Operation::GeneratorNext, args) if args.len() == 1 => {
+            Instruction::GeneratorNext(register(*dst)?, generator(args[0])?)
+        }
+        Op::Lookup(dst, Operation::GeneratorResume(ResumeInput::Unit), args) if args.len() == 1 => {
+            Instruction::GeneratorResumeUnit(register(*dst)?, generator(args[0])?)
+        }
+        Op::Lookup(dst, Operation::GeneratorResume(ResumeInput::Value), args)
+            if args.len() == 2 =>
+        {
+            Instruction::GeneratorResume(register(*dst)?, generator(args[0])?, register(args[1])?)
+        }
+        Op::Lookup(_, Operation::GeneratorClose, args) if args.len() == 1 => {
+            Instruction::GeneratorClose(generator(args[0])?)
+        }
+        Op::Lookup(
+            dst,
+            operation @ (Operation::GeneratorIsYielded | Operation::GeneratorIsComplete),
+            args,
+        ) if args.len() == 1 => Instruction::EnumIs(
+            register(*dst)?,
+            register(args[0])?,
+            u32::from(matches!(operation, Operation::GeneratorIsComplete)),
+        ),
+        Op::Lookup(
+            dst,
+            operation @ (Operation::GeneratorYielded | Operation::GeneratorCompleted),
+            args,
+        ) if args.len() == 1 => {
+            let step = register(args[0])?;
+            let variant = u32::from(matches!(operation, Operation::GeneratorCompleted));
+            if context.payload_needs_drop(step, variant) {
+                Instruction::EnumTake(register(*dst)?, step, variant)
+            } else {
+                Instruction::EnumPayload(register(*dst)?, step, variant)
+            }
         }
         Op::Lookup(dst, Operation::LayoutForRc, args) if args.is_empty() => {
             Instruction::LayoutForRc(register(*dst)?)

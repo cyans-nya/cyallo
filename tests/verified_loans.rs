@@ -60,6 +60,7 @@ fn image(
     instructions: &[Instruction],
 ) -> FunctionImage {
     FunctionImage {
+        generator: None,
         registers: registers.into(),
         parameters: parameters.into(),
         result: result.map(Into::into),

@@ -136,6 +136,7 @@ mod images {
             traits: Box::new([]),
             implementations: Box::new([]),
             functions: Box::new([FunctionImage {
+                generator: None,
                 registers: registers.into(),
                 parameters: Box::new([]),
                 result: None,

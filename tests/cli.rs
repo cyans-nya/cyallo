@@ -745,6 +745,9 @@ fn verified_engine_matches_the_interpreter_on_supported_programs() {
         "examples/lookups.ya",
         "examples/locations.ya",
         "examples/managed.ya",
+        "examples/concurrency/generators/sequence.ya",
+        "examples/concurrency/generators/resume-result.ya",
+        "examples/concurrency/generators/delegation.ya",
     ] {
         let run = |engine| cli(&["run", example, "--engine", engine]).output().unwrap();
         let verified = run("verified");

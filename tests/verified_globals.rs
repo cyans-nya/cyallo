@@ -138,6 +138,7 @@ mod images {
             traits: Box::new([]),
             implementations: Box::new([]),
             functions: Box::new([FunctionImage {
+                generator: None,
                 registers: Box::new([RegisterType::Loan {
                     access: LoanAccess::Exclusive,
                     origin,

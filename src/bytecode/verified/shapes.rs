@@ -186,6 +186,33 @@ impl Shapes {
                     .collect::<Option<Box<[_]>>>()?;
                 self.structural_shape(Shape::Tuple(fields))?
             }
+            // The empty tuple is the unit value: a composite with no fields.
+            Type::Tuple(items) if items.is_empty() => {
+                self.structural_shape(Shape::Tuple(Box::new([])))?
+            }
+            // A generator: what it yields, what a resume passes in and what it
+            // returns, in the signature table.
+            Type::Opaque(_, arguments, traits) if traits.generator() && arguments.len() == 3 => {
+                let yielded = self.value(&arguments[0])?;
+                let resume = self.value(&arguments[1])?;
+                let returned = self.value(&arguments[2])?;
+                let description = Signature {
+                    parameters: Box::new([yielded, resume]),
+                    result: Some(returned),
+                };
+                let index = match self
+                    .signatures
+                    .iter()
+                    .position(|known| *known == description)
+                {
+                    Some(index) => index,
+                    None => {
+                        self.signatures.push(description);
+                        self.signatures.len() - 1
+                    }
+                };
+                ValueType::Generator(SignatureId(u32::try_from(index).ok()?))
+            }
             Type::Tuple(items) if !items.is_empty() => {
                 if let Some(&id) = self.by_type.get(ty) {
                     return Some(ValueType::Composite(id));
@@ -284,6 +311,18 @@ impl Shapes {
             Type::Opaque(_, arguments, traits) if traits.deref() && arguments.len() == 1 => {
                 let element = self.value(&arguments[0])?;
                 self.structural_shape(Shape::Cell { element })?
+            }
+            // A step of a generator in its storage form: yielded, then returned.
+            Type::Storage(StorageKind::GeneratorStep, inner) => {
+                let Type::Tuple(items) = &**inner else {
+                    return None;
+                };
+                let [yielded, returned] = items.as_slice() else {
+                    return None;
+                };
+                let yielded = self.value(yielded)?;
+                let returned = self.value(returned)?;
+                self.structural_shape(Shape::Enum(Box::new([Some(yielded), Some(returned)])))?
             }
             // The allocator protocol's request is a size and an alignment.
             Type::Opaque(_, _, traits) if traits.layout() => {
@@ -405,7 +444,7 @@ impl Shapes {
     /// reference, directly or inside a composite.
     pub fn needs_drop(&self, ty: ValueType) -> bool {
         match ty {
-            ValueType::Rc(_) | ValueType::Weak(_) => true,
+            ValueType::Rc(_) | ValueType::Weak(_) | ValueType::Generator(_) => true,
             ValueType::Composite(shape) => match self.shapes.get(shape.index()) {
                 Some(Shape::Tuple(fields)) => fields.iter().any(|&field| self.needs_drop(field)),
                 Some(Shape::Enum(variants)) => variants

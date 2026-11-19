@@ -17,6 +17,7 @@ fn image(
     instructions: &[Instruction],
 ) -> FunctionImage {
     FunctionImage {
+        generator: None,
         registers: registers.iter().copied().map(Into::into).collect(),
         parameters: parameters.into(),
         result: result.map(Into::into),

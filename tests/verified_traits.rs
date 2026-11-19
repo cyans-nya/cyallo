@@ -132,6 +132,7 @@ mod images {
     /// `f1(self: &i64) -> i64`.
     fn reader(access: LoanAccess, result: Option<ValueType>) -> FunctionImage {
         FunctionImage {
+            generator: None,
             registers: Box::new([RegisterType::Loan {
                 access,
                 origin: LoanOrigin::Parameter { register: SELF },
@@ -151,6 +152,7 @@ mod images {
 
     fn entry(call: Vec<CallSite>, code: Vec<Instruction>) -> FunctionImage {
         FunctionImage {
+            generator: None,
             registers: Box::new([RegisterType::Object(TraitId(0))]),
             parameters: Box::new([]),
             result: None,

@@ -160,6 +160,12 @@ opcodes! {
     Allocate = 128, 3;
     Deallocate = 129, 2;
     RcNewIn = 130, 4;
+    Yield = 131, 3;
+    GeneratorStart = 132, 3;
+    GeneratorNext = 133, 3;
+    GeneratorResumeUnit = 134, 3;
+    GeneratorResume = 135, 4;
+    GeneratorClose = 136, 2;
 }
 
 impl TextOp {
@@ -309,6 +315,22 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
             }
             Instruction::ToText(dst, src) => (Opcode::ToText, [dst.0, src.0, 0], 2),
             Instruction::ParseInteger(dst, text) => (Opcode::ParseInteger, [dst.0, text.0, 0], 2),
+            Instruction::Yield(dst, value) => (Opcode::Yield, [dst.0, value.0, 0], 2),
+            Instruction::GeneratorStart(dst, generator) => {
+                (Opcode::GeneratorStart, [dst.0, generator.0, 0], 2)
+            }
+            Instruction::GeneratorNext(dst, generator) => {
+                (Opcode::GeneratorNext, [dst.0, generator.0, 0], 2)
+            }
+            Instruction::GeneratorResumeUnit(dst, generator) => {
+                (Opcode::GeneratorResumeUnit, [dst.0, generator.0, 0], 2)
+            }
+            Instruction::GeneratorResume(dst, generator, value) => {
+                (Opcode::GeneratorResume, [dst.0, generator.0, value.0], 3)
+            }
+            Instruction::GeneratorClose(generator) => {
+                (Opcode::GeneratorClose, [generator.0, 0, 0], 1)
+            }
             Instruction::LayoutForRc(dst) => (Opcode::LayoutForRc, [dst.0, 0, 0], 1),
             Instruction::Allocate(dst, layout) => (Opcode::Allocate, [dst.0, layout.0, 0], 2),
             Instruction::Deallocate(allocation) => (Opcode::Deallocate, [allocation.0, 0, 0], 1),
@@ -541,6 +563,12 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::TextReplace => Instruction::TextReplace(reg(0), reg(1), list(2)),
             Opcode::ToText => Instruction::ToText(reg(0), reg(1)),
             Opcode::ParseInteger => Instruction::ParseInteger(reg(0), reg(1)),
+            Opcode::Yield => Instruction::Yield(reg(0), reg(1)),
+            Opcode::GeneratorStart => Instruction::GeneratorStart(reg(0), reg(1)),
+            Opcode::GeneratorNext => Instruction::GeneratorNext(reg(0), reg(1)),
+            Opcode::GeneratorResumeUnit => Instruction::GeneratorResumeUnit(reg(0), reg(1)),
+            Opcode::GeneratorResume => Instruction::GeneratorResume(reg(0), reg(1), reg(2)),
+            Opcode::GeneratorClose => Instruction::GeneratorClose(reg(0)),
             Opcode::LayoutForRc => Instruction::LayoutForRc(reg(0)),
             Opcode::Allocate => Instruction::Allocate(reg(0), reg(1)),
             Opcode::Deallocate => Instruction::Deallocate(reg(0)),

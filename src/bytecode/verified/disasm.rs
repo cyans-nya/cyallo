@@ -123,6 +123,7 @@ impl fmt::Display for VerifiedModule {
                     RegisterType::Object(id) => write!(f, "  r{index}: dyn trait{}", id.0)?,
                     RegisterType::Path => write!(f, "  r{index}: path")?,
                     RegisterType::Allocation => write!(f, "  r{index}: allocation")?,
+                    RegisterType::Generator(id) => write!(f, "  r{index}: generator sig{}", id.0)?,
                     RegisterType::Location(id) => {
                         write!(f, "  r{index}: location managed{}", id.0)?
                     }
@@ -316,6 +317,24 @@ impl fmt::Display for VerifiedModule {
                         write_list(f, &function.lists()[list.index()])?;
                     }
                     Instruction::ToText(dst, src) => write!(f, "r{} = to.text r{}", dst.0, src.0)?,
+                    Instruction::Yield(dst, value) => write!(f, "r{} = yield r{}", dst.0, value.0)?,
+                    Instruction::GeneratorStart(dst, generator) => {
+                        write!(f, "r{} = generator.start r{}", dst.0, generator.0)?
+                    }
+                    Instruction::GeneratorNext(dst, generator) => {
+                        write!(f, "r{} = generator.next r{}", dst.0, generator.0)?
+                    }
+                    Instruction::GeneratorResumeUnit(dst, generator) => {
+                        write!(f, "r{} = generator.resume r{}", dst.0, generator.0)?
+                    }
+                    Instruction::GeneratorResume(dst, generator, value) => write!(
+                        f,
+                        "r{} = generator.resume r{}, r{}",
+                        dst.0, generator.0, value.0
+                    )?,
+                    Instruction::GeneratorClose(generator) => {
+                        write!(f, "generator.close r{}", generator.0)?
+                    }
                     Instruction::LayoutForRc(dst) => write!(f, "r{} = layout.rc", dst.0)?,
                     Instruction::Allocate(dst, layout) => {
                         write!(f, "r{} = allocate r{}", dst.0, layout.0)?
@@ -505,6 +524,7 @@ fn value_name(ty: ValueType) -> String {
         ValueType::Object(id) => format!("dyn trait{}", id.0),
         ValueType::Path => "path".to_owned(),
         ValueType::Allocation => "allocation".to_owned(),
+        ValueType::Generator(id) => format!("generator sig{}", id.0),
         ValueType::Location(id) => format!("location managed{}", id.0),
         ValueType::Rc(managed) => format!("rc m{}", managed.0),
         ValueType::Weak(managed) => format!("weak m{}", managed.0),

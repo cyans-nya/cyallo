@@ -28,17 +28,17 @@ pub use lower::LowerError;
 pub(crate) use run::ScalarFrameSnapshot;
 pub use run::ScalarRecoveryError;
 pub use run::{
-    Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, HeapStats, InputSource,
-    OutputSink, PathFault, RunError,
+    Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, GeneratorFault, HeapStats,
+    InputSource, OutputSink, PathFault, RunError,
 };
 pub use sdk::SdkCompileError;
 
-/// Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 25;
+pub const FORMAT_VERSION: u32 = 26;
 
 macro_rules! index {
     ($name:ident) => {
@@ -103,6 +103,11 @@ pub enum ValueType {
     /// A block of memory an allocator handed out. It is a token: the engine
     /// keeps no accounting of what it stands for.
     Allocation,
+    /// A suspended routine that yields, resumes and returns values. Its
+    /// description reuses the signature table: the parameters are what it
+    /// yields and what a resume passes in, the result is what it returns.
+    /// The generator owns its frame, so it is released with its owner.
+    Generator(SignatureId),
 }
 
 /// A method a trait declares: what its receiver may do and its other types.
@@ -162,7 +167,8 @@ impl ValueType {
             | Self::Object(_)
             | Self::Path
             | Self::Location(_)
-            | Self::Allocation => None,
+            | Self::Allocation
+            | Self::Generator(_) => None,
         }
     }
 }
@@ -268,6 +274,8 @@ pub enum RegisterType {
     Location(ManagedId),
     /// A block of memory an allocator handed out.
     Allocation,
+    /// A suspended routine.
+    Generator(SignatureId),
     /// A closure that captured loans. It behaves like a loan on their root:
     /// the root stays live and borrowed while it lives, and the value cannot
     /// be stored, passed or returned by value.
@@ -300,6 +308,7 @@ impl From<ValueType> for RegisterType {
             ValueType::Path => Self::Path,
             ValueType::Location(managed) => Self::Location(managed),
             ValueType::Allocation => Self::Allocation,
+            ValueType::Generator(signature) => Self::Generator(signature),
         }
     }
 }
@@ -337,6 +346,7 @@ impl RegisterType {
             Self::Path => ValueType::Path,
             Self::Location(managed) => ValueType::Location(managed),
             Self::Allocation => ValueType::Allocation,
+            Self::Generator(signature) => ValueType::Generator(signature),
             _ => return None,
         })
     }
@@ -607,6 +617,23 @@ pub enum Instruction {
     /// space. The result is a two-variant enum: one carries the integer, the
     /// other a payload-free error.
     ParseInteger(Register, Register),
+    /// Suspend the generator whose body this is, handing the value to whoever
+    /// resumed it. The destination receives the value passed to the next
+    /// resume.
+    Yield(Register, Register),
+    /// Run a new generator to its first suspension. The result is a step: a
+    /// two-variant enum, the yielded value then the returned value.
+    GeneratorStart(Register, Register),
+    /// Start a new generator or continue a suspended one that takes the unit
+    /// resume value.
+    GeneratorNext(Register, Register),
+    /// Continue a suspended generator that takes the unit resume value.
+    GeneratorResumeUnit(Register, Register),
+    /// Continue a suspended generator with a value.
+    GeneratorResume(Register, Register, Register),
+    /// Release a generator and everything its suspended frame owns. Closing
+    /// twice is not an error.
+    GeneratorClose(Register),
     /// The fixed size and alignment a counted allocation asks for.
     LayoutForRc(Register),
     /// Ask the global allocator for a block of the layout. The result is a
@@ -798,6 +825,14 @@ impl Instruction {
             }
             WriteLoan(loan, value) => ([Some(loan), Some(value)], &[], None),
             Input(dst, _) | PathMissing(dst) => ([None, None], &[], Some(dst)),
+            Yield(dst, value) => ([Some(value), None], &[], Some(dst)),
+            GeneratorStart(dst, generator)
+            | GeneratorNext(dst, generator)
+            | GeneratorResumeUnit(dst, generator) => ([Some(generator), None], &[], Some(dst)),
+            GeneratorResume(dst, generator, value) => {
+                ([Some(generator), Some(value)], &[], Some(dst))
+            }
+            GeneratorClose(generator) => ([Some(generator), None], &[], None),
             LayoutForRc(dst) => ([None, None], &[], Some(dst)),
             Allocate(dst, layout) => ([Some(layout), None], &[], Some(dst)),
             Deallocate(allocation) => ([Some(allocation), None], &[], None),
@@ -933,6 +968,10 @@ impl StorageState {
 /// instruction number, independent of variable-width word offsets.
 #[derive(Debug, Clone)]
 pub struct FunctionImage {
+    /// The description of the generator this routine is the body of, if any.
+    /// Calling a closure of such a routine makes a generator instead of
+    /// running it; the routine's result is what the generator returns.
+    pub generator: Option<SignatureId>,
     pub registers: Box<[RegisterType]>,
     pub parameters: Box<[Register]>,
     pub result: Option<ValueType>,
@@ -965,6 +1004,7 @@ pub struct ModuleImage {
 /// Read-only input for execution and future backend preparation.
 #[derive(Debug)]
 pub struct VerifiedFunction {
+    generator: Option<SignatureId>,
     registers: Box<[RegisterType]>,
     parameters: Box<[Register]>,
     shapes: Arc<[Shape]>,
@@ -1124,6 +1164,7 @@ impl VerifiedFunction {
             RegisterType::Path => Ok(ValueType::Path),
             RegisterType::Location(managed) => Ok(ValueType::Location(managed)),
             RegisterType::Allocation => Ok(ValueType::Allocation),
+            RegisterType::Generator(signature) => Ok(ValueType::Generator(signature)),
             RegisterType::BorrowingFunction { .. } => {
                 Err(InvalidBytecode::EscapingBorrow(register))
             }
@@ -1189,6 +1230,52 @@ impl VerifiedFunction {
             Ok((1, 0))
         } else {
             Err(InvalidBytecode::ExpectedEnum(register))
+        }
+    }
+
+    /// The description of the generator a register holds, or an exclusive loan
+    /// of one holds.
+    fn generator_description(&self, register: Register) -> Result<&Signature, InvalidBytecode> {
+        if let RegisterType::Loan { access, .. } = self.register_kind(register)?
+            && access != LoanAccess::Exclusive
+        {
+            return Err(InvalidBytecode::ExpectedExclusiveLoan(register));
+        }
+        let ValueType::Generator(id) = self.through(register)? else {
+            return Err(InvalidBytecode::ExpectedGenerator(register));
+        };
+        let description = self.signature(id)?;
+        if description.parameters.len() != 2 || description.result.is_none() {
+            return Err(InvalidBytecode::UnknownSignature(id));
+        }
+        Ok(description)
+    }
+
+    /// The type is the empty tuple, the resume value of `next` and `resume()`.
+    fn require_unit(&self, ty: ValueType, register: Register) -> Result<(), InvalidBytecode> {
+        match ty {
+            ValueType::Composite(shape) if matches!(self.shapes.get(shape.index()), Some(Shape::Tuple(f)) if f.is_empty()) => {
+                Ok(())
+            }
+            _ => Err(InvalidBytecode::ExpectedGenerator(register)),
+        }
+    }
+
+    /// The step a generator produces: its yielded value in the first variant,
+    /// its returned value in the second.
+    fn step_variants(
+        &self,
+        register: Register,
+        description: &Signature,
+    ) -> Result<(), InvalidBytecode> {
+        match self.enum_variants(register)? {
+            [Some(yielded), Some(returned)]
+                if *yielded == description.parameters[0]
+                    && Some(*returned) == description.result =>
+            {
+                Ok(())
+            }
+            _ => Err(InvalidBytecode::ExpectedEnum(register)),
         }
     }
 
@@ -1526,6 +1613,8 @@ pub enum InvalidBytecode {
         word: usize,
         value: u32,
     },
+    ExpectedGenerator(Register),
+    YieldOutsideGenerator,
     InvalidInputKind {
         word: usize,
         value: u32,
@@ -1693,7 +1782,7 @@ impl ModuleImage {
             }
             for component in shape_components(shape) {
                 match component {
-                    ValueType::Function(signature)
+                    ValueType::Function(signature) | ValueType::Generator(signature)
                         if signature.index() >= self.signatures.len() =>
                     {
                         return Err(image_error(InvalidBytecode::UnknownSignature(signature)));
@@ -1734,7 +1823,9 @@ impl ModuleImage {
                     ValueType::Composite(id) if id.index() >= shapes.len() => {
                         return Err(image_error(InvalidBytecode::UnknownShape(id)));
                     }
-                    ValueType::Function(id) if id.index() >= signatures.len() => {
+                    ValueType::Function(id) | ValueType::Generator(id)
+                        if id.index() >= signatures.len() =>
+                    {
                         return Err(image_error(InvalidBytecode::UnknownSignature(id)));
                     }
                     _ => {}
@@ -1766,6 +1857,7 @@ impl ModuleImage {
                 managed: managed.clone(),
                 traits: traits.clone(),
                 implementations: implementations.clone(),
+                generator: image.generator,
                 registers: image.registers,
                 parameters: image.parameters,
                 result: image.result,
@@ -1958,7 +2050,7 @@ impl VerifiedFunction {
                     return Err(error(None, InvalidBytecode::UnsizedValue(register)));
                 }
             }
-            if let RegisterType::Function(signature) = kind {
+            if let RegisterType::Function(signature) | RegisterType::Generator(signature) = kind {
                 self.signature(signature)
                     .map_err(|kind| error(None, kind))?;
             }
@@ -1974,6 +2066,21 @@ impl VerifiedFunction {
                 && self.managed.get(managed.index()).is_none()
             {
                 return Err(error(None, InvalidBytecode::UnknownManaged(managed)));
+            }
+        }
+        if let Some(id) = self.generator {
+            let description = self.signature(id).map_err(|kind| error(None, kind))?;
+            if description.parameters.len() != 2 || description.result != self.result {
+                return Err(error(None, InvalidBytecode::ResultPresence));
+            }
+            // A suspended frame outlives the call that made it, so it cannot
+            // hold a loan its caller lent.
+            if let Some(&register) = self
+                .parameters
+                .iter()
+                .find(|register| self.registers[register.index()].is_loan())
+            {
+                return Err(error(None, InvalidBytecode::InvalidLoanParameter(register)));
             }
         }
         let mut parameters = vec![StorageState::Dead; self.registers.len()];
@@ -2170,6 +2277,9 @@ impl VerifiedFunction {
                 let callee = functions
                     .get(id.index())
                     .ok_or(InvalidBytecode::UnknownFunction(id))?;
+                if callee.generator.is_some() {
+                    return Err(InvalidBytecode::ClosureTarget(id));
+                }
                 self.verify_guest_arguments(&call.arguments, &callee.parameters, callee)?;
                 callee.result
             }
@@ -2293,6 +2403,9 @@ impl VerifiedFunction {
                     self.require_value(arg, ValueType::Location(managed))?
                 }
                 RegisterType::Allocation => self.require_value(arg, ValueType::Allocation)?,
+                RegisterType::Generator(signature) => {
+                    self.require_value(arg, ValueType::Generator(signature))?
+                }
                 RegisterType::Weak(managed) => self.require_value(arg, ValueType::Weak(managed))?,
                 RegisterType::Composite(shape) => {
                     self.require_value(arg, ValueType::Composite(shape))?;
@@ -2567,6 +2680,35 @@ impl VerifiedFunction {
                     self.register_type(src)?;
                 }
                 self.require_text(dst)
+            }
+            Instruction::Yield(dst, value) => {
+                let Some(id) = self.generator else {
+                    return Err(InvalidBytecode::YieldOutsideGenerator);
+                };
+                let description = self.signature(id)?;
+                let [yielded, resume] = *description.parameters else {
+                    return Err(InvalidBytecode::UnknownSignature(id));
+                };
+                self.require_value(value, yielded)?;
+                self.require_value(dst, resume)
+            }
+            Instruction::GeneratorStart(dst, generator)
+            | Instruction::GeneratorNext(dst, generator)
+            | Instruction::GeneratorResumeUnit(dst, generator) => {
+                let description = self.generator_description(generator)?;
+                self.step_variants(dst, description)?;
+                if !matches!(inst, Instruction::GeneratorStart(..)) {
+                    self.require_unit(description.parameters[1], generator)?;
+                }
+                Ok(())
+            }
+            Instruction::GeneratorResume(dst, generator, value) => {
+                let description = self.generator_description(generator)?;
+                self.step_variants(dst, description)?;
+                self.require_value(value, description.parameters[1])
+            }
+            Instruction::GeneratorClose(generator) => {
+                self.generator_description(generator).map(|_| ())
             }
             Instruction::LayoutForRc(dst) => self.require_layout(dst),
             Instruction::Allocate(dst, layout) => {
@@ -2971,8 +3113,17 @@ impl VerifiedFunction {
                     .get(target.index())
                     .ok_or(InvalidBytecode::UnknownFunction(target))?;
                 let declared = signature.parameters.len();
-                if callee.parameters.len() != captures.len() + declared
-                    || callee.result != signature.result
+                // Calling a closure of a generator body makes a generator.
+                let made = match callee.generator {
+                    Some(description) => {
+                        if self.signature(description)?.result != callee.result {
+                            return Err(InvalidBytecode::ClosureTarget(target));
+                        }
+                        Some(ValueType::Generator(description))
+                    }
+                    None => callee.result,
+                };
+                if callee.parameters.len() != captures.len() + declared || made != signature.result
                 {
                     return Err(InvalidBytecode::ClosureTarget(target));
                 }

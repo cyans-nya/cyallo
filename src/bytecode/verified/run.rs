@@ -41,6 +41,20 @@ pub enum ExecutionStatus {
     Failed(RunError),
 }
 
+/// Why a generator cannot be advanced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratorFault {
+    /// Resumed after it returned or was closed.
+    Finished,
+    AlreadyRunning,
+    /// Resumed before `start`.
+    NotStarted,
+    /// Started twice.
+    AlreadyStarted,
+    /// The generator table is full.
+    LimitExceeded,
+}
+
 /// Why a storage path cannot be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathFault {
@@ -82,6 +96,13 @@ pub enum RunError {
         function: FunctionId,
         instruction: InstructionId,
         span: Span,
+    },
+    /// A generator was advanced in a state that does not allow it.
+    Generator {
+        function: FunctionId,
+        instruction: InstructionId,
+        span: Span,
+        fault: GeneratorFault,
     },
     /// A storage path does not lead anywhere in the value it is applied to.
     Path {
@@ -212,6 +233,15 @@ impl fmt::Display for RunError {
                 "division by zero in function {} at instruction {}",
                 function.0, instruction.0
             ),
+            Self::Generator { fault, .. } => f.write_str(match fault {
+                GeneratorFault::Finished => "cannot resume a completed or closed generator",
+                GeneratorFault::AlreadyRunning => "generator is already running",
+                GeneratorFault::NotStarted => "generator has not started; call start() first",
+                GeneratorFault::AlreadyStarted => {
+                    "generator has already started; continue it with resume()"
+                }
+                GeneratorFault::LimitExceeded => "generator limit exceeded",
+            }),
             Self::Path { fault, .. } => f.write_str(match fault {
                 PathFault::NegativeIndex => "storage path index must not be negative",
                 PathFault::OutOfBounds => "storage path projection out of bounds",
@@ -363,6 +393,9 @@ struct Frame {
     mapped: Option<Box<FrameValue>>,
     /// The counted object whose allocator this frame deallocates for.
     finalizing: Option<usize>,
+    /// The generator this frame is the body of while it runs, and the
+    /// register of the resumer that receives the step.
+    generator: Option<(usize, Register)>,
 }
 
 #[derive(Debug, Clone)]
@@ -379,6 +412,9 @@ enum FrameValue {
     Path(Option<Arc<[PathStep]>>),
     /// A block an allocator handed out, by its serial number.
     Allocation(u64),
+    /// The generator at this index of the generator table. Its owner releases
+    /// it, and the suspended frame it holds is a root for the collector.
+    Generator(usize),
     /// A retained reference to a field of a heap record: a place rooted in a
     /// heap object, which the collector keeps alive.
     Location(BorrowedPlace),
@@ -529,7 +565,34 @@ struct Memory {
     finalizers: VecDeque<usize>,
     /// The number of allocations handed out so far.
     allocations: u64,
+    /// Generators, by index. A released generator leaves a hole.
+    generators: Vec<Option<GeneratorSlot>>,
+    free_generators: Vec<usize>,
 }
+
+/// Where a generator is in its life.
+#[derive(Debug, Clone, Copy)]
+enum GeneratorState {
+    /// Made, not started.
+    New,
+    /// Suspended at a yield: the register that receives the next resume
+    /// value, and the stack index the frame ran at.
+    Suspended { input: Register, depth: usize },
+    /// Its frame is on the stack.
+    Running,
+    /// Returned or closed.
+    Done,
+}
+
+#[derive(Debug)]
+struct GeneratorSlot {
+    state: GeneratorState,
+    /// The suspended frame; absent while it runs and once it is done.
+    frame: Option<Frame>,
+}
+
+/// More generators than this exhaust the table.
+const MAX_GENERATORS: usize = 1 << 20;
 
 /// A counted object: its owners, its weak references and its payload, which
 /// is gone once the last owner is released.
@@ -562,6 +625,8 @@ impl Memory {
             free_counted: Vec::new(),
             finalizers: VecDeque::new(),
             allocations: 0,
+            generators: Vec::new(),
+            free_generators: Vec::new(),
         }
     }
 
@@ -618,6 +683,11 @@ impl Memory {
                     self.block(index).weak -= 1;
                     self.free_if_unused(index);
                 }
+                FrameValue::Generator(index) => {
+                    self.close_generator(index);
+                    self.generators[index] = None;
+                    self.free_generators.push(index);
+                }
                 FrameValue::Composite(Composite::Tuple(fields)) => {
                     pending.extend(fields.into_vec())
                 }
@@ -648,6 +718,41 @@ impl Memory {
         if block.strong == 0 && block.weak == 0 && !block.finalizing {
             self.counted[index] = None;
             self.free_counted.push(index);
+        }
+    }
+
+    /// Keep a new generator's frame. `None` when the table is full.
+    fn new_generator(&mut self, frame: Frame) -> Option<usize> {
+        let slot = GeneratorSlot {
+            state: GeneratorState::New,
+            frame: Some(frame),
+        };
+        if let Some(index) = self.free_generators.pop() {
+            self.generators[index] = Some(slot);
+            Some(index)
+        } else if self.generators.len() < MAX_GENERATORS {
+            self.generators.push(Some(slot));
+            Some(self.generators.len() - 1)
+        } else {
+            None
+        }
+    }
+
+    fn generator(&mut self, index: usize) -> &mut GeneratorSlot {
+        match self.generators[index].as_mut() {
+            Some(slot) => slot,
+            None => unreachable!("a value refers to a released generator"),
+        }
+    }
+
+    /// Finish a generator: what its suspended frame owns is released.
+    fn close_generator(&mut self, index: usize) {
+        let slot = self.generator(index);
+        slot.state = GeneratorState::Done;
+        if let Some(frame) = slot.frame.take() {
+            for value in frame.slots.into_vec().into_iter().flatten() {
+                self.drop_value(value);
+            }
         }
     }
 
@@ -732,6 +837,13 @@ impl Memory {
                     .flatten()
                     .filter_map(|block| block.allocator.as_ref()?.state.as_ref()),
             )
+            .chain(
+                self.generators
+                    .iter()
+                    .flatten()
+                    .filter_map(|slot| slot.frame.as_ref())
+                    .flat_map(|frame| frame.slots.iter().flatten()),
+            )
         {
             trace(value, &mut marks, &mut pending);
         }
@@ -782,6 +894,7 @@ fn trace(value: &FrameValue, marks: &mut [bool], pending: &mut Vec<usize>) {
             | FrameValue::Text(_)
             | FrameValue::Path(_)
             | FrameValue::Allocation(_)
+            | FrameValue::Generator(_)
             | FrameValue::Rc(_)
             | FrameValue::Weak(_)
             | FrameValue::Moved => {}
@@ -976,6 +1089,7 @@ impl Frame {
             destination,
             mapped: None,
             finalizing: None,
+            generator: None,
         };
         for (&register, value) in body.parameters.iter().zip(values) {
             frame.set_value(layout, register, value);
@@ -997,6 +1111,7 @@ impl Frame {
             | FrameValue::Path(_)
             | FrameValue::Location(_)
             | FrameValue::Allocation(_)
+            | FrameValue::Generator(_)
             | FrameValue::Moved => {
                 unreachable!("verified scalar operand")
             }
@@ -1017,6 +1132,7 @@ impl Frame {
             | FrameValue::Path(_)
             | FrameValue::Location(_)
             | FrameValue::Allocation(_)
+            | FrameValue::Generator(_)
             | FrameValue::Moved => {
                 unreachable!("verified loan operand")
             }
@@ -2161,6 +2277,33 @@ impl VerifiedModule {
                             unreachable!("verified closure operand");
                         };
                         let target = &self.functions[closure.function.index()];
+                        if target.generator.is_some()
+                            && !matches!(call.target, CallTarget::Mapped(_))
+                        {
+                            // Calling the closure of a generator body makes a
+                            // generator over copies of what it captured.
+                            let captures: Vec<_> = closure
+                                .captures
+                                .iter()
+                                .map(|capture| memory.clone_value(capture))
+                                .collect();
+                            let values = captures
+                                .into_iter()
+                                .chain(call.arguments.iter().map(|&reg| frame.value(layout, reg)));
+                            let suspended = Frame::new(closure.function, target, values, None);
+                            let Some(id) = memory.new_generator(suspended) else {
+                                return Err(RunError::Generator {
+                                    function,
+                                    instruction: from,
+                                    span: body.spans[pc],
+                                    fault: GeneratorFault::LimitExceeded,
+                                });
+                            };
+                            if let Some(dst) = call.destination {
+                                frame.set_value(layout, dst, FrameValue::Generator(id));
+                            }
+                            return Ok(StepOutcome::Continue);
+                        }
                         let values = closure
                             .captures
                             .iter()
@@ -2210,6 +2353,138 @@ impl VerifiedModule {
                         },
                     )?,
                 }
+            }
+            Instruction::Return(value) if frame.generator.is_some() => {
+                let Some((id, resumer)) = frame.generator else {
+                    unreachable!("checked above");
+                };
+                let Some(returned) = value.map(|reg| frame.value(layout, reg)) else {
+                    unreachable!("a generator returns a value");
+                };
+                stack.pop();
+                memory.generator(id).state = GeneratorState::Done;
+                let caller = stack
+                    .last_mut()
+                    .expect("a generator runs above its resumer");
+                let caller_body = &self.functions[caller.function.index()];
+                let caller_layout = caller_body.frame_layout();
+                caller.set_value(caller_layout, resumer, step(1, returned));
+            }
+            Instruction::Yield(dst, value) => {
+                let Some((id, resumer)) = frame.generator.take() else {
+                    unreachable!("verified yield inside a generator");
+                };
+                let yielded = frame.value(layout, value);
+                let Some(suspended) = stack.pop() else {
+                    unreachable!("the yielding frame is on the stack");
+                };
+                let slot = memory.generator(id);
+                slot.state = GeneratorState::Suspended {
+                    input: dst,
+                    depth: stack.len(),
+                };
+                slot.frame = Some(suspended);
+                let caller = stack
+                    .last_mut()
+                    .expect("a generator runs above its resumer");
+                let caller_body = &self.functions[caller.function.index()];
+                let caller_layout = caller_body.frame_layout();
+                caller.set_value(caller_layout, resumer, step(0, yielded));
+            }
+            Instruction::GeneratorStart(dst, generator)
+            | Instruction::GeneratorNext(dst, generator)
+            | Instruction::GeneratorResumeUnit(dst, generator)
+            | Instruction::GeneratorResume(dst, generator, _) => {
+                let supplied = match body.instructions[pc] {
+                    Instruction::GeneratorResume(_, _, value) => {
+                        Some(stack[depth - 1].value(layout, value))
+                    }
+                    _ => None,
+                };
+                let held = self
+                    .held_value(stack, memory, body, generator)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let Some(FrameValue::Generator(id)) = held else {
+                    unreachable!("verified generator operand");
+                };
+                let fault = |fault| RunError::Generator {
+                    function,
+                    instruction: from,
+                    span: body.spans[pc],
+                    fault,
+                };
+                let instruction = body.instructions[pc];
+                let state = memory.generator(id).state;
+                let input = match (state, instruction) {
+                    (GeneratorState::Running, _) => {
+                        return Err(fault(GeneratorFault::AlreadyRunning));
+                    }
+                    (GeneratorState::Done, _) => return Err(fault(GeneratorFault::Finished)),
+                    (GeneratorState::New, Instruction::GeneratorResumeUnit(..))
+                    | (GeneratorState::New, Instruction::GeneratorResume(..)) => {
+                        return Err(fault(GeneratorFault::NotStarted));
+                    }
+                    (GeneratorState::Suspended { .. }, Instruction::GeneratorStart(..)) => {
+                        return Err(fault(GeneratorFault::AlreadyStarted));
+                    }
+                    (GeneratorState::New, _) => None,
+                    (
+                        GeneratorState::Suspended { input, depth },
+                        Instruction::GeneratorResume(..),
+                    ) => Some((input, depth, supplied.expect("a resume value"))),
+                    (GeneratorState::Suspended { input, depth }, _) => Some((
+                        input,
+                        depth,
+                        FrameValue::Composite(Composite::Tuple(Box::new([]))),
+                    )),
+                };
+                if depth >= max_frames {
+                    return Err(RunError::FrameLimit);
+                }
+                let slot = memory.generator(id);
+                slot.state = GeneratorState::Running;
+                let Some(mut resumed) = slot.frame.take() else {
+                    unreachable!("an idle generator keeps its frame");
+                };
+                let resumed_layout = self.functions[resumed.function.index()].frame_layout();
+                if let Some((register, from_depth, value)) = input {
+                    resumed.set_value(resumed_layout, register, value);
+                    // The frame runs at a new stack index: loans of its own
+                    // registers follow it.
+                    for held in resumed.slots.iter_mut().flatten() {
+                        if let FrameValue::Loan(place) = held
+                            && let Root::Frame {
+                                frame: owner,
+                                register,
+                            } = place.root
+                            && owner == from_depth
+                        {
+                            place.root = Root::Frame {
+                                frame: depth,
+                                register,
+                            };
+                        }
+                    }
+                }
+                resumed.generator = Some((id, dst));
+                stack.push(resumed);
+            }
+            Instruction::GeneratorClose(generator) => {
+                let held = self
+                    .held_value(stack, memory, body, generator)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let Some(FrameValue::Generator(id)) = held else {
+                    unreachable!("verified generator operand");
+                };
+                if matches!(memory.generator(id).state, GeneratorState::Running) {
+                    return Err(RunError::Generator {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                        fault: GeneratorFault::AlreadyRunning,
+                    });
+                }
+                memory.close_generator(id);
             }
             Instruction::Return(value) => {
                 let value = value.map(|reg| frame.value(layout, reg));
@@ -2994,6 +3269,15 @@ fn read_input(line: &str, kind: InputKind) -> Option<FrameValue> {
     })
 }
 
+/// A step of a generator: the yielded value in variant 0, the returned
+/// value in variant 1.
+fn step(variant: u32, value: FrameValue) -> FrameValue {
+    FrameValue::Composite(Composite::Enum {
+        variant,
+        payload: Some(Box::new(value)),
+    })
+}
+
 /// The value a storage path reaches from a root value.
 fn apply_path<'a>(
     memory: &'a Memory,
@@ -3078,6 +3362,7 @@ fn spell(value: &FrameValue, style: TextStyle) -> String {
             | FrameValue::Path(_)
             | FrameValue::Location(_)
             | FrameValue::Allocation(_)
+            | FrameValue::Generator(_)
             | FrameValue::Moved,
         ) => unreachable!("verified text operand is a scalar or string"),
     }
