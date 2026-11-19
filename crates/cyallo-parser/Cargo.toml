@@ -6,3 +6,13 @@ edition = "2024"
 [dependencies]
 cyallo-compile-jobs = { path = "../cyallo-compile-jobs" }
 cyallo-ast = { path = "../cyallo-ast" }
+memchr = { version = "2.8.3", optional = true }
+
+[features]
+# Benchmark-only control: comment scans through `memchr`.
+memchr-control = ["dep:memchr"]
+
+[[bench]]
+name = "lexer_scan"
+harness = false
+required-features = ["memchr-control"]
