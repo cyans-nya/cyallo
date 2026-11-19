@@ -42,7 +42,7 @@ struct Cli {
         long,
         global = true,
         value_enum,
-        help = "Override source dialect (.ya: modern, .psc: compatibility; otherwise modern)"
+        help = "Override source dialect (.ya: modern, .psc: CAIE pseudo code, .pss: simplified CAIE pseudo code; otherwise modern)"
     )]
     dialect: Option<Dialect>,
     #[arg(long, global = true, value_enum, default_value = "auto")]

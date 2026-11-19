@@ -5,6 +5,26 @@ IR, optimizers, execution engines, runtime crates, and their examples. They reco
 the project's implementation constraints, rather than a claim that every existing
 path has already been migrated.
 
+## Readability and correctness
+
+Write code so a reviewer can trace the normal path, boundary cases, and failure
+paths directly. Make the invariant behind a bounds check, conversion, or packed
+representation visible where the code relies on it. Use simple control flow and
+names that state what values mean.
+
+For a numeric value with domain meaning, first reuse the definition that owns
+that meaning, or derive it from the relevant type or data. If a new value is
+necessary, define a named constant at its point of ownership and document why
+that value is correct. Reuse requires the same meaning as well as the same
+number. Use raw literals only where their meaning is evident in context.
+
+For performance choices such as a scan width or dispatch threshold, document
+the workload and measurement that support the choice, or label it experimental
+until measured. Verify the optimization against its reference behavior,
+including inputs at and around the chosen boundary. During review, identify
+the owning definition or rationale for each such value and the check that
+would catch a violation of the invariant.
+
 ## Typed status and error models
 
 Represent each status, outcome, kind, and failure with an enum whose variants

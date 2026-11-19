@@ -658,6 +658,7 @@ fn lower_function(
         }
         blocks.push(lowered);
     }
+    release_owned_at_returns(&mut blocks, &parameters, &places, &context, &sites);
     let registers = places.registers.into_boxed_slice();
     let prologue = lifetimes::insert(
         &mut blocks,
@@ -680,6 +681,85 @@ fn lower_function(
         spans: body.spans,
         statements: body.statements,
     })
+}
+
+/// Release the owners a routine still holds when it returns. The checked IR
+/// releases a local at the end of its scope, which an explicit `return` skips,
+/// and releases a parameter nowhere, so both leaked until the frame vanished.
+/// A drop of a value that was moved out releases nothing, so only definite
+/// initialization matters: a register is released at a return if every path
+/// to it has written the register. Owners written on only some paths stay
+/// unreleased there.
+fn release_owned_at_returns(
+    blocks: &mut [Block],
+    parameters: &[Register],
+    places: &Places,
+    context: &Context<'_>,
+    sites: &Sites,
+) {
+    use std::collections::HashSet;
+    let owned: Vec<Register> = places
+        .locals
+        .iter()
+        .copied()
+        .filter(|register| {
+            places
+                .registers
+                .get(register.index())
+                .is_some_and(|kind| context.register_needs_drop(*kind))
+        })
+        .collect();
+    if owned.is_empty() {
+        return;
+    }
+    let mut written: Vec<Option<HashSet<Register>>> = vec![None; blocks.len()];
+    written[0] = Some(parameters.iter().copied().collect());
+    let mut pending = vec![0usize];
+    while let Some(index) = pending.pop() {
+        let Some(mut state) = written[index].clone() else {
+            continue;
+        };
+        for operation in &blocks[index].operations {
+            state.extend(
+                operation
+                    .value
+                    .register_access(&sites.calls, &sites.lists)
+                    .write,
+            );
+        }
+        for successor in blocks[index].exit.value.successors().into_iter().flatten() {
+            let merged = match &written[successor.0] {
+                None => state.clone(),
+                Some(known) => known.intersection(&state).copied().collect(),
+            };
+            if written[successor.0].as_ref() != Some(&merged) {
+                written[successor.0] = Some(merged);
+                pending.push(successor.0);
+            }
+        }
+    }
+    for (index, block) in blocks.iter_mut().enumerate() {
+        let (Exit::Return(returned), Some(mut state)) = (block.exit.value, written[index].clone())
+        else {
+            continue;
+        };
+        for operation in &block.operations {
+            state.extend(
+                operation
+                    .value
+                    .register_access(&sites.calls, &sites.lists)
+                    .write,
+            );
+        }
+        for &register in owned.iter().rev() {
+            if state.contains(&register) && returned != Some(register) {
+                block.operations.push(Located {
+                    value: Instruction::Drop(register),
+                    span: block.exit.span,
+                });
+            }
+        }
+    }
 }
 
 /// Call sites and output templates built while lowering one function.
