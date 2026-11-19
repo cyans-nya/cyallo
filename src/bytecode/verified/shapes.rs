@@ -254,6 +254,7 @@ impl Shapes {
             }
             // A failure to load a module or to view an object.
             Type::Storage(StorageKind::LoadError | StorageKind::ViewError, _) => ValueType::Failure,
+            Type::NativeCallable(_) => ValueType::NativeCallable,
             // Service contexts, registrations, keys and live references.
             Type::Context => ValueType::Context,
             Type::Registration => ValueType::Registration,
@@ -593,7 +594,8 @@ impl Shapes {
             | ValueType::Context
             | ValueType::Registration
             | ValueType::ServiceKey
-            | ValueType::ServiceRef(_) => false,
+            | ValueType::ServiceRef(_)
+            | ValueType::NativeCallable => false,
         }
     }
 

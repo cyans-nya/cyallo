@@ -128,6 +128,7 @@ impl fmt::Display for VerifiedModule {
                     RegisterType::Failure => write!(f, "  r{index}: failure")?,
                     RegisterType::Any => write!(f, "  r{index}: any")?,
                     RegisterType::Context => write!(f, "  r{index}: context")?,
+                    RegisterType::NativeCallable => write!(f, "  r{index}: native callable")?,
                     RegisterType::Registration => write!(f, "  r{index}: registration")?,
                     RegisterType::ServiceKey => write!(f, "  r{index}: service key")?,
                     RegisterType::ServiceRef(id) => {
@@ -579,6 +580,9 @@ impl fmt::Display for VerifiedModule {
                     Instruction::Count(op, dst, lhs, rhs) => {
                         write!(f, "r{} = count.{op:?} r{}, r{}", dst.0, lhs.0, rhs.0)?
                     }
+                    Instruction::NativeCallableConst(dst, declaration) => {
+                        write!(f, "r{} = native.callable #{declaration}", dst.0)?
+                    }
                     Instruction::ServiceContext(dst) => write!(f, "r{} = service.context", dst.0)?,
                     Instruction::ServiceExtend(dst, ctx) => {
                         write!(f, "r{} = service.extend r{}", dst.0, ctx.0)?
@@ -695,6 +699,7 @@ fn value_name(ty: ValueType) -> String {
         ValueType::Failure => "failure".to_owned(),
         ValueType::Any => "any".to_owned(),
         ValueType::Context => "context".to_owned(),
+        ValueType::NativeCallable => "native callable".to_owned(),
         ValueType::Registration => "registration".to_owned(),
         ValueType::ServiceKey => "service key".to_owned(),
         ValueType::ServiceRef(id) => format!("service ref trait{}", id.0),

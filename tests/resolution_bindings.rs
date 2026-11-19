@@ -51,7 +51,10 @@ fn body_failure(source: &str) -> Failure {
 fn output(source: &str) -> String {
     let eager = run(compile(source).unwrap());
     let deferred = run(compile_for_execution(source, CompileOptions::default()).unwrap());
-    assert_eq!(eager, deferred, "eager and deferred output differ for:\n{source}");
+    assert_eq!(
+        eager, deferred,
+        "eager and deferred output differ for:\n{source}"
+    );
     eager
 }
 
@@ -163,7 +166,9 @@ std::io::print(area(6))
 #[test]
 fn top_level_shadowing_of_bindings_keeps_distinct_storage() {
     assert_eq!(
-        output("let value = 1\nlet value = value + 1\nlet value = \"text\"\nstd::io::print(value)\n"),
+        output(
+            "let value = 1\nlet value = value + 1\nlet value = \"text\"\nstd::io::print(value)\n"
+        ),
         "text\n"
     );
     let (_, _, text) = failure("let n = 1\nn = 2\n");

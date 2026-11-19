@@ -39,7 +39,8 @@ fn bytecode_can_verify_and_show_a_selected_routine() {
             .contains("output.caie")
     );
 
-    let result = cli(&["bytecode", "examples/objects/views.ya", "--verified", "0"])
+    let unsupported = unsupported_program();
+    let result = cli(&["bytecode", unsupported.to_str().unwrap(), "--verified", "0"])
         .output()
         .unwrap();
     assert!(!result.status.success());
@@ -756,7 +757,7 @@ fn verified_engine_matches_the_interpreter_on_supported_programs() {
         "examples/modules/dynamic/main.ya",
         "examples/services/main.ya",
         "examples/lookup-services/main.ya",
-        "examples/lookup-services/main.ya",
+        "examples/objects/views.ya",
         "examples/concurrency/modules/main.ya",
     ] {
         let run = |engine| cli(&["run", example, "--engine", engine]).output().unwrap();
@@ -766,9 +767,18 @@ fn verified_engine_matches_the_interpreter_on_supported_programs() {
     }
 }
 
+/// A program the verified engine cannot lower yet: it keeps a character, which
+/// has no verified representation.
+fn unsupported_program() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("cyallo-unsupported-{}.ya", std::process::id()));
+    std::fs::write(&path, "let c = 'a'\nstd::io::print(c)\n").unwrap();
+    path
+}
+
 #[test]
 fn verified_engine_refuses_unsupported_programs_before_running() {
-    let result = cli(&["run", "examples/objects/views.ya", "--engine", "verified"])
+    let unsupported = unsupported_program();
+    let result = cli(&["run", unsupported.to_str().unwrap(), "--engine", "verified"])
         .output()
         .unwrap();
     assert!(!result.status.success());

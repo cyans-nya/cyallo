@@ -131,7 +131,11 @@ impl TokenKind {
     pub(crate) fn from_packed_word(packed: u64) -> Self {
         let slot = (packed.wrapping_mul(KEYWORD_HASH) >> (64 - KEYWORD_SLOT_BITS)) as usize;
         let (key, kind) = KEYWORD_TABLE[slot];
-        if key == packed { kind } else { Self::Identifier }
+        if key == packed {
+            kind
+        } else {
+            Self::Identifier
+        }
     }
     /// Keyword lookup that reads at most 8 bytes of `bytes` at `start`.
     #[inline(always)]
@@ -142,7 +146,11 @@ impl TokenKind {
         let packed = match bytes.get(start..start + 8) {
             Some(w) => {
                 let all = u64::from_le_bytes(w.try_into().unwrap());
-                if len == 8 { all } else { all & ((1u64 << (8 * len)) - 1) }
+                if len == 8 {
+                    all
+                } else {
+                    all & ((1u64 << (8 * len)) - 1)
+                }
             }
             None => {
                 let mut buf = [0u8; 8];
@@ -292,7 +300,14 @@ mod tests {
         let mut words: Vec<String> = KEYWORDS
             .iter()
             .flat_map(|(w, _)| {
-                [w.to_string(), w.to_uppercase(), format!("{w}_"), format!("{w}x"), w[1..].into(), format!("_{w}")]
+                [
+                    w.to_string(),
+                    w.to_uppercase(),
+                    format!("{w}_"),
+                    format!("{w}x"),
+                    w[1..].into(),
+                    format!("_{w}"),
+                ]
             })
             .collect();
         let alphabet = b"aefnotrx_9";
@@ -312,8 +327,16 @@ mod tests {
             // Both the in-bounds fast path and the tail path (word at end of input).
             let mut padded = b.to_vec();
             padded.extend_from_slice(b"        ");
-            assert_eq!(TokenKind::from_word_at(&padded, 0, b.len()), TokenKind::from_word(&w), "{w}");
-            assert_eq!(TokenKind::from_word_at(b, 0, b.len()), TokenKind::from_word(&w), "{w} at end");
+            assert_eq!(
+                TokenKind::from_word_at(&padded, 0, b.len()),
+                TokenKind::from_word(&w),
+                "{w}"
+            );
+            assert_eq!(
+                TokenKind::from_word_at(b, 0, b.len()),
+                TokenKind::from_word(&w),
+                "{w} at end"
+            );
         }
     }
 }

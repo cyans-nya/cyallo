@@ -1557,6 +1557,9 @@ fn lower_operation(
                 _ => return Err(unsupported()),
             }
         }
+        Op::Lookup(dst, Operation::NativeCallable(declaration), args) if args.is_empty() => {
+            Instruction::NativeCallableConst(register(*dst)?, declaration.0)
+        }
         Op::Lookup(dst, Operation::Erase, args) if args.len() == 1 => {
             Instruction::AnyErase(register(*dst)?, register(args[0])?)
         }
@@ -1740,7 +1743,11 @@ fn lower_operation(
             Instruction::ToText(register(*dst)?, register(args[0])?)
         }
         Op::Builtin(dst, Intrinsic::Abs | Intrinsic::NumAbs, args)
-            if args.len() == 1 && places.scalar(args[0]) == Some(ScalarType::I64) =>
+            if args.len() == 1
+                && matches!(
+                    places.scalar(args[0]),
+                    Some(ScalarType::I64 | ScalarType::F64)
+                ) =>
         {
             Instruction::Abs(register(*dst)?, register(args[0])?)
         }

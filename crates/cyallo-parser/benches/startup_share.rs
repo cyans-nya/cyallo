@@ -22,19 +22,55 @@ fn median_us(mut f: impl FnMut(), iters: usize) -> f64 {
 fn main() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut sources = vec![std::fs::read_to_string(root.join("std.ya")).unwrap()];
-    let mut names: Vec<_> = std::fs::read_dir(root.join("std")).unwrap().flatten().map(|e| e.path()).collect();
+    let mut names: Vec<_> = std::fs::read_dir(root.join("std"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
     names.sort();
-    for p in names.iter().filter(|p| p.extension().is_some_and(|x| x == "ya")) {
+    for p in names
+        .iter()
+        .filter(|p| p.extension().is_some_and(|x| x == "ya"))
+    {
         sources.push(std::fs::read_to_string(p).unwrap());
     }
     let bytes: usize = sources.iter().map(String::len).sum();
     let fib = std::fs::read_to_string(root.join("examples/fib.ya")).unwrap();
     println!("std sources: {} files, {} bytes", sources.len(), bytes);
-    let lex = median_us(|| for s in &sources { black_box(lex_modern(black_box(s)).ok()); }, 200);
-    let index = median_us(|| for s in &sources { black_box(index_modern(black_box(s)).ok()); }, 200);
-    let full = median_us(|| for s in &sources { black_box(parse(black_box(s)).ok()); }, 100);
-    let fib_full = median_us(|| { black_box(parse(black_box(&fib)).ok()); }, 2000);
-    println!("lex           {lex:8.1} us  ({:.2} GB/s)", bytes as f64 / lex / 1e3);
+    let lex = median_us(
+        || {
+            for s in &sources {
+                black_box(lex_modern(black_box(s)).ok());
+            }
+        },
+        200,
+    );
+    let index = median_us(
+        || {
+            for s in &sources {
+                black_box(index_modern(black_box(s)).ok());
+            }
+        },
+        200,
+    );
+    let full = median_us(
+        || {
+            for s in &sources {
+                black_box(parse(black_box(s)).ok());
+            }
+        },
+        100,
+    );
+    let fib_full = median_us(
+        || {
+            black_box(parse(black_box(&fib)).ok());
+        },
+        2000,
+    );
+    println!(
+        "lex           {lex:8.1} us  ({:.2} GB/s)",
+        bytes as f64 / lex / 1e3
+    );
     println!("lex + index   {index:8.1} us");
     println!("full parse    {full:8.1} us");
     println!("fib.ya parse  {fib_full:8.1} us");

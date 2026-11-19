@@ -16,7 +16,9 @@ const VARIANTS: [(&str, ScanVariant); 8] = [
 ];
 
 fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -57,7 +59,11 @@ fn report(name: &str, sources: &[String], iters: usize) {
     let r = measure(sources, iters, 15);
     print!("{name:<34} {:>8} B {:>4} files |", bytes, sources.len());
     for ((label, _), ns) in VARIANTS.iter().zip(&r) {
-        print!(" {label} {:.0}ns ({:.2} GB/s) |", ns / sources.len() as f64, bytes as f64 / ns);
+        print!(
+            " {label} {:.0}ns ({:.2} GB/s) |",
+            ns / sources.len() as f64,
+            bytes as f64 / ns
+        );
     }
     println!();
     let base = r[0];
@@ -77,7 +83,10 @@ fn main() {
     }
     files.push(root.join("std.ya"));
     files.sort();
-    let real: Vec<String> = files.iter().filter_map(|f| std::fs::read_to_string(f).ok()).collect();
+    let real: Vec<String> = files
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .collect();
     let mut by_size = real.clone();
     by_size.sort_by_key(String::len);
     report("real: all .ya", &real, 2000);
@@ -87,7 +96,9 @@ fn main() {
     report("real: concatenated", std::slice::from_ref(&big), 2000);
 
     for n in [2usize, 8, 16, 32, 64, 256, 4096] {
-        let c: String = (0..200).map(|_| format!("x // {}\n", "c".repeat(n))).collect();
+        let c: String = (0..200)
+            .map(|_| format!("x // {}\n", "c".repeat(n)))
+            .collect();
         report(&format!("gen: 200 comments of {n} B"), &[c], 2000);
     }
     for n in [1usize, 2, 4, 8, 16, 32, 64, 256, 4096] {
@@ -95,6 +106,8 @@ fn main() {
         report(&format!("gen: 200 blank runs of {n} B"), &[w], 2000);
     }
     // Typical indentation: LF then 4/8/12 spaces then token.
-    let ind: String = (0..300).map(|i| format!("\n{}x", " ".repeat(4 * (1 + i % 3)))).collect();
+    let ind: String = (0..300)
+        .map(|i| format!("\n{}x", " ".repeat(4 * (1 + i % 3))))
+        .collect();
     report("gen: indented lines (4/8/12)", &[ind], 5000);
 }

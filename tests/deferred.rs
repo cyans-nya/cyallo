@@ -91,7 +91,9 @@ fn concurrent_demand_for_one_body_shares_one_result() {
     for i in 0..64 {
         source.push_str(&format!("fn r{i}(x: i64) -> i64 {{ return x + {i} }}\n"));
     }
-    source.push_str("fn target(n: i64) -> i64 {\n if n <= 0 { return 0 }\n return r7(n) + target(n - 1)\n}\n");
+    source.push_str(
+        "fn target(n: i64) -> i64 {\n if n <= 0 { return 0 }\n return r7(n) + target(n - 1)\n}\n",
+    );
     source.push_str("std::io::print(1)\n");
     let program = Arc::new(compile_for_execution(&source, CompileOptions::default()).unwrap());
     let index = program.functions().len() - 1;

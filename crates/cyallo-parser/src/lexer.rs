@@ -128,7 +128,10 @@ pub mod scan {
     pub const LANES: usize = u8x16::LEN;
 
     pub fn line_comment_len_scalar(bytes: &[u8]) -> usize {
-        bytes.iter().position(|&b| b == b'\n').unwrap_or(bytes.len())
+        bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap_or(bytes.len())
     }
 
     /// Bytes before the first LF, or the whole slice.
@@ -151,7 +154,10 @@ pub mod scan {
 
     /// Length of the leading run of space, tab and CR.
     pub fn blank_run_len_scalar(bytes: &[u8]) -> usize {
-        bytes.iter().position(|&b| !is_blank(b)).unwrap_or(bytes.len())
+        bytes
+            .iter()
+            .position(|&b| !is_blank(b))
+            .unwrap_or(bytes.len())
     }
 
     pub fn blank_run_len_simd(bytes: &[u8]) -> usize {
@@ -225,11 +231,9 @@ pub mod scan {
     }
     scanner!(BothHybrid, blank_run_len_hybrid, line_comment_len_simd);
     #[cfg(feature = "memchr-control")]
-    scanner!(
-        CommentMemchr,
-        blank_run_len_scalar,
-        |b: &[u8]| memchr::memchr(b'\n', b).unwrap_or(b.len())
-    );
+    scanner!(CommentMemchr, blank_run_len_scalar, |b: &[u8]| {
+        memchr::memchr(b'\n', b).unwrap_or(b.len())
+    });
     pub(super) type Adopted = CommentSimdHashed;
 }
 
@@ -491,7 +495,10 @@ mod tests {
         let adopted = match lex(source) {
             Ok(l) => format!(
                 "{:?}",
-                l.tokens().iter().map(|t| (t.kind, t.span, l.text(*t))).collect::<Vec<_>>()
+                l.tokens()
+                    .iter()
+                    .map(|t| (t.kind, t.span, l.text(*t)))
+                    .collect::<Vec<_>>()
             ),
             Err(d) => format!("ERR {d:?}"),
         };
@@ -529,7 +536,11 @@ mod tests {
                     for p in probes {
                         let mut b = base.clone();
                         b[at] = p;
-                        assert_eq!(line_comment_len_scalar(&b), line_comment_len_simd(&b), "{b:?}");
+                        assert_eq!(
+                            line_comment_len_scalar(&b),
+                            line_comment_len_simd(&b),
+                            "{b:?}"
+                        );
                         assert_eq!(blank_run_len_scalar(&b), blank_run_len_simd(&b), "{b:?}");
                     }
                 }
@@ -572,9 +583,27 @@ mod tests {
     #[test]
     fn variants_agree_on_edge_inputs() {
         for src in [
-            "", " ", "\r", "\n", "//", "///", "// \r", "\r//\r\n", "/", "/ /", "a/=b", "a//b",
-            "\"//\"", "'//'", "x \"unterminated // c", "é", " é", "//é", "\t\t\t\u{a0}",
-            "\r\r\r\n\n\r", "// c\n// d\n\n// e",
+            "",
+            " ",
+            "\r",
+            "\n",
+            "//",
+            "///",
+            "// \r",
+            "\r//\r\n",
+            "/",
+            "/ /",
+            "a/=b",
+            "a//b",
+            "\"//\"",
+            "'//'",
+            "x \"unterminated // c",
+            "é",
+            " é",
+            "//é",
+            "\t\t\t\u{a0}",
+            "\r\r\r\n\n\r",
+            "// c\n// d\n\n// e",
         ] {
             assert_same(src);
         }
@@ -583,9 +612,39 @@ mod tests {
     #[test]
     fn variants_agree_on_random_sources() {
         let frags = [
-            " ", "  ", "\t", "\r", "\n", "\r\n", "//", "// c ", "//é", "/", "a", "bc_9", "if", "1",
-            "2.5", "1e", "\"s\"", "\"//\"", "'x'", "'é'", "'a", "\"", "é", "😀", "->", "..=", "{",
-            "}", "#", "\u{a0}", "                ", "////////////////////", "x",
+            " ",
+            "  ",
+            "\t",
+            "\r",
+            "\n",
+            "\r\n",
+            "//",
+            "// c ",
+            "//é",
+            "/",
+            "a",
+            "bc_9",
+            "if",
+            "1",
+            "2.5",
+            "1e",
+            "\"s\"",
+            "\"//\"",
+            "'x'",
+            "'é'",
+            "'a",
+            "\"",
+            "é",
+            "😀",
+            "->",
+            "..=",
+            "{",
+            "}",
+            "#",
+            "\u{a0}",
+            "                ",
+            "////////////////////",
+            "x",
         ];
         let mut rng = Rng(0x9E3779B97F4A7C15);
         for _ in 0..20_000 {
@@ -603,7 +662,9 @@ mod tests {
     #[test]
     fn variants_agree_on_repository_sources() {
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
             for e in rd.flatten() {
                 let p = e.path();
                 if p.is_dir() {

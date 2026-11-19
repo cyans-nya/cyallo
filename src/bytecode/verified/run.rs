@@ -511,6 +511,8 @@ enum FrameValue {
     ServiceKey(usize),
     /// A live reference to a key's service in a context.
     ServiceRef(usize, usize),
+    /// A native function, by declaration number.
+    NativeCallable(u32),
     /// A retained reference to a field of a heap record: a place rooted in a
     /// heap object, which the collector keeps alive.
     Location(BorrowedPlace),
@@ -986,6 +988,9 @@ struct Memory {
     sleeping_until: Option<Instant>,
     /// The namespace object of each module loaded so far, by load key.
     namespaces: HashMap<usize, FrameValue>,
+    /// The adapter routine of each native function and argument types called
+    /// through an erased value.
+    adapters: HashMap<(u32, Vec<ValueType>), usize>,
     /// The loaded modules whose initializers have run.
     initialized: HashSet<usize>,
     services: Services,
@@ -1109,6 +1114,7 @@ impl Memory {
             waiting: None,
             sleeping_until: None,
             namespaces: HashMap::new(),
+            adapters: HashMap::new(),
             initialized: HashSet::new(),
             services: Services::default(),
         }
@@ -1190,7 +1196,8 @@ impl Memory {
                 FrameValue::Context(_)
                 | FrameValue::Registration(_)
                 | FrameValue::ServiceKey(_)
-                | FrameValue::ServiceRef(..) => {}
+                | FrameValue::ServiceRef(..)
+                | FrameValue::NativeCallable(_) => {}
                 FrameValue::Generator(index) => {
                     self.close_generator(index);
                     self.generators[index] = None;
@@ -1493,7 +1500,8 @@ fn trace(value: &FrameValue, marks: &mut [bool], pending: &mut Vec<usize>) {
             FrameValue::Context(_)
             | FrameValue::Registration(_)
             | FrameValue::ServiceKey(_)
-            | FrameValue::ServiceRef(..) => {}
+            | FrameValue::ServiceRef(..)
+            | FrameValue::NativeCallable(_) => {}
             FrameValue::Loan(place) | FrameValue::Location(place) => {
                 if let Root::Heap(object) = place.root {
                     mark(object);
@@ -1753,6 +1761,7 @@ impl Frame {
             | FrameValue::Registration(_)
             | FrameValue::ServiceKey(_)
             | FrameValue::ServiceRef(..)
+            | FrameValue::NativeCallable(_)
             | FrameValue::Moved => {
                 unreachable!("verified scalar operand")
             }
@@ -1787,6 +1796,7 @@ impl Frame {
             | FrameValue::Registration(_)
             | FrameValue::ServiceKey(_)
             | FrameValue::ServiceRef(..)
+            | FrameValue::NativeCallable(_)
             | FrameValue::Moved => {
                 unreachable!("verified loan operand")
             }
@@ -1928,6 +1938,14 @@ enum StepOutcome {
     Continue,
     /// The instruction could not finish yet and will be tried again.
     Blocked,
+    /// A native function is called through an erased value: the arguments with
+    /// their types, and the register that receives the erased result.
+    NativeCall {
+        destination: Register,
+        declaration: u32,
+        arguments: Vec<(ValueType, FrameValue)>,
+        position: (FunctionId, InstructionId, Span),
+    },
     /// A module is to be loaded, and its namespace delivered to the register.
     Load {
         destination: Register,
@@ -2731,15 +2749,18 @@ impl VerifiedModule {
                 frame.set(layout, dst, Scalar::U64(value));
             }
             Instruction::Abs(dst, src) => {
-                let Scalar::I64(value) = frame.get(layout, src) else {
-                    unreachable!("verified integer operand");
+                let result = match frame.get(layout, src) {
+                    Scalar::I64(value) => {
+                        Scalar::I64(value.checked_abs().ok_or(RunError::IntegerOverflow {
+                            function,
+                            instruction: from,
+                            span: body.spans[pc],
+                        })?)
+                    }
+                    Scalar::F64(bits) => Scalar::F64(f64::from_bits(bits).abs().to_bits()),
+                    _ => unreachable!("verified number operand"),
                 };
-                let value = value.checked_abs().ok_or(RunError::IntegerOverflow {
-                    function,
-                    instruction: from,
-                    span: body.spans[pc],
-                })?;
-                frame.set(layout, dst, Scalar::I64(value));
+                frame.set(layout, dst, result);
             }
             Instruction::Extremum(op, dst, lhs, rhs) => {
                 let (Scalar::I64(lhs), Scalar::I64(rhs)) =
@@ -3646,6 +3667,25 @@ impl VerifiedModule {
                 let FrameValue::Dynamic(erased) = frame.value(layout, callee) else {
                     unreachable!("verified erased callee");
                 };
+                if let (ValueType::NativeCallable, FrameValue::NativeCallable(declaration)) =
+                    *erased
+                {
+                    let arguments = body.lists[list.index()]
+                        .iter()
+                        .map(|&register| {
+                            let ty = body.registers()[register.index()]
+                                .value()
+                                .unwrap_or(ValueType::Dynamic);
+                            erased_parts(frame.value(layout, register), ty)
+                        })
+                        .collect();
+                    return Ok(StepOutcome::NativeCall {
+                        destination: dst,
+                        declaration,
+                        arguments,
+                        position: (function, from, body.spans[pc]),
+                    });
+                }
                 let (ValueType::Function(signature), FrameValue::Closure(closure)) = *erased else {
                     return Err(fault());
                 };
@@ -3714,6 +3754,9 @@ impl VerifiedModule {
                     IntegerOp::NotEqual => Scalar::Bool(a != b),
                 };
                 frame.set(layout, dst, result);
+            }
+            Instruction::NativeCallableConst(dst, declaration) => {
+                frame.set_value(layout, dst, FrameValue::NativeCallable(declaration));
             }
             Instruction::ServiceContext(..)
             | Instruction::ServiceExtend(..)
@@ -5214,6 +5257,7 @@ fn spell(value: &FrameValue, style: TextStyle) -> String {
             | FrameValue::Registration(_)
             | FrameValue::ServiceKey(_)
             | FrameValue::ServiceRef(..)
+            | FrameValue::NativeCallable(_)
             | FrameValue::Moved,
         ) => unreachable!("verified text operand is a scalar or string"),
     }
@@ -5295,6 +5339,88 @@ impl Activation {
             ExecutionState::Returned(value) => ExecutionStatus::Returned(*value),
             ExecutionState::Failed(error) => ExecutionStatus::Failed(*error),
         }
+    }
+
+    /// Call a native function through an erased value: compile an adapter for
+    /// the argument types once, add it to the running code, and run it with the
+    /// arguments. The erased result lands in the register.
+    #[allow(clippy::too_many_arguments)]
+    fn perform_native_call(
+        module: &mut VerifiedModule,
+        memory: &mut Memory,
+        stack: &mut Vec<Frame>,
+        frames: usize,
+        destination: Register,
+        declaration: u32,
+        arguments: Vec<(ValueType, FrameValue)>,
+        position: (FunctionId, InstructionId, Span),
+    ) -> Result<(), RunError> {
+        let (function, instruction, span) = position;
+        let refuse = |fault| RunError::Object {
+            function,
+            instruction,
+            span,
+            fault,
+        };
+        let types: Vec<ValueType> = arguments.iter().map(|(ty, _)| *ty).collect();
+        let key = (declaration, types.clone());
+        if !memory.adapters.contains_key(&key) {
+            // Only plain data has a checked type to compile an adapter for.
+            let mut checked = Vec::with_capacity(types.len());
+            for ty in &types {
+                checked.push(match ty {
+                    ValueType::Scalar(ScalarType::I64) => cyallo_ast::Type::Integer,
+                    ValueType::Scalar(ScalarType::F64) => cyallo_ast::Type::Real,
+                    ValueType::Scalar(ScalarType::Bool) => cyallo_ast::Type::Boolean,
+                    ValueType::Text => cyallo_ast::Type::String,
+                    _ => return Err(refuse(ObjectFault::Type)),
+                });
+            }
+            let Some(program) = module.source.clone() else {
+                return Err(refuse(ObjectFault::Type));
+            };
+            let request = crate::dynamic_modules::CallRequest {
+                target: cyallo_ir::dynamic::CallableTarget::Native(cyallo_ast::DeclarationId(
+                    declaration,
+                )),
+                arguments: checked,
+                expected: None,
+                span,
+            };
+            let compiled = crate::dynamic_modules::specialize_calls(program, vec![request])
+                .map_err(|_| refuse(ObjectFault::Type))?;
+            let Some(adapter) = compiled.adapters.first() else {
+                return Err(refuse(ObjectFault::Type));
+            };
+            let routine = adapter.function;
+            let mut roots: Vec<usize> = module.roots.to_vec();
+            if !roots.contains(&routine) {
+                roots.push(routine);
+            }
+            let next =
+                VerifiedModule::lower_extended(compiled.program, module.entry.index(), &roots)
+                    .map_err(|_| refuse(ObjectFault::Type))?;
+            module
+                .is_extended_by(&next)
+                .map_err(|_| refuse(ObjectFault::Type))?;
+            memory.globals.resize(next.globals.len(), None);
+            *module = next;
+            memory.adapters.insert(key.clone(), routine);
+        }
+        let routine = memory.adapters[&key];
+        let Some(id) = module.lowered(routine) else {
+            return Err(refuse(ObjectFault::Type));
+        };
+        if stack.len() >= frames {
+            return Err(RunError::FrameLimit);
+        }
+        let target = &module.functions[id.index()];
+        let result = target.result;
+        let values = arguments.into_iter().map(|(_, value)| value);
+        let mut next = Frame::new(id, target, values, Some(destination));
+        next.wrap = Some(result);
+        stack.push(next);
+        Ok(())
     }
 
     /// Load the module at the path, extend the running code with it, and run
@@ -5458,6 +5584,22 @@ impl Activation {
             // A module load changes the code under the running frames, so it
             // happens here, between instructions.
             let outcome = match outcome {
+                Ok(StepOutcome::NativeCall {
+                    destination,
+                    declaration,
+                    arguments,
+                    position,
+                }) => Self::perform_native_call(
+                    &mut self.module,
+                    &mut self.memory,
+                    stack,
+                    self.limits.frames,
+                    destination,
+                    declaration,
+                    arguments,
+                    position,
+                )
+                .map(|()| StepOutcome::Continue),
                 Ok(StepOutcome::Load {
                     destination,
                     path,
@@ -5506,7 +5648,9 @@ impl Activation {
                         self.module.rotate(stack, &mut self.memory, false);
                     }
                 }
-                Ok(StepOutcome::Load { .. }) => unreachable!("a load was just performed"),
+                Ok(StepOutcome::Load { .. } | StepOutcome::NativeCall { .. }) => {
+                    unreachable!("a load or call was just performed")
+                }
                 Ok(StepOutcome::Returned(value)) if entry => {
                     let scalar = value.map(|value| match value {
                         FrameValue::Scalar(value) => value,

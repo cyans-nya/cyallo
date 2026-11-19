@@ -305,7 +305,8 @@ impl Resolver {
             // declaration list and the export list once per module, keeping the first
             // declaration for a repeated name as the former linear `find` did.
             let exports: HashSet<&str> = node.ast.exports.iter().map(|e| &**e).collect();
-            let exported = |prefix: &str, name: &str| exports.contains(format!("{prefix}{name}").as_str());
+            let exported =
+                |prefix: &str, name: &str| exports.contains(format!("{prefix}{name}").as_str());
             let mut definitions: Vec<(Box<str>, Kind, bool)> = node
                 .ast
                 .functions
@@ -313,7 +314,11 @@ impl Resolver {
                 .map(|f| (f.name.clone(), Kind::Value, exports.contains(&*f.name)))
                 .collect();
             definitions.extend(node.ast.type_aliases.iter().map(|alias| {
-                (alias.name.clone(), Kind::Type, exported("$type$", &alias.name))
+                (
+                    alias.name.clone(),
+                    Kind::Type,
+                    exported("$type$", &alias.name),
+                )
             }));
             definitions.extend(
                 node.ast
@@ -340,7 +345,11 @@ impl Resolver {
                     .map(|t| (t.name.clone(), Kind::Type, exported("$type$", &t.name))),
             );
             definitions.extend(node.ast.properties.iter().map(|p| {
-                (p.name.clone(), Kind::Property, exported("$property$", &p.name))
+                (
+                    p.name.clone(),
+                    Kind::Property,
+                    exported("$property$", &p.name),
+                )
             }));
             definitions.extend(node.ast.body.iter().filter_map(|s| match &s.kind {
                 StmtKind::Constant(n, _) | StmtKind::Declare(n, _) => {

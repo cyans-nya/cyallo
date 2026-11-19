@@ -33,12 +33,12 @@ pub use run::{
 };
 pub use sdk::SdkCompileError;
 
-/// Version 33 adds service contexts. Version 32 adds owned erased values, constant aggregates and count arithmetic. Version 31 adds run-time module loading. Version 30 adds by-value trait receivers. Version 29 adds open objects and erased values. Version 28 adds tasks and clocks. Version 27 adds channels. Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 34 adds native callables in erased values. Version 33 adds service contexts. Version 32 adds owned erased values, constant aggregates and count arithmetic. Version 31 adds run-time module loading. Version 30 adds by-value trait receivers. Version 29 adds open objects and erased values. Version 28 adds tasks and clocks. Version 27 adds channels. Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 33;
+pub const FORMAT_VERSION: u32 = 34;
 
 macro_rules! index {
     ($name:ident) => {
@@ -142,6 +142,9 @@ pub enum ValueType {
     /// A live reference to a service the trait describes: each call finds the
     /// provider the context sees at that moment.
     ServiceRef(TraitId),
+    /// A function the standard library provides, named by its declaration. It
+    /// has no body here: calling it through an erased value compiles an adapter.
+    NativeCallable,
 }
 
 /// A method a trait declares: what its receiver may do and its other types.
@@ -259,7 +262,8 @@ impl ValueType {
             | Self::Context
             | Self::Registration
             | Self::ServiceKey
-            | Self::ServiceRef(_) => None,
+            | Self::ServiceRef(_)
+            | Self::NativeCallable => None,
         }
     }
 }
@@ -391,6 +395,8 @@ pub enum RegisterType {
     ServiceKey,
     /// A live reference to a service.
     ServiceRef(TraitId),
+    /// A native function value.
+    NativeCallable,
     /// A closure that captured loans. It behaves like a loan on their root:
     /// the root stays live and borrowed while it lives, and the value cannot
     /// be stored, passed or returned by value.
@@ -436,6 +442,7 @@ impl From<ValueType> for RegisterType {
             ValueType::Registration => Self::Registration,
             ValueType::ServiceKey => Self::ServiceKey,
             ValueType::ServiceRef(id) => Self::ServiceRef(id),
+            ValueType::NativeCallable => Self::NativeCallable,
         }
     }
 }
@@ -486,6 +493,7 @@ impl RegisterType {
             Self::Registration => ValueType::Registration,
             Self::ServiceKey => ValueType::ServiceKey,
             Self::ServiceRef(id) => ValueType::ServiceRef(id),
+            Self::NativeCallable => ValueType::NativeCallable,
             _ => return None,
         })
     }
@@ -850,6 +858,8 @@ pub enum Instruction {
     DynamicInvoke(Register, Register, OperandListId),
     /// Wrap the value with its type.
     Erase(Register, Register),
+    /// The native function with this declaration number.
+    NativeCallableConst(Register, u32),
     /// A new root service context.
     ServiceContext(Register),
     /// A context that sees what its parent sees.
@@ -1126,7 +1136,9 @@ impl Instruction {
             DynamicInvoke(dst, callee, list) => {
                 ([Some(callee), None], &lists[list.index()], Some(dst))
             }
-            ServiceContext(dst) | ServiceKeyConst(dst, _) => ([None, None], &[], Some(dst)),
+            ServiceContext(dst) | ServiceKeyConst(dst, _) | NativeCallableConst(dst, _) => {
+                ([None, None], &[], Some(dst))
+            }
             ServiceExtend(dst, ctx) => ([Some(ctx), None], &[], Some(dst)),
             ServiceIsolate(dst, ctx, key)
             | ServiceReference(dst, ctx, key)
@@ -1527,6 +1539,7 @@ impl VerifiedFunction {
             RegisterType::Registration => Ok(ValueType::Registration),
             RegisterType::ServiceKey => Ok(ValueType::ServiceKey),
             RegisterType::ServiceRef(id) => Ok(ValueType::ServiceRef(id)),
+            RegisterType::NativeCallable => Ok(ValueType::NativeCallable),
             RegisterType::BorrowingFunction { .. } => {
                 Err(InvalidBytecode::EscapingBorrow(register))
             }
@@ -2817,7 +2830,8 @@ impl VerifiedFunction {
                 | RegisterType::Context
                 | RegisterType::Registration
                 | RegisterType::ServiceKey
-                | RegisterType::ServiceRef(_) => {}
+                | RegisterType::ServiceRef(_)
+                | RegisterType::NativeCallable => {}
                 RegisterType::Loan {
                     origin: LoanOrigin::Parameter { register: origin },
                     ..
@@ -3147,6 +3161,9 @@ impl VerifiedFunction {
                 RegisterType::ServiceKey => self.require_value(arg, ValueType::ServiceKey)?,
                 RegisterType::ServiceRef(id) => {
                     self.require_value(arg, ValueType::ServiceRef(id))?
+                }
+                RegisterType::NativeCallable => {
+                    self.require_value(arg, ValueType::NativeCallable)?
                 }
                 RegisterType::Weak(managed) => self.require_value(arg, ValueType::Weak(managed))?,
                 RegisterType::Composite(shape) => {
@@ -3519,6 +3536,9 @@ impl VerifiedFunction {
                     self.require_erasable(argument)?;
                 }
                 Ok(())
+            }
+            Instruction::NativeCallableConst(dst, _) => {
+                self.require_value(dst, ValueType::NativeCallable)
             }
             Instruction::ServiceContext(dst) => self.require_value(dst, ValueType::Context),
             Instruction::ServiceExtend(dst, ctx) => {
@@ -3920,8 +3940,12 @@ impl VerifiedFunction {
                 self.require_type(dst, ScalarType::U64)
             }
             Instruction::Abs(dst, src) => {
-                self.require_type(src, ScalarType::I64)?;
-                self.require_type(dst, ScalarType::I64)
+                // Integers (checked) and floats.
+                let ty = self.register_type(src)?;
+                if !matches!(ty, ScalarType::I64 | ScalarType::F64) {
+                    return Err(InvalidBytecode::ExpectedScalar(src));
+                }
+                self.require_type(dst, ty)
             }
             Instruction::Extremum(_, dst, lhs, rhs) => {
                 self.require_type(lhs, ScalarType::I64)?;
