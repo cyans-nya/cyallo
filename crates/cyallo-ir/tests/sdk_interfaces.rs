@@ -55,9 +55,18 @@ fn an_interface_without_implementers_links_unbound() {
 #[test]
 fn binding_errors_are_typed_and_precise() {
     for (extra, expected) in [
-        ("impl interface nope for host { }", "unresolved interface module"),
-        ("impl interface host for host { }", "is not an `interface mod`"),
-        ("impl interface api for nowhere { }", "unresolved implementing module"),
+        (
+            "impl interface nope for host { }",
+            "unresolved interface module",
+        ),
+        (
+            "impl interface host for host { }",
+            "is not an `interface mod`",
+        ),
+        (
+            "impl interface api for nowhere { }",
+            "unresolved implementing module",
+        ),
         (
             "impl interface api for host { type Missing = host::A }",
             "is not an opaque record",

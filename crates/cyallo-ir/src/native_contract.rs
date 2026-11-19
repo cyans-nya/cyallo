@@ -399,7 +399,8 @@ impl Bindings {
             (Type::Opaque(p_name, ps, p_traits), Type::Opaque(a_name, args, a_traits))
                 if p_name == a_name
                     && ps.len() == args.len()
-                    && (p_traits.pure() == a_traits.pure() || (!p_traits.pure() && a_traits.pure())) =>
+                    && (p_traits.pure() == a_traits.pure()
+                        || (!p_traits.pure() && a_traits.pure())) =>
             {
                 for (p, a) in ps.iter().zip(args) {
                     self.unify(env, p, a, index)?;
@@ -2112,10 +2113,7 @@ mod tests {
             &[owner.clone(), Type::String],
         )
         .unwrap();
-        assert_eq!(
-            location.result,
-            host_type(&env, "load", Type::Boolean)
-        );
+        assert_eq!(location.result, host_type(&env, "load", Type::Boolean));
         assert_eq!(location.params[0].passing, ParameterPassing::Read);
         assert_eq!(location.params[1].passing, ParameterPassing::Read);
         assert_eq!(location.params[0].ty, owner);
@@ -2260,16 +2258,13 @@ mod tests {
             host_type(&env, "completed", Type::Integer)
         );
         assert!(member(&env, &reference(task), "join", &[], &[], SPAN).is_err());
-        let pure = match host_type_args(
-            &env,
-            "next",
-            vec![Type::Integer, Type::Void, Type::Integer],
-        ) {
-            Type::Opaque(name, arguments, traits) => {
-                Type::Opaque(name, arguments, traits.with_pure(true))
-            }
-            other => panic!("{other:?}"),
-        };
+        let pure =
+            match host_type_args(&env, "next", vec![Type::Integer, Type::Void, Type::Integer]) {
+                Type::Opaque(name, arguments, traits) => {
+                    Type::Opaque(name, arguments, traits.with_pure(true))
+                }
+                other => panic!("{other:?}"),
+            };
         let resumed = member(&env, &pure, "resume", &[], &[], SPAN)
             .unwrap()
             .unwrap();

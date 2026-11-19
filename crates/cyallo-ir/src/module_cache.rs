@@ -319,9 +319,10 @@ pub(crate) fn keys(
                         .get(name)
                         .map(|s| (name.clone(), s.clone().into()))
                         .or_else(|| {
-                            globals.iter().find(|g| g.name == *name).map(|g| {
-                                (name.clone(), fingerprint(&(&g.ty, g.constant)))
-                            })
+                            globals
+                                .iter()
+                                .find(|g| g.name == *name)
+                                .map(|g| (name.clone(), fingerprint(&(&g.ty, g.constant))))
                         })
                         .or_else(|| {
                             types
@@ -406,7 +407,8 @@ mod tests {
     }
     #[test]
     fn identity_is_structural_and_deterministic() {
-        let source = "pub record R { a: i64 }\nfn f(x: i64) -> i64 { return x + 1 }\nlet v = f(2)\n";
+        let source =
+            "pub record R { a: i64 }\nfn f(x: i64) -> i64 { return x + 1 }\nlet v = f(2)\n";
         assert_eq!(id(source), id(source));
         // Structure changes the identity; so does a literal.
         assert_ne!(id(source), id(&source.replace("x + 1", "x + 2")));
@@ -426,10 +428,12 @@ mod tests {
         let mut a = Ast::default();
         let mut b = Ast::default();
         for name in ["alpha", "beta", "gamma", "delta", "epsilon"] {
-            a.source_names.insert(name.into(), name.to_uppercase().into());
+            a.source_names
+                .insert(name.into(), name.to_uppercase().into());
         }
         for name in ["epsilon", "delta", "gamma", "beta", "alpha"] {
-            b.source_names.insert(name.into(), name.to_uppercase().into());
+            b.source_names
+                .insert(name.into(), name.to_uppercase().into());
         }
         assert_eq!(fingerprint(&a), fingerprint(&b));
         b.source_names.insert("zeta".into(), "ZETA".into());
@@ -439,6 +443,9 @@ mod tests {
     fn nested_structure_is_not_ambiguous() {
         // Length prefixes keep ("ab", "c") apart from ("a", "bc").
         assert_ne!(fingerprint(&("ab", "c")), fingerprint(&("a", "bc")));
-        assert_ne!(fingerprint(&vec![vec![1u8], vec![]]), fingerprint(&vec![vec![], vec![1u8]]));
+        assert_ne!(
+            fingerprint(&vec![vec![1u8], vec![]]),
+            fingerprint(&vec![vec![], vec![1u8]])
+        );
     }
 }

@@ -1,8 +1,11 @@
 //! Source adapters and executable packaging. Language semantics live in cyallo-ir.
+use crate::dynamic_modules::{ArchivedSyntax, SourceTrees};
 use crate::ir;
 use cyallo_ast::*;
 pub(crate) use cyallo_ir::analysis::contextualize;
 pub use cyallo_ir::{CompileOptions, Dialect};
+use cyallo_parser::ParsedFile;
+use std::sync::Arc;
 type Result<T> = std::result::Result<T, Diagnostic>;
 pub fn compile(source: &str) -> Result<ir::Program> {
     compile_with_options(source, CompileOptions::default())
@@ -20,6 +23,59 @@ pub(crate) fn compile_source(
 /// Parse declarations and check the entry body; defer routine bodies until used.
 pub fn compile_for_execution(source: &str, options: CompileOptions) -> Result<ir::Program> {
     compile_source_inner(source, options, false, true)
+}
+
+/// Check and compile a published modern parser snapshot.
+pub fn compile_snapshot(file: Arc<ParsedFile>, options: CompileOptions) -> Result<ir::Program> {
+    compile_snapshot_inner(file, options, false)
+}
+
+/// Compile a published snapshot, deferring routine body checks until use.
+pub fn compile_snapshot_for_execution(
+    file: Arc<ParsedFile>,
+    options: CompileOptions,
+) -> Result<ir::Program> {
+    compile_snapshot_inner(file, options, true)
+}
+
+#[derive(Debug)]
+struct SnapshotDialectMismatch {
+    dialect: Dialect,
+}
+
+impl std::fmt::Display for SnapshotDialectMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a modern snapshot cannot be compiled in the {:?} dialect",
+            self.dialect
+        )
+    }
+}
+
+impl std::error::Error for SnapshotDialectMismatch {}
+
+fn invalid_snapshot_dialect(error: SnapshotDialectMismatch) -> Diagnostic {
+    Diagnostic::new("E002", error.to_string(), Span::default())
+}
+
+fn compile_snapshot_inner(
+    file: Arc<ParsedFile>,
+    options: CompileOptions,
+    deferred: bool,
+) -> Result<ir::Program> {
+    if options.dialect != Dialect::Modern {
+        return Err(invalid_snapshot_dialect(SnapshotDialectMismatch {
+            dialect: options.dialect,
+        }));
+    }
+    compile_modern_snapshot(
+        file,
+        options,
+        deferred,
+        &cyallo_ir::import_policy::ImportPolicy::default(),
+        &cyallo_ir::core_package::CorePackage::embedded(),
+    )
 }
 fn compile_source_inner(
     source: &str,
@@ -66,88 +122,94 @@ fn compile_source_configured(
     policy: &cyallo_ir::import_policy::ImportPolicy,
     core: &cyallo_ir::core_package::CorePackage<'_>,
 ) -> Result<ir::Program> {
-    let ast = if options.dialect == Dialect::Modern {
-        cyallo_parser::parse_modern_with_jobs(
-            source,
+    if options.dialect == Dialect::Modern {
+        let file = cyallo_parser::parse_modern_snapshot(
+            Arc::from(source),
             repl,
             cyallo_compile_jobs::Jobs(options.jobs),
-        )?
-    } else if repl {
-        caie_int_parser::parse_repl(source)?
-    } else {
-        caie_int_parser::parse(source)?
-    };
-    if options.dialect == Dialect::Modern {
-        let mut archive = source.to_owned();
-        let core_archive = core
-            .append_to(&mut archive)
-            .map_err(cyallo_ir::core_package::invalid_core_source)?;
-        let raw = ast.clone();
-        let mut ast = crate::namespace::link_with_core(
-            vec![ast],
-            &["main.ya".into()],
-            0,
-            policy,
-            core,
-            core_archive.base,
         )?;
-        ast.source_files = std::iter::once(cyallo_ir::module_graph::SourceFile {
-            id: cyallo_ir::module_graph::SourceFileId {
-                path: "main.ya".into(),
-                trust: SourceTrust::User,
-            },
-            span: Span::new(0, source.len() as u32),
-        })
-        .chain(
-            core_archive
-                .ranges
-                .iter()
-                .map(|r| cyallo_ir::module_graph::SourceFile {
-                    id: cyallo_ir::module_graph::SourceFileId {
-                        path: r.path.clone(),
-                        trust: SourceTrust::Core,
-                    },
-                    span: r.span,
-                }),
-        )
-        .collect();
-        let source_files = ast.source_files.clone();
-        let authorization = ast.native.import_policy.clone();
-        let mut program = compile_resolved(&archive, ast, options, deferred)?;
-        let mut ranges = vec![crate::modules::SourceRange {
-            path: None,
-            span: Span::new(0, source.len() as u32),
-        }];
-        ranges.extend(
-            core_archive
-                .ranges
-                .into_iter()
-                .map(|range| crate::modules::SourceRange {
-                    path: Some(range.path),
-                    span: range.span,
-                }),
-        );
-        let mut plan = crate::dynamic_modules::CompilePlan::new(
-            crate::dynamic_modules::CompileSources {
-                source_files,
-                asts: vec![raw],
-                paths: vec!["main.ya".into()],
-                entry: 0,
-                archive,
-                ranges: ranges.clone(),
-                core_base: core_archive.base,
-            },
-            options,
-            policy,
-            core,
-        );
-        plan.authorization = authorization;
-        program.dynamic_plan = Some(std::sync::Arc::new(plan));
-        program.source_modules = ranges.into_boxed_slice();
-        Ok(program)
+        compile_modern_snapshot(Arc::new(file), options, deferred, policy, core)
     } else {
-        compile_ast(source, ast, options, deferred)
+        let syntax = caie_int_parser::parse_indexed_with_mode(source, repl)?;
+        compile_ast(source, syntax.to_source_tree(), options, deferred)
     }
+}
+
+fn compile_modern_snapshot(
+    file: Arc<ParsedFile>,
+    options: CompileOptions,
+    deferred: bool,
+    policy: &cyallo_ir::import_policy::ImportPolicy,
+    core: &cyallo_ir::core_package::CorePackage<'_>,
+) -> Result<ir::Program> {
+    let source_len = file.source().text().len() as u32;
+    let mut archive = file.source().text().to_owned();
+    let trees = SourceTrees::new(vec![ArchivedSyntax { file, offset: 0 }]);
+    let core_archive = core
+        .append_to(&mut archive)
+        .map_err(cyallo_ir::core_package::invalid_core_source)?;
+    let mut ast = crate::namespace::link_with_core(
+        trees.materialize(0)?,
+        &["main.ya".into()],
+        0,
+        policy,
+        core,
+        core_archive.base,
+    )?;
+    ast.source_files = std::iter::once(cyallo_ir::module_graph::SourceFile {
+        id: cyallo_ir::module_graph::SourceFileId {
+            path: "main.ya".into(),
+            trust: SourceTrust::User,
+        },
+        span: Span::new(0, source_len),
+    })
+    .chain(
+        core_archive
+            .ranges
+            .iter()
+            .map(|r| cyallo_ir::module_graph::SourceFile {
+                id: cyallo_ir::module_graph::SourceFileId {
+                    path: r.path.clone(),
+                    trust: SourceTrust::Core,
+                },
+                span: r.span,
+            }),
+    )
+    .collect();
+    let source_files = ast.source_files.clone();
+    let authorization = ast.native.import_policy.clone();
+    let mut program = compile_resolved(&archive, ast, options, deferred)?;
+    let mut ranges = vec![crate::modules::SourceRange {
+        path: None,
+        span: Span::new(0, source_len),
+    }];
+    ranges.extend(
+        core_archive
+            .ranges
+            .into_iter()
+            .map(|range| crate::modules::SourceRange {
+                path: Some(range.path),
+                span: range.span,
+            }),
+    );
+    let mut plan = crate::dynamic_modules::CompilePlan::new(
+        crate::dynamic_modules::CompileSources {
+            source_files,
+            trees,
+            paths: vec!["main.ya".into()],
+            entry: 0,
+            archive,
+            ranges: ranges.clone(),
+            core_base: core_archive.base,
+        },
+        options,
+        policy,
+        core,
+    );
+    plan.authorization = authorization;
+    program.dynamic_plan = Some(std::sync::Arc::new(plan));
+    program.source_modules = ranges.into_boxed_slice();
+    Ok(program)
 }
 pub(crate) fn compile_ast(
     source: &str,

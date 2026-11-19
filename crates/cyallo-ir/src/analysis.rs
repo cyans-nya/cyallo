@@ -965,7 +965,10 @@ pub fn contextualize(expression: &Expr, wanted: &Type) -> Result<Expr> {
         for value in values.iter_mut() {
             *value = contextualize(value, element)?;
         }
-        *types = vec![Type::Opaque(target.clone(), vec![], *traits), element.clone()];
+        *types = vec![
+            Type::Opaque(target.clone(), vec![], *traits),
+            element.clone(),
+        ];
     }
     Ok(e)
 }
@@ -2007,7 +2010,9 @@ impl Lower<'_> {
             .collect();
         Ok(
             match crate::inference::expression_type(base, &known, self.types)? {
-                Type::Opaque(_, mut arguments, traits) if traits.deref() && arguments.len() == 1 => {
+                Type::Opaque(_, mut arguments, traits)
+                    if traits.deref() && arguments.len() == 1 =>
+                {
                     Some((base, arguments.remove(0)))
                 }
                 _ => None,
@@ -2136,9 +2141,10 @@ impl Lower<'_> {
                     let (dimensions, element) = match t {
                         Type::Array(bounds, element) => (bounds.len(), element),
                         Type::SparseArray(element) | Type::Slice(element) => (1, element),
-                        collection if collection.collection_element().is_some() => {
-                            (1, Box::new(collection.collection_element().unwrap().clone()))
-                        }
+                        collection if collection.collection_element().is_some() => (
+                            1,
+                            Box::new(collection.collection_element().unwrap().clone()),
+                        ),
                         _ => {
                             return Err(Diagnostic::new(
                                 "E108",
@@ -2302,7 +2308,8 @@ impl Lower<'_> {
             } = &actual
                 && (!*mutable || *writable)
                 && (matches!(pointee.as_ref(), Type::Array(_, t) if t == element)
-                    || (!pointee.is_double_ended() && pointee.collection_element() == Some(element)))
+                    || (!pointee.is_double_ended()
+                        && pointee.collection_element() == Some(element)))
             {
                 return self.lookup_op(
                     crate::lookup::Operation::Slice(*mutable),

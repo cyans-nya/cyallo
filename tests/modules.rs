@@ -32,6 +32,24 @@ fn filesystem_dialects_stay_separate() {
     std::fs::write(directory.0.join("lib/exam.psc"), [0xff]).unwrap();
     let sources = cyallo::modules::load_path(&entry).unwrap();
     assert_eq!(sources.len(), 2);
+    let loader = cyallo::module_loader::ModuleLoader::for_entry(&entry).unwrap();
+    let parsed = loader.load_parsed(&entry, cyallo::Jobs(1)).unwrap();
+    let (archive, ranges) = cyallo::modules::parsed_source_context(&parsed);
+    assert_eq!(archive, cyallo::modules::source_archive(&sources));
+    assert_eq!(
+        ranges[0].span.source_text(&archive),
+        "pub const ANSWER = 42\n"
+    );
+    // A parsed graph represents the bytes that were read during discovery.
+    std::fs::write(directory.0.join("math.ya"), "pub const ANSWER = 99\n").unwrap();
+    let program =
+        cyallo::modules::compile_parsed_modules(1, &parsed, Default::default(), true).unwrap();
+    let mut session = Session::new(Arc::new(program)).unwrap();
+    session.run(100);
+    assert_eq!(session.status(), &Status::Finished);
+    assert_eq!(session.context.output, "42\n");
+    std::fs::write(directory.0.join("math.ya"), "pub const ANSWER = 42\n").unwrap();
+
     let program = cyallo::modules::compile_path(&entry, Default::default(), false).unwrap();
     let mut session = Session::new(Arc::new(program)).unwrap();
     session.run(100);
@@ -174,6 +192,27 @@ fn nested_imported_body_spans_are_shifted_once() {
         &archive[error.span.start as usize..error.span.end as usize],
         "missing"
     );
+}
+
+#[test]
+fn batch_module_errors_follow_input_order() {
+    let sources = [
+        module("first.ya", "let = 1\n"),
+        module("second.ya", "let value = \"unterminated\n"),
+    ];
+    let archive = cyallo::modules::source_archive(&sources);
+    for jobs in [1, 4] {
+        let options = cyallo::CompileOptions {
+            jobs,
+            ..Default::default()
+        };
+        let diagnostic = compile_modules(1, &sources, options, false).unwrap_err();
+        let ranges = cyallo::modules::source_ranges(&sources);
+        let (path, source, diagnostic) =
+            cyallo::modules::diagnostic_context(&archive, &ranges, &diagnostic).unwrap();
+        assert_eq!(path, "first.ya");
+        assert_eq!(diagnostic.span.source_text(source), "=");
+    }
 }
 #[test]
 fn service_modules_run_from_cli() {

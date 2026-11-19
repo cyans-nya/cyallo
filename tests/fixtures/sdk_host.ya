@@ -1,0 +1,19 @@
+pub interface mod api {
+    pub proc tick(value: i64) -> i64;
+}
+
+use api::tick as host_tick
+
+proc tick(value: i64) -> i64 { return value }
+
+pub proc entry(value: i64) -> i64 {
+    let result = host_tick(value);
+    return result + 1
+}
+
+pub proc local(value: i64) -> i64 { return tick(value) }
+
+pub proc discard(value: i64) -> i64 {
+    host_tick(value);
+    return value
+}

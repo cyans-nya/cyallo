@@ -1,5 +1,5 @@
 use super::*;
-impl Parser<'_> {
+impl Parser<'_, '_> {
     pub(super) fn word(&mut self, word: &str) -> bool {
         if self.token_text() == word {
             self.pos += 1;
@@ -120,7 +120,10 @@ impl Parser<'_> {
             return Ok(true);
         }
         let interface = self.token_text() == "interface"
-            && self.tokens.get(self.pos + 1).is_some_and(|t| self.tokens.text(*t) == "mod");
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .is_some_and(|t| self.tokens.text(*t) == "mod");
         if interface {
             self.pos += 1;
         }
@@ -148,7 +151,10 @@ impl Parser<'_> {
             return Ok(true);
         }
         if self.token_text() == "opaque"
-            && self.tokens.get(self.pos + 1).is_some_and(|t| t.kind == TokenKind::Record)
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .is_some_and(|t| t.kind == TokenKind::Record)
         {
             self.pos += 1;
             let mut record = self.opaque_record(start)?;
@@ -160,7 +166,10 @@ impl Parser<'_> {
             return Ok(true);
         }
         if self.token_text() == "world"
-            && self.tokens.get(self.pos + 1).is_some_and(|t| t.kind == TokenKind::Identifier)
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .is_some_and(|t| t.kind == TokenKind::Identifier)
         {
             self.pos += 1;
             let world = self.world_declaration(public, start)?;
@@ -359,7 +368,11 @@ impl Parser<'_> {
                 self.eol()?;
             } else if self.word("import") {
                 let path = self.qualified_name()?;
-                let alias = if self.word("as") { Some(self.name()?) } else { None };
+                let alias = if self.word("as") {
+                    Some(self.name()?)
+                } else {
+                    None
+                };
                 let members = if self.take("{") {
                     self.newlines();
                     let mut members = vec![];

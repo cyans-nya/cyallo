@@ -9,7 +9,7 @@ pub(super) struct ManagedPrefix {
     pub kind: MemoryKind,
     pub locality: Locality,
 }
-impl Parser<'_> {
+impl Parser<'_, '_> {
     /// Parses storage syntax independently of its optional locality modifier.
     pub(super) fn managed_prefix(&mut self) -> Result<Option<ManagedPrefix>, Diagnostic> {
         use cyallo_ast::diagnostic::{ManagedSyntaxError as E, invalid_managed_syntax};

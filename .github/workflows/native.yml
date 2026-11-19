@@ -3,6 +3,26 @@ on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
 jobs:
+  verified-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            machine: Linux x86_64
+          - runner: ubuntu-24.04-arm
+            machine: Linux aarch64
+          - runner: macos-15-intel
+            machine: Darwin x86_64
+          - runner: macos-15
+            machine: Darwin arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: test "$(uname -sm)" = "${{ matrix.machine }}"
+      - run: cargo test --release --locked --test verified_native
+      - run: cargo test --release --locked --lib backend::verified
   native:
     strategy:
       fail-fast: false

@@ -39,7 +39,9 @@ mod tests {
         file.trim_end_matches(".ya").replace('/', "::")
     }
     fn bound(item: &str) -> bool {
-        crate::bindings::NativeBindings::embedded().get(item).is_some()
+        crate::bindings::NativeBindings::embedded()
+            .get(item)
+            .is_some()
     }
     fn check_native_function(function: &cyallo_ast::Function, path: &str, owner: Option<&str>) {
         check_annotations(&function.annotations, path);
@@ -49,7 +51,10 @@ mod tests {
             None => format!("{}::{}", module_path(path), function.name),
         };
         if bound(&item) {
-            assert!(function.annotations.is_empty(), "{path}: {item} is both annotated and bound");
+            assert!(
+                function.annotations.is_empty(),
+                "{path}: {item} is both annotated and bound"
+            );
             return;
         }
         assert_eq!(
@@ -83,7 +88,10 @@ mod tests {
             }
             // Every binding's key is a known private ABI key.
             for (item, key) in crate::bindings::NativeBindings::embedded().iter() {
-                assert!(crate::internal::from_key(key).is_some(), "{item}: unknown key {key}");
+                assert!(
+                    crate::internal::from_key(key).is_some(),
+                    "{item}: unknown key {key}"
+                );
             }
             for trait_ in &ast.traits {
                 check_annotations(&trait_.annotations, source.path);

@@ -4,6 +4,7 @@ mod error;
 pub use error::CompileError;
 mod tiered;
 pub use crate::admission::{EagerDecision, EagerPolicy};
+pub mod verified;
 mod winch;
 #[cfg(feature = "wasm-adapter")]
 mod winch_wasm;

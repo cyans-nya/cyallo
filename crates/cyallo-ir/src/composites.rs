@@ -103,7 +103,10 @@ pub fn type_view(ty: &Type, definitions: &HashMap<String, Type>) -> Type {
         Type::Storage(kind, inner) => Type::Storage(*kind, Box::new(type_view(inner, definitions))),
         Type::Opaque(name, arguments, traits) => Type::Opaque(
             name.clone(),
-            arguments.iter().map(|t| type_view(t, definitions)).collect(),
+            arguments
+                .iter()
+                .map(|t| type_view(t, definitions))
+                .collect(),
             *traits,
         ),
         Type::Array(bounds, inner) => {
@@ -322,8 +325,7 @@ fn resolve_using(
                 ty(inner, defs, active, depth, span)?;
                 // A core enum spelled as its marker becomes the declared enum.
                 if let Some(CompositeDefinition::Native(declaration)) = defs.get(&native_key(*kind))
-                    && let Some(contract) =
-                        crate::enums::contract_for(declaration, *kind, inner)
+                    && let Some(contract) = crate::enums::contract_for(declaration, *kind, inner)
                 {
                     *t = Type::Enum(std::sync::Arc::new(contract));
                 }

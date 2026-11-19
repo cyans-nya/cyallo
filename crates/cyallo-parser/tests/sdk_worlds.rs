@@ -1,6 +1,6 @@
 use cyallo_ast::*;
-use cyallo_parser::{index_modern, parse};
 use cyallo_compile_jobs::Jobs;
+use cyallo_parser::{index_modern, parse};
 
 const SDK: &str = r#"
 pub interface mod api {
@@ -44,8 +44,15 @@ fn sdk_and_world_declarations_parse_with_identity_preserving_ast() {
     let extension = &ast.worlds[1];
     assert_eq!(extension.name.as_ref(), "Extension");
     assert!(extension.public);
-    assert!(matches!(&extension.items[0], WorldItem::Include { path, .. } if path.as_ref() == "Base"));
-    let WorldItem::Import { path, members: Some(members), .. } = &extension.items[1] else {
+    assert!(
+        matches!(&extension.items[0], WorldItem::Include { path, .. } if path.as_ref() == "Base")
+    );
+    let WorldItem::Import {
+        path,
+        members: Some(members),
+        ..
+    } = &extension.items[1]
+    else {
         panic!("expected an import with a member list")
     };
     assert_eq!(path.as_ref(), "std::fs");
@@ -53,7 +60,9 @@ fn sdk_and_world_declarations_parse_with_identity_preserving_ast() {
     assert!(
         matches!(&extension.items[2], WorldItem::Import { alias: Some(alias), members: None, .. } if alias.as_ref() == "host_api")
     );
-    assert!(matches!(&extension.items[3], WorldItem::Export { function } if function.name.as_ref() == "activate"));
+    assert!(
+        matches!(&extension.items[3], WorldItem::Export { function } if function.name.as_ref() == "activate")
+    );
 
     let implementation = &ast.interface_implementations[0];
     assert_eq!(implementation.interface.as_ref(), "host_sdk::api");
@@ -78,9 +87,15 @@ fn parallel_parsing_matches_the_sequential_parser() {
 fn malformed_sdk_syntax_is_rejected() {
     for (source, expected) in [
         ("opaque record R { value: i64 }", "no fields"),
-        ("world W { frobnicate x }", "expected include, import or export"),
+        (
+            "world W { frobnicate x }",
+            "expected include, import or export",
+        ),
         ("world W { export proc f() { return } }", "signature only"),
-        ("world W { import a { fn f() -> i64 { return 1 } } }", "signatures only"),
+        (
+            "world W { import a { fn f() -> i64 { return 1 } } }",
+            "signatures only",
+        ),
         (
             "impl interface a::b for c { type T = i64\n type T = i64 }",
             "duplicate type binding",

@@ -172,7 +172,9 @@ mod pool_tests {
     }
     #[test]
     fn batch_size_does_not_create_pools() {
-        let widths = (2..9).flat_map(|len| threads_used(Jobs(4), len)).collect::<HashSet<_>>();
+        let widths = (2..9)
+            .flat_map(|len| threads_used(Jobs(4), len))
+            .collect::<HashSet<_>>();
         assert!(widths.len() <= 4, "{} distinct threads", widths.len());
     }
     #[test]
@@ -186,7 +188,10 @@ mod pool_tests {
             })
         });
         assert!(result.is_err());
-        assert_eq!(Jobs(2).map(&[1, 2, 3, 4], 1, |_, _, v| *v * 2), vec![2, 4, 6, 8]);
+        assert_eq!(
+            Jobs(2).map(&[1, 2, 3, 4], 1, |_, _, v| *v * 2),
+            vec![2, 4, 6, 8]
+        );
     }
     #[test]
     fn mutable_items_and_borrowed_data_work() {
@@ -198,10 +203,17 @@ mod pool_tests {
     #[test]
     fn concurrent_callers_share_the_pool_without_blocking_each_other() {
         let handles: Vec<_> = (0..6)
-            .map(|n| std::thread::spawn(move || Jobs(4).map(&(0..40).collect::<Vec<_>>(), 1, move |_, _, v| v + n)))
+            .map(|n| {
+                std::thread::spawn(move || {
+                    Jobs(4).map(&(0..40).collect::<Vec<_>>(), 1, move |_, _, v| v + n)
+                })
+            })
             .collect();
         for (n, handle) in handles.into_iter().enumerate() {
-            assert_eq!(handle.join().unwrap(), (0..40).map(|v| v + n).collect::<Vec<_>>());
+            assert_eq!(
+                handle.join().unwrap(),
+                (0..40).map(|v| v + n).collect::<Vec<_>>()
+            );
         }
     }
 }

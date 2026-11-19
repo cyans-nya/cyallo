@@ -8,7 +8,10 @@ mod units;
 use cyallo_ast::*;
 pub use lexer::{Lexed, lex, lex_modern};
 pub use token::{Token, TokenKind};
-pub use units::{IndexedSource, ParseUnit, index_modern, parse_modern_with_jobs};
+pub use units::{
+    BodyHandle, IndexedSource, ParseUnit, ParsedFile, ParsedUnit, SourceSnapshot, index_modern,
+    parse_modern_snapshot, parse_modern_snapshots, parse_modern_with_jobs,
+};
 pub fn parse(source: &str) -> Result<Ast, Diagnostic> {
     parse_modern(source, false)
 }
@@ -21,8 +24,9 @@ pub fn parse_modern(source: &str, repl: bool) -> Result<Ast, Diagnostic> {
 }
 #[cfg(test)]
 fn parse_whole(source: &str, repl: bool) -> Result<Ast, Diagnostic> {
+    let tokens = lex_modern(source)?;
     Parser {
-        tokens: lex_modern(source)?,
+        tokens: tokens.fragment(0..tokens.len() - 1),
         pos: 0,
         expression_statements: repl,
         nesting: 0,
@@ -31,8 +35,8 @@ fn parse_whole(source: &str, repl: bool) -> Result<Ast, Diagnostic> {
     }
     .program()
 }
-struct Parser<'src> {
-    tokens: Lexed<'src>,
+struct Parser<'tokens, 'src> {
+    tokens: lexer::TokenWindow<'tokens, 'src>,
     pos: usize,
     expression_statements: bool,
     /// Open parentheses/brackets in the current expression; newlines are insignificant inside.
@@ -47,7 +51,7 @@ const MAX_DEPTH: usize = 256;
 /// Unary operands bind tighter than `as`, which binds tighter than every binary operator.
 const CAST_PRECEDENCE: u8 = 7;
 const UNARY_OPERAND: u8 = CAST_PRECEDENCE + 1;
-impl<'src> Parser<'src> {
+impl<'src> Parser<'_, 'src> {
     /// Runs `parse` one level deeper, failing past [`MAX_DEPTH`].
     fn nested<T>(
         &mut self,

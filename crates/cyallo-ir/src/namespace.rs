@@ -85,6 +85,7 @@ struct Resolver {
 /// A method declared inside an `interface mod`: contract only.
 struct InterfaceMethod {
     module: usize,
+    id: DeclarationId,
     owner: String,
     public: bool,
     function: Function,
@@ -227,7 +228,10 @@ impl Resolver {
             let Some(key) = this.bindings.get(&path) else {
                 return Ok(());
             };
-            if annotations.iter().any(|a| a.name.as_ref() == "cyallo_internal") {
+            if annotations
+                .iter()
+                .any(|a| a.name.as_ref() == "cyallo_internal")
+            {
                 return Err(invalid_declaration(
                     DeclarationError::BindingConflict(path.into()),
                     span,
@@ -251,7 +255,12 @@ impl Resolver {
         }
         for declaration in &mut ast.enums {
             let path = format!("{module}::{}", declaration.name);
-            attach(self, path.clone(), &mut declaration.annotations, declaration.span)?;
+            attach(
+                self,
+                path.clone(),
+                &mut declaration.annotations,
+                declaration.span,
+            )?;
             for variant in &mut declaration.variants {
                 let path = format!("{path}::{}", variant.name);
                 attach(self, path, &mut variant.annotations, variant.span)?;
@@ -476,7 +485,8 @@ impl Resolver {
                 }
                 let id = DeclarationId(next_declaration);
                 next_declaration += 1;
-                if kind == Kind::Type && node.ast.records.iter().any(|r| r.name == name && r.opaque) {
+                if kind == Kind::Type && node.ast.records.iter().any(|r| r.name == name && r.opaque)
+                {
                     self.opaque.insert(id);
                 }
                 if let Some(InternalSemantic::Type(NativeType::Opaque(_))) = semantic
@@ -577,7 +587,11 @@ impl Resolver {
                 let diagnostic = |error| invalid_declaration(error, implementation.span);
                 let interface = self
                     .path(module, &implementation.interface, Some(Kind::Module))
-                    .and_then(|symbol| self.nodes.iter().position(|n| n.path == symbol.target.as_ref()))
+                    .and_then(|symbol| {
+                        self.nodes
+                            .iter()
+                            .position(|n| n.path == symbol.target.as_ref())
+                    })
                     .ok_or_else(|| {
                         diagnostic(DeclarationError::UnresolvedInterface(
                             implementation.interface.clone(),
@@ -590,7 +604,11 @@ impl Resolver {
                 }
                 let _implementer = self
                     .path(module, &implementation.module, Some(Kind::Module))
-                    .and_then(|symbol| self.nodes.iter().position(|n| n.path == symbol.target.as_ref()))
+                    .and_then(|symbol| {
+                        self.nodes
+                            .iter()
+                            .position(|n| n.path == symbol.target.as_ref())
+                    })
                     .ok_or_else(|| {
                         diagnostic(DeclarationError::UnresolvedImplementer(
                             implementation.module.clone(),
@@ -621,7 +639,8 @@ impl Resolver {
                         .and_then(|symbols| symbols.iter().find(|s| s.kind == Kind::Type))
                         .cloned()
                         .ok_or_else(not_opaque)?;
-                    if let Some(previous) = self.bound_opaque.insert(symbol.id, implementation.span) {
+                    if let Some(previous) = self.bound_opaque.insert(symbol.id, implementation.span)
+                    {
                         return Err(diagnostic(DeclarationError::DuplicateOpaqueBinding(name))
                             .with_related(previous, "first binding"));
                     }
@@ -632,7 +651,12 @@ impl Resolver {
         // Every opaque type of an implemented interface needs a binding, and every
         // binding must name a resolvable, acyclic type in its implementer.
         for &interface in &self.implemented_interfaces {
-            for record in self.nodes[interface].ast.records.iter().filter(|r| r.opaque) {
+            for record in self.nodes[interface]
+                .ast
+                .records
+                .iter()
+                .filter(|r| r.opaque)
+            {
                 let symbol = self.nodes[interface].names[record.name.as_ref()]
                     .iter()
                     .find(|s| s.kind == Kind::Type)
@@ -738,8 +762,13 @@ impl Resolver {
             self.canonical_type(&function.result, package)
         )
     }
-    /// Public items of one `interface mod`, for digests.
-    fn interface_items(&self, index: usize, ast: &Ast) -> Result<Vec<crate::sdk::InterfaceItem>> {
+    /// Public interface metadata and the resolved identities for its bindable items.
+    fn interface_items(
+        &self,
+        index: usize,
+        ast: &Ast,
+        declarations: &mut Vec<(Box<str>, DeclarationId)>,
+    ) -> Result<Vec<crate::sdk::InterfaceItem>> {
         use crate::sdk::{InterfaceItem, ItemKind, SdkError, sdk_diagnostic, since};
         let node = &self.nodes[index];
         let package = node.package;
@@ -765,22 +794,45 @@ impl Resolver {
         let version = |annotations: &[DeclarationAnnotation], span: Span| {
             since(annotations).map_err(|e: SdkError| sdk_diagnostic(e, span))
         };
+        let declaration_ids: HashMap<_, _> = node
+            .names
+            .values()
+            .flatten()
+            .filter(|symbol| symbol.defining_module == index)
+            .map(|symbol| (symbol.target.as_ref(), symbol.id))
+            .collect();
+        let declaration_id = |target: &str, span: Span| {
+            use crate::module_graph::{ModuleError, module_diagnostic};
+            declaration_ids.get(target).copied().ok_or_else(|| {
+                module_diagnostic(ModuleError::MissingSymbol {
+                    symbol: target.into(),
+                    span,
+                })
+            })
+        };
         let mut items = vec![];
         for function in &ast.functions {
             let name = source(&function.name);
             if !exported(&name, "") {
                 continue;
             }
-            items.push(InterfaceItem::new(
-                &path(&name),
-                ItemKind::Function,
-                version(&function.annotations, function.span)?,
-                self.canonical_signature(function, package),
-            )
-            .bindable(
-                function.body_kind == FunctionBodyKind::Declaration,
-                Some(function.params.len()),
-            ));
+            let path = path(&name);
+            let bodyless = function.body_kind == FunctionBodyKind::Declaration;
+            if bodyless {
+                declarations.push((
+                    path.as_str().into(),
+                    declaration_id(&function.name, function.span)?,
+                ));
+            }
+            items.push(
+                InterfaceItem::new(
+                    &path,
+                    ItemKind::Function,
+                    version(&function.annotations, function.span)?,
+                    self.canonical_signature(function, package),
+                )
+                .bindable(bodyless, Some(function.params.len())),
+            );
         }
         for record in &ast.records {
             let name = source(&record.name);
@@ -793,20 +845,36 @@ impl Resolver {
                 .map(|(field, ty)| format!("{field}: {}", self.canonical_type(ty, package)))
                 .collect();
             let (kind, text) = if record.opaque {
-                (ItemKind::OpaqueRecord, format!("opaque<{}>", record.type_params.len()))
+                (
+                    ItemKind::OpaqueRecord,
+                    format!("opaque<{}>", record.type_params.len()),
+                )
             } else {
                 (
                     ItemKind::Record,
-                    format!("<{}>{{{}}}", record.type_params.join(","), fields.join(", ")),
+                    format!(
+                        "<{}>{{{}}}",
+                        record.type_params.join(","),
+                        fields.join(", ")
+                    ),
                 )
             };
-            items.push(InterfaceItem::new(
-                &path(&name),
-                kind,
-                version(&record.annotations, record.span)?,
-                text,
-            )
-            .bindable(record.opaque, None));
+            let path = path(&name);
+            if record.opaque {
+                declarations.push((
+                    path.as_str().into(),
+                    declaration_id(&record.name, record.span)?,
+                ));
+            }
+            items.push(
+                InterfaceItem::new(
+                    &path,
+                    kind,
+                    version(&record.annotations, record.span)?,
+                    text,
+                )
+                .bindable(record.opaque, None),
+            );
         }
         for declaration in &ast.enums {
             let name = source(&declaration.name);
@@ -843,13 +911,23 @@ impl Resolver {
             let methods: Vec<_> = trait_
                 .methods
                 .iter()
-                .map(|m| format!("{}: {}", source(&m.name), self.canonical_signature(m, package)))
+                .map(|m| {
+                    format!(
+                        "{}: {}",
+                        source(&m.name),
+                        self.canonical_signature(m, package)
+                    )
+                })
                 .collect();
             items.push(InterfaceItem::new(
                 &path(&name),
                 ItemKind::Trait,
                 version(&trait_.annotations, trait_.span)?,
-                format!("<{}>{{{}}}", trait_.type_params.join(","), methods.join("; ")),
+                format!(
+                    "<{}>{{{}}}",
+                    trait_.type_params.join(","),
+                    methods.join("; ")
+                ),
             ));
         }
         for alias in &ast.type_aliases {
@@ -863,18 +941,26 @@ impl Resolver {
                 self.canonical_type(&alias.ty, package),
             ));
         }
-        for method in self.interface_methods.iter().filter(|m| m.module == index && m.public) {
+        for method in self
+            .interface_methods
+            .iter()
+            .filter(|m| m.module == index && m.public)
+        {
             let name = source(&method.function.name);
-            items.push(InterfaceItem::new(
-                &format!("{}::{name}", method.owner),
-                ItemKind::Method,
-                version(&method.function.annotations, method.function.span)?,
-                self.canonical_signature(&method.function, package),
-            )
-            .bindable(
-                method.function.body_kind == FunctionBodyKind::Declaration,
-                Some(method.function.params.len()),
-            ));
+            let path = format!("{}::{name}", method.owner);
+            let bodyless = method.function.body_kind == FunctionBodyKind::Declaration;
+            if bodyless {
+                declarations.push((path.as_str().into(), method.id));
+            }
+            items.push(
+                InterfaceItem::new(
+                    &path,
+                    ItemKind::Method,
+                    version(&method.function.annotations, method.function.span)?,
+                    self.canonical_signature(&method.function, package),
+                )
+                .bindable(bodyless, Some(method.function.params.len())),
+            );
         }
         Ok(items)
     }
@@ -971,9 +1057,10 @@ impl Resolver {
             for item in &world.items {
                 match item {
                     WorldItem::Include { path, span } => {
-                        let symbol = this
-                            .path(module, path, Some(Kind::World))
-                            .ok_or_else(|| fail(DeclarationError::UnresolvedWorld(path.clone()), *span))?;
+                        let symbol =
+                            this.path(module, path, Some(Kind::World)).ok_or_else(|| {
+                                fail(DeclarationError::UnresolvedWorld(path.clone()), *span)
+                            })?;
                         let included = match pending.iter().position(|p| p.id == symbol.id) {
                             Some(position) => resolve(this, pending, position, done, stack)?,
                             None => *done.get(&symbol.id).ok_or_else(|| {
@@ -1000,9 +1087,8 @@ impl Resolver {
                         members,
                         span,
                     } => {
-                        let symbol = this
-                            .path(module, path, Some(Kind::Module))
-                            .ok_or_else(|| {
+                        let symbol =
+                            this.path(module, path, Some(Kind::Module)).ok_or_else(|| {
                                 fail(DeclarationError::UnresolvedWorldImport(path.clone()), *span)
                             })?;
                         this.check_import(module, &symbol, *span)?;
@@ -1022,7 +1108,8 @@ impl Resolver {
                             let mut names = vec![];
                             for member in members {
                                 signatures.push(
-                                    this.check_world_member(module, target, member, path)?.into(),
+                                    this.check_world_member(module, target, member, path)?
+                                        .into(),
                                 );
                                 names.push(member.name.clone());
                             }
@@ -1044,9 +1131,19 @@ impl Resolver {
                     WorldItem::Export { function } => {
                         let mut signature = function.clone();
                         for parameter in &mut signature.params {
-                            this.ty(module, &mut parameter.ty, &function.type_params, function.span)?;
+                            this.ty(
+                                module,
+                                &mut parameter.ty,
+                                &function.type_params,
+                                function.span,
+                            )?;
                         }
-                        this.ty(module, &mut signature.result, &function.type_params, function.span)?;
+                        this.ty(
+                            module,
+                            &mut signature.result,
+                            &function.type_params,
+                            function.span,
+                        )?;
                         add_export(
                             &mut resolved,
                             ResolvedWorldExport {
@@ -1065,14 +1162,21 @@ impl Resolver {
                 .imports
                 .iter()
                 .map(|import| {
-                    let mut signatures: Vec<_> =
-                        import.member_signatures.iter().map(|s| s.as_ref()).collect();
+                    let mut signatures: Vec<_> = import
+                        .member_signatures
+                        .iter()
+                        .map(|s| s.as_ref())
+                        .collect();
                     signatures.sort_unstable();
                     format!(
                         "import {} {} {}",
                         import.field,
                         this.relative_path(&import.path, package),
-                        if import.members.is_some() { signatures.join(" | ") } else { "*".into() }
+                        if import.members.is_some() {
+                            signatures.join(" | ")
+                        } else {
+                            "*".into()
+                        }
                     )
                 })
                 .chain(resolved.exports.iter().map(|export| {
@@ -1143,9 +1247,19 @@ impl Resolver {
         let resolved = |module: usize, function: &Function| -> Result<Function> {
             let mut function = function.clone();
             for parameter in &mut function.params {
-                self.ty(module, &mut parameter.ty, &function.type_params, function.span)?;
+                self.ty(
+                    module,
+                    &mut parameter.ty,
+                    &function.type_params,
+                    function.span,
+                )?;
             }
-            self.ty(module, &mut function.result, &function.type_params, function.span)?;
+            self.ty(
+                module,
+                &mut function.result,
+                &function.type_params,
+                function.span,
+            )?;
             Ok(function)
         };
         // Generic parameters keep positional meaning: rename to the target's names
@@ -1684,7 +1798,10 @@ impl Resolver {
                     let expected = self.opaque_arity.get(&declaration).copied().unwrap_or(0);
                     if expected != 0 {
                         return Err(invalid_declaration(
-                            DeclarationError::GenericArity { expected, actual: 0 },
+                            DeclarationError::GenericArity {
+                                expected,
+                                actual: 0,
+                            },
                             span,
                         ));
                     }
@@ -1734,8 +1851,10 @@ impl Resolver {
                     self.native_target(&target)
                 {
                     *ty = Type::Dependent(declaration, std::mem::take(arguments));
-                } else if let Some((declaration, InternalSemantic::Type(NativeType::Opaque(traits)))) =
-                    self.native_target(&target)
+                } else if let Some((
+                    declaration,
+                    InternalSemantic::Type(NativeType::Opaque(traits)),
+                )) = self.native_target(&target)
                 {
                     let expected = self.opaque_arity.get(&declaration).copied().unwrap_or(0);
                     if traits.weak() {
@@ -2420,6 +2539,7 @@ impl Resolver {
         let mut associated: Vec<Vec<Function>> = (0..self.nodes.len()).map(|_| vec![]).collect();
         let mut modules = vec![];
         let mut digest_items: Vec<crate::sdk::InterfaceItem> = vec![];
+        let mut interface_declarations = vec![];
         for (module, mut declaration) in std::mem::take(&mut self.associated_functions) {
             self.function(module, &mut declaration.function, &[], &[])?;
             if self.nodes[module].interface {
@@ -2431,6 +2551,7 @@ impl Resolver {
                     .unwrap_or_default();
                 self.interface_methods.push(InterfaceMethod {
                     module,
+                    id: declaration.id,
                     owner,
                     public: true,
                     function: declaration.function,
@@ -2532,8 +2653,10 @@ impl Resolver {
                         self.function(index, &mut function, &[], &implementation.type_params)?;
                         let pkg = self.nodes[index].package;
                         let owner = self.canonical_type(&receiver, pkg);
+                        let id = self.declaration_id();
                         self.interface_methods.push(InterfaceMethod {
                             module: index,
+                            id,
                             owner,
                             public: method.public,
                             function,
@@ -2688,7 +2811,11 @@ impl Resolver {
                 .collect();
             bindings.sort_by(|a, b| a.name.cmp(&b.name).then(a.target.cmp(&b.target)));
             if node.interface && node.package == entry_package {
-                digest_items.extend(self.interface_items(index, &ast)?);
+                digest_items.extend(self.interface_items(
+                    index,
+                    &ast,
+                    &mut interface_declarations,
+                )?);
             }
             modules.push(ResolvedModule {
                 id: ModuleId(node.id),
@@ -2702,7 +2829,11 @@ impl Resolver {
             worlds: self
                 .worlds
                 .iter()
-                .filter(|w| self.nodes.iter().any(|n| n.id == w.module.0 && n.package == entry_package))
+                .filter(|w| {
+                    self.nodes
+                        .iter()
+                        .any(|n| n.id == w.module.0 && n.package == entry_package)
+                })
                 .map(|w| crate::sdk::WorldDigest {
                     path: self.relative_path(&w.path, entry_package).into(),
                     digest: w.digest,
@@ -2722,7 +2853,10 @@ impl Resolver {
                     .flat_map(|(name, symbols)| {
                         symbols
                             .iter()
-                            .filter(|symbol| !matches!(symbol.kind, Kind::Property | Kind::World) && symbol.public)
+                            .filter(|symbol| {
+                                !matches!(symbol.kind, Kind::Property | Kind::World)
+                                    && symbol.public
+                            })
                             .map(|symbol| ResolvedExport {
                                 kind: match symbol.kind {
                                     Kind::Value => ExportKind::Value,
@@ -2769,6 +2903,7 @@ impl Resolver {
         }
         let graph = ResolvedProgram {
             interface,
+            interface_declarations,
             worlds: std::mem::take(&mut self.worlds),
             source_files: vec![],
             modules,

@@ -4,11 +4,14 @@
 //! the spelling of a declared module can obtain trusted core provenance.
 
 use crate::{Diagnostic, SourceModule, Span};
-use cyallo_ast::ModuleDeclaration;
+use cyallo_ast::indexed::{IndexedAst, ModuleNode};
+use cyallo_compile_jobs::Jobs;
+use cyallo_parser::ParsedFile;
 use std::{
     collections::HashSet,
     fmt, fs, io,
     path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,6 +323,14 @@ impl ReadGrant {
 pub struct ModuleLoader {
     grant: ReadGrant,
 }
+
+/// A discovered file and the syntax used to discover its dependencies.
+#[derive(Debug)]
+pub struct ParsedModule {
+    pub path: String,
+    pub file: Arc<ParsedFile>,
+}
+
 impl ModuleLoader {
     pub fn new(grant: ReadGrant) -> Self {
         Self { grant }
@@ -349,6 +360,7 @@ impl ModuleLoader {
         };
         let load = Load {
             grant: &self.grant,
+            jobs: Jobs::SEQUENTIAL,
             active: HashSet::new(),
             stack: vec![],
             sources: vec![],
@@ -366,6 +378,20 @@ impl ModuleLoader {
     /// Loads declared source files only. All per-load identities and cycle state
     /// are local to this call; errors do not poison later loads of this instance.
     pub fn load(&self, entry: &Path) -> Result<Vec<SourceModule>, ModuleLoadError> {
+        self.load_parsed(entry, Jobs::default()).map(|files| {
+            files
+                .into_iter()
+                .map(|module| SourceModule::new(module.path, module.file.source().text()))
+                .collect()
+        })
+    }
+
+    /// Discover dependencies in source order and retain each parsed snapshot.
+    pub fn load_parsed(
+        &self,
+        entry: &Path,
+        jobs: Jobs,
+    ) -> Result<Vec<ParsedModule>, ModuleLoadError> {
         let canonical = io_at(
             ModuleIoOperation::CanonicalizeEntry,
             entry,
@@ -388,6 +414,7 @@ impl ModuleLoader {
         let directory = canonical.parent().unwrap_or(self.grant.root());
         let mut load = Load {
             grant: &self.grant,
+            jobs,
             active: HashSet::new(),
             stack: vec![],
             sources: vec![],
@@ -403,9 +430,10 @@ struct Candidate {
 }
 struct Load<'a> {
     grant: &'a ReadGrant,
+    jobs: Jobs,
     active: HashSet<PathBuf>,
     stack: Vec<PathBuf>,
-    sources: Vec<SourceModule>,
+    sources: Vec<ParsedModule>,
 }
 impl Load<'_> {
     fn candidate(&self, label: &Path, span: Span) -> Result<Option<Candidate>, ModuleLoadError> {
@@ -454,16 +482,25 @@ impl Load<'_> {
     fn declarations(
         &mut self,
         directory: &Path,
-        modules: &[ModuleDeclaration],
+        syntax: &IndexedAst,
+        node: &ModuleNode,
     ) -> Result<(), ModuleLoadError> {
-        for module in modules {
-            let child_dir = directory.join(module.name.as_ref());
-            if let Some(body) = &module.body {
-                self.declarations(&child_dir, &body.modules)?;
+        for module in syntax
+            .get_list(node.modules)
+            .expect("module belongs to the file")
+        {
+            let name = syntax.name(module.name).expect("name belongs to the file");
+            let child_dir = directory.join(name);
+            if let Some(body) = module.body {
+                self.declarations(
+                    &child_dir,
+                    syntax,
+                    syntax.get(body).expect("module body belongs to the file"),
+                )?;
                 continue;
             }
             let candidates = [
-                directory.join(format!("{}.ya", module.name)),
+                directory.join(format!("{name}.ya")),
                 child_dir.join("mod.ya"),
             ];
             let first = self.candidate(&candidates[0], module.span)?;
@@ -471,14 +508,14 @@ impl Load<'_> {
             let selected = match (first, second) {
                 (Some(_), Some(_)) => {
                     return Err(ModuleLoadError::AmbiguousSource {
-                        module: module.name.clone(),
+                        module: name.into(),
                         candidates,
                         span: module.span,
                     });
                 }
                 (None, None) => {
                     return Err(ModuleLoadError::MissingSource {
-                        module: module.name.clone(),
+                        module: name.into(),
                         candidates,
                         span: module.span,
                     });
@@ -520,15 +557,19 @@ impl Load<'_> {
                 span,
                 fs::read_to_string(canonical),
             )?;
-            let ast = cyallo_parser::parse_modern(&source, false).map_err(|diagnostic| {
-                ModuleLoadError::Syntax {
+            let file = cyallo_parser::parse_modern_snapshot(Arc::from(source), false, self.jobs)
+                .map_err(|diagnostic| ModuleLoadError::Syntax {
                     path: label.to_owned(),
                     diagnostic,
-                }
-            })?;
-            self.declarations(directory, &ast.modules)?;
-            self.sources
-                .push(SourceModule::new(label.display().to_string(), source));
+                })?;
+            for unit in file.units() {
+                let syntax = unit.syntax();
+                self.declarations(directory, syntax, syntax.root())?;
+            }
+            self.sources.push(ParsedModule {
+                path: label.display().to_string(),
+                file: Arc::new(file),
+            });
             Ok(())
         })();
         self.stack.pop();

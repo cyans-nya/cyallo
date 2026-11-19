@@ -6,6 +6,9 @@ the low-latency and optimized native tiers. Compile and test the replacement in
 slices. Switch shipping entry points together once the new pipeline meets the
 language, runtime, and SDK contracts. [Execution cutover](compiler-runtime-overhaul-plan.md#direct-execution-cutover)
 
+The [Winch and Cranelift implementation plan](jit-implementation-plan.md)
+defines stage owners, prerequisites, safe parallel work and acceptance tests.
+
 The current `Program` packages legacy bytecode. The opt-in `VerifiedModule`
 lowers a selected checked routine and its transitive direct callees. Its
 scalar interpreter uses verified reusable frame slots and returns a fuel error
@@ -14,6 +17,13 @@ budget and preserves verified frames and the next instruction between slices.
 It executes selected scalar routines through the verified interpreter
 interface. The runtime entry points still need the complete verified
 interpreter before cutover. [Program packaging](../src/compiler.rs) · [Verified lowering](../src/bytecode/verified/lower.rs) · [Scalar runner](../src/bytecode/verified/run.rs)
+
+The opt-in scalar code store prepares functions from that verified module,
+validates relocations and metadata, and publishes native entry pins. Native
+call handoffs consume the resolved address from the linkage table. The
+dispatcher uses the retained callee pin and records the caller continuation.
+A paused mixed-tier activation can transfer both frames to the verified
+interpreter with its original fuel count. [Code store](../src/backend/verified/publish.rs) · [Native activation](../src/backend/verified/run.rs)
 
 ## Modules and dependencies
 
@@ -43,12 +53,11 @@ immutable result of installing a provider's bindings against an SDK. A **bound
 call** targets an SDK item through its installed binding. This document does not
 use "provider call" or "installed provider" for those.
 
-**Tiers.** Winch is Wasmtime's single-pass baseline compiler. It compiles
-quickly and produces plain code, so it serves as the low-latency first tier.
-Cranelift is an optimizing compiler with a higher compile cost and faster code, so
-it serves the hot tier. Both consume the same prepared plan, so the second adapter
-adds emission and conformance work only, not another semantic model. The
-interpreter remains the reference and the fallback for ineligible routines.
+**Tiers.** Winch serves the low-latency baseline tier. Cranelift has a
+low-latency profile and an optimizing profile for hot routines. Both consume
+the same prepared plan. After independent conformance, the verified
+interpreter is the executable reference and runs routines ineligible for
+native compilation.
 
 Preparation and image validation are in-process modules with independently
 testable inputs. Winch and Cranelift are two adapters at the emission seam.
@@ -165,8 +174,10 @@ provider only and owns no instance state.
    returns.
 2. Results return only through the owning runtime's mailbox. The runtime decides
    publication. The pool never installs code, resolves bindings or reads feedback.
-3. Each instance has a named cap on queued and in-flight jobs, and workers take
-   jobs round-robin across instances, so one instance cannot starve another.
+3. Each instance has a named cap on queued and in-flight jobs. Runtimes that
+   share an explicit compile admission capability take turns round-robin
+   within that capability. It owns the ready queue and cursor. Independent
+   capabilities share worker capacity and keep their own admission state.
 4. Dropping or resetting an instance cancels its queued jobs and discards its
    late results on delivery, using the instance identity.
 5. Pool size, the per-instance caps and the queue order are named fields of the
@@ -445,11 +456,45 @@ can enforce them.
     warnings are not widened. Formatting follows the repository's decision in
     [performance and checks](pending-decisions/08-performance-and-checks.md).
 
+## Remove executable no-ops before interpreter conformance
+
+The verified v3 dump for `cyallo bytecode examples/functions.psc --verified 1`
+contained six `nop` instructions. PCs `0000`, `0011`, and `0016` marked source
+statements. PCs `0001`, `0017`, and `0020` stand in for address calculations
+eliminated when `n` was placed in a frame register. Both arrive as metadata or
+empty work in the checked IR. Version 4 lowers these through the following
+stages. [Frame-local placement](../crates/cyallo-ir/src/analysis.rs#L506) · [Verified lowering](../src/bytecode/verified/lower.rs)
+
+1. Form typed blocks from checked IR targets and terminators. Record source
+   statement boundaries as debug metadata and omit eliminated address
+   calculations. Preserve each removed target's successor by forwarding its
+   block label. Prune blocks unreachable from entry. Report a typed lowering
+   error if a reachable path falls through the end of the function.
+2. Compute liveness on that graph. Insert storage transitions and edge
+   cleanup while targets still refer to block labels. Keep cleanup on the
+   branch that requires it, including loop backedges.
+3. Assign executable PCs after insertion. Resolve branches, instruction
+   source spans and debugger stops together. Anchor a statement to the
+   verified location where the debugger should stop before its work begins.
+   Preserve source order and control-flow provenance when several statement
+   boundaries share a location. Debug metadata consumes no fuel.
+4. Remove `Nop` from the verified instruction schema and increment the
+   format version. Executable storage transitions continue to consume fuel.
+
+The regression tests check zero `nop` instructions, factorial results `1`
+and `120` for inputs `0` and `5`, and resumption with one-instruction slices.
+They exercise forwarded labels, backedges, and statement markers visible at
+an activation pause. The debugger can query those markers without
+advancing the activation. Integration with the shipping debugger follows the
+verified execution cutover. [Scalar integration tests](../tests/verified_bytecode.rs) · [PC layout](../src/bytecode/verified/layout.rs)
+
 ## First implementation slice and cutover tests
 
 1. Exercise the resumable scalar activation with bounded fuel, direct calls
-   and failure spans using a checked source program. Extend interpreter
-   coverage and preserve suspension and typed outcomes before native admission.
+   and failure spans using a checked source program. Remove executable
+   no-ops and check relocated targets and debug markers. Verify storage, loans,
+   cleanup and the fixture bound call through the installed table. Preserve
+   suspension and typed outcomes as interpreter coverage expands.
 2. Add shared preparation, a scalar native entry ABI, and auditable publication.
    Bring up a scalar leaf on Winch and Cranelift, then direct calls. Require
    budget and frame handoffs before admitting loops or recursion. Expand to the

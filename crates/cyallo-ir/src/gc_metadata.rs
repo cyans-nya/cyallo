@@ -185,7 +185,10 @@ mod tests {
             registers,
             code: code
                 .into_iter()
-                .map(|op| Instruction { op, span: Span::default() })
+                .map(|op| Instruction {
+                    op,
+                    span: Span::default(),
+                })
                 .collect(),
         }
     }

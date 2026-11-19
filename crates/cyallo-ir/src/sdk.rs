@@ -116,16 +116,100 @@ impl InterfaceDigests {
     pub fn item(&self, path: &str) -> Option<&InterfaceItem> {
         self.items.iter().find(|item| item.path.as_ref() == path)
     }
+
+    /// Compare the locked use set with this candidate interface. Version
+    /// selection and same-version consistency are checked by the loader.
+    pub fn check_used_items(
+        &self,
+        locked: &BTreeMap<Box<str>, Digest>,
+    ) -> Result<(), ItemMismatch> {
+        let actual: BTreeMap<_, _> = self
+            .items
+            .iter()
+            .map(|item| (item.path.as_ref(), item.digest))
+            .collect();
+        let differences: Vec<_> = locked
+            .iter()
+            .filter_map(|(path, &expected)| {
+                let available = actual.get(path.as_ref()).copied();
+                (available != Some(expected)).then(|| ItemDifference {
+                    path: path.clone(),
+                    expected,
+                    available,
+                })
+            })
+            .collect();
+        if differences.is_empty() {
+            Ok(())
+        } else {
+            Err(ItemMismatch { differences })
+        }
+    }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemDifference {
+    pub path: Box<str>,
+    pub expected: Digest,
+    /// `None` means the candidate does not export the locked item.
+    pub available: Option<Digest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemMismatch {
+    pub differences: Vec<ItemDifference>,
+}
+
+impl fmt::Display for ItemMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SDK items differ from the locked use set")?;
+        for difference in &self.differences {
+            write!(
+                f,
+                "\n  `{}` expects {}",
+                difference.path, difference.expected
+            )?;
+            match difference.available {
+                Some(available) => write!(f, ", found {available}")?,
+                None => f.write_str(", item is missing")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ItemMismatch {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SdkError {
-    InvalidSince { text: Box<str> },
-    ItemRemoved { path: Box<str> },
-    WorldRemoved { path: Box<str> },
-    ItemChanged { path: Box<str>, previous: Digest, current: Digest },
-    NewItemWithoutSince { path: Box<str>, version: Version },
-    NewItemSinceMismatch { path: Box<str>, since: Version, version: Version },
-    ItemFromFuture { path: Box<str>, since: Version, version: Version },
+    InvalidSince {
+        text: Box<str>,
+    },
+    ItemRemoved {
+        path: Box<str>,
+    },
+    WorldRemoved {
+        path: Box<str>,
+    },
+    ItemChanged {
+        path: Box<str>,
+        previous: Digest,
+        current: Digest,
+    },
+    NewItemWithoutSince {
+        path: Box<str>,
+        version: Version,
+    },
+    NewItemSinceMismatch {
+        path: Box<str>,
+        since: Version,
+        version: Version,
+    },
+    ItemFromFuture {
+        path: Box<str>,
+        since: Version,
+        version: Version,
+    },
 }
 impl fmt::Display for SdkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -137,18 +221,30 @@ impl fmt::Display for SdkError {
             Self::WorldRemoved { path } => {
                 write!(f, "world `{path}` was removed in a compatible release")
             }
-            Self::ItemChanged { path, previous, current } => write!(
+            Self::ItemChanged {
+                path,
+                previous,
+                current,
+            } => write!(
                 f,
                 "`{path}` changed in a compatible release ({previous} became {current})"
             ),
             Self::NewItemWithoutSince { path, version } => {
                 write!(f, "new item `{path}` needs `#[since(\"{version}\")]`")
             }
-            Self::NewItemSinceMismatch { path, since, version } => write!(
+            Self::NewItemSinceMismatch {
+                path,
+                since,
+                version,
+            } => write!(
                 f,
                 "new item `{path}` is marked since {since}, but this release is {version}"
             ),
-            Self::ItemFromFuture { path, since, version } => write!(
+            Self::ItemFromFuture {
+                path,
+                since,
+                version,
+            } => write!(
                 f,
                 "`{path}` is marked since {since}, which is newer than release {version}"
             ),
@@ -164,7 +260,11 @@ pub fn since(annotations: &[DeclarationAnnotation]) -> Result<Option<Version>, S
     annotations
         .iter()
         .find(|a| a.name.as_ref() == "since")
-        .map(|a| Version::parse(&a.value).ok_or_else(|| SdkError::InvalidSince { text: a.value.clone() }))
+        .map(|a| {
+            Version::parse(&a.value).ok_or_else(|| SdkError::InvalidSince {
+                text: a.value.clone(),
+            })
+        })
         .transpose()
 }
 /// A compatible (minor) release keeps every earlier item byte-for-byte, adds only
@@ -179,7 +279,9 @@ pub fn check_minor_update(
     let after: BTreeMap<_, _> = next.items.iter().map(|i| (&i.path, i)).collect();
     for (path, old) in &before {
         match after.get(path) {
-            None => errors.push(SdkError::ItemRemoved { path: (*path).clone() }),
+            None => errors.push(SdkError::ItemRemoved {
+                path: (*path).clone(),
+            }),
             Some(new) if new.digest != old.digest => errors.push(SdkError::ItemChanged {
                 path: (*path).clone(),
                 previous: old.digest,
@@ -192,13 +294,20 @@ pub fn check_minor_update(
         if let Some(since) = new.since
             && since > version
         {
-            errors.push(SdkError::ItemFromFuture { path: (*path).clone(), since, version });
+            errors.push(SdkError::ItemFromFuture {
+                path: (*path).clone(),
+                since,
+                version,
+            });
         }
         if before.contains_key(path) {
             continue;
         }
         match new.since {
-            None => errors.push(SdkError::NewItemWithoutSince { path: (*path).clone(), version }),
+            None => errors.push(SdkError::NewItemWithoutSince {
+                path: (*path).clone(),
+                version,
+            }),
             Some(since) if since != version => errors.push(SdkError::NewItemSinceMismatch {
                 path: (*path).clone(),
                 since,
@@ -209,10 +318,16 @@ pub fn check_minor_update(
     }
     for old in &previous.worlds {
         if !next.worlds.iter().any(|w| w.path == old.path) {
-            errors.push(SdkError::WorldRemoved { path: old.path.clone() });
+            errors.push(SdkError::WorldRemoved {
+                path: old.path.clone(),
+            });
         }
     }
-    if errors.is_empty() { Ok(()) } else { Err(errors) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -221,11 +336,21 @@ mod tests {
         InterfaceItem::new(path, ItemKind::Function, since, text.into())
     }
     fn digests(items: Vec<InterfaceItem>) -> InterfaceDigests {
-        InterfaceDigests { items, worlds: vec![] }.sorted()
+        InterfaceDigests {
+            items,
+            worlds: vec![],
+        }
+        .sorted()
     }
     #[test]
     fn versions_parse_strictly_and_order_numerically() {
-        assert_eq!(Version::parse("1.10"), Some(Version { major: 1, minor: 10 }));
+        assert_eq!(
+            Version::parse("1.10"),
+            Some(Version {
+                major: 1,
+                minor: 10
+            })
+        );
         assert!(Version::parse("1.2") < Version::parse("1.10"));
         for bad in ["1", "1.", ".2", "1.2.3", "a.b", "-1.0", "1.+2"] {
             assert_eq!(Version::parse(bad), None, "{bad}");
@@ -237,7 +362,10 @@ mod tests {
         assert_eq!(base.digest, item("api::f", None, "fn()->i64").digest);
         assert_ne!(base.digest, item("api::g", None, "fn()->i64").digest);
         assert_ne!(base.digest, item("api::f", None, "fn()->bool").digest);
-        assert_ne!(base.digest, item("api::f", Version::parse("1.1"), "fn()->i64").digest);
+        assert_ne!(
+            base.digest,
+            item("api::f", Version::parse("1.1"), "fn()->i64").digest
+        );
     }
     #[test]
     fn minor_updates_allow_only_new_marked_items() {
@@ -257,10 +385,25 @@ mod tests {
             item("e", Some(Version::parse("1.2").unwrap()), "z"),
         ]);
         let errors = check_minor_update(&old, &bad, v11).unwrap_err();
-        assert!(errors.iter().any(|e| matches!(e, SdkError::ItemChanged { path, .. } if path.as_ref() == "a")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, SdkError::ItemChanged { path, .. } if path.as_ref() == "a"))
+        );
         assert!(errors.contains(&SdkError::ItemRemoved { path: "b".into() }));
-        assert!(errors.contains(&SdkError::NewItemWithoutSince { path: "c".into(), version: v11 }));
-        assert!(errors.contains(&SdkError::NewItemSinceMismatch { path: "d".into(), since: v10, version: v11 }));
-        assert!(errors.iter().any(|e| matches!(e, SdkError::ItemFromFuture { path, .. } if path.as_ref() == "e")));
+        assert!(errors.contains(&SdkError::NewItemWithoutSince {
+            path: "c".into(),
+            version: v11
+        }));
+        assert!(errors.contains(&SdkError::NewItemSinceMismatch {
+            path: "d".into(),
+            since: v10,
+            version: v11
+        }));
+        assert!(
+            errors.iter().any(
+                |e| matches!(e, SdkError::ItemFromFuture { path, .. } if path.as_ref() == "e")
+            )
+        );
     }
 }

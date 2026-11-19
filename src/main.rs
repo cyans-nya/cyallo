@@ -153,11 +153,14 @@ enum Dialect {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Inspect typed register bytecode or the per-routine Winch Wasm adapter.
+    /// Inspect bytecode, verified scalar bytecode, or the Winch Wasm adapter.
     Bytecode {
         file: PathBuf,
         #[arg(long)]
         wasm: Option<usize>,
+        /// Verify and disassemble the linked routine and its direct callees.
+        #[arg(long, value_name = "ROUTINE_ID", conflicts_with = "wasm")]
+        verified: Option<usize>,
     },
     /// Start a persistent interactive session (modern syntax by default).
     Repl {
@@ -204,6 +207,8 @@ enum Engine {
     #[value(alias = "tiered")]
     Jit,
     Interpreter,
+    /// The verified bytecode interpreter. Programs it cannot lower are refused.
+    Verified,
     /// Eager per-routine Cranelift compilation with low-latency settings.
     Cranelift,
     /// Eager per-routine Cranelift compilation optimized for execution speed.
@@ -256,7 +261,7 @@ fn compile_engine(
     inlining: bool,
 ) -> color_eyre::Result<Option<Compiled>> {
     Ok(match engine {
-        Engine::Interpreter => None,
+        Engine::Interpreter | Engine::Verified => None,
         Engine::Cranelift => Some(Compiled::Direct(
             CraneliftConfig {
                 inlining,
@@ -408,24 +413,29 @@ fn main() -> color_eyre::Result<()> {
         Command::Run {
             engine: Engine::Jit | Engine::Interpreter,
             ..
+        } | Command::Bytecode {
+            verified: Some(_),
+            ..
         }
     );
     let frontend_result = if options.dialect == cyallo::Dialect::Modern {
-        match cyallo::modules::load_path(file) {
-            Ok(sources) => {
-                text = cyallo::modules::source_archive(&sources);
-                source_ranges = cyallo::modules::source_ranges(&sources);
-                cyallo::module_loader::ModuleLoader::for_entry(file)
-                    .map_err(cyallo::module_loader::module_load_diagnostic)
-                    .and_then(|loader| {
-                        cyallo::modules::compile_modules(
-                            sources.len() - 1,
-                            &sources,
-                            options,
-                            deferred,
-                        )
-                        .map(|program| program.with_module_loader(loader))
-                    })
+        let loaded = cyallo::module_loader::ModuleLoader::for_entry(file)
+            .and_then(|loader| {
+                loader
+                    .load_parsed(file, cyallo::Jobs(options.jobs))
+                    .map(|sources| (loader, sources))
+            })
+            .map_err(cyallo::module_loader::module_load_diagnostic);
+        match loaded {
+            Ok((loader, sources)) => {
+                (text, source_ranges) = cyallo::modules::parsed_source_context(&sources);
+                cyallo::modules::compile_parsed_modules(
+                    sources.len() - 1,
+                    &sources,
+                    options,
+                    deferred,
+                )
+                .map(|program| program.with_module_loader(loader))
             }
             Err(error) => Err(error),
         }
@@ -465,8 +475,12 @@ fn main() -> color_eyre::Result<()> {
         check_emission(&program)?;
     }
     match cli.command {
-        Command::Bytecode { wasm, .. } => {
-            if let Some(function) = wasm {
+        Command::Bytecode { wasm, verified, .. } => {
+            if let Some(routine) = verified {
+                let bytecode =
+                    cyallo::bytecode::verified::VerifiedModule::lower(&program, routine)?;
+                print!("{}", bytecode.disassemble());
+            } else if let Some(function) = wasm {
                 let bytecode = program
                     .bytecode()
                     .functions
@@ -489,6 +503,10 @@ fn main() -> color_eyre::Result<()> {
                 Dialect::Simplified => "simplified (fixed inferred types)",
             }
         ),
+        Command::Run {
+            engine: Engine::Verified,
+            ..
+        } => run_verified(&program)?,
         Command::Run { engine, .. } => {
             if !run(
                 program,
@@ -524,6 +542,24 @@ fn main() -> color_eyre::Result<()> {
         _ => unreachable!("non-file commands handled above"),
     }
 
+    Ok(())
+}
+/// Entry routine of a linked program.
+const ENTRY_ROUTINE: usize = 0;
+/// Fuel and call depth of a verified run.
+const VERIFIED_LIMITS: cyallo::bytecode::verified::ExecutionLimits =
+    cyallo::bytecode::verified::ExecutionLimits {
+        fuel: usize::MAX,
+        frames: 10_000,
+    };
+/// Run the entry routine in the verified interpreter. A program that uses an
+/// operation it cannot execute stops before running, with the reason.
+fn run_verified(program: &cyallo::ir::Program) -> color_eyre::Result<()> {
+    let module = cyallo::bytecode::verified::VerifiedModule::lower(program, ENTRY_ROUTINE)?;
+    if let Err(error) = module.run(&[], VERIFIED_LIMITS) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
     Ok(())
 }
 /// Instruction budget per run slice while the live view is on.

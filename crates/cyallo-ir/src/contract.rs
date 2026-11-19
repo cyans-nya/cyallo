@@ -93,21 +93,58 @@ const fn contract(
     effects: Effects,
     consumes_arguments: bool,
 ) -> IntrinsicContract {
-    IntrinsicContract { disposition, effects, safepoint, consumes_arguments }
+    IntrinsicContract {
+        disposition,
+        effects,
+        safepoint,
+        consumes_arguments,
+    }
 }
 use Disposition::{EnginePrimitive as Engine, HostCall as Host, SourceCandidate as Source};
 use Safepoint::{MayCollect as Collect, MayReenter as Reenter, Never};
 const NONE: Effects = Effects::NONE;
-const FAILS: Effects = Effects { may_fail: true, ..NONE };
-const READS: Effects = Effects { reads_memory: true, ..NONE };
-const READS_FAILS: Effects = Effects { reads_memory: true, may_fail: true, ..NONE };
-const ALLOCATES: Effects = Effects { allocates: true, ..NONE };
-const ALLOCATES_FAILS: Effects = Effects { allocates: true, may_fail: true, ..NONE };
-const READS_ALLOCATES: Effects = Effects { reads_memory: true, allocates: true, ..NONE };
-const READS_ALLOCATES_FAILS: Effects =
-    Effects { reads_memory: true, allocates: true, may_fail: true, ..NONE };
-const WRITES: Effects = Effects { writes_memory: true, ..NONE };
-const FRESH: Effects = Effects { allocates: true, fresh_identity: true, ..NONE };
+const FAILS: Effects = Effects {
+    may_fail: true,
+    ..NONE
+};
+const READS: Effects = Effects {
+    reads_memory: true,
+    ..NONE
+};
+const READS_FAILS: Effects = Effects {
+    reads_memory: true,
+    may_fail: true,
+    ..NONE
+};
+const ALLOCATES: Effects = Effects {
+    allocates: true,
+    ..NONE
+};
+const ALLOCATES_FAILS: Effects = Effects {
+    allocates: true,
+    may_fail: true,
+    ..NONE
+};
+const READS_ALLOCATES: Effects = Effects {
+    reads_memory: true,
+    allocates: true,
+    ..NONE
+};
+const READS_ALLOCATES_FAILS: Effects = Effects {
+    reads_memory: true,
+    allocates: true,
+    may_fail: true,
+    ..NONE
+};
+const WRITES: Effects = Effects {
+    writes_memory: true,
+    ..NONE
+};
+const FRESH: Effects = Effects {
+    allocates: true,
+    fresh_identity: true,
+    ..NONE
+};
 impl Intrinsic {
     /// The operation's contract. The match has no wildcard: adding an intrinsic
     /// requires deciding its contract.
@@ -119,8 +156,8 @@ impl Intrinsic {
             // possible; per-operation tightening is future work.
             Abs | Min | Max | Clamp | NumAbs | NumMin | NumMax | NumClamp | Round | Floor
             | Ceil | Sqrt | Pow | FloatRound | FloatFloor | FloatCeil | FloatSqrt | FloatPow
-            | Truncate | CharFromCode | CastI8 | CastI16 | CastI32 | CastI64 | CastU8
-            | CastU16 | CastU32 | CastU64 | CastIsize | CastUsize | CastF32 | CastF64 => {
+            | Truncate | CharFromCode | CastI8 | CastI16 | CastI32 | CastI64 | CastU8 | CastU16
+            | CastU32 | CastU64 | CastIsize | CastUsize | CastF32 | CastF64 => {
                 contract(Engine, Never, FAILS, false)
             }
             LowerChar | UpperChar | CharCode => contract(Source, Never, NONE, false),
@@ -148,25 +185,56 @@ impl Intrinsic {
             Allocate => contract(
                 Engine,
                 Collect,
-                Effects { writes_memory: true, allocates: true, may_fail: true, ..NONE },
+                Effects {
+                    writes_memory: true,
+                    allocates: true,
+                    may_fail: true,
+                    ..NONE
+                },
                 true,
             ),
-            Deallocate => contract(Engine, Collect, Effects { may_fail: true, ..WRITES }, true),
+            Deallocate => contract(
+                Engine,
+                Collect,
+                Effects {
+                    may_fail: true,
+                    ..WRITES
+                },
+                true,
+            ),
             LayoutNew | AllocErrorNew => contract(Engine, Collect, ALLOCATES_FAILS, false),
             RcTryNewIn => contract(
                 Engine,
                 Reenter,
-                Effects { writes_memory: true, allocates: true, calls_guest: true, ..NONE },
+                Effects {
+                    writes_memory: true,
+                    allocates: true,
+                    calls_guest: true,
+                    ..NONE
+                },
                 true,
             ),
-            RcClone | RcDowngrade | RcUpgrade => contract(Engine, Never, Effects { reads_memory: true, ..WRITES }, false),
+            RcClone | RcDowngrade | RcUpgrade => contract(
+                Engine,
+                Never,
+                Effects {
+                    reads_memory: true,
+                    ..WRITES
+                },
+                false,
+            ),
             RcStrongCount | RcWeakCount => contract(Engine, Never, READS, false),
             GcClone => contract(Engine, Collect, READS_ALLOCATES, false),
             CloneValue => contract(Engine, Collect, READS_ALLOCATES_FAILS, false),
             DropValue => contract(
                 Engine,
                 Reenter,
-                Effects { writes_memory: true, calls_guest: true, may_fail: true, ..NONE },
+                Effects {
+                    writes_memory: true,
+                    calls_guest: true,
+                    may_fail: true,
+                    ..NONE
+                },
                 true,
             ),
             CellNew => contract(Engine, Collect, FRESH, true),
@@ -175,42 +243,94 @@ impl Intrinsic {
             MappedLookup => contract(
                 Engine,
                 Reenter,
-                Effects { reads_memory: true, allocates: true, calls_guest: true, may_fail: true, ..NONE },
+                Effects {
+                    reads_memory: true,
+                    allocates: true,
+                    calls_guest: true,
+                    may_fail: true,
+                    ..NONE
+                },
                 false,
             ),
             Erase => contract(Engine, Collect, ALLOCATES, true),
             Checked => contract(Engine, Collect, ALLOCATES_FAILS, true),
             FreshSymbol => contract(Engine, Collect, FRESH, false),
             ObjectView => contract(Engine, Collect, READS_ALLOCATES, false),
-            ObjectFreeze => contract(Engine, Never, Effects { reads_memory: true, ..WRITES }, false),
+            ObjectFreeze => contract(
+                Engine,
+                Never,
+                Effects {
+                    reads_memory: true,
+                    ..WRITES
+                },
+                false,
+            ),
             ContextNew | ServiceKeyNew => contract(Engine, Collect, FRESH, false),
             // Host boundary.
             ModuleLoad => contract(
                 Host,
                 Reenter,
-                Effects { io: true, nondeterministic: true, may_park: true, may_fail: true, allocates: true, ..NONE },
+                Effects {
+                    io: true,
+                    nondeterministic: true,
+                    may_park: true,
+                    may_fail: true,
+                    allocates: true,
+                    ..NONE
+                },
                 false,
             ),
-            ChannelBounded | ChannelUnbounded | ClockNew => {
-                contract(Host, Collect, Effects { may_fail: true, ..FRESH }, false)
-            }
+            ChannelBounded | ChannelUnbounded | ClockNew => contract(
+                Host,
+                Collect,
+                Effects {
+                    may_fail: true,
+                    ..FRESH
+                },
+                false,
+            ),
             TaskSpawn => contract(
                 Host,
                 Collect,
-                Effects { nondeterministic: true, may_fail: true, ..FRESH },
+                Effects {
+                    nondeterministic: true,
+                    may_fail: true,
+                    ..FRESH
+                },
                 true,
             ),
-            Random => contract(Host, Never, Effects { nondeterministic: true, may_fail: true, ..NONE }, false),
+            Random => contract(
+                Host,
+                Never,
+                Effects {
+                    nondeterministic: true,
+                    may_fail: true,
+                    ..NONE
+                },
+                false,
+            ),
             Print => contract(
                 Host,
                 Reenter,
-                Effects { io: true, may_park: true, may_fail: true, reads_memory: true, ..NONE },
+                Effects {
+                    io: true,
+                    may_park: true,
+                    may_fail: true,
+                    reads_memory: true,
+                    ..NONE
+                },
                 false,
             ),
             Input => contract(
                 Host,
                 Reenter,
-                Effects { io: true, may_park: true, may_fail: true, writes_memory: true, ..NONE },
+                Effects {
+                    io: true,
+                    may_park: true,
+                    may_fail: true,
+                    writes_memory: true,
+                    ..NONE
+                },
                 false,
             ),
         }
@@ -257,7 +377,11 @@ impl MemberContract {
     pub fn consumes(&self) -> bool {
         self.operands.rest == Operand::Transfer
             || self.operands.receiver == Operand::Transfer
-            || self.operands.exceptions.iter().any(|(_, m)| *m == Operand::Transfer)
+            || self
+                .operands
+                .exceptions
+                .iter()
+                .any(|(_, m)| *m == Operand::Transfer)
     }
 }
 const fn member(
@@ -266,10 +390,19 @@ const fn member(
     effects: Effects,
     operands: OperandModes,
 ) -> MemberContract {
-    MemberContract { disposition, effects, safepoint, operands }
+    MemberContract {
+        disposition,
+        effects,
+        safepoint,
+        operands,
+    }
 }
 const fn modes(receiver: Operand, rest: Operand) -> OperandModes {
-    OperandModes { receiver, rest, exceptions: &[] }
+    OperandModes {
+        receiver,
+        rest,
+        exceptions: &[],
+    }
 }
 /// All operands read (copy or borrow).
 const READ_ALL: OperandModes = modes(Operand::Read, Operand::Read);
@@ -282,71 +415,139 @@ impl crate::internal::MemberIntrinsic {
     /// The member's contract. No wildcard arm: a new member needs a decision.
     pub fn contract(self) -> MemberContract {
         use crate::internal::MemberIntrinsic::*;
-        let reenter_guest = |extra: Effects| Effects { calls_guest: true, may_fail: true, ..extra };
+        let reenter_guest = |extra: Effects| Effects {
+            calls_guest: true,
+            may_fail: true,
+            ..extra
+        };
         match self {
             // Generators run guest code on their own frame; frame-coupled.
             GeneratorStart | GeneratorResume | GeneratorNext => member(
                 Engine,
                 Reenter,
-                reenter_guest(Effects { reads_memory: true, writes_memory: true, allocates: true, ..NONE }),
+                reenter_guest(Effects {
+                    reads_memory: true,
+                    writes_memory: true,
+                    allocates: true,
+                    ..NONE
+                }),
                 MUTATES_SELF,
             ),
             GeneratorClose => member(
                 Engine,
                 Reenter,
-                reenter_guest(Effects { writes_memory: true, ..NONE }),
+                reenter_guest(Effects {
+                    writes_memory: true,
+                    ..NONE
+                }),
                 MUTATES_SELF,
             ),
             // Thin readers over a step, outcome or error value: source-expressible.
             GeneratorIsComplete | GeneratorIsYielded | ResultIsOk | ResultIsErr | OptionIsSome
-            | OptionIsNone | SendErrorClosed | SendErrorFull | SendErrorLimit | LoadErrorNotFound
-            | LoadErrorDenied | LoadErrorCheck | ReceiveErrorClosed | ReceiveErrorEmpty
-            | TaskIsCompleted | TaskIsFailed | TaskIsCancelled | TaskIsStopped => {
-                member(Source, Never, READS, READ_ALL)
-            }
+            | OptionIsNone | SendErrorClosed | SendErrorFull | SendErrorLimit
+            | LoadErrorNotFound | LoadErrorDenied | LoadErrorCheck | ReceiveErrorClosed
+            | ReceiveErrorEmpty | TaskIsCompleted | TaskIsFailed | TaskIsCancelled
+            | TaskIsStopped => member(Source, Never, READS, READ_ALL),
             // Extraction that fails on the wrong variant (consumes the value).
-            GeneratorYielded | GeneratorCompleted | ResultUnwrap | ResultUnwrapErr | OptionUnwrap
-            | OptionOrFail | SendErrorValue | TaskCompleted => member(
+            GeneratorYielded | GeneratorCompleted | ResultUnwrap | ResultUnwrapErr
+            | OptionUnwrap | OptionOrFail | SendErrorValue | TaskCompleted => member(
                 Source,
                 Never,
-                Effects { reads_memory: true, may_fail: true, ..NONE },
+                Effects {
+                    reads_memory: true,
+                    may_fail: true,
+                    ..NONE
+                },
                 TAKES_SELF,
             ),
             LayoutSize | LayoutAlign => member(Engine, Never, READS, READ_ALL),
             // Reference counts and clones.
-            RcClone | RcDowngrade | RcUpgrade => {
-                member(Engine, Never, Effects { reads_memory: true, writes_memory: true, ..NONE }, READ_ALL)
-            }
+            RcClone | RcDowngrade | RcUpgrade => member(
+                Engine,
+                Never,
+                Effects {
+                    reads_memory: true,
+                    writes_memory: true,
+                    ..NONE
+                },
+                READ_ALL,
+            ),
             RcStrongCount | RcWeakCount => member(Engine, Never, READS, READ_ALL),
-            GcClone => member(Engine, Collect, Effects { reads_memory: true, allocates: true, ..NONE }, READ_ALL),
+            GcClone => member(
+                Engine,
+                Collect,
+                Effects {
+                    reads_memory: true,
+                    allocates: true,
+                    ..NONE
+                },
+                READ_ALL,
+            ),
             // Slices and collections.
-            Slice => member(Engine, Collect, Effects { reads_memory: true, allocates: true, ..NONE }, SHARED_SELF),
+            Slice => member(
+                Engine,
+                Collect,
+                Effects {
+                    reads_memory: true,
+                    allocates: true,
+                    ..NONE
+                },
+                SHARED_SELF,
+            ),
             MutableSlice => member(
                 Engine,
                 Collect,
-                Effects { reads_memory: true, allocates: true, ..NONE },
+                Effects {
+                    reads_memory: true,
+                    allocates: true,
+                    ..NONE
+                },
                 modes(Operand::MutableAddress, Operand::Read),
             ),
             CollectionPushBack | CollectionPushFront => member(
                 Engine,
                 Collect,
-                Effects { reads_memory: true, writes_memory: true, allocates: true, may_fail: true, ..NONE },
+                Effects {
+                    reads_memory: true,
+                    writes_memory: true,
+                    allocates: true,
+                    may_fail: true,
+                    ..NONE
+                },
                 MUTATES_SELF,
             ),
             CollectionPopBack | CollectionPopFront => member(
                 Engine,
                 Collect,
-                Effects { reads_memory: true, writes_memory: true, allocates: true, ..NONE },
+                Effects {
+                    reads_memory: true,
+                    writes_memory: true,
+                    allocates: true,
+                    ..NONE
+                },
                 MUTATES_SELF,
             ),
             CollectionLength => member(Engine, Never, READS, SHARED_SELF),
-            RangeReverse => member(Source, Collect, Effects { reads_memory: true, allocates: true, ..NONE }, READ_ALL),
+            RangeReverse => member(
+                Source,
+                Collect,
+                Effects {
+                    reads_memory: true,
+                    allocates: true,
+                    ..NONE
+                },
+                READ_ALL,
+            ),
             // Cells and locations. Storing drops the old value, which can run a
             // destructor; replacing hands the old value back.
             CellReplace => member(
                 Engine,
                 Never,
-                Effects { reads_memory: true, writes_memory: true, ..NONE },
+                Effects {
+                    reads_memory: true,
+                    writes_memory: true,
+                    ..NONE
+                },
                 OperandModes {
                     receiver: Operand::SharedAddress,
                     rest: Operand::Read,
@@ -356,13 +557,24 @@ impl crate::internal::MemberIntrinsic {
             LocationLoad => member(
                 Engine,
                 Collect,
-                Effects { reads_memory: true, allocates: true, may_fail: true, ..NONE },
+                Effects {
+                    reads_memory: true,
+                    allocates: true,
+                    may_fail: true,
+                    ..NONE
+                },
                 READ_ALL,
             ),
             LocationStore => member(
                 Engine,
                 Reenter,
-                Effects { reads_memory: true, writes_memory: true, calls_guest: true, may_fail: true, ..NONE },
+                Effects {
+                    reads_memory: true,
+                    writes_memory: true,
+                    calls_guest: true,
+                    may_fail: true,
+                    ..NONE
+                },
                 OperandModes {
                     receiver: Operand::Read,
                     rest: Operand::Read,
@@ -372,98 +584,209 @@ impl crate::internal::MemberIntrinsic {
             StoragePathField | StoragePathElement | StoragePathTarget => member(
                 Engine,
                 Collect,
-                Effects { reads_memory: true, allocates: true, may_fail: true, ..NONE },
+                Effects {
+                    reads_memory: true,
+                    allocates: true,
+                    may_fail: true,
+                    ..NONE
+                },
                 TAKES_SELF,
             ),
             // Channels, clocks and tasks cross to the scheduler.
             ChannelClone | ClockClone => member(
                 Host,
                 Collect,
-                Effects { writes_memory: true, allocates: true, ..NONE },
+                Effects {
+                    writes_memory: true,
+                    allocates: true,
+                    ..NONE
+                },
                 READ_ALL,
             ),
-            ChannelClose | TaskCancel => {
-                member(Host, Never, Effects { writes_memory: true, nondeterministic: true, ..NONE }, READ_ALL)
-            }
-            ChannelIsClosed | TaskIsFinished => {
-                member(Host, Never, Effects { reads_memory: true, nondeterministic: true, ..NONE }, READ_ALL)
-            }
+            ChannelClose | TaskCancel => member(
+                Host,
+                Never,
+                Effects {
+                    writes_memory: true,
+                    nondeterministic: true,
+                    ..NONE
+                },
+                READ_ALL,
+            ),
+            ChannelIsClosed | TaskIsFinished => member(
+                Host,
+                Never,
+                Effects {
+                    reads_memory: true,
+                    nondeterministic: true,
+                    ..NONE
+                },
+                READ_ALL,
+            ),
             ChannelSend => member(
                 Host,
                 Reenter,
-                Effects { writes_memory: true, nondeterministic: true, may_park: true, may_fail: true, allocates: true, ..NONE },
-                OperandModes { receiver: Operand::Read, rest: Operand::Read, exceptions: &[(1, Operand::Transfer)] },
+                Effects {
+                    writes_memory: true,
+                    nondeterministic: true,
+                    may_park: true,
+                    may_fail: true,
+                    allocates: true,
+                    ..NONE
+                },
+                OperandModes {
+                    receiver: Operand::Read,
+                    rest: Operand::Read,
+                    exceptions: &[(1, Operand::Transfer)],
+                },
             ),
             ChannelTrySend => member(
                 Host,
                 Collect,
-                Effects { writes_memory: true, nondeterministic: true, allocates: true, ..NONE },
-                OperandModes { receiver: Operand::Read, rest: Operand::Read, exceptions: &[(1, Operand::Transfer)] },
+                Effects {
+                    writes_memory: true,
+                    nondeterministic: true,
+                    allocates: true,
+                    ..NONE
+                },
+                OperandModes {
+                    receiver: Operand::Read,
+                    rest: Operand::Read,
+                    exceptions: &[(1, Operand::Transfer)],
+                },
             ),
             ChannelReceive => member(
                 Host,
                 Reenter,
-                Effects { writes_memory: true, nondeterministic: true, may_park: true, may_fail: true, allocates: true, ..NONE },
+                Effects {
+                    writes_memory: true,
+                    nondeterministic: true,
+                    may_park: true,
+                    may_fail: true,
+                    allocates: true,
+                    ..NONE
+                },
                 READ_ALL,
             ),
             ChannelTryReceive => member(
                 Host,
                 Collect,
-                Effects { writes_memory: true, nondeterministic: true, allocates: true, ..NONE },
+                Effects {
+                    writes_memory: true,
+                    nondeterministic: true,
+                    allocates: true,
+                    ..NONE
+                },
                 READ_ALL,
             ),
             ClockSleep => member(
                 Host,
                 Reenter,
-                Effects { nondeterministic: true, may_park: true, ..NONE },
+                Effects {
+                    nondeterministic: true,
+                    may_park: true,
+                    ..NONE
+                },
                 READ_ALL,
             ),
             TaskJoin => member(
                 Host,
                 Reenter,
-                Effects { writes_memory: true, nondeterministic: true, may_park: true, may_fail: true, allocates: true, ..NONE },
+                Effects {
+                    writes_memory: true,
+                    nondeterministic: true,
+                    may_park: true,
+                    may_fail: true,
+                    allocates: true,
+                    ..NONE
+                },
                 TAKES_SELF,
             ),
             // Error message text.
-            LoadErrorMessage | ViewErrorMessage => {
-                member(Source, Collect, Effects { reads_memory: true, allocates: true, ..NONE }, READ_ALL)
-            }
+            LoadErrorMessage | ViewErrorMessage => member(
+                Source,
+                Collect,
+                Effects {
+                    reads_memory: true,
+                    allocates: true,
+                    ..NONE
+                },
+                READ_ALL,
+            ),
             // Service contexts.
             ContextExtend | ContextIsolate => member(
                 Engine,
                 Collect,
-                Effects { allocates: true, fresh_identity: true, ..NONE },
+                Effects {
+                    allocates: true,
+                    fresh_identity: true,
+                    ..NONE
+                },
                 READ_ALL,
             ),
             ContextService => member(
                 Engine,
                 Collect,
-                Effects { reads_memory: true, allocates: true, may_fail: true, ..NONE },
+                Effects {
+                    reads_memory: true,
+                    allocates: true,
+                    may_fail: true,
+                    ..NONE
+                },
                 READ_ALL,
             ),
             ContextAvailable => member(Engine, Never, READS, READ_ALL),
             ContextProvide => member(
                 Engine,
                 Collect,
-                Effects { reads_memory: true, writes_memory: true, allocates: true, may_fail: true, ..NONE },
-                OperandModes { receiver: Operand::Read, rest: Operand::Read, exceptions: &[(2, Operand::Transfer)] },
+                Effects {
+                    reads_memory: true,
+                    writes_memory: true,
+                    allocates: true,
+                    may_fail: true,
+                    ..NONE
+                },
+                OperandModes {
+                    receiver: Operand::Read,
+                    rest: Operand::Read,
+                    exceptions: &[(2, Operand::Transfer)],
+                },
             ),
             ContextInject => member(
                 Engine,
                 Reenter,
-                reenter_guest(Effects { reads_memory: true, writes_memory: true, ..NONE }),
-                OperandModes { receiver: Operand::Read, rest: Operand::Read, exceptions: &[(2, Operand::Transfer)] },
+                reenter_guest(Effects {
+                    reads_memory: true,
+                    writes_memory: true,
+                    ..NONE
+                }),
+                OperandModes {
+                    receiver: Operand::Read,
+                    rest: Operand::Read,
+                    exceptions: &[(2, Operand::Transfer)],
+                },
             ),
             ContextOnDispose => member(
                 Engine,
                 Collect,
-                Effects { writes_memory: true, allocates: true, ..NONE },
-                OperandModes { receiver: Operand::Read, rest: Operand::Read, exceptions: &[(1, Operand::Transfer)] },
+                Effects {
+                    writes_memory: true,
+                    allocates: true,
+                    ..NONE
+                },
+                OperandModes {
+                    receiver: Operand::Read,
+                    rest: Operand::Read,
+                    exceptions: &[(1, Operand::Transfer)],
+                },
             ),
             ContextDispose | RegistrationDispose => member(
                 Engine,
                 Reenter,
-                reenter_guest(Effects { writes_memory: true, ..NONE }),
+                reenter_guest(Effects {
+                    writes_memory: true,
+                    ..NONE
+                }),
                 READ_ALL,
             ),
         }
@@ -497,12 +820,18 @@ impl OperationContract {
 }
 impl From<IntrinsicContract> for OperationContract {
     fn from(c: IntrinsicContract) -> Self {
-        Self { safepoint: c.safepoint, effects: c.effects }
+        Self {
+            safepoint: c.safepoint,
+            effects: c.effects,
+        }
     }
 }
 impl From<MemberContract> for OperationContract {
     fn from(c: MemberContract) -> Self {
-        Self { safepoint: c.safepoint, effects: c.effects }
+        Self {
+            safepoint: c.safepoint,
+            effects: c.effects,
+        }
     }
 }
 impl crate::concurrent::Operation {
@@ -630,14 +959,33 @@ mod tests {
     fn old_consumes(i: Intrinsic) -> bool {
         matches!(
             i,
-            TaskSpawn | CellNew | Allocate | Deallocate | ResultOk | ResultErr | RcTryNewIn
-                | VecLiteral | DequeLiteral | OptionSome | Erase | Checked | LookupPath | DropValue
+            TaskSpawn
+                | CellNew
+                | Allocate
+                | Deallocate
+                | ResultOk
+                | ResultErr
+                | RcTryNewIn
+                | VecLiteral
+                | DequeLiteral
+                | OptionSome
+                | Erase
+                | Checked
+                | LookupPath
+                | DropValue
         )
     }
     fn old_pure(i: Intrinsic) -> bool {
         !matches!(
             i,
-            Random | Print | Input | FreshSymbol | CellNew | ContextNew | ServiceKeyNew | MappedLookup
+            Random
+                | Print
+                | Input
+                | FreshSymbol
+                | CellNew
+                | ContextNew
+                | ServiceKeyNew
+                | MappedLookup
         )
     }
     #[test]
@@ -655,15 +1003,32 @@ mod tests {
         // old rule was never consulted for them. `builtins::pure` now answers from
         // the contract; only `Op::Builtin` consults it.
         let lookup_lowered = [
-            Allocate, Deallocate, RcTryNewIn, RcClone, RcDowngrade, RcUpgrade, DropValue,
-            ObjectFreeze, ChannelBounded, ChannelUnbounded, ClockNew, TaskSpawn, ModuleLoad,
+            Allocate,
+            Deallocate,
+            RcTryNewIn,
+            RcClone,
+            RcDowngrade,
+            RcUpgrade,
+            DropValue,
+            ObjectFreeze,
+            ChannelBounded,
+            ChannelUnbounded,
+            ClockNew,
+            TaskSpawn,
+            ModuleLoad,
         ];
         for &i in Intrinsic::ALL {
             let pure = i.contract().effects.is_pure();
             if pure {
-                assert!(old_pure(i), "{i} is pure in its contract but not in the old rule");
+                assert!(
+                    old_pure(i),
+                    "{i} is pure in its contract but not in the old rule"
+                );
             } else if old_pure(i) {
-                assert!(lookup_lowered.contains(&i), "{i} became impure without a reason");
+                assert!(
+                    lookup_lowered.contains(&i),
+                    "{i} became impure without a reason"
+                );
             }
         }
     }
@@ -678,7 +1043,11 @@ mod tests {
                 assert_eq!(c.safepoint, Safepoint::MayReenter, "{i}");
             }
             if e.allocates {
-                assert_ne!(c.safepoint, Safepoint::Never, "{i} allocates at a safepoint");
+                assert_ne!(
+                    c.safepoint,
+                    Safepoint::Never,
+                    "{i} allocates at a safepoint"
+                );
             }
             // Source candidates are pure computation.
             if c.disposition == Disposition::SourceCandidate {
@@ -695,17 +1064,46 @@ mod tests {
     }
     #[test]
     fn first_native_lowering_targets_are_inlinable() {
-        for i in [CastI8, CastI64, CastU32, CastF64, Length, StringLength, ArrayLength, RcStrongCount, OptionNone] {
+        for i in [
+            CastI8,
+            CastI64,
+            CastU32,
+            CastF64,
+            Length,
+            StringLength,
+            ArrayLength,
+            RcStrongCount,
+            OptionNone,
+        ] {
             assert!(i.contract().inlinable(), "{i}");
         }
-        for i in [OptionSome, VecFrom, Print, TaskSpawn, DropValue, MappedLookup, ModuleLoad] {
+        for i in [
+            OptionSome,
+            VecFrom,
+            Print,
+            TaskSpawn,
+            DropValue,
+            MappedLookup,
+            ModuleLoad,
+        ] {
             assert!(!i.contract().inlinable(), "{i}");
         }
-        assert!(Intrinsic::ALL.iter().filter(|i| i.contract().inlinable()).count() >= 25);
+        assert!(
+            Intrinsic::ALL
+                .iter()
+                .filter(|i| i.contract().inlinable())
+                .count()
+                >= 25
+        );
     }
     #[test]
     fn dispositions_partition_the_catalogue_as_audited() {
-        let count = |d| Intrinsic::ALL.iter().filter(|i| i.contract().disposition == d).count();
+        let count = |d| {
+            Intrinsic::ALL
+                .iter()
+                .filter(|i| i.contract().disposition == d)
+                .count()
+        };
         let (engine, host, source) = (
             count(Disposition::EnginePrimitive),
             count(Disposition::HostCall),
@@ -786,7 +1184,11 @@ mod tests {
         assert_eq!(MemberIntrinsic::ALL.len(), 75);
         for &m in MemberIntrinsic::ALL {
             for index in 0..5 {
-                assert_eq!(m.contract().operands.mode(index), old_member_mode(m, index), "{m:?} operand {index}");
+                assert_eq!(
+                    m.contract().operands.mode(index),
+                    old_member_mode(m, index),
+                    "{m:?} operand {index}"
+                );
             }
         }
     }
@@ -800,7 +1202,11 @@ mod tests {
                 assert_eq!(c.safepoint, Safepoint::MayReenter, "{m:?}");
             }
             if e.allocates {
-                assert_ne!(c.safepoint, Safepoint::Never, "{m:?} allocates at a safepoint");
+                assert_ne!(
+                    c.safepoint,
+                    Safepoint::Never,
+                    "{m:?} allocates at a safepoint"
+                );
             }
             if c.disposition == Disposition::SourceCandidate {
                 assert!(e.is_pure() && c.safepoint != Safepoint::MayReenter, "{m:?}");
@@ -822,7 +1228,12 @@ mod tests {
     #[test]
     fn member_dispositions_and_inlinable_set_are_pinned() {
         use crate::internal::MemberIntrinsic;
-        let count = |d| MemberIntrinsic::ALL.iter().filter(|m| m.contract().disposition == d).count();
+        let count = |d| {
+            MemberIntrinsic::ALL
+                .iter()
+                .filter(|m| m.contract().disposition == d)
+                .count()
+        };
         let (engine, host, source) = (
             count(Disposition::EnginePrimitive),
             count(Disposition::HostCall),
@@ -830,10 +1241,22 @@ mod tests {
         );
         assert_eq!(engine + host + source, 75);
         assert_eq!((engine, host, source), (34, 12, 29));
-        for m in [MemberIntrinsic::RcStrongCount, MemberIntrinsic::CollectionLength, MemberIntrinsic::LayoutSize, MemberIntrinsic::OptionIsSome, MemberIntrinsic::CellReplace] {
+        for m in [
+            MemberIntrinsic::RcStrongCount,
+            MemberIntrinsic::CollectionLength,
+            MemberIntrinsic::LayoutSize,
+            MemberIntrinsic::OptionIsSome,
+            MemberIntrinsic::CellReplace,
+        ] {
             assert!(m.contract().inlinable(), "{m:?}");
         }
-        for m in [MemberIntrinsic::GeneratorResume, MemberIntrinsic::ChannelSend, MemberIntrinsic::TaskJoin, MemberIntrinsic::ContextDispose, MemberIntrinsic::LocationStore] {
+        for m in [
+            MemberIntrinsic::GeneratorResume,
+            MemberIntrinsic::ChannelSend,
+            MemberIntrinsic::TaskJoin,
+            MemberIntrinsic::ContextDispose,
+            MemberIntrinsic::LocationStore,
+        ] {
             assert!(!m.contract().inlinable(), "{m:?}");
         }
     }
@@ -856,14 +1279,37 @@ mod tests {
             assert_eq!(i.contract().effects, m.contract().effects, "{i}");
         }
         // Operations with no single origin are fully conservative.
-        for op in [O::LayoutForRc, O::Range(false), O::CellRead, O::CellWrite, O::StoragePathNew, O::ManagedNew(cyallo_ast::MemoryKind::Gc, false)] {
+        for op in [
+            O::LayoutForRc,
+            O::Range(false),
+            O::CellRead,
+            O::CellWrite,
+            O::StoragePathNew,
+            O::ManagedNew(cyallo_ast::MemoryKind::Gc, false),
+        ] {
             assert_eq!(op.contract(), OperationContract::CONSERVATIVE, "{op:?}");
         }
         // Operations that cannot collect, so metadata need not treat them as safepoints.
-        for op in [O::RcStrongCount, O::CollectionLength, O::IsSome, O::IsNone, O::LayoutSize, O::CellReplace, O::GeneratorIsComplete, O::LoadErrorNotFound] {
+        for op in [
+            O::RcStrongCount,
+            O::CollectionLength,
+            O::IsSome,
+            O::IsNone,
+            O::LayoutSize,
+            O::CellReplace,
+            O::GeneratorIsComplete,
+            O::LoadErrorNotFound,
+        ] {
             assert_eq!(op.contract().safepoint, Safepoint::Never, "{op:?}");
         }
-        for op in [O::Some, O::CollectionPush(false), O::GeneratorResume(crate::lookup::ResumeInput::Unit), O::DropValue, O::Mapped, O::ModuleLoad] {
+        for op in [
+            O::Some,
+            O::CollectionPush(false),
+            O::GeneratorResume(crate::lookup::ResumeInput::Unit),
+            O::DropValue,
+            O::Mapped,
+            O::ModuleLoad,
+        ] {
             assert_ne!(op.contract().safepoint, Safepoint::Never, "{op:?}");
         }
     }

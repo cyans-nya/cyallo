@@ -2,7 +2,7 @@
 use super::*;
 use cyallo_ast::diagnostic::{EnumSyntaxError as E, invalid_enum_syntax};
 use std::collections::HashSet;
-impl Parser<'_> {
+impl Parser<'_, '_> {
     pub(super) fn enum_declaration(
         &mut self,
         ast: &mut Ast,

@@ -572,7 +572,7 @@ impl Session {
                     self.drop_value(value)?;
                 }
             }
-            | Value::Cell(value)
+            Value::Cell(value)
             | Value::Enum(_, Some(value))
             | Value::Dynamic(_, value)
             | Value::Erased(_, value)

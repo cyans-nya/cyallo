@@ -3,6 +3,7 @@ pub use oxc_span::{GetSpan, GetSpanMut, SPAN, Span};
 pub mod diagnostic;
 mod display;
 mod enums;
+pub mod indexed;
 pub use display::source_name;
 pub use enums::*;
 mod number;

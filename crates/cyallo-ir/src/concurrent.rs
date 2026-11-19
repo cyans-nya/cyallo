@@ -51,11 +51,12 @@ pub fn transferable(ty: &Type) -> bool {
         Type::Array(_, t) | Type::SparseArray(t) => transferable(t),
         Type::Tuple(ts) => ts.iter().all(transferable),
         Type::Record(_, fs) | Type::AnonymousRecord(fs) => fs.iter().all(|(_, t)| transferable(t)),
-        Type::Opaque(_, arguments, traits) => traits.transferable() && arguments.iter().all(transferable),
-        Type::Storage(
-            K::Option | K::Result | K::GeneratorStep | K::SendError,
-            t,
-        ) => transferable(t),
+        Type::Opaque(_, arguments, traits) => {
+            traits.transferable() && arguments.iter().all(transferable)
+        }
+        Type::Storage(K::Option | K::Result | K::GeneratorStep | K::SendError, t) => {
+            transferable(t)
+        }
         _ => false,
     }
 }
@@ -106,7 +107,9 @@ pub fn resolve(
         {
             (Operation::Bounded, declared.clone())
         }
-        (Intrinsic::ChannelUnbounded, [t, declared], []) if transferable(t) && channel_pair(declared, t) => {
+        (Intrinsic::ChannelUnbounded, [t, declared], [])
+            if transferable(t) && channel_pair(declared, t) =>
+        {
             (Operation::Unbounded, declared.clone())
         }
         // The result is the declared type: the declaration, not a kind, names it.

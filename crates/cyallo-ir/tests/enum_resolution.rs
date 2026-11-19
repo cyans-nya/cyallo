@@ -36,11 +36,13 @@ fn payload_contracts_are_nominal_and_constructor_bodies_keep_variant_ids() {
     let mut graph = specialize(
         "enum First { Value: i64 }\nenum Second { Value: i64 }\nlet a = First::Value(1)\nlet b = Second::Value(2)\n",
     );
+    let native = graph.native.clone();
+    let entry = graph.entry_index();
     let (types, contracts) = graph.with_sources(|asts| {
-        let types = composites::resolve_modules(asts).unwrap();
-        let contracts = asts
+        let types = composites::resolve_modules(asts, &native).unwrap();
+        let contracts = asts[entry]
+            .functions
             .iter()
-            .flat_map(|a| &a.functions)
             .filter(|f| f.origin == RoutineOrigin::EnumConstructor)
             .cloned()
             .collect::<Vec<_>>();
@@ -52,6 +54,7 @@ fn payload_contracts_are_nominal_and_constructor_bodies_keep_variant_ids() {
     assert_ne!(first, second);
     let Type::Enum(first) = first else { panic!() };
     assert_eq!(first.variants[0].payload, Some(Type::Integer));
+    assert_eq!(contracts.len(), 2);
     for constructor in contracts {
         let Type::Enum(contract) = &constructor.result else {
             panic!()
@@ -130,7 +133,10 @@ fn recursive_enum_layouts_require_indirection() {
         .unwrap_err();
     assert_eq!(error.code, "E184");
     let mut indirect = specialize("enum List { End, Next: gc List }\n");
-    let types = indirect.with_sources(composites::resolve_modules).unwrap();
+    let native = indirect.native.clone();
+    let types = indirect
+        .with_sources(|asts| composites::resolve_modules(asts, &native))
+        .unwrap();
     let name = &indirect.modules[indirect.entry_index()].source.enums[0].name;
     let Type::Enum(contract) = &types[name.as_ref()] else {
         panic!()

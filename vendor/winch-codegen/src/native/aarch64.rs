@@ -62,6 +62,18 @@ impl Assembler {
             .buffer_mut()
             .bind_label(label, &mut Default::default());
     }
+    pub fn start_site(&mut self, site: u32) {
+        self.asm
+            .buffer_mut()
+            .start_srcloc(cranelift_codegen::ir::RelSourceLoc::new(site));
+    }
+    pub fn end_site(&mut self) {
+        self.asm.buffer_mut().end_srcloc();
+    }
+    pub fn finish_image(self) -> Option<(Vec<u8>, Vec<SourceRange>)> {
+        let base = cranelift_codegen::ir::SourceLoc::new(SCALAR_SOURCE_BASE);
+        super::finish_image(self.asm.finalize(Some(base)))
+    }
     pub fn jump(&mut self, label: Label) {
         self.asm.jmp(label);
     }

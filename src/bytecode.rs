@@ -1,4 +1,5 @@
 //! Typed register bytecode: fixed-width words, indexed branches, separate source maps.
+pub mod verified;
 use crate::{
     Span, Type,
     ir::{self, Op},

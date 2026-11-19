@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 cyallo-ast = { path = "../cyallo-ast" }
+cyallo-compile-jobs = { path = "../cyallo-compile-jobs" }
 cyallo-parser = { path = "../cyallo-parser" }
 cyallo-host = { path = "../cyallo-host" }
 

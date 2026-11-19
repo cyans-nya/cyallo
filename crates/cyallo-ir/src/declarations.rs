@@ -210,10 +210,16 @@ impl fmt::Display for DeclarationError {
                 write!(f, "unresolved implementing module `{path}`")
             }
             Self::NotOpaqueType { interface, name } => {
-                write!(f, "`{name}` is not an opaque record of interface `{interface}`")
+                write!(
+                    f,
+                    "`{name}` is not an opaque record of interface `{interface}`"
+                )
             }
             Self::DuplicateOpaqueBinding(name) => {
-                write!(f, "opaque type `{name}` is already bound by another implementation")
+                write!(
+                    f,
+                    "opaque type `{name}` is already bound by another implementation"
+                )
             }
             Self::MissingOpaqueBinding { interface, name } => write!(
                 f,
@@ -228,7 +234,10 @@ impl fmt::Display for DeclarationError {
                 "`{path}` has both a source annotation and a provider binding"
             ),
             Self::UnusedBinding(path) => {
-                write!(f, "the provider binds `{path}`, which the package does not declare")
+                write!(
+                    f,
+                    "the provider binds `{path}`, which the package does not declare"
+                )
             }
             Self::UnresolvedWorld(path) => write!(f, "unresolved world `{path}`"),
             Self::UnresolvedWorldImport(path) => {
@@ -486,7 +495,10 @@ fn potentially_owning(ty: &Type, nonowning_parameter: &impl Fn(&str) -> bool) ->
             _,
         ) => false,
         Type::Opaque(_, arguments, traits) => {
-            traits.resource() || arguments.iter().any(|ty| potentially_owning(ty, nonowning_parameter))
+            traits.resource()
+                || arguments
+                    .iter()
+                    .any(|ty| potentially_owning(ty, nonowning_parameter))
         }
         Type::Storage(_, inner)
         | Type::Array(_, inner)
@@ -724,9 +736,7 @@ pub fn allocator_contract(declaration: &Trait) -> Result<(), AllocatorContractEr
     };
     // The protocol is stated by roles, not names: `allocate` takes a layout and
     // returns `Result<allocation, AllocError>`; `deallocate` takes an allocation.
-    let role = |ty: &Type, wanted: fn(&cyallo_ast::OpaqueTraits) -> bool| {
-        matches!(ty, Type::Opaque(_, args, traits) if args.is_empty() && wanted(traits))
-    };
+    let role = |ty: &Type, wanted: fn(&cyallo_ast::OpaqueTraits) -> bool| matches!(ty, Type::Opaque(_, args, traits) if args.is_empty() && wanted(traits));
     if !common(allocate)
         || !role(&allocate.params[1].ty, |t| t.layout())
         || !crate::memory::allocator_result_allocation(&allocate.result)
@@ -916,7 +926,10 @@ impl TypeEnvironment {
                 .collect::<Vec<_>>();
             let ty = crate::enums::native_type(declaration.storage, arguments);
             if let Some(contract) = crate::enums::contract(&ty, &native) {
-                types.insert(contract.name.to_string(), Type::Enum(std::sync::Arc::new(contract)));
+                types.insert(
+                    contract.name.to_string(),
+                    Type::Enum(std::sync::Arc::new(contract)),
+                );
             }
         }
         for declaration in &native.functions {

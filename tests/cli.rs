@@ -8,6 +8,46 @@ fn cli(args: &[&str]) -> Command {
     command
 }
 #[test]
+fn bytecode_can_verify_and_show_a_selected_routine() {
+    let result = cli(&["bytecode", "examples/functions.psc", "--verified", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let disassembly = String::from_utf8(result.stdout).unwrap();
+    assert!(disassembly.contains("verified bytecode v"));
+    assert!(disassembly.contains("frame slots"));
+    assert!(disassembly.contains("storage.dead"));
+    assert!(disassembly.contains("call.direct f0("));
+    assert!(disassembly.contains(".statement"));
+    assert!(
+        !disassembly
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some("nop"))
+    );
+
+    let result = cli(&["bytecode", "examples/functions.psc", "--verified", "0"])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert!(
+        String::from_utf8(result.stdout)
+            .unwrap()
+            .contains("output.caie")
+    );
+
+    let result = cli(&["bytecode", "examples/input.psc", "--verified", "0"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("unsupported scalar"));
+}
+
+#[test]
 fn moving_gc_cli_and_repl_reset_report_collections() {
     for engine in ["interpreter", "jit", "cranelift", "cranelift_speed"] {
         let result = cli(&[
@@ -630,4 +670,31 @@ fn enum_examples_execute_through_the_cli() {
             assert_eq!(String::from_utf8_lossy(&result.stdout), expected);
         }
     }
+}
+
+#[test]
+fn verified_engine_matches_the_interpreter_on_supported_programs() {
+    for example in [
+        "examples/functions.psc",
+        "examples/loops.psc",
+        "examples/fib.ya",
+        "examples/arrays.psc",
+        "examples/strings.psc",
+        "examples/composites.ya",
+    ] {
+        let run = |engine| cli(&["run", example, "--engine", engine]).output().unwrap();
+        let verified = run("verified");
+        assert!(verified.status.success(), "{example}");
+        assert_eq!(verified.stdout, run("interpreter").stdout, "{example}");
+    }
+}
+
+#[test]
+fn verified_engine_refuses_unsupported_programs_before_running() {
+    let result = cli(&["run", "examples/input.psc", "--engine", "verified"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("unsupported"));
 }

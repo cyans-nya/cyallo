@@ -1,0 +1,16 @@
+pub interface mod api {
+    pub fn calculate(n: i64) -> i64;
+}
+
+mod implementation {
+    pub fn twice(value: i64) -> i64 { return value + value }
+    pub fn twice_plus_one(value: i64) -> i64 { return value + value + 1 }
+    pub fn wrong_type(value: bool) -> i64 { return 0 }
+    pub fn needs_cast(value: i64) -> i64 { return (value as u8) as i64 }
+}
+
+use api::calculate as bound
+fn calculate(n: i64) -> i64 { return n }
+
+pub fn entry(n: i64) -> i64 { return bound(n) }
+pub fn local(n: i64) -> i64 { return calculate(n) }

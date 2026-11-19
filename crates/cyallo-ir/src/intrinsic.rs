@@ -507,7 +507,9 @@ pub fn resolve_declared(
         Intrinsic::ObjectView | Intrinsic::Parse => result_arguments()
             .and_then(|types| types.first().cloned())
             .map(|ty| vec![ty]),
-        Intrinsic::OptionNone => crate::lookup::option_payload(&contract.result).map(|ty| vec![ty.clone()]),
+        Intrinsic::OptionNone => {
+            crate::lookup::option_payload(&contract.result).map(|ty| vec![ty.clone()])
+        }
         Intrinsic::Checked => Some(vec![contract.result.clone()]),
         // A host constructor must declare an opaque host type as its result; any other
         // declared result is an invalid signature for the operation.
@@ -516,10 +518,12 @@ pub fn resolve_declared(
             Type::Opaque(..) => Some(vec![contract.result.clone()]),
             _ => None,
         },
-        Intrinsic::ClockNew | Intrinsic::TaskSpawn | Intrinsic::RcDowngrade => match &contract.result {
-            Type::Opaque(..) => Some(vec![contract.result.clone()]),
-            _ => None,
-        },
+        Intrinsic::ClockNew | Intrinsic::TaskSpawn | Intrinsic::RcDowngrade => {
+            match &contract.result {
+                Type::Opaque(..) => Some(vec![contract.result.clone()]),
+                _ => None,
+            }
+        }
         // Constructors of opaque host types take the declared type; the operation
         // validates its shape.
         Intrinsic::MissingPath

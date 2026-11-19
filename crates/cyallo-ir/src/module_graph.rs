@@ -33,6 +33,8 @@ pub struct ResolvedModule {
 pub struct ResolvedProgram {
     /// Digests of the entry package's interface modules and every world.
     pub interface: crate::sdk::InterfaceDigests,
+    /// Resolver-assigned identities for the entry package's bindable items.
+    pub(crate) interface_declarations: Vec<(Box<str>, DeclarationId)>,
     /// Worlds with `include` expanded. Order is declaration order per module.
     pub worlds: Vec<ResolvedWorld>,
     pub source_files: Vec<SourceFile>,

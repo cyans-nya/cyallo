@@ -30,7 +30,19 @@ detail on the marker removal: [../storagekind-removal.md](../storagekind-removal
   values with reserved variant ids; annotations and native signatures produce the declared
   enums; `std::option::some/none` and `std::result::ok/err` are removed.
 - Persistent compile worker pool (process-wide by decision), structural module-cache keys.
-- Backend design ([../backend-design.md](../backend-design.md)): the process-wide pool is a capacity provider
-  only (per-instance caps, round-robin, no retained instance state); quality and structure rules
-  replace speed gates, so benchmarks are recorded and do not block merges.
 - Per-match payload cells and overwritten enum payload cells are reused without GC.
+
+## Backend decisions
+
+- The process-wide compile pool supplies capacity only. The replacement must
+  enforce per-instance queue and in-flight caps, take jobs round-robin across
+  instances, and retain zero instance state after each job returns. The
+  owning runtime validates and publishes results from its own mailbox.
+  [Compile worker capacity](../backend-design.md#compile-worker-capacity)
+- Code quality, auditable structure, and correctness govern acceptance.
+  Benchmark results document the measured costs and guide changes.
+  [Code quality rules](../backend-design.md#code-quality-rules)
+- Use the SDK registration definitions of SDK, provider, binding, installed
+  table, and bound call throughout the replacement. The first shared
+  interpreter and SDK fixture executes a bound call through the installed
+  table. [SDK terminology](../sdk-registration.md#terminology)

@@ -203,6 +203,30 @@ fn in_memory_compilation_has_no_ambient_file_authority() {
 }
 
 #[test]
+fn indexed_snapshot_survives_successive_module_publications() {
+    use cyallo::module_loader::{ModuleLoader, ReadGrant};
+
+    let files = Files::new();
+    files.write("first.ya", "pub fn answer() -> i64 { return 20 }\n");
+    files.write("second.ya", "pub fn answer() -> i64 { return 22 }\n");
+    let source: Arc<str> = Arc::from(concat!(
+        "use std::module::load\n",
+        "type Plugin = object { answer: fn() -> i64 }\n",
+        "let first = load(\"first.ya\").unwrap()\n",
+        "let second = load(\"second.ya\").unwrap()\n",
+        "std::io::print(first.answer() + second.answer())\n",
+    ));
+    let snapshot = cyallo_parser::parse_modern_snapshot(source, false, cyallo::Jobs(1)).unwrap();
+    let program =
+        cyallo::compile_snapshot_for_execution(Arc::new(snapshot), CompileOptions::default())
+            .unwrap()
+            .with_module_loader(ModuleLoader::new(ReadGrant::directory(&files.0).unwrap()));
+    let mut session = Session::new(Arc::new(program)).unwrap();
+    drive(&mut session, None, 1);
+    assert_eq!(session.context.output, "42\n");
+}
+
+#[test]
 fn loads_additional_modules_and_different_contracts_without_replaying_root_code() {
     let files = Files::new();
     files.write(
@@ -440,18 +464,20 @@ fn import_declarations_can_move_and_shadow_without_changing_compiler_paths() {
             .map(|(path, source)| SourceText { path, source }),
     )
     .unwrap()
-    .with_bindings(cyallo_ir::bindings::NativeBindings::embedded().map(|path, key| {
-        let path = match path.strip_prefix("std::module::") {
-            Some(rest) => format!(
-                "std::plugins::{}",
-                rest.replace("LoadError", "LoadFailure")
-                    .replace("load", "read_file")
-                    .replace("is_denied", "was_denied")
-            ),
-            None => path.to_string(),
-        };
-        Some((path, key.to_string()))
-    }));
+    .with_bindings(
+        cyallo_ir::bindings::NativeBindings::embedded().map(|path, key| {
+            let path = match path.strip_prefix("std::module::") {
+                Some(rest) => format!(
+                    "std::plugins::{}",
+                    rest.replace("LoadError", "LoadFailure")
+                        .replace("load", "read_file")
+                        .replace("is_denied", "was_denied")
+                ),
+                None => path.to_string(),
+            };
+            Some((path, key.to_string()))
+        }),
+    );
     let program = cyallo::compile_with_core_package(
         r#"
 use std::plugins::read_file as read_plugin

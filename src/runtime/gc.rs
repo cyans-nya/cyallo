@@ -551,7 +551,7 @@ impl Collector {
                                 owners(value, pending);
                             }
                         }
-                        | Value::Cell(value)
+                        Value::Cell(value)
                         | Value::Enum(_, Some(value))
                         | Value::Dynamic(_, value)
                         | Value::Erased(_, value)
@@ -591,7 +591,7 @@ fn trace(
         }
         Value::Slice { owner, .. } => visit(*owner)?,
         Value::EnumStorage(_, Some(id)) | Value::NativeEnumStorage(_, Some(id)) => visit(*id)?,
-        | Value::Cell(v)
+        Value::Cell(v)
         | Value::Enum(_, Some(v))
         | Value::Dynamic(_, v)
         | Value::Erased(_, v)
@@ -637,7 +637,7 @@ fn relocate(value: &mut Value, rewrite: &impl Fn(&mut usize)) {
         }
         Value::Slice { owner, .. } => rewrite(owner),
         Value::EnumStorage(_, Some(id)) | Value::NativeEnumStorage(_, Some(id)) => rewrite(id),
-        | Value::Cell(v)
+        Value::Cell(v)
         | Value::Enum(_, Some(v))
         | Value::Dynamic(_, v)
         | Value::Erased(_, v)

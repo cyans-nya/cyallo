@@ -1,5 +1,9 @@
 # 08 — Performance and checks not run
 
+Benchmarks inform changes and are recorded with their environment. Merge
+acceptance follows the quality, structure, and correctness rules in the
+[backend design](../backend-design.md#code-quality-rules).
+
 - **Slowdown.** The Option/Result loop written in the new syntax takes about 2258 ms
   (interpreter) and 1588 ms (JIT), against 1907 / 1274 ms for the earlier helper-function
   program on the same tree and 1954 / 1339 ms on the baseline. The programs differ (enum

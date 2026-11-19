@@ -7,16 +7,15 @@ pub struct Lexed<'src> {
     tokens: Box<[Token]>,
 }
 impl<'src> Lexed<'src> {
-    pub(crate) fn fragment(&self, range: std::ops::Range<usize>) -> Self {
+    pub(crate) fn fragment(&self, range: std::ops::Range<usize>) -> TokenWindow<'_, 'src> {
         let end = self.tokens[range.end].span.start;
-        let mut tokens = self.tokens[range].to_vec();
-        tokens.push(Token {
-            kind: TokenKind::Eof,
-            span: Span::new(end, end),
-        });
-        Self {
+        TokenWindow {
             source: self.source,
-            tokens: tokens.into_boxed_slice(),
+            tokens: &self.tokens[range],
+            eof: Token {
+                kind: TokenKind::Eof,
+                span: Span::new(end, end),
+            },
         }
     }
     pub fn source(&self) -> &'src str {
@@ -28,7 +27,42 @@ impl<'src> Lexed<'src> {
     pub fn tokens(&self) -> &[Token] {
         &self.tokens
     }
+
+    pub(crate) fn into_tokens(self) -> Box<[Token]> {
+        self.tokens
+    }
 }
+
+/// A borrowed parse-unit range with its own terminal token. Lookahead cannot
+/// read the next unit, and diagnostics retain the original source coordinates.
+pub(crate) struct TokenWindow<'tokens, 'src> {
+    source: &'src str,
+    tokens: &'tokens [Token],
+    eof: Token,
+}
+
+impl<'src> TokenWindow<'_, 'src> {
+    pub(crate) fn get(&self, index: usize) -> Option<&Token> {
+        if index == self.tokens.len() {
+            Some(&self.eof)
+        } else {
+            self.tokens.get(index)
+        }
+    }
+
+    pub(crate) fn text(&self, token: Token) -> &'src str {
+        token.span.source_text(self.source)
+    }
+}
+
+impl std::ops::Index<usize> for TokenWindow<'_, '_> {
+    type Output = Token;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("parser token index within unit")
+    }
+}
+
 impl std::ops::Deref for Lexed<'_> {
     type Target = [Token];
     fn deref(&self) -> &Self::Target {

@@ -22,6 +22,17 @@ worlds drafts. Use them the same way.
 Avoid "provider call" or "installed provider" for a bound call or an installed
 table. "Provider bindings" in older text means the provider's `NativeBindings`.
 
+The first integration fixture uses the installed table to select a checked
+Cyallo reference by declaration ID. The verified interpreter executes the
+reference through a direct guest call. The fixture uses two separate bindings
+for the same alias, and checks selected results, typed overflow and its source
+span. [Scalar reference fixture](../tests/sdk_reference.rs)
+
+The synchronous host fixture binds a bodyless `proc` to an embedder callback.
+It verifies one callback invocation across one-instruction budget slices,
+terminal failure at the call site, and isolation between installations.
+[Scalar host fixture](../tests/sdk_host.rs)
+
 ## What needs binding
 
 `InterfaceItem::requires_binding` (from `ResolvedProgram.interface`, see
@@ -58,10 +69,38 @@ let installed = Registry::new()
 installed.contract("tasks::sum");  // what the compiler may rely on
 ```
 
-A `Registry` is a plain value owned by one runtime or session. There is no global
-table; two registries may bind the same item differently, and a test covers that.
-`install` is the only place validation happens, and it reports every problem, not the
-first.
+A `Registry` is a plain value owned by one runtime or session. Two registries may
+bind the same item differently. `install` collects registration errors while checking
+bindings against an SDK interface.
+
+For a resolved program, `Registry::install_for_program` also links each checked
+contract to its resolver-assigned `DeclarationId`. The returned `ResolvedBindings`
+is immutable and scoped to that program and provider. Imports preserve the original
+declaration ID, so an alias reaches the same contract without another path lookup.
+Linking fails if an item has no declaration or does not identify a single declaration.
+The execution path still uses legacy provider bindings while this interface is adopted.
+
+`VerifiedModule::lower_sdk_reference` accepts a closed Modern source bundle
+from an embedder and installs its registry against that exact resolved graph.
+It links bodyless free functions to qualified source references with matching
+`i64` or `bool` signatures. This slice supports value parameters, read-only
+operands, synchronous execution, and declared arithmetic failure. The normal
+semantic checker checks the reference bodies. Verified lowering rejects any
+reachable operation outside the interpreter's supported set. Each compiled
+fixture retains its own selected implementation. [Reference linking](../crates/cyallo-ir/src/registry/reference.rs) · [Verified fixture compilation](../src/bytecode/verified/sdk.rs)
+
+`ScalarSdk::host_call` registers the contract, SDK digest and callback together.
+`VerifiedModule::lower_sdk` links that registration against a closed Modern
+bundle. The verified call-site target records the installed host slot.
+The verifier checks its argument and result types, and the interpreter passes
+copied scalar values to the retained callback. This slice supports fixed
+`i64` and `bool` procedure signatures with a scalar result, read-only value
+operands and `Safepoint::Never`. The host can return a typed rejection if its
+contract declares `may_fail`. A bad return type, unexpected rejection or
+unwinding callback panic terminates the activation at the bound call's PC.
+An unused scalar result has no destination. The interpreter still calls the
+host and validates its result or reports its failure.
+[Scalar host API](../src/bytecode/verified/bound.rs) · [Interpreter execution](../src/bytecode/verified/run.rs)
 
 ## What installation checks
 
@@ -83,12 +122,11 @@ own intrinsics by tests in `contract.rs`.
 
 ## What is not built yet
 
-- Nothing consumes `Installed` yet: the compiler still resolves native items through
-  `#[cyallo_internal]` keys. Replacing those keys with registry lookups is the
-  migration step (phases 6-8 of the plan).
-- A reference is only a name. Resolving it to a body, running it as the interpreter
-  semantics and checking native lowerings against it (the conformance harness) is not
-  implemented.
+- Default execution still resolves native items through the legacy private key path.
+  Checked lowering and runtime dispatch need to consume linked provider contracts.
+- General reference resolution and conformance still need declarative bodies,
+  world loading, native lowerings, and host effects that park, collect, or
+  reenter guest execution.
 - `Engine` lowerings are declared but there is no emitter API to supply them.
 - The digest is supplied by the implementer from the SDK artifact; the load handshake and
   use-set checks from the drafts are not implemented.
@@ -124,8 +162,6 @@ bindings.
   `std::module::load` links against the host package's own bindings.
 - **Diagnostics.** A binding has no annotation text, so an error about it points at the
   bound declaration.
-- **Not yet the registry.** This step moves the keys out of the SDK source and makes the
-  provider own the binding. It does not use `Registry`/`Installed`, digests or contracts:
-  those need the standard modules to be `interface mod`s with digests, so the registry can
-  validate them (next step). Keys still map to `StorageKind`; removing that is the family
-  migration that follows.
+- **Compatibility path.** The provider owns these keys. The embedded standard bundle
+  still uses them while migration adds interface digests and adopts `Registry` contracts.
+  Keys still map to `StorageKind`, which will be removed as each declaration family migrates.

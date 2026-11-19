@@ -55,7 +55,7 @@ pub(crate) fn specialize_calls(
         }
         let core = plan.core.view();
         let mut linked = crate::namespace::link_with_core(
-            plan.asts.clone(),
+            plan.trees.materialize(plan.entry).map_err(E::CallCheck)?,
             &plan.paths,
             plan.entry,
             &plan.policy,

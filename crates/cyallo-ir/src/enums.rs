@@ -230,7 +230,11 @@ pub fn contract(ty: &Type, native: &NativeDeclarations) -> Option<EnumType> {
     contract_for(source, *storage, inner)
 }
 /// The enum a native declaration denotes for the given argument payload.
-pub fn contract_for(source: &EnumDeclaration, storage: StorageKind, inner: &Type) -> Option<EnumType> {
+pub fn contract_for(
+    source: &EnumDeclaration,
+    storage: StorageKind,
+    inner: &Type,
+) -> Option<EnumType> {
     let storage = &storage;
     let arguments = native_arguments(*storage, inner)?;
     let bindings = source
@@ -297,7 +301,9 @@ pub fn validate_native_enums(native: &NativeDeclarations) -> Result<(), Diagnost
         let roles: &[(EnumEncoding, Payload)] = match native.storage {
             StorageKind::Option => &[(OptionSome, Parameter(0)), (OptionNone, Unit)],
             StorageKind::Result => &[(ResultOk, Parameter(0)), (ResultErr, Parameter(1))],
-            StorageKind::GeneratorStep => &[(StepYielded, Parameter(0)), (StepComplete, Parameter(1))],
+            StorageKind::GeneratorStep => {
+                &[(StepYielded, Parameter(0)), (StepComplete, Parameter(1))]
+            }
             StorageKind::SendError => &[
                 (SendClosed, Parameter(0)),
                 (SendFull, Parameter(0)),
@@ -451,9 +457,7 @@ pub(crate) fn validate_templates(asts: &[Ast]) -> Result<(), Diagnostic> {
             Type::Array(_, field) | Type::SparseArray(field) | Type::Slice(field) => {
                 walk(field, definitions, active, origin, depth + 1)?
             }
-            Type::Storage(_, field) => {
-                walk(field, definitions, active, origin, depth + 1)?
-            }
+            Type::Storage(_, field) => walk(field, definitions, active, origin, depth + 1)?,
             Type::Opaque(_, arguments, traits) if !traits.indirect() => {
                 for field in arguments {
                     walk(field, definitions, active, origin, depth + 1)?;

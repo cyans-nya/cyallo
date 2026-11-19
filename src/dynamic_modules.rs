@@ -54,7 +54,7 @@ struct Loaded {
 #[derive(Debug, Clone)]
 pub(crate) struct CompilePlan {
     source_files: Vec<cyallo_ir::module_graph::SourceFile>,
-    asts: Vec<Ast>,
+    trees: SourceTrees,
     paths: Vec<String>,
     entry: usize,
     archive: String,
@@ -70,13 +70,60 @@ pub(crate) struct CompilePlan {
 }
 pub(crate) struct CompileSources {
     pub source_files: Vec<cyallo_ir::module_graph::SourceFile>,
-    pub asts: Vec<Ast>,
+    pub trees: SourceTrees,
     pub paths: Vec<String>,
     pub entry: usize,
     pub archive: String,
     pub ranges: Vec<SourceRange>,
     pub core_base: u32,
 }
+
+/// A file's immutable, file-relative syntax and its placement in the archive.
+#[derive(Debug, Clone)]
+pub(crate) struct ArchivedSyntax {
+    pub file: Arc<cyallo_parser::ParsedFile>,
+    pub offset: u32,
+}
+
+impl ArchivedSyntax {
+    pub(crate) fn materialize(&self) -> Result<Ast, ast::Diagnostic> {
+        let mut tree = self.file.to_source_tree();
+        if self.offset != 0 {
+            ast::spans::shift_ast(&mut tree, self.offset)?;
+        }
+        Ok(tree)
+    }
+}
+
+/// Source snapshots for the static graph, with synthetic runtime packages in a
+/// separate overlay. Materialization is the boundary to the mutable linker.
+#[derive(Debug, Clone)]
+pub(crate) struct SourceTrees {
+    files: Vec<ArchivedSyntax>,
+    packages: Vec<Arc<ModuleDeclaration>>,
+}
+
+impl SourceTrees {
+    pub(crate) fn new(files: Vec<ArchivedSyntax>) -> Self {
+        Self {
+            files,
+            packages: vec![],
+        }
+    }
+
+    pub(crate) fn materialize(&self, entry: usize) -> Result<Vec<Ast>, ast::Diagnostic> {
+        let mut files = self
+            .files
+            .iter()
+            .map(ArchivedSyntax::materialize)
+            .collect::<Result<Vec<_>, _>>()?;
+        files[entry]
+            .modules
+            .extend(self.packages.iter().map(|package| (**package).clone()));
+        Ok(files)
+    }
+}
+
 impl CompilePlan {
     pub(crate) fn call_requests(&self) -> Vec<CallRequest> {
         self.calls
@@ -92,7 +139,7 @@ impl CompilePlan {
     ) -> Self {
         let CompileSources {
             source_files,
-            asts,
+            trees,
             paths,
             entry,
             archive,
@@ -101,7 +148,7 @@ impl CompilePlan {
         } = sources;
         Self {
             source_files,
-            asts,
+            trees,
             paths,
             entry,
             archive,
@@ -248,25 +295,23 @@ pub(crate) fn load(
         index
     } else {
         let sources = loader
-            .load(&canonical)
+            .load_parsed(&canonical, crate::Jobs(plan.options.jobs))
             .map_err(|error| LoadError::Load(Arc::new(error)))?;
         let mut files = HashMap::new();
-        for source in &sources {
+        for source in sources {
             plan.archive
                 .push_str(&format!("\n// module: {}\n", source.path));
             let offset = u32::try_from(plan.archive.len())
                 .map_err(|_| LoadError::Publication(P::SourceArchiveOverflow))?;
-            plan.archive.push_str(&source.source);
+            plan.archive.push_str(source.file.source().text());
             let end = u32::try_from(plan.archive.len())
                 .map_err(|_| LoadError::Publication(P::SourceArchiveOverflow))?;
-            let mut parsed =
-                cyallo_parser::parse_modern(&source.source, false).map_err(|diagnostic| {
-                    LoadError::Check {
-                        path: PathBuf::from(&source.path),
-                        diagnostic,
-                    }
-                })?;
-            ast::spans::shift_ast(&mut parsed, offset).map_err(|diagnostic| LoadError::Check {
+            let parsed = ArchivedSyntax {
+                file: source.file,
+                offset,
+            }
+            .materialize()
+            .map_err(|diagnostic| LoadError::Check {
                 path: canonical.clone(),
                 diagnostic,
             })?;
@@ -293,7 +338,7 @@ pub(crate) fn load(
         )?;
         let name: Box<str> = format!("cyalloDynamicModule{}", plan.loaded.len()).into();
         let module: Box<str> = format!("crate::{name}").into();
-        plan.asts[plan.entry].modules.push(ModuleDeclaration {
+        plan.trees.packages.push(Arc::new(ModuleDeclaration {
             interface: false,
             boundary: ast::ModuleBoundary::Package,
             annotations: vec![],
@@ -301,7 +346,7 @@ pub(crate) fn load(
             public: false,
             body: Some(Box::new(root)),
             span: request.span,
-        });
+        }));
         plan.policy.scopes.push(ImportScope {
             referrer: module.clone(),
             matching: ScopeMatch::Subtree,
@@ -318,8 +363,17 @@ pub(crate) fn load(
         plan.loaded.len() - 1
     };
     let core = plan.core.view();
+    let trees = plan.trees.materialize(plan.entry).map_err(|diagnostic| {
+        localize(
+            &plan,
+            LoadError::Check {
+                path: canonical.clone(),
+                diagnostic,
+            },
+        )
+    })?;
     let mut linked = crate::namespace::link_with_core(
-        plan.asts.clone(),
+        trees,
         &plan.paths,
         plan.entry,
         &plan.policy,

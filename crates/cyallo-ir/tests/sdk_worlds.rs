@@ -72,10 +72,16 @@ pub world Both {
 fn world_errors_are_typed_and_precise() {
     for (world, expected) in [
         ("world A { include Missing }", "unresolved world `Missing`"),
-        ("world A { include B }\nworld B { include A }", "includes itself"),
+        (
+            "world A { include B }\nworld B { include A }",
+            "includes itself",
+        ),
         ("world A { include A }", "includes itself"),
         ("world A { import nowhere }", "does not name a module"),
-        ("world A { import io\n import io }", "two imports are named `io`"),
+        (
+            "world A { import io\n import io }",
+            "two imports are named `io`",
+        ),
         (
             "world A { import io\n import fs as io }",
             "two imports are named `io`",
@@ -114,9 +120,13 @@ fn world_errors_are_typed_and_precise() {
 }
 #[test]
 fn conflicting_imports_through_includes_are_rejected_but_aliases_resolve_them() {
-    let conflict = with("world A { import io }\nworld B { import fs as io }\nworld C { include A\n include B }");
+    let conflict = with(
+        "world A { import io }\nworld B { import fs as io }\nworld C { include A\n include B }",
+    );
     assert!(message(&conflict).contains("two imports are named `io`"));
-    let aliased = with("world A { import io }\nworld B { import fs as files }\nworld C { include A\n include B }");
+    let aliased = with(
+        "world A { import io }\nworld B { import fs as files }\nworld C { include A\n include B }",
+    );
     link(&aliased).unwrap();
 }
 #[test]

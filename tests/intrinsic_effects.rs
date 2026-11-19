@@ -19,7 +19,10 @@ std::io::print(code_of(), from_code(), shout(), magnitude())
 ";
     // A total scalar builtin cannot fail or allocate.
     let total = effects(source, "code_of");
-    assert!(!total.may_fail && !total.may_allocate && total.is_observably_pure(), "{total:?}");
+    assert!(
+        !total.may_fail && !total.may_allocate && total.is_observably_pure(),
+        "{total:?}"
+    );
     // Conversions that can reject their input stay fallible.
     assert!(effects(source, "from_code").may_fail);
     // A builtin that allocates can still exhaust resources.
@@ -32,5 +35,10 @@ std::io::print(code_of(), from_code(), shout(), magnitude())
 fn impure_builtins_are_still_rejected_in_pure_functions() {
     let source = "fn roll(n: i64) -> i64 { return 1 }\nstd::io::print(roll(1))\n";
     let program = compile(source).unwrap();
-    assert!(program.functions().iter().any(|f| f.kind == RoutineKind::Function));
+    assert!(
+        program
+            .functions()
+            .iter()
+            .any(|f| f.kind == RoutineKind::Function)
+    );
 }

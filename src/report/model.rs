@@ -113,6 +113,7 @@ fn engine_name(engine: Engine) -> &'static str {
     match engine {
         Engine::Jit => "jit",
         Engine::Interpreter => "interpreter",
+        Engine::Verified => "verified",
         Engine::Cranelift => "cranelift",
         Engine::CraneliftSpeed => "cranelift_speed",
     }

@@ -95,7 +95,9 @@ pub fn resolve(id: Intrinsic, types: &[Type], arguments: &[Type]) -> Option<(Ope
         {
             (Operation::LayoutNew, declared.clone())
         }
-        (Allocate, [declared], [ty]) if layout_type(ty) && allocator_result_allocation(declared) => {
+        (Allocate, [declared], [ty])
+            if layout_type(ty) && allocator_result_allocation(declared) =>
+        {
             (Operation::Allocate, declared.clone())
         }
         (Deallocate, [], [ty]) if allocation_type(ty) => (Operation::Deallocate, Type::Void),
@@ -120,8 +122,10 @@ pub fn same_regions(left: &Type, right: &Type) -> bool {
     }
     // The marker and the declared enum denote the same core type.
     if matches!(left, Type::Storage(..)) != matches!(right, Type::Storage(..))
-        && let (Some((a, p)), Some((b, q))) =
-            (crate::enums::core_shape(left), crate::enums::core_shape(right))
+        && let (Some((a, p)), Some((b, q))) = (
+            crate::enums::core_shape(left),
+            crate::enums::core_shape(right),
+        )
     {
         return a == b && p.len() == q.len() && p.iter().zip(&q).all(|(p, q)| same_regions(p, q));
     }

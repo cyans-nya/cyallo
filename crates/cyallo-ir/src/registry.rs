@@ -14,9 +14,13 @@
 //! The result, [`Installed`], is immutable; the compiler and backends query contracts
 //! from it and trust only what installation validated.
 use crate::contract::{Disposition, MemberContract, Safepoint};
+use crate::module_graph::ResolvedProgram;
 use crate::sdk::{Digest, InterfaceDigests, InterfaceItem, ItemKind};
-use std::collections::BTreeMap;
+use cyallo_ast::DeclarationId;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+mod reference;
+pub use reference::{LinkedScalarHost, LinkedScalarReference, ReferenceLinkError, ScalarLinks};
 /// The contract of a bound routine: disposition, safepoint, effects and operand passing.
 pub type BindingContract = MemberContract;
 /// Engines a lowering can be supplied for. The interpreter always runs the reference.
@@ -85,49 +89,104 @@ pub enum ContractViolation {
 impl fmt::Display for ContractViolation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ParkingNeedsReentry => f.write_str("an operation that parks must have a re-entry safepoint"),
+            Self::ParkingNeedsReentry => {
+                f.write_str("an operation that parks must have a re-entry safepoint")
+            }
             Self::GuestCallNeedsReentry => {
                 f.write_str("an operation that calls guest code must have a re-entry safepoint")
             }
-            Self::AllocationNeedsSafepoint => {
-                f.write_str("an operation that allocates cannot declare that it never reaches a safepoint")
+            Self::AllocationNeedsSafepoint => f.write_str(
+                "an operation that allocates cannot declare that it never reaches a safepoint",
+            ),
+            Self::HostCallDisposition => {
+                f.write_str("a host call must declare the host-call disposition")
             }
-            Self::HostCallDisposition => f.write_str("a host call must declare the host-call disposition"),
-            Self::IntrinsicDisposition => f.write_str("an intrinsic must declare the engine-primitive disposition"),
+            Self::IntrinsicDisposition => {
+                f.write_str("an intrinsic must declare the engine-primitive disposition")
+            }
             Self::MissingReference => f.write_str("an intrinsic must supply reference semantics"),
             Self::OperandOutOfRange { index, arity } => {
-                write!(f, "operand {index} is out of range for a routine with {arity} parameters")
+                write!(
+                    f,
+                    "operand {index} is out of range for a routine with {arity} parameters"
+                )
             }
         }
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistrationError {
-    UnknownItem { path: Box<str> },
-    KindMismatch { path: Box<str>, found: ItemKind, wanted: &'static str },
-    NotBindable { path: Box<str> },
-    DigestMismatch { path: Box<str>, registered: Digest, sdk: Digest },
-    Duplicate { path: Box<str> },
-    Unbound { path: Box<str> },
-    Contract { path: Box<str>, violation: ContractViolation },
+    UnknownItem {
+        path: Box<str>,
+    },
+    KindMismatch {
+        path: Box<str>,
+        found: ItemKind,
+        wanted: &'static str,
+    },
+    NotBindable {
+        path: Box<str>,
+    },
+    DigestMismatch {
+        path: Box<str>,
+        registered: Digest,
+        sdk: Digest,
+    },
+    Duplicate {
+        path: Box<str>,
+    },
+    Unbound {
+        path: Box<str>,
+    },
+    Contract {
+        path: Box<str>,
+        violation: ContractViolation,
+    },
+    MissingDeclaration {
+        path: Box<str>,
+    },
+    AmbiguousDeclaration {
+        path: Box<str>,
+    },
 }
 impl fmt::Display for RegistrationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownItem { path } => write!(f, "the SDK has no item `{path}`"),
-            Self::KindMismatch { path, found, wanted } => {
-                write!(f, "`{path}` is a {found:?}, but this registration binds a {wanted}")
+            Self::KindMismatch {
+                path,
+                found,
+                wanted,
+            } => {
+                write!(
+                    f,
+                    "`{path}` is a {found:?}, but this registration binds a {wanted}"
+                )
             }
             Self::NotBindable { path } => {
-                write!(f, "`{path}` has an implementation in the SDK and cannot be bound")
+                write!(
+                    f,
+                    "`{path}` has an implementation in the SDK and cannot be bound"
+                )
             }
-            Self::DigestMismatch { path, registered, sdk } => write!(
+            Self::DigestMismatch {
+                path,
+                registered,
+                sdk,
+            } => write!(
                 f,
                 "`{path}` was implemented against {registered}, but the SDK declares {sdk}"
             ),
             Self::Duplicate { path } => write!(f, "`{path}` is bound more than once"),
             Self::Unbound { path } => write!(f, "`{path}` has no implementation"),
             Self::Contract { path, violation } => write!(f, "contract of `{path}`: {violation}"),
+            Self::MissingDeclaration { path } => write!(f, "`{path}` has no resolved declaration"),
+            Self::AmbiguousDeclaration { path } => {
+                write!(
+                    f,
+                    "`{path}` does not identify a single resolved declaration"
+                )
+            }
         }
     }
 }
@@ -143,7 +202,13 @@ impl Registry {
         Self::default()
     }
     fn add(mut self, path: &str, digest: Digest, implementation: Implementation) -> Self {
-        self.entries.push((path.into(), Binding { digest, implementation }));
+        self.entries.push((
+            path.into(),
+            Binding {
+                digest,
+                implementation,
+            },
+        ));
         self
     }
     /// Bind a routine to an opaque host call.
@@ -159,7 +224,15 @@ impl Registry {
         reference: Option<Reference>,
         lowerings: Vec<Engine>,
     ) -> Self {
-        self.add(path, digest, Implementation::Intrinsic { contract, reference, lowerings })
+        self.add(
+            path,
+            digest,
+            Implementation::Intrinsic {
+                contract,
+                reference,
+                lowerings,
+            },
+        )
     }
     /// Bind the representation of an opaque record.
     pub fn opaque_type(self, path: &str, digest: Digest, contract: OpaqueContract) -> Self {
@@ -181,7 +254,11 @@ impl Registry {
                 continue;
             }
             if let Some(wanted) = kind_mismatch(item, &binding.implementation) {
-                errors.push(RegistrationError::KindMismatch { path, found: item.kind, wanted });
+                errors.push(RegistrationError::KindMismatch {
+                    path,
+                    found: item.kind,
+                    wanted,
+                });
                 continue;
             }
             if binding.digest != item.digest {
@@ -206,10 +283,62 @@ impl Registry {
             if !bindings.contains_key(&item.path)
                 && !errors.iter().any(|e| bound_path(e) == Some(&item.path))
             {
-                errors.push(RegistrationError::Unbound { path: item.path.clone() });
+                errors.push(RegistrationError::Unbound {
+                    path: item.path.clone(),
+                });
             }
         }
-        if errors.is_empty() { Ok(Installed { bindings }) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(Installed { bindings })
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Validate and link provider contracts for this resolved program. From this
+    /// point on, consumers use declaration IDs, including for imported aliases.
+    pub fn install_for_program(
+        self,
+        program: &ResolvedProgram,
+    ) -> Result<ResolvedBindings, Vec<RegistrationError>> {
+        let installed = self.install(&program.interface)?;
+        let mut declarations = HashMap::new();
+        for (path, id) in &program.interface_declarations {
+            declarations
+                .entry(path.as_ref())
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(*id));
+        }
+
+        let mut bindings = HashMap::new();
+        let mut errors = vec![];
+        for (path, binding) in installed.bindings {
+            match declarations.get(path.as_ref()) {
+                Some(Some(id)) if !bindings.contains_key(id) => {
+                    bindings.insert(*id, binding);
+                }
+                Some(_) => errors.push(RegistrationError::AmbiguousDeclaration { path }),
+                None => errors.push(RegistrationError::MissingDeclaration { path }),
+            }
+        }
+        if errors.is_empty() {
+            Ok(ResolvedBindings { bindings })
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+/// Immutable provider contracts keyed by declarations in the resolved program
+/// they were installed against. Numeric IDs are scoped to that program.
+#[derive(Debug, Clone)]
+pub struct ResolvedBindings {
+    bindings: HashMap<DeclarationId, Binding>,
+}
+
+impl ResolvedBindings {
+    pub fn get(&self, declaration: DeclarationId) -> Option<&Binding> {
+        self.bindings.get(&declaration)
     }
 }
 /// The path an error is about, if it was raised while binding that path.
@@ -240,7 +369,11 @@ fn violation(item: &InterfaceItem, implementation: &Implementation) -> Option<Co
             }
             (c, true)
         }
-        Implementation::Intrinsic { contract, reference, .. } => {
+        Implementation::Intrinsic {
+            contract,
+            reference,
+            ..
+        } => {
             if contract.disposition != Disposition::EnginePrimitive {
                 return Some(ContractViolation::IntrinsicDisposition);
             }
@@ -262,8 +395,8 @@ fn violation(item: &InterfaceItem, implementation: &Implementation) -> Option<Co
         return Some(ContractViolation::AllocationNeedsSafepoint);
     }
     if let Some(arity) = item.arity {
-        let positions = contract.operands.exceptions.iter().map(|(i, _)| *i);
-        if let Some(index) = positions.chain(std::iter::once(0)).find(|i| *i >= arity.max(1)) {
+        let mut positions = contract.operands.exceptions.iter().map(|(i, _)| *i);
+        if let Some(index) = positions.find(|i| *i >= arity) {
             return Some(ContractViolation::OperandOutOfRange { index, arity });
         }
     }
@@ -298,6 +431,8 @@ impl Installed {
         self.bindings.is_empty()
     }
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Binding)> {
-        self.bindings.iter().map(|(path, binding)| (path.as_ref(), binding))
+        self.bindings
+            .iter()
+            .map(|(path, binding)| (path.as_ref(), binding))
     }
 }

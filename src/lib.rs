@@ -19,6 +19,7 @@ use cyallo_ir::builtins;
 use cyallo_ir::namespace;
 pub mod bytecode;
 mod compiler;
+mod integer;
 pub use cyallo_channel as channel;
 pub use cyallo_scheduler as concurrency;
 mod constants;
@@ -37,8 +38,9 @@ pub use cyallo_ir::osr;
 pub mod repl;
 pub mod runtime;
 pub use compiler::{
-    CompileOptions, Dialect, compile, compile_for_execution, compile_with_core_package,
-    compile_with_import_policy, compile_with_options,
+    CompileOptions, Dialect, compile, compile_for_execution, compile_snapshot,
+    compile_snapshot_for_execution, compile_with_core_package, compile_with_import_policy,
+    compile_with_options,
 };
 pub use cyallo_ast::{Diagnostic, SourceFile, Span, Type};
 pub use cyallo_compile_jobs::Jobs;

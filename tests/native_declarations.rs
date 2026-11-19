@@ -260,7 +260,11 @@ fn source_archive_preserves_core_paths_and_utf8_spans() {
     let core = package_with(
         &sources,
         NativeBindings::embedded().map(|path, key| {
-            let key = if path == "std::task::Task" { "unknown_representation" } else { key };
+            let key = if path == "std::task::Task" {
+                "unknown_representation"
+            } else {
+                key
+            };
             Some((path.to_string(), key.to_string()))
         }),
     );
@@ -287,9 +291,7 @@ fn source_archive_preserves_core_paths_and_utf8_spans() {
     assert_eq!(path, "std/task.ya");
     // A provider binding has no annotation text of its own, so the diagnostic points
     // at the bound declaration, still in the right file and at UTF-8-correct offsets.
-    assert!(
-        text[local.span.start as usize..local.span.end as usize].contains("record Task<T>")
-    );
+    assert!(text[local.span.start as usize..local.span.end as usize].contains("record Task<T>"));
 }
 
 #[test]
@@ -480,7 +482,11 @@ fn malformed_native_enum_payloads_and_roles_are_rejected() {
     }
     let sources = standard_sources();
     let swapped = NativeBindings::embedded().map(|path, key| {
-        let key = if path == "std::option::Option::None" { "result_err_variant" } else { key };
+        let key = if path == "std::option::Option::None" {
+            "result_err_variant"
+        } else {
+            key
+        };
         Some((path.to_string(), key.to_string()))
     });
     assert_eq!(

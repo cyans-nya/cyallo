@@ -14,6 +14,7 @@ mod modules;
 pub(crate) mod native;
 pub(crate) mod services;
 mod utilities;
+use crate::integer::{IntegerDivision, IntegerError};
 use crate::ir::{LocalStorage, Op, Program, Reg, TextStyle};
 use crate::metrics::{ExecutionEngine, ExecutionReport, FrameMetrics};
 pub use concurrent::ConcurrencyError;
@@ -1849,7 +1850,7 @@ impl Session {
 }
 fn remap_functions(value: &mut Value, remap: &[usize]) {
     match value {
-        | Value::Enum(_, Some(v))
+        Value::Enum(_, Some(v))
         | Value::Dynamic(_, v)
         | Value::Erased(_, v)
         | Value::StoragePath(v, _) => remap_functions(v, remap),
@@ -1874,7 +1875,7 @@ fn remap_functions(value: &mut Value, remap: &[usize]) {
 }
 fn remap_service_keys(value: &mut Value, remap: &[usize]) {
     match value {
-        | Value::Enum(_, Some(v))
+        Value::Enum(_, Some(v))
         | Value::Dynamic(_, v)
         | Value::Erased(_, v)
         | Value::StoragePath(v, _) => remap_service_keys(v, remap),
@@ -1967,27 +1968,28 @@ fn binary(op: cyallo_ast::Operator, a: &Value, b: &Value) -> RunResult<Value> {
             Operator::Add => Some(x.checked_add(*y)),
             Operator::Subtract => Some(x.checked_sub(*y)),
             Operator::Multiply => Some(x.checked_mul(*y)),
-            Operator::IntegerDivide | Operator::Divide => Some(x.checked_div(*y)),
-            Operator::Remainder => Some(if *x == i64::MIN && *y == -1 {
-                Some(0)
-            } else {
-                x.checked_rem(*y)
-            }),
+            Operator::IntegerDivide | Operator::Divide | Operator::Remainder => {
+                let division = if op == Operator::Remainder {
+                    IntegerDivision::Remainder
+                } else {
+                    IntegerDivision::Quotient
+                };
+                return division
+                    .evaluate(*x, *y)
+                    .map(Value::Integer)
+                    .map_err(|error| {
+                        RuntimeError::Arithmetic(match error {
+                            IntegerError::DivisionByZero => ArithmeticError::DivisionByZero,
+                            IntegerError::Overflow => ArithmeticError::IntegerOverflow,
+                        })
+                    });
+            }
             _ => None,
         };
         if let Some(n) = n {
-            return n.map(Value::Integer).ok_or_else(|| {
-                if *y == 0
-                    && matches!(
-                        op,
-                        Operator::IntegerDivide | Operator::Divide | Operator::Remainder
-                    )
-                {
-                    ArithmeticError::DivisionByZero.into()
-                } else {
-                    ArithmeticError::IntegerOverflow.into()
-                }
-            });
+            return n
+                .map(Value::Integer)
+                .ok_or(ArithmeticError::IntegerOverflow.into());
         }
         let cmp = match op {
             Operator::Equal => Some(x == y),

@@ -476,13 +476,19 @@ impl Specializer {
             body,
             &mut |e| {
                 match &mut e.kind {
-                    ExprKind::Invoke(callee,args) => {
-                        if let ExprKind::Field(base,name)|ExprKind::ExtensionField(base,name,_)=&callee.kind
-                            && let Ok(receiver)=crate::inference::expression_type(base,known,routines)
+                    ExprKind::Invoke(callee, args) => {
+                        if let ExprKind::Field(base, name) | ExprKind::ExtensionField(base, name, _) =
+                            &callee.kind
+                            && let Ok(receiver) =
+                                crate::inference::expression_type(base, known, routines)
                             && !matches!(receiver.pointee_or_self(),Type::Record(_,fields)|Type::AnonymousRecord(fields) if fields.iter().any(|(field,_)|field==name))
-                            && let Some(parameters)=crate::native_contract::parameter_types(routines,&receiver,name,e.span)
+                            && let Some(parameters) = crate::native_contract::parameter_types(
+                                routines, &receiver, name, e.span,
+                            )
                         {
-                            for (argument,expected) in args.iter_mut().zip(parameters){self.context_expression(argument,Some(&expected))?;}
+                            for (argument, expected) in args.iter_mut().zip(parameters) {
+                                self.context_expression(argument, Some(&expected))?;
+                            }
                         }
                     }
                     ExprKind::Binary(Operator::Equal | Operator::NotEqual, left, right) => {

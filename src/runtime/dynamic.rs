@@ -120,8 +120,7 @@ impl Session {
                         pending.push(&self.heap[*id].value);
                     }
                 }
-                Value::Enum(_, Some(value))
-                | Value::Cell(value) => pending.push(value),
+                Value::Enum(_, Some(value)) | Value::Cell(value) => pending.push(value),
                 _ => {}
             }
         }

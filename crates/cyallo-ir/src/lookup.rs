@@ -179,7 +179,10 @@ pub fn step_payload(ty: &Type) -> Option<(&Type, &Type)> {
             },
             _ => None,
         },
-        _ => Some((role_payload(ty, StepYielded)?, role_payload(ty, StepComplete)?)),
+        _ => Some((
+            role_payload(ty, StepYielded)?,
+            role_payload(ty, StepComplete)?,
+        )),
     }
 }
 /// The unsent value type of a `SendError` type, in either form.
@@ -250,7 +253,8 @@ pub fn constructor(name: Intrinsic, ty: &Type, args: &[Type]) -> Option<(Operati
         Intrinsic::MissingPath => (
             Operation::Missing,
             ty.clone(),
-            args.is_empty() && matches!(ty, Type::Opaque(_, applied, traits) if traits.path() && applied.len() == 1),
+            args.is_empty()
+                && matches!(ty, Type::Opaque(_, applied, traits) if traits.path() && applied.len() == 1),
         ),
         // `path(value)`: the declared path type applied to the value's type.
         Intrinsic::LookupPath => (

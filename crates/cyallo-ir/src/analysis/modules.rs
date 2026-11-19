@@ -48,6 +48,7 @@ pub fn analyze_modules_cached(
     let identity = crate::module_graph::ResolvedProgram {
         worlds: graph.worlds.clone(),
         interface: graph.interface.clone(),
+        interface_declarations: graph.interface_declarations.clone(),
         source_files: graph.source_files.clone(),
         modules: graph
             .modules

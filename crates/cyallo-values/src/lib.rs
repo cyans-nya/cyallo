@@ -12,7 +12,7 @@ pub struct RangeValue {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
-    NativeEnum(cyallo_ast::EnumVariant,Option<Box<Value>>),
+    NativeEnum(cyallo_ast::EnumVariant, Option<Box<Value>>),
     NativeEnumStorage(cyallo_ast::EnumVariant, Option<usize>),
     Enum(cyallo_ast::VariantId, Option<Box<Value>>),
     EnumStorage(cyallo_ast::VariantId, Option<usize>),
@@ -162,7 +162,9 @@ impl Value {
             Self::Enum(variant, Some(value)) if *variant == cyallo_ast::VariantId::STEP_YIELDED => {
                 Some(GeneratorStep::Yielded(value))
             }
-            Self::Enum(variant, Some(value)) if *variant == cyallo_ast::VariantId::STEP_COMPLETE => {
+            Self::Enum(variant, Some(value))
+                if *variant == cyallo_ast::VariantId::STEP_COMPLETE =>
+            {
                 Some(GeneratorStep::Complete(value))
             }
             _ => None,
@@ -194,15 +196,23 @@ impl Value {
     }
     pub fn into_option(self) -> Result<Option<Box<Value>>, Value> {
         match self {
-            Self::Enum(variant, payload) if variant == cyallo_ast::VariantId::OPTION_SOME && payload.is_some() => Ok(payload),
+            Self::Enum(variant, payload)
+                if variant == cyallo_ast::VariantId::OPTION_SOME && payload.is_some() =>
+            {
+                Ok(payload)
+            }
             Self::Enum(variant, None) if variant == cyallo_ast::VariantId::OPTION_NONE => Ok(None),
             other => Err(other),
         }
     }
     pub fn into_result(self) -> Result<Result<Box<Value>, Box<Value>>, Value> {
         match self {
-            Self::Enum(variant, Some(value)) if variant == cyallo_ast::VariantId::RESULT_OK => Ok(Ok(value)),
-            Self::Enum(variant, Some(value)) if variant == cyallo_ast::VariantId::RESULT_ERR => Ok(Err(value)),
+            Self::Enum(variant, Some(value)) if variant == cyallo_ast::VariantId::RESULT_OK => {
+                Ok(Ok(value))
+            }
+            Self::Enum(variant, Some(value)) if variant == cyallo_ast::VariantId::RESULT_ERR => {
+                Ok(Err(value))
+            }
             other => Err(other),
         }
     }
@@ -238,7 +248,13 @@ impl std::fmt::Display for Value {
                 }
                 f.write_str(">")
             }
-            Self::NativeEnum(variant,payload)=>{write!(f,"<variant {}",variant.declaration.0.0)?;if let Some(payload)=payload{write!(f,": {payload}")?;}f.write_str(">")},
+            Self::NativeEnum(variant, payload) => {
+                write!(f, "<variant {}", variant.declaration.0.0)?;
+                if let Some(payload) = payload {
+                    write!(f, ": {payload}")?;
+                }
+                f.write_str(">")
+            }
             Self::NativeEnumStorage(variant, _) => {
                 write!(f, "<stored variant {}>", variant.declaration.0.0)
             }

@@ -7,9 +7,25 @@ pub use token::{Token, TokenKind};
 pub fn parse(source: &str) -> Result<Ast, Diagnostic> {
     parse_mode(source, false)
 }
+
+/// Parse compatibility syntax into the shared, immutable node tables.
+pub fn parse_indexed(source: &str) -> Result<indexed::IndexedAst, Diagnostic> {
+    parse_indexed_with_mode(source, false)
+}
+
+/// Parse a file or REPL entry into the shared, immutable node tables.
+pub fn parse_indexed_with_mode(
+    source: &str,
+    expression_statements: bool,
+) -> Result<indexed::IndexedAst, Diagnostic> {
+    indexed::IndexedAst::from_source_tree(parse_mode(source, expression_statements)?)
+        .map_err(|error| indexed::index_diagnostic(error, Span::default()))
+}
+
 pub fn parse_repl(source: &str) -> Result<Ast, Diagnostic> {
     parse_mode(source, true)
 }
+
 fn parse_mode(source: &str, expression_statements: bool) -> Result<Ast, Diagnostic> {
     Parser {
         tokens: lex(source)?,
@@ -537,5 +553,23 @@ impl Parser<'_> {
             };
         }
         Ok(lhs)
+    }
+}
+
+#[cfg(test)]
+mod indexed_tests {
+    use super::*;
+
+    #[test]
+    fn compatibility_index_preserves_case_folded_names_and_array_bounds() {
+        let source = "DECLARE Count : ARRAY[1:3] OF INTEGER\nCount[2] <- 7\nOUTPUT count[2]\n";
+        let expected = parse(source).unwrap();
+        let indexed = parse_indexed(source).unwrap();
+        let actual = indexed.to_source_tree();
+        assert_eq!(
+            actual.source_names.get("COUNT").map(Box::as_ref),
+            Some("Count")
+        );
+        assert_eq!(format!("{expected:?}"), format!("{actual:?}"));
     }
 }

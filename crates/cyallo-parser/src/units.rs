@@ -1,7 +1,13 @@
 //! Independent modern declarations/statements sharing one immutable token index.
 use super::*;
+use cyallo_ast::indexed::{FunctionNode, Id, IndexedAst, index_diagnostic};
 use cyallo_compile_jobs::Jobs;
 use std::ops::Range;
+use std::sync::Arc;
+
+const MIN_PARALLEL_FILES: usize = 2;
+const MIN_PARALLEL_UNITS: usize = 4;
+
 #[derive(Debug, Clone)]
 pub struct ParseUnit {
     pub tokens: Range<usize>,
@@ -33,8 +39,17 @@ impl<'src> IndexedSource<'src> {
         .program()
     }
     pub fn parse(&self, repl: bool, jobs: Jobs) -> Result<Ast, Diagnostic> {
-        let parsed = jobs.map(&self.units, 4, |_, i, _| self.parse_unit(i, repl));
-        self.assemble(parsed)
+        self.assemble(self.parse_units(repl, jobs))
+    }
+    fn freeze_unit(&self, index: usize, repl: bool) -> Result<IndexedAst, Diagnostic> {
+        let tree = self.parse_unit(index, repl)?;
+        IndexedAst::from_source_tree(tree)
+            .map_err(|error| index_diagnostic(error, self.units[index].span))
+    }
+    fn parse_units(&self, repl: bool, jobs: Jobs) -> Vec<Result<Ast, Diagnostic>> {
+        jobs.map(&self.units, MIN_PARALLEL_UNITS, |_, i, _| {
+            self.parse_unit(i, repl)
+        })
     }
     /// Merge results in unit order, independent of their execution order.
     pub fn assemble(&self, parsed: Vec<Result<Ast, Diagnostic>>) -> Result<Ast, Diagnostic> {
@@ -47,26 +62,29 @@ impl<'src> IndexedSource<'src> {
         }
         let mut out = Ast::default();
         for ast in parsed {
-            let mut ast = ast?;
-            out.enums.append(&mut ast.enums);
-            out.body.append(&mut ast.body);
-            out.functions.append(&mut ast.functions);
-            out.type_aliases.append(&mut ast.type_aliases);
-            out.records.append(&mut ast.records);
-            out.imports.append(&mut ast.imports);
-            out.exports.append(&mut ast.exports);
-            out.traits.append(&mut ast.traits);
-            out.implementations.append(&mut ast.implementations);
-            out.properties.append(&mut ast.properties);
-            out.modules.append(&mut ast.modules);
-            out.worlds.append(&mut ast.worlds);
-            out.interface_implementations
-                .append(&mut ast.interface_implementations);
-            out.inherent_implementations
-                .append(&mut ast.inherent_implementations);
+            append_unit(&mut out, ast?);
         }
         Ok(out)
     }
+}
+
+fn append_unit(out: &mut Ast, mut unit: Ast) {
+    out.enums.append(&mut unit.enums);
+    out.body.append(&mut unit.body);
+    out.functions.append(&mut unit.functions);
+    out.type_aliases.append(&mut unit.type_aliases);
+    out.records.append(&mut unit.records);
+    out.imports.append(&mut unit.imports);
+    out.exports.append(&mut unit.exports);
+    out.traits.append(&mut unit.traits);
+    out.implementations.append(&mut unit.implementations);
+    out.properties.append(&mut unit.properties);
+    out.modules.append(&mut unit.modules);
+    out.worlds.append(&mut unit.worlds);
+    out.interface_implementations
+        .append(&mut unit.interface_implementations);
+    out.inherent_implementations
+        .append(&mut unit.inherent_implementations);
 }
 pub fn index_modern(source: &str) -> Result<IndexedSource<'_>, Diagnostic> {
     let tokens = lex_modern(source)?;
@@ -139,9 +157,332 @@ pub fn parse_modern_with_jobs(source: &str, repl: bool, jobs: Jobs) -> Result<As
     index_modern(source)?.parse(repl, jobs)
 }
 
+/// The original source and file-wide token stream shared by a parsed file's units.
+#[derive(Debug)]
+pub struct SourceSnapshot {
+    text: Arc<str>,
+    tokens: Box<[Token]>,
+    line_starts: Box<[u32]>,
+}
+
+impl SourceSnapshot {
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn tokens(&self) -> &[Token] {
+        &self.tokens
+    }
+
+    pub fn line_starts(&self) -> &[u32] {
+        &self.line_starts
+    }
+}
+
+/// A fully parsed modern file with units in source order.
+#[derive(Debug)]
+pub struct ParsedFile {
+    source: Arc<SourceSnapshot>,
+    units: Box<[Arc<ParsedUnit>]>,
+}
+
+impl ParsedFile {
+    pub fn source(&self) -> &SourceSnapshot {
+        &self.source
+    }
+
+    pub fn units(&self) -> &[Arc<ParsedUnit>] {
+        &self.units
+    }
+
+    /// Materialize the ordered, file-relative tree at the legacy resolver boundary.
+    pub fn to_source_tree(&self) -> Ast {
+        let mut tree = Ast::default();
+        for unit in &self.units {
+            append_unit(&mut tree, unit.syntax.to_source_tree());
+        }
+        tree
+    }
+}
+
+/// A published, read-only parse unit using typed, unit-local syntax tables.
+#[derive(Debug)]
+pub struct ParsedUnit {
+    source: Arc<SourceSnapshot>,
+    range: ParseUnit,
+    syntax: IndexedAst,
+}
+
+impl ParsedUnit {
+    pub fn source(&self) -> &SourceSnapshot {
+        &self.source
+    }
+
+    pub fn span(&self) -> Span {
+        self.range.span
+    }
+
+    /// The actual file tokens belonging to this unit, excluding synthetic EOF.
+    pub fn tokens(&self) -> &[Token] {
+        &self.source.tokens[self.range.tokens.clone()]
+    }
+
+    pub fn syntax(&self) -> &IndexedAst {
+        &self.syntax
+    }
+
+    /// Handles for source bodies declared at the unit root, in parser order.
+    pub fn bodies(self: &Arc<Self>) -> impl Iterator<Item = BodyHandle> + '_ {
+        self.syntax
+            .get_list(self.syntax.root().functions)
+            .expect("root function list belongs to this unit")
+            .iter()
+            .copied()
+            .filter_map(move |id| {
+                let function = self.syntax.get(id).expect("function belongs to this unit");
+                (function.body_kind == FunctionBodyKind::Source).then(|| BodyHandle {
+                    unit: Arc::clone(self),
+                    id,
+                })
+            })
+    }
+}
+
+/// A routine body and its owning unit. Cloning a handle only retains the unit.
+#[derive(Clone, Debug)]
+pub struct BodyHandle {
+    unit: Arc<ParsedUnit>,
+    id: Id<FunctionNode>,
+}
+
+impl BodyHandle {
+    pub fn unit(&self) -> &ParsedUnit {
+        &self.unit
+    }
+
+    pub fn function(&self) -> &FunctionNode {
+        self.unit
+            .syntax
+            .get(self.id)
+            .expect("function belongs to this unit")
+    }
+}
+
+/// Parse once and freeze each unit into its own indexed tables before publication.
+/// The file is published only when all units succeed.
+pub fn parse_modern_snapshot(
+    source: Arc<str>,
+    repl: bool,
+    jobs: Jobs,
+) -> Result<ParsedFile, Diagnostic> {
+    let indexed = index_modern(&source)?;
+    let parsed = jobs.map(indexed.units(), MIN_PARALLEL_UNITS, |_, i, _| {
+        indexed.freeze_unit(i, repl)
+    });
+    let IndexedSource { tokens, units } = indexed;
+    let tokens = tokens.into_tokens();
+    publish_snapshot(source, tokens, units, parsed)
+}
+
+/// Parse a source graph with the same bounded job pool across all its units.
+/// Return results in file order so callers can report the earliest error.
+pub fn parse_modern_snapshots(sources: &[&str], jobs: Jobs) -> Vec<Result<ParsedFile, Diagnostic>> {
+    let indexed = jobs.map(sources, MIN_PARALLEL_FILES, |_, _, &source| {
+        index_modern(source)
+    });
+    let work: Vec<_> = indexed
+        .iter()
+        .enumerate()
+        .flat_map(|(file, index)| {
+            (0..index.as_ref().map_or(0, |index| index.units.len())).map(move |unit| (file, unit))
+        })
+        .collect();
+    let parsed = jobs.map(&work, MIN_PARALLEL_UNITS, |_, _, &(file, unit)| {
+        indexed[file]
+            .as_ref()
+            .expect("work belongs to an indexed file")
+            .freeze_unit(unit, false)
+    });
+    let mut files: Vec<Vec<_>> = (0..sources.len()).map(|_| Vec::new()).collect();
+    for ((file, _), unit) in work.into_iter().zip(parsed) {
+        files[file].push(unit);
+    }
+    indexed
+        .into_iter()
+        .zip(sources)
+        .zip(files)
+        .map(|((index, &source), parsed)| {
+            let IndexedSource { tokens, units } = index?;
+            publish_snapshot(Arc::from(source), tokens.into_tokens(), units, parsed)
+        })
+        .collect()
+}
+
+fn publish_snapshot(
+    source: Arc<str>,
+    tokens: Box<[Token]>,
+    units: Vec<ParseUnit>,
+    parsed: Vec<Result<IndexedAst, Diagnostic>>,
+) -> Result<ParsedFile, Diagnostic> {
+    // Lexing rejects sources larger than the u32 span range.
+    let line_starts = std::iter::once(0)
+        .chain(
+            source
+                .bytes()
+                .enumerate()
+                .filter_map(|(i, byte)| (byte == b'\n').then_some((i + 1) as u32)),
+        )
+        .collect();
+    let source = Arc::new(SourceSnapshot {
+        text: source,
+        tokens,
+        line_starts,
+    });
+    let units = units
+        .into_iter()
+        .zip(parsed)
+        .map(|(range, syntax)| {
+            let syntax = syntax?;
+            Ok(Arc::new(ParsedUnit {
+                source: Arc::clone(&source),
+                range,
+                syntax,
+            }))
+        })
+        .collect::<Result<_, Diagnostic>>()?;
+    Ok(ParsedFile { source, units })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_body_retains_its_unit_and_shared_source() {
+        let source: Arc<str> = Arc::from("proc first() {}\nproc second() {}\n");
+        let original = Arc::clone(&source);
+        let snapshot = parse_modern_snapshot(source, false, Jobs(1)).unwrap();
+        let [first, second] = snapshot.units() else {
+            panic!("expected two parse units");
+        };
+        assert!(std::ptr::eq(first.source(), second.source()));
+        let body = first.bodies().next().unwrap();
+        let retained = body.clone();
+        let other_unit = Arc::downgrade(second);
+        drop(snapshot);
+
+        assert!(other_unit.upgrade().is_none());
+        assert!(std::ptr::eq(body.function(), retained.function()));
+        assert_eq!(
+            body.unit().syntax().name(body.function().name),
+            Some("first")
+        );
+        assert_eq!(
+            body.function()
+                .span
+                .source_text(body.unit().source().text()),
+            "proc first() {}",
+        );
+        assert!(std::ptr::eq(original.as_ref(), body.unit().source().text()));
+    }
+
+    #[test]
+    fn snapshot_preserves_first_diagnostic_in_source_order() {
+        let source = "proc first() {}\nlet = 1\nlet good = 2\nlet = 3\n";
+        let error = parse_modern_snapshot(Arc::from(source), false, Jobs(4)).unwrap_err();
+        let legacy = parse_modern_with_jobs(source, false, Jobs(1)).unwrap_err();
+        let first_invalid_token = source.find("= 1").unwrap() as u32;
+        assert_eq!(
+            error.span,
+            Span::new(first_invalid_token, first_invalid_token + 1)
+        );
+        assert_eq!(error, legacy);
+    }
+
+    #[test]
+    fn indexed_snapshots_round_trip_declarations_and_executable_syntax() {
+        for source in [
+            include_str!("../../../examples/sdk/worlds.ya"),
+            include_str!("../../../examples/composites.ya"),
+            include_str!("../../../examples/enums/patterns.ya"),
+            include_str!("../../../examples/concurrency/generators/delegation.ya"),
+            "mod external;\nmod empty {}\npub world W { import empty {}; import external; }\n",
+        ] {
+            let index = index_modern(source).unwrap();
+            let expected = index.parse(false, Jobs(1)).unwrap();
+            for jobs in [Jobs(1), Jobs(4)] {
+                let indexed = parse_modern_snapshot(Arc::from(source), false, jobs).unwrap();
+                let restored = indexed.to_source_tree();
+                assert_eq!(format!("{expected:?}"), format!("{restored:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_names_share_spelling_but_keep_occurrence_spans() {
+        use cyallo_ast::indexed::{ExprSyntax, StmtSyntax};
+        let source = "fn twice(n: i64) -> i64 {\n return n + n\n}\n";
+        let file = parse_modern_snapshot(Arc::from(source), false, Jobs(1)).unwrap();
+        let unit = &file.units()[0];
+        let routine = unit.bodies().next().unwrap();
+        let ast = unit.syntax();
+        let [statement] = ast.get_list(routine.function().body).unwrap() else {
+            panic!("expected a return statement");
+        };
+        let StmtSyntax::Return(value) = &ast.get(*statement).unwrap().kind else {
+            panic!("expected a return statement");
+        };
+        let ExprSyntax::Binary(Operator::Add, left, right) = &ast.get(*value).unwrap().kind else {
+            panic!("expected an addition");
+        };
+        let left = ast.get(*left).unwrap();
+        let right = ast.get(*right).unwrap();
+        let (ExprSyntax::Name(left_name), ExprSyntax::Name(right_name)) = (&left.kind, &right.kind)
+        else {
+            panic!("expected two name occurrences");
+        };
+        assert_eq!(left_name, right_name);
+        assert_eq!(ast.name(*left_name), Some("n"));
+        assert_ne!(left.span, right.span);
+        assert_eq!(file.source().line_starts(), [0, 26, 40, 42]);
+    }
+
+    #[test]
+    fn indexing_a_long_left_associated_chain_preserves_its_depth() {
+        use cyallo_ast::indexed::{ExprSyntax, StmtSyntax};
+        let terms = 4096;
+        let source = format!("let n = {}\n", vec!["1"; terms].join(" + "));
+        let file = parse_modern_snapshot(Arc::from(source), false, Jobs(1)).unwrap();
+        let ast = file.units()[0].syntax();
+        let [statement] = ast.get_list(ast.root().body).unwrap() else {
+            panic!("expected a binding");
+        };
+        let StmtSyntax::Binding(_, _, _, _, value) = &ast.get(*statement).unwrap().kind else {
+            panic!("expected a binding");
+        };
+        let mut at = *value;
+        let mut operators = 0;
+        while let ExprSyntax::Binary(Operator::Add, left, _) = &ast.get(at).unwrap().kind {
+            at = *left;
+            operators += 1;
+        }
+        assert_eq!(operators, terms - 1);
+    }
+
+    #[test]
+    fn a_unit_borrows_tokens_and_stops_lookahead_at_its_own_eof() {
+        let source = "let first = 1\n  let second = 2";
+        let indexed = index_modern(source).unwrap();
+        let range = indexed.units()[0].tokens.clone();
+        let window = indexed.tokens.fragment(range.clone());
+
+        assert!(std::ptr::eq(&window[0], &indexed.tokens[range.start]));
+        let end = indexed.tokens[range.end].span.start;
+        assert_eq!(end as usize, source.find("let second").unwrap());
+        assert_eq!(window[range.len()].kind, TokenKind::Eof);
+        assert_eq!(window[range.len()].span, Span::new(end, end));
+        assert!(window.get(range.len() + 1).is_none());
+    }
+
     #[test]
     fn indexed_units_match_the_original_parser_and_spans() {
         let source = r#"

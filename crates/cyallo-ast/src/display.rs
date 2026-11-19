@@ -242,10 +242,9 @@ impl Display for Type {
                 write!(f, "{name}<")?;
                 // Multi-parameter constructors store their arguments as a tuple.
                 match (kind, payload.as_ref()) {
-                    (
-                        StorageKind::Result | StorageKind::GeneratorStep,
-                        Self::Tuple(arguments),
-                    ) => list(f, arguments)?,
+                    (StorageKind::Result | StorageKind::GeneratorStep, Self::Tuple(arguments)) => {
+                        list(f, arguments)?
+                    }
                     (_, payload) => payload.fmt(f)?,
                 }
                 f.write_str(">")
