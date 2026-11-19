@@ -489,11 +489,19 @@ fn empty_entry(source_len: usize) -> ir::Function {
     }
 }
 fn requires_tracing(ast: &Ast) -> bool {
-    count(Counter::BodiesTracingCopied, ast.functions.len());
     let mut found = false;
     let mut visit = |body: &[Stmt]| {
-        let mut body = body.to_vec();
-        cyallo_ast::visit::visit_block(&mut body,&mut |e|{found|=matches!(e.kind,ExprKind::ManagedNew(..)|ExprKind::ObjectLiteral(..)) || matches!(&e.kind,ExprKind::IntrinsicCall(id,..) if Intrinsic::from_id(*id)==Some(Intrinsic::RcTryNewIn));Ok(())},&mut |_,_|Ok(())).expect("infallible tracing traversal");
+        // Read-only: bodies are inspected in place, never copied.
+        cyallo_ast::visit::inspect_block(
+            body,
+            &mut |e| {
+                found |= matches!(
+                    e.kind,
+                    ExprKind::ManagedNew(..) | ExprKind::ObjectLiteral(..)
+                ) || matches!(&e.kind, ExprKind::IntrinsicCall(id, ..) if Intrinsic::from_id(*id) == Some(Intrinsic::RcTryNewIn));
+            },
+            &mut |_, _| {},
+        );
     };
     visit(&ast.body);
     for f in &ast.functions {
