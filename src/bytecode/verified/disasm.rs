@@ -123,6 +123,10 @@ impl fmt::Display for VerifiedModule {
                     RegisterType::Object(id) => write!(f, "  r{index}: dyn trait{}", id.0)?,
                     RegisterType::Path => write!(f, "  r{index}: path")?,
                     RegisterType::Allocation => write!(f, "  r{index}: allocation")?,
+                    RegisterType::Sender(id) => write!(f, "  r{index}: sender managed{}", id.0)?,
+                    RegisterType::Receiver(id) => {
+                        write!(f, "  r{index}: receiver managed{}", id.0)?
+                    }
                     RegisterType::Generator(id) => write!(f, "  r{index}: generator sig{}", id.0)?,
                     RegisterType::Location(id) => {
                         write!(f, "  r{index}: location managed{}", id.0)?
@@ -317,6 +321,36 @@ impl fmt::Display for VerifiedModule {
                         write_list(f, &function.lists()[list.index()])?;
                     }
                     Instruction::ToText(dst, src) => write!(f, "r{} = to.text r{}", dst.0, src.0)?,
+                    Instruction::ChannelBounded(dst, capacity) => {
+                        write!(f, "r{} = channel.bounded r{}", dst.0, capacity.0)?
+                    }
+                    Instruction::ChannelUnbounded(dst) => {
+                        write!(f, "r{} = channel.unbounded", dst.0)?
+                    }
+                    Instruction::ChannelClone(dst, end) => {
+                        write!(f, "r{} = channel.clone r{}", dst.0, end.0)?
+                    }
+                    Instruction::ChannelClose(end) => write!(f, "channel.close r{}", end.0)?,
+                    Instruction::ChannelIsClosed(dst, end) => {
+                        write!(f, "r{} = channel.is_closed r{}", dst.0, end.0)?
+                    }
+                    Instruction::ChannelSend(dst, list, _) => {
+                        write!(f, "r{} = channel.send", dst.0)?;
+                        write_list(f, &function.lists()[list.index()])?;
+                    }
+                    Instruction::ChannelTrySend(dst, list, _) => {
+                        write!(f, "r{} = channel.try_send", dst.0)?;
+                        write_list(f, &function.lists()[list.index()])?;
+                    }
+                    Instruction::ChannelReceive(dst, end, _) => {
+                        write!(f, "r{} = channel.recv r{}", dst.0, end.0)?
+                    }
+                    Instruction::ChannelTryReceive(dst, end, _) => {
+                        write!(f, "r{} = channel.try_recv r{}", dst.0, end.0)?
+                    }
+                    Instruction::SendErrorValue(dst, error) => {
+                        write!(f, "r{} = send_error.value r{}", dst.0, error.0)?
+                    }
                     Instruction::Yield(dst, value) => write!(f, "r{} = yield r{}", dst.0, value.0)?,
                     Instruction::GeneratorStart(dst, generator) => {
                         write!(f, "r{} = generator.start r{}", dst.0, generator.0)?
@@ -485,6 +519,9 @@ impl fmt::Display for VerifiedModule {
                     Instruction::EnumPayload(dst, src, variant) => {
                         write!(f, "r{} = enum.payload r{}, #{variant}", dst.0, src.0)?;
                     }
+                    Instruction::EnumExpect(src, variant) => {
+                        write!(f, "enum.expect r{}, #{variant}", src.0)?;
+                    }
                     Instruction::Trap => f.write_str("trap")?,
                 }
                 writeln!(f, "  [{}..{}]", span.start, span.end)?;
@@ -525,6 +562,8 @@ fn value_name(ty: ValueType) -> String {
         ValueType::Path => "path".to_owned(),
         ValueType::Allocation => "allocation".to_owned(),
         ValueType::Generator(id) => format!("generator sig{}", id.0),
+        ValueType::Sender(id) => format!("sender managed{}", id.0),
+        ValueType::Receiver(id) => format!("receiver managed{}", id.0),
         ValueType::Location(id) => format!("location managed{}", id.0),
         ValueType::Rc(managed) => format!("rc m{}", managed.0),
         ValueType::Weak(managed) => format!("weak m{}", managed.0),

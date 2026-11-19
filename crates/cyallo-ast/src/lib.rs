@@ -124,6 +124,11 @@ opaque_traits! {
     14 collection with_collection "An indexable sequence of its single argument: `v[i]`, `len`, slices, `for`.";
     15 double_ended with_double_ended "A collection that also grows and shrinks at the front.";
     16 location with_location "A retained reference to a field of a traced record: `load` and `store` through it.";
+    17 sender with_sender "The sending end of a channel over its single argument.";
+    18 receiver with_receiver "The receiving end of a channel over its single argument.";
+    19 task with_task "A spawned task whose result is its single argument.";
+    20 task_outcome with_task_outcome "How a task ended; its single argument is the result of a completed one.";
+    21 clock with_clock "A capability to sleep.";
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {

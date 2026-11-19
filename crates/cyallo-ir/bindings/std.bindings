@@ -21,7 +21,7 @@ std::channel::ReceiveError::Closed receive_closed_variant
 std::channel::ReceiveError::Empty receive_empty_variant
 std::channel::ReceiveError::is_closed receive_error_closed
 std::channel::ReceiveError::is_empty receive_error_empty
-std::channel::Receiver opaque:transfer,effectful,clone,resource
+std::channel::Receiver opaque:transfer,effectful,clone,resource,receiver
 std::channel::Receiver::clone channel_clone
 std::channel::Receiver::close channel_close
 std::channel::Receiver::is_closed channel_is_closed
@@ -35,7 +35,7 @@ std::channel::SendError::into_value send_error_value
 std::channel::SendError::is_closed send_error_closed
 std::channel::SendError::is_full send_error_full
 std::channel::SendError::is_limit send_error_limit
-std::channel::Sender opaque:transfer,effectful,clone,resource
+std::channel::Sender opaque:transfer,effectful,clone,resource,sender
 std::channel::Sender::clone channel_clone
 std::channel::Sender::close channel_close
 std::channel::Sender::is_closed channel_is_closed
@@ -205,11 +205,11 @@ std::string::replace string_replace
 std::string::starts_with string_starts_with
 std::string::trim string_trim
 std::string::upper string_upper
-std::task::Task opaque:effectful,resource
+std::task::Task opaque:effectful,resource,task
 std::task::Task::cancel task_cancel
 std::task::Task::is_finished task_is_finished
 std::task::Task::join task_join
-std::task::TaskOutcome opaque:clone
+std::task::TaskOutcome opaque:clone,task_outcome
 std::task::TaskOutcome::completed task_completed
 std::task::TaskOutcome::is_cancelled task_is_cancelled
 std::task::TaskOutcome::is_completed task_is_completed
@@ -217,7 +217,7 @@ std::task::TaskOutcome::is_failed task_is_failed
 std::task::TaskOutcome::is_stopped task_is_stopped
 std::task::Transferable transferable_trait
 std::task::spawn task_spawn
-std::time::Clock opaque:transfer,effectful,clone,resource
+std::time::Clock opaque:transfer,effectful,clone,resource,clock
 std::time::Clock::clone clock_clone
 std::time::Clock::sleep clock_sleep
 std::time::clock clock_new

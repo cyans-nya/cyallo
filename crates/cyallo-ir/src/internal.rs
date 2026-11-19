@@ -169,7 +169,7 @@ pub enum InternalSemantic {
 }
 
 /// `opaque` or `opaque:flag,flag`: a host type with no engine-known identity. Flags:
-/// `copy`, `transfer`, `effectful`, `clone`, `resource`, `indirect`, `generator`, `weak`, `deref`, `target`, `path`, `layout`, `allocation`, `collection`, `double_ended`, `location`.
+/// `copy`, `transfer`, `effectful`, `clone`, `resource`, `indirect`, `generator`, `weak`, `deref`, `target`, `path`, `layout`, `allocation`, `collection`, `double_ended`, `location`, `sender`, `receiver`, `task`, `task_outcome`, `clock`.
 fn opaque_key(key: &str) -> Option<cyallo_ast::OpaqueTraits> {
     let flags = match key {
         "opaque" => "",
@@ -194,6 +194,11 @@ fn opaque_key(key: &str) -> Option<cyallo_ast::OpaqueTraits> {
             "collection" => traits = traits.with_collection(true),
             "double_ended" => traits = traits.with_double_ended(true),
             "location" => traits = traits.with_location(true),
+            "sender" => traits = traits.with_sender(true),
+            "receiver" => traits = traits.with_receiver(true),
+            "task" => traits = traits.with_task(true),
+            "task_outcome" => traits = traits.with_task_outcome(true),
+            "clock" => traits = traits.with_clock(true),
             _ => return None,
         }
     }

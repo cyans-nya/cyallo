@@ -33,12 +33,12 @@ pub use run::{
 };
 pub use sdk::SdkCompileError;
 
-/// Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 27 adds channels. Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 26;
+pub const FORMAT_VERSION: u32 = 27;
 
 macro_rules! index {
     ($name:ident) => {
@@ -108,6 +108,13 @@ pub enum ValueType {
     /// yields and what a resume passes in, the result is what it returns.
     /// The generator owns its frame, so it is released with its owner.
     Generator(SignatureId),
+    /// The sending end of a channel. The managed type is the element type.
+    /// Ends are counted: releasing the last sender closes the channel for
+    /// receivers once the queue drains, and releasing the last receiver
+    /// closes it and discards the queue.
+    Sender(ManagedId),
+    /// The receiving end of a channel. The managed type is the element type.
+    Receiver(ManagedId),
 }
 
 /// A method a trait declares: what its receiver may do and its other types.
@@ -168,7 +175,9 @@ impl ValueType {
             | Self::Path
             | Self::Location(_)
             | Self::Allocation
-            | Self::Generator(_) => None,
+            | Self::Generator(_)
+            | Self::Sender(_)
+            | Self::Receiver(_) => None,
         }
     }
 }
@@ -276,6 +285,10 @@ pub enum RegisterType {
     Allocation,
     /// A suspended routine.
     Generator(SignatureId),
+    /// The sending end of a channel.
+    Sender(ManagedId),
+    /// The receiving end of a channel.
+    Receiver(ManagedId),
     /// A closure that captured loans. It behaves like a loan on their root:
     /// the root stays live and borrowed while it lives, and the value cannot
     /// be stored, passed or returned by value.
@@ -309,6 +322,8 @@ impl From<ValueType> for RegisterType {
             ValueType::Location(managed) => Self::Location(managed),
             ValueType::Allocation => Self::Allocation,
             ValueType::Generator(signature) => Self::Generator(signature),
+            ValueType::Sender(managed) => Self::Sender(managed),
+            ValueType::Receiver(managed) => Self::Receiver(managed),
         }
     }
 }
@@ -347,6 +362,8 @@ impl RegisterType {
             Self::Location(managed) => ValueType::Location(managed),
             Self::Allocation => ValueType::Allocation,
             Self::Generator(signature) => ValueType::Generator(signature),
+            Self::Sender(managed) => ValueType::Sender(managed),
+            Self::Receiver(managed) => ValueType::Receiver(managed),
             _ => return None,
         })
     }
@@ -487,6 +504,45 @@ pub enum TextFailure {
     RangeOutOfBounds,
 }
 
+/// Where the variants a channel operation builds sit in its result type, packed
+/// at lowering from the declared encodings: result ok and error, then for a
+/// send error the closed, full and limit variants, and for a receive error the
+/// closed and empty variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelVariants(pub u32);
+
+impl ChannelVariants {
+    const WIDTH: u32 = 6;
+
+    pub fn pack(fields: [u32; 5]) -> Option<Self> {
+        let mut packed = 0;
+        for (index, field) in fields.into_iter().enumerate() {
+            if field >= 1 << Self::WIDTH {
+                return None;
+            }
+            packed |= field << (index as u32 * Self::WIDTH);
+        }
+        Some(Self(packed))
+    }
+
+    pub fn field(self, index: usize) -> u32 {
+        (self.0 >> (index as u32 * Self::WIDTH)) & ((1 << Self::WIDTH) - 1)
+    }
+
+    pub fn ok(self) -> u32 {
+        self.field(0)
+    }
+
+    pub fn err(self) -> u32 {
+        self.field(1)
+    }
+
+    /// The first, second and third variants of the error type.
+    pub fn failure(self, index: usize) -> u32 {
+        self.field(2 + index)
+    }
+}
+
 /// What one line of input becomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputKind {
@@ -617,6 +673,29 @@ pub enum Instruction {
     /// space. The result is a two-variant enum: one carries the integer, the
     /// other a payload-free error.
     ParseInteger(Register, Register),
+    /// A channel that holds up to the capacity; the result pairs its sender
+    /// with its receiver.
+    ChannelBounded(Register, Register),
+    /// A channel without a capacity limit.
+    ChannelUnbounded(Register),
+    /// Another end of the same channel.
+    ChannelClone(Register, Register),
+    /// Close the channel from either end: sends fail from now on, and a
+    /// closing receiver discards what is queued.
+    ChannelClose(Register),
+    ChannelIsClosed(Register, Register),
+    /// Send, waiting while the channel is full. Operands: the sender and the
+    /// value. The result is a result of unit or a send error carrying the value
+    /// back.
+    ChannelSend(Register, OperandListId, ChannelVariants),
+    /// Send without waiting.
+    ChannelTrySend(Register, OperandListId, ChannelVariants),
+    /// Receive, waiting while the channel is empty and open.
+    ChannelReceive(Register, Register, ChannelVariants),
+    /// Receive without waiting.
+    ChannelTryReceive(Register, Register, ChannelVariants),
+    /// The value a send error carries, whichever failure it reports.
+    SendErrorValue(Register, Register),
     /// Suspend the generator whose body this is, handing the value to whoever
     /// resumed it. The destination receives the value passed to the next
     /// resume.
@@ -711,6 +790,8 @@ pub enum Instruction {
     EnumIs(Register, Register, u32),
     /// Copy out the payload of the variant. Fails on any other variant.
     EnumPayload(Register, Register, u32),
+    /// Fail unless the enum holds this variant, for a payload nobody reads.
+    EnumExpect(Register, u32),
     TextConstant(Register, TextId),
     TextConcat(Register, Register, Register),
     TextCompare(TextOp, Register, Register, Register),
@@ -825,6 +906,18 @@ impl Instruction {
             }
             WriteLoan(loan, value) => ([Some(loan), Some(value)], &[], None),
             Input(dst, _) | PathMissing(dst) => ([None, None], &[], Some(dst)),
+            ChannelBounded(dst, capacity) => ([Some(capacity), None], &[], Some(dst)),
+            ChannelUnbounded(dst) => ([None, None], &[], Some(dst)),
+            ChannelClone(dst, end) | ChannelIsClosed(dst, end) | SendErrorValue(dst, end) => {
+                ([Some(end), None], &[], Some(dst))
+            }
+            ChannelClose(end) => ([Some(end), None], &[], None),
+            ChannelSend(dst, list, _) | ChannelTrySend(dst, list, _) => {
+                ([None, None], &lists[list.index()], Some(dst))
+            }
+            ChannelReceive(dst, end, _) | ChannelTryReceive(dst, end, _) => {
+                ([Some(end), None], &[], Some(dst))
+            }
             Yield(dst, value) => ([Some(value), None], &[], Some(dst)),
             GeneratorStart(dst, generator)
             | GeneratorNext(dst, generator)
@@ -911,6 +1004,7 @@ impl Instruction {
             }
             Closure(dst, _, list) => ([None, None], &lists[list.index()], Some(dst)),
             Tuple(dst, list) => ([None, None], &lists[list.index()], Some(dst)),
+            EnumExpect(src, _) => ([Some(src), None], &[], None),
             Extract(dst, src, _) | EnumIs(dst, src, _) | EnumPayload(dst, src, _) => {
                 ([Some(src), None], &[], Some(dst))
             }
@@ -1165,6 +1259,8 @@ impl VerifiedFunction {
             RegisterType::Location(managed) => Ok(ValueType::Location(managed)),
             RegisterType::Allocation => Ok(ValueType::Allocation),
             RegisterType::Generator(signature) => Ok(ValueType::Generator(signature)),
+            RegisterType::Sender(managed) => Ok(ValueType::Sender(managed)),
+            RegisterType::Receiver(managed) => Ok(ValueType::Receiver(managed)),
             RegisterType::BorrowingFunction { .. } => {
                 Err(InvalidBytecode::EscapingBorrow(register))
             }
@@ -1230,6 +1326,108 @@ impl VerifiedFunction {
             Ok((1, 0))
         } else {
             Err(InvalidBytecode::ExpectedEnum(register))
+        }
+    }
+
+    /// The register holds a channel's sender and receiver of one element type.
+    fn channel_pair(&self, register: Register) -> Result<(), InvalidBytecode> {
+        let ValueType::Composite(shape) = self.value_type(register)? else {
+            return Err(InvalidBytecode::ExpectedTuple(register));
+        };
+        match self.shape(shape)? {
+            Shape::Tuple(ends)
+                if matches!(
+                    **ends,
+                    [ValueType::Sender(sender), ValueType::Receiver(receiver)] if sender == receiver
+                ) =>
+            {
+                Ok(())
+            }
+            _ => Err(InvalidBytecode::ExpectedChannelEnd(register)),
+        }
+    }
+
+    /// Whether the register holds (or loans) a sender, and the element type.
+    fn channel_end(&self, register: Register) -> Result<(bool, ValueType), InvalidBytecode> {
+        let (is_sender, managed) = match self.through(register)? {
+            ValueType::Sender(managed) => (true, managed),
+            ValueType::Receiver(managed) => (false, managed),
+            _ => return Err(InvalidBytecode::ExpectedChannelEnd(register)),
+        };
+        let element = self
+            .managed
+            .get(managed.index())
+            .copied()
+            .ok_or(InvalidBytecode::UnknownManaged(managed))?;
+        Ok((is_sender, element))
+    }
+
+    fn is_unit(&self, ty: Option<ValueType>) -> bool {
+        matches!(ty, Some(ValueType::Composite(shape))
+            if matches!(self.shapes.get(shape.index()), Some(Shape::Tuple(f)) if f.is_empty()))
+    }
+
+    /// The result of a send: unit, or a send error that carries the element.
+    fn send_result(
+        &self,
+        register: Register,
+        element: ValueType,
+        v: ChannelVariants,
+    ) -> Result<(), InvalidBytecode> {
+        let bad = || InvalidBytecode::ExpectedEnum(register);
+        let variants = self.enum_variants(register)?;
+        let (ok, err) = (v.ok() as usize, v.err() as usize);
+        if variants.len() != 2 || ok > 1 || err > 1 || ok == err || !self.is_unit(variants[ok]) {
+            return Err(bad());
+        }
+        let Some(ValueType::Composite(failure)) = variants[err] else {
+            return Err(bad());
+        };
+        let Shape::Enum(kinds) = self.shape(failure)? else {
+            return Err(bad());
+        };
+        let distinct = |a: u32, b: u32| a != b;
+        let in_range = (0..3).all(|i| (v.failure(i) as usize) < kinds.len());
+        if kinds.len() != 3
+            || !in_range
+            || !(distinct(v.failure(0), v.failure(1))
+                && distinct(v.failure(0), v.failure(2))
+                && distinct(v.failure(1), v.failure(2)))
+            || !kinds.iter().all(|payload| *payload == Some(element))
+        {
+            return Err(bad());
+        }
+        Ok(())
+    }
+
+    /// The result of a receive: the element, or a receive error with two unit
+    /// variants.
+    fn receive_result(
+        &self,
+        register: Register,
+        element: ValueType,
+        v: ChannelVariants,
+    ) -> Result<(), InvalidBytecode> {
+        let bad = || InvalidBytecode::ExpectedEnum(register);
+        let variants = self.enum_variants(register)?;
+        let (ok, err) = (v.ok() as usize, v.err() as usize);
+        if variants.len() != 2 || ok > 1 || err > 1 || ok == err || variants[ok] != Some(element) {
+            return Err(bad());
+        }
+        let Some(ValueType::Composite(failure)) = variants[err] else {
+            return Err(bad());
+        };
+        match self.shape(failure)? {
+            Shape::Enum(kinds)
+                if kinds.len() == 2
+                    && kinds.iter().all(Option::is_none)
+                    && (v.failure(0) as usize) < 2
+                    && (v.failure(1) as usize) < 2
+                    && v.failure(0) != v.failure(1) =>
+            {
+                Ok(())
+            }
+            _ => Err(bad()),
         }
     }
 
@@ -1614,6 +1812,7 @@ pub enum InvalidBytecode {
         value: u32,
     },
     ExpectedGenerator(Register),
+    ExpectedChannelEnd(Register),
     YieldOutsideGenerator,
     InvalidInputKind {
         word: usize,
@@ -1791,6 +1990,8 @@ impl ModuleImage {
                     | ValueType::Rc(managed)
                     | ValueType::Weak(managed)
                     | ValueType::Location(managed)
+                    | ValueType::Sender(managed)
+                    | ValueType::Receiver(managed)
                         if managed.index() >= self.managed.len() =>
                     {
                         return Err(image_error(InvalidBytecode::UnknownManaged(managed)));
@@ -2062,7 +2263,9 @@ impl VerifiedFunction {
             if let RegisterType::Gc(managed)
             | RegisterType::Rc(managed)
             | RegisterType::Weak(managed)
-            | RegisterType::Location(managed) = kind
+            | RegisterType::Location(managed)
+            | RegisterType::Sender(managed)
+            | RegisterType::Receiver(managed) = kind
                 && self.managed.get(managed.index()).is_none()
             {
                 return Err(error(None, InvalidBytecode::UnknownManaged(managed)));
@@ -2098,7 +2301,9 @@ impl VerifiedFunction {
                 | RegisterType::Weak(_)
                 | RegisterType::Path
                 | RegisterType::Location(_)
-                | RegisterType::Allocation => {}
+                | RegisterType::Allocation
+                | RegisterType::Sender(_)
+                | RegisterType::Receiver(_) => {}
                 RegisterType::Loan {
                     origin: LoanOrigin::Parameter { register: origin },
                     ..
@@ -2406,6 +2611,12 @@ impl VerifiedFunction {
                 RegisterType::Generator(signature) => {
                     self.require_value(arg, ValueType::Generator(signature))?
                 }
+                RegisterType::Sender(managed) => {
+                    self.require_value(arg, ValueType::Sender(managed))?
+                }
+                RegisterType::Receiver(managed) => {
+                    self.require_value(arg, ValueType::Receiver(managed))?
+                }
                 RegisterType::Weak(managed) => self.require_value(arg, ValueType::Weak(managed))?,
                 RegisterType::Composite(shape) => {
                     self.require_value(arg, ValueType::Composite(shape))?;
@@ -2680,6 +2891,59 @@ impl VerifiedFunction {
                     self.register_type(src)?;
                 }
                 self.require_text(dst)
+            }
+            Instruction::ChannelBounded(dst, capacity) => {
+                self.require_type(capacity, ScalarType::U64)?;
+                self.channel_pair(dst)
+            }
+            Instruction::ChannelUnbounded(dst) => self.channel_pair(dst),
+            Instruction::ChannelClone(dst, end) => {
+                self.channel_end(end)?;
+                self.require_value(dst, self.through(end)?)
+            }
+            Instruction::ChannelClose(end) => self.channel_end(end).map(|_| ()),
+            Instruction::ChannelIsClosed(dst, end) => {
+                self.channel_end(end)?;
+                self.require_type(dst, ScalarType::Bool)
+            }
+            Instruction::ChannelSend(dst, list, variants)
+            | Instruction::ChannelTrySend(dst, list, variants) => {
+                let &[sender, value] = self.operand_list(list)? else {
+                    return Err(InvalidBytecode::ArgumentCount {
+                        expected: 2,
+                        actual: self.operand_list(list)?.len(),
+                    });
+                };
+                let (is_sender, element) = self.channel_end(sender)?;
+                if !is_sender {
+                    return Err(InvalidBytecode::ExpectedChannelEnd(sender));
+                }
+                self.require_value(value, element)?;
+                self.send_result(dst, element, variants)
+            }
+            Instruction::ChannelReceive(dst, end, variants)
+            | Instruction::ChannelTryReceive(dst, end, variants) => {
+                let (is_sender, element) = self.channel_end(end)?;
+                if is_sender {
+                    return Err(InvalidBytecode::ExpectedChannelEnd(end));
+                }
+                self.receive_result(dst, element, variants)
+            }
+            Instruction::SendErrorValue(dst, error) => {
+                let ValueType::Composite(shape) = self.through(error)? else {
+                    return Err(InvalidBytecode::ExpectedEnum(error));
+                };
+                match self.shape(shape)? {
+                    Shape::Enum(variants)
+                        if !variants.is_empty()
+                            && variants.iter().all(|payload| payload.is_some())
+                            && variants.windows(2).all(|pair| pair[0] == pair[1]) =>
+                    {
+                        let payload = variants[0].unwrap_or(ValueType::Path);
+                        self.require_value(dst, payload)
+                    }
+                    _ => Err(InvalidBytecode::ExpectedEnum(error)),
+                }
             }
             Instruction::Yield(dst, value) => {
                 let Some(id) = self.generator else {
@@ -3055,6 +3319,15 @@ impl VerifiedFunction {
                     });
                 };
                 self.require_value(dst, ty)
+            }
+            Instruction::EnumExpect(src, variant) => {
+                if self.variant_payload(src, variant).is_err() {
+                    return Err(InvalidBytecode::UnknownVariant {
+                        register: src,
+                        variant,
+                    });
+                }
+                Ok(())
             }
             Instruction::EnumPayload(dst, src, variant) => {
                 let Some(ty) = self.variant_payload(src, variant)? else {

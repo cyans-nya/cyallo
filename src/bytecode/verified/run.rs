@@ -97,6 +97,19 @@ pub enum RunError {
         instruction: InstructionId,
         span: Span,
     },
+    /// Every task is waiting for another, or a lone task waits for a channel
+    /// nobody can serve.
+    Deadlock {
+        function: FunctionId,
+        instruction: InstructionId,
+        span: Span,
+    },
+    /// The channel table is full.
+    ChannelLimit {
+        function: FunctionId,
+        instruction: InstructionId,
+        span: Span,
+    },
     /// A generator was advanced in a state that does not allow it.
     Generator {
         function: FunctionId,
@@ -233,6 +246,10 @@ impl fmt::Display for RunError {
                 "division by zero in function {} at instruction {}",
                 function.0, instruction.0
             ),
+            Self::Deadlock { .. } => {
+                f.write_str("deadlock: the task waits for a channel that no other task can serve")
+            }
+            Self::ChannelLimit { .. } => f.write_str("channel limit exceeded"),
             Self::Generator { fault, .. } => f.write_str(match fault {
                 GeneratorFault::Finished => "cannot resume a completed or closed generator",
                 GeneratorFault::AlreadyRunning => "generator is already running",
@@ -415,6 +432,10 @@ enum FrameValue {
     /// The generator at this index of the generator table. Its owner releases
     /// it, and the suspended frame it holds is a root for the collector.
     Generator(usize),
+    /// The sending end of the channel at this index of the channel table.
+    Sender(usize),
+    /// The receiving end of the channel at this index.
+    Receiver(usize),
     /// A retained reference to a field of a heap record: a place rooted in a
     /// heap object, which the collector keeps alive.
     Location(BorrowedPlace),
@@ -568,7 +589,34 @@ struct Memory {
     /// Generators, by index. A released generator leaves a hole.
     generators: Vec<Option<GeneratorSlot>>,
     free_generators: Vec<usize>,
+    /// Channels, by index. A channel with no ends left leaves a hole.
+    channels: Vec<Option<Channel>>,
+    free_channels: Vec<usize>,
 }
+
+/// A channel: a queue, a capacity and counted ends.
+#[derive(Debug)]
+struct Channel {
+    capacity: Option<usize>,
+    closed: bool,
+    queue: VecDeque<FrameValue>,
+    senders: usize,
+    receivers: usize,
+    /// Receivers parked on an empty queue. A rendezvous send may hand its value
+    /// to one of them even though the channel has no buffer.
+    waiting: usize,
+}
+
+impl Channel {
+    /// Whether a send finds room: space in the buffer, or a receiver waiting.
+    fn has_room(&self) -> bool {
+        self.capacity
+            .is_none_or(|capacity| self.queue.len() < capacity + self.waiting)
+    }
+}
+
+/// More channels than this exhaust the table.
+const MAX_CHANNELS: usize = 1 << 20;
 
 /// Where a generator is in its life.
 #[derive(Debug, Clone, Copy)]
@@ -627,6 +675,8 @@ impl Memory {
             allocations: 0,
             generators: Vec::new(),
             free_generators: Vec::new(),
+            channels: Vec::new(),
+            free_channels: Vec::new(),
         }
     }
 
@@ -683,6 +733,25 @@ impl Memory {
                     self.block(index).weak -= 1;
                     self.free_if_unused(index);
                 }
+                FrameValue::Sender(index) => {
+                    let channel = self.channel(index);
+                    channel.senders -= 1;
+                    if channel.senders == 0 {
+                        // Receivers still drain what was queued.
+                        channel.closed = true;
+                    }
+                    self.free_channel_if_unused(index);
+                }
+                FrameValue::Receiver(index) => {
+                    let channel = self.channel(index);
+                    channel.receivers -= 1;
+                    if channel.receivers == 0 {
+                        // Nobody is left to read what was queued.
+                        channel.closed = true;
+                        pending.extend(channel.queue.drain(..));
+                    }
+                    self.free_channel_if_unused(index);
+                }
                 FrameValue::Generator(index) => {
                     self.close_generator(index);
                     self.generators[index] = None;
@@ -718,6 +787,43 @@ impl Memory {
         if block.strong == 0 && block.weak == 0 && !block.finalizing {
             self.counted[index] = None;
             self.free_counted.push(index);
+        }
+    }
+
+    /// A new channel with one sender and one receiver, `None` when the table
+    /// is full.
+    fn new_channel(&mut self, capacity: Option<usize>) -> Option<usize> {
+        let channel = Channel {
+            capacity,
+            closed: false,
+            queue: VecDeque::new(),
+            senders: 1,
+            receivers: 1,
+            waiting: 0,
+        };
+        if let Some(index) = self.free_channels.pop() {
+            self.channels[index] = Some(channel);
+            Some(index)
+        } else if self.channels.len() < MAX_CHANNELS {
+            self.channels.push(Some(channel));
+            Some(self.channels.len() - 1)
+        } else {
+            None
+        }
+    }
+
+    fn channel(&mut self, index: usize) -> &mut Channel {
+        match self.channels[index].as_mut() {
+            Some(channel) => channel,
+            None => unreachable!("a value refers to a released channel"),
+        }
+    }
+
+    fn free_channel_if_unused(&mut self, index: usize) {
+        let channel = self.channel(index);
+        if channel.senders == 0 && channel.receivers == 0 {
+            self.channels[index] = None;
+            self.free_channels.push(index);
         }
     }
 
@@ -779,6 +885,14 @@ impl Memory {
             FrameValue::Weak(block) => {
                 self.block(*block).weak += 1;
                 FrameValue::Weak(*block)
+            }
+            FrameValue::Sender(index) => {
+                self.channel(*index).senders += 1;
+                FrameValue::Sender(*index)
+            }
+            FrameValue::Receiver(index) => {
+                self.channel(*index).receivers += 1;
+                FrameValue::Receiver(*index)
             }
             FrameValue::Composite(Composite::Tuple(fields)) => FrameValue::Composite(
                 Composite::Tuple(fields.iter().map(|field| self.clone_value(field)).collect()),
@@ -844,6 +958,12 @@ impl Memory {
                     .filter_map(|slot| slot.frame.as_ref())
                     .flat_map(|frame| frame.slots.iter().flatten()),
             )
+            .chain(
+                self.channels
+                    .iter()
+                    .flatten()
+                    .flat_map(|channel| channel.queue.iter()),
+            )
         {
             trace(value, &mut marks, &mut pending);
         }
@@ -895,6 +1015,8 @@ fn trace(value: &FrameValue, marks: &mut [bool], pending: &mut Vec<usize>) {
             | FrameValue::Path(_)
             | FrameValue::Allocation(_)
             | FrameValue::Generator(_)
+            | FrameValue::Sender(_)
+            | FrameValue::Receiver(_)
             | FrameValue::Rc(_)
             | FrameValue::Weak(_)
             | FrameValue::Moved => {}
@@ -1112,6 +1234,8 @@ impl Frame {
             | FrameValue::Location(_)
             | FrameValue::Allocation(_)
             | FrameValue::Generator(_)
+            | FrameValue::Sender(_)
+            | FrameValue::Receiver(_)
             | FrameValue::Moved => {
                 unreachable!("verified scalar operand")
             }
@@ -1133,6 +1257,8 @@ impl Frame {
             | FrameValue::Location(_)
             | FrameValue::Allocation(_)
             | FrameValue::Generator(_)
+            | FrameValue::Sender(_)
+            | FrameValue::Receiver(_)
             | FrameValue::Moved => {
                 unreachable!("verified loan operand")
             }
@@ -2370,6 +2496,159 @@ impl VerifiedModule {
                 let caller_layout = caller_body.frame_layout();
                 caller.set_value(caller_layout, resumer, step(1, returned));
             }
+            Instruction::ChannelBounded(dst, _) | Instruction::ChannelUnbounded(dst) => {
+                let capacity = match body.instructions[pc] {
+                    Instruction::ChannelBounded(_, capacity) => {
+                        let Scalar::U64(capacity) = frame.get(layout, capacity) else {
+                            unreachable!("verified capacity");
+                        };
+                        Some(usize::try_from(capacity).unwrap_or(usize::MAX))
+                    }
+                    _ => None,
+                };
+                let Some(id) = memory.new_channel(capacity) else {
+                    return Err(RunError::ChannelLimit {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    });
+                };
+                let ends =
+                    Composite::Tuple(Box::new([FrameValue::Sender(id), FrameValue::Receiver(id)]));
+                frame.set_value(layout, dst, FrameValue::Composite(ends));
+            }
+            Instruction::ChannelClone(dst, end) => {
+                let held = self
+                    .held_value(stack, memory, body, end)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let Some(end) = held else {
+                    unreachable!("verified channel end");
+                };
+                let copy = memory.clone_value(&end);
+                stack[depth - 1].set_value(layout, dst, copy);
+            }
+            Instruction::ChannelClose(end) | Instruction::ChannelIsClosed(_, end) => {
+                let held = self
+                    .held_value(stack, memory, body, end)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let (id, receiving) = match held {
+                    Some(FrameValue::Sender(id)) => (id, false),
+                    Some(FrameValue::Receiver(id)) => (id, true),
+                    _ => unreachable!("verified channel end"),
+                };
+                if let Instruction::ChannelIsClosed(dst, _) = body.instructions[pc] {
+                    let closed = memory.channel(id).closed;
+                    stack[depth - 1].set_value(
+                        layout,
+                        dst,
+                        FrameValue::Scalar(Scalar::Bool(closed)),
+                    );
+                } else {
+                    let channel = memory.channel(id);
+                    channel.closed = true;
+                    if receiving {
+                        let discarded: Vec<_> = channel.queue.drain(..).collect();
+                        for value in discarded {
+                            memory.drop_value(value);
+                        }
+                    }
+                }
+            }
+            Instruction::ChannelSend(dst, list, variants)
+            | Instruction::ChannelTrySend(dst, list, variants) => {
+                let &[sender, value] = &*body.lists[list.index()] else {
+                    unreachable!("verified send operands");
+                };
+                let held = self
+                    .held_value(stack, memory, body, sender)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let Some(FrameValue::Sender(id)) = held else {
+                    unreachable!("verified sender");
+                };
+                let value = stack[depth - 1].value(layout, value);
+                let blocking = matches!(body.instructions[pc], Instruction::ChannelSend(..));
+                let channel = memory.channel(id);
+                let outcome = if channel.closed {
+                    Some(variants.failure(0))
+                } else if channel.has_room() {
+                    None
+                } else if blocking {
+                    return Err(RunError::Deadlock {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    });
+                } else {
+                    Some(variants.failure(1))
+                };
+                let result = match outcome {
+                    None => {
+                        channel.queue.push_back(value);
+                        Composite::Enum {
+                            variant: variants.ok(),
+                            payload: Some(Box::new(unit())),
+                        }
+                    }
+                    Some(failure) => Composite::Enum {
+                        variant: variants.err(),
+                        payload: Some(Box::new(FrameValue::Composite(Composite::Enum {
+                            variant: failure,
+                            payload: Some(Box::new(value)),
+                        }))),
+                    },
+                };
+                stack[depth - 1].set_value(layout, dst, FrameValue::Composite(result));
+            }
+            Instruction::ChannelReceive(dst, end, variants)
+            | Instruction::ChannelTryReceive(dst, end, variants) => {
+                let held = self
+                    .held_value(stack, memory, body, end)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let Some(FrameValue::Receiver(id)) = held else {
+                    unreachable!("verified receiver");
+                };
+                let blocking = matches!(body.instructions[pc], Instruction::ChannelReceive(..));
+                let channel = memory.channel(id);
+                let result = if let Some(value) = channel.queue.pop_front() {
+                    Composite::Enum {
+                        variant: variants.ok(),
+                        payload: Some(Box::new(value)),
+                    }
+                } else if channel.closed || !blocking {
+                    let failure = if channel.closed {
+                        variants.failure(0)
+                    } else {
+                        variants.failure(1)
+                    };
+                    Composite::Enum {
+                        variant: variants.err(),
+                        payload: Some(Box::new(FrameValue::Composite(Composite::Enum {
+                            variant: failure,
+                            payload: None,
+                        }))),
+                    }
+                } else {
+                    return Err(RunError::Deadlock {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    });
+                };
+                stack[depth - 1].set_value(layout, dst, FrameValue::Composite(result));
+            }
+            Instruction::SendErrorValue(dst, error) => {
+                let held = self
+                    .held_value(stack, memory, body, error)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let Some(FrameValue::Composite(Composite::Enum {
+                    payload: Some(payload),
+                    ..
+                })) = held
+                else {
+                    unreachable!("verified send error");
+                };
+                stack[depth - 1].set_value(layout, dst, *payload);
+            }
             Instruction::Yield(dst, value) => {
                 let Some((id, resumer)) = frame.generator.take() else {
                     unreachable!("verified yield inside a generator");
@@ -2599,6 +2878,18 @@ impl VerifiedModule {
                     *held == variant
                 };
                 stack[depth - 1].set(layout, dst, Scalar::Bool(is));
+            }
+            Instruction::EnumExpect(src, variant) => {
+                let Composite::Enum { variant: held, .. } = frame.composite(layout, src) else {
+                    unreachable!("verified enum operand");
+                };
+                if *held != variant {
+                    return Err(RunError::EnumVariant {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    });
+                }
             }
             Instruction::EnumPayload(dst, src, variant) => {
                 let Composite::Enum {
@@ -3269,6 +3560,11 @@ fn read_input(line: &str, kind: InputKind) -> Option<FrameValue> {
     })
 }
 
+/// The unit value: a tuple without fields.
+fn unit() -> FrameValue {
+    FrameValue::Composite(Composite::Tuple(Box::new([])))
+}
+
 /// A step of a generator: the yielded value in variant 0, the returned
 /// value in variant 1.
 fn step(variant: u32, value: FrameValue) -> FrameValue {
@@ -3363,6 +3659,8 @@ fn spell(value: &FrameValue, style: TextStyle) -> String {
             | FrameValue::Location(_)
             | FrameValue::Allocation(_)
             | FrameValue::Generator(_)
+            | FrameValue::Sender(_)
+            | FrameValue::Receiver(_)
             | FrameValue::Moved,
         ) => unreachable!("verified text operand is a scalar or string"),
     }

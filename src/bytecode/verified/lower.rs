@@ -1,9 +1,9 @@
 use super::{
-    BooleanOp, CallSite, CallSiteId, CallTarget, Extremum, FORMAT_VERSION, FloatOp, FunctionId,
-    FunctionImage, HostBindingId, Implementation, ImplementationId, InputKind, Instruction,
-    InstructionId, IntegerOp, LoanAccess, ModuleImage, OperandListId, OutputId, OutputPiece,
-    OutputTemplate, Register, RegisterType, Scalar, ScalarHostBinding, ScalarType, TextId,
-    TextMapOp, TextOp, TextTestOp, TraitId, ValueType, VerifiedModule, VerifyError,
+    BooleanOp, CallSite, CallSiteId, CallTarget, ChannelVariants, Extremum, FORMAT_VERSION,
+    FloatOp, FunctionId, FunctionImage, HostBindingId, Implementation, ImplementationId, InputKind,
+    Instruction, InstructionId, IntegerOp, LoanAccess, ModuleImage, OperandListId, OutputId,
+    OutputPiece, OutputTemplate, Register, RegisterType, Scalar, ScalarHostBinding, ScalarType,
+    TextId, TextMapOp, TextOp, TextTestOp, TraitId, ValueType, VerifiedModule, VerifyError,
     cfg::{self, Block, Exit, Located, Statement},
     encode, layout, lifetimes,
     loans::Places,
@@ -13,8 +13,9 @@ use crate::{
     Diagnostic, Span, Type,
     ir::{Function, Op, Program, Routine},
 };
-use cyallo_ast::{ConstantValue, Literal, MemoryKind, NumberKind, Operator};
+use cyallo_ast::{ConstantValue, EnumEncoding, Literal, MemoryKind, NumberKind, Operator};
 use cyallo_ir::{
+    concurrent::Operation as ConcurrentOperation,
     enums::Projection,
     intrinsic::Intrinsic,
     lookup::{Operation, ResumeInput},
@@ -284,6 +285,157 @@ pub(super) fn lower_type(ty: &Type) -> Option<ScalarType> {
         Type::Boolean => Some(ScalarType::Bool),
         _ => None,
     }
+}
+
+fn is_channel_operation(operation: ConcurrentOperation) -> bool {
+    use ConcurrentOperation::*;
+    matches!(
+        operation,
+        Bounded
+            | Unbounded
+            | Clone
+            | Close
+            | IsClosed
+            | Send
+            | TrySend
+            | Receive
+            | TryReceive
+            | SendErrorValue
+            | SendErrorClosed
+            | SendErrorFull
+            | SendErrorLimit
+            | ReceiveErrorClosed
+            | ReceiveErrorEmpty
+    )
+}
+
+/// One channel operation. `None` when the operands have no verified form.
+fn lower_channel(
+    operation: ConcurrentOperation,
+    dst: usize,
+    args: &[usize],
+    operand: &dyn Fn(usize) -> Result<Register, LowerError>,
+    context: &Context<'_>,
+    sites: &mut Sites,
+    routine: usize,
+) -> Option<Result<Instruction, LowerError>> {
+    use ConcurrentOperation::*;
+    let places = context.places;
+    let register = |index| places.register(index);
+    let shape_of = |register: Register| match places.registers.get(register.index())? {
+        RegisterType::Composite(shape) => Some(*shape),
+        _ => None,
+    };
+    // The positions, in a result's error type, of the given encodings.
+    let variants_of = |result: Register, failures: [EnumEncoding; 3]| -> Option<ChannelVariants> {
+        let shape = shape_of(result)?;
+        let (ok, err) = context.shapes.result_variants(shape)?;
+        let ValueType::Composite(failure) = context.shapes.variant_payload(shape, err)? else {
+            return None;
+        };
+        let found = |encoding| context.shapes.variant_with(failure, encoding);
+        ChannelVariants::pack([
+            ok,
+            err,
+            found(failures[0])?,
+            found(failures[1])?,
+            found(failures[2]).unwrap_or(2),
+        ])
+    };
+    let mut build = || -> Result<Instruction, LowerError> {
+        Ok(match (operation, args) {
+            (Bounded, [capacity]) => {
+                Instruction::ChannelBounded(register(dst)?, register(*capacity)?)
+            }
+            (Unbounded, []) => Instruction::ChannelUnbounded(register(dst)?),
+            (Clone, [end]) => Instruction::ChannelClone(register(dst)?, operand(*end)?),
+            (Close, [end]) => Instruction::ChannelClose(operand(*end)?),
+            (IsClosed, [end]) => Instruction::ChannelIsClosed(register(dst)?, operand(*end)?),
+            (Send | TrySend, [sender, value]) => {
+                let result = register(dst)?;
+                let variants = variants_of(
+                    result,
+                    [
+                        EnumEncoding::SendClosed,
+                        EnumEncoding::SendFull,
+                        EnumEncoding::SendLimit,
+                    ],
+                )
+                .ok_or(LowerError::UnsupportedStorage {
+                    routine,
+                    detail: "a send result has no verified form".into(),
+                })?;
+                let list = new_list(
+                    routine,
+                    sites,
+                    [operand(*sender)?, register(*value)?].into_iter().map(Ok),
+                )?;
+                if matches!(operation, Send) {
+                    Instruction::ChannelSend(result, list, variants)
+                } else {
+                    Instruction::ChannelTrySend(result, list, variants)
+                }
+            }
+            (Receive | TryReceive, [end]) => {
+                let result = register(dst)?;
+                let variants = variants_of(
+                    result,
+                    [
+                        EnumEncoding::ReceiveClosed,
+                        EnumEncoding::ReceiveEmpty,
+                        EnumEncoding::ReceiveEmpty,
+                    ],
+                )
+                .ok_or(LowerError::UnsupportedStorage {
+                    routine,
+                    detail: "a receive result has no verified form".into(),
+                })?;
+                if matches!(operation, Receive) {
+                    Instruction::ChannelReceive(result, operand(*end)?, variants)
+                } else {
+                    Instruction::ChannelTryReceive(result, operand(*end)?, variants)
+                }
+            }
+            (SendErrorValue, [error]) => {
+                Instruction::SendErrorValue(register(dst)?, register(*error)?)
+            }
+            (
+                SendErrorClosed | SendErrorFull | SendErrorLimit | ReceiveErrorClosed
+                | ReceiveErrorEmpty,
+                [error],
+            ) => {
+                let error = register(*error)?;
+                let encoding = match operation {
+                    SendErrorClosed => EnumEncoding::SendClosed,
+                    SendErrorFull => EnumEncoding::SendFull,
+                    SendErrorLimit => EnumEncoding::SendLimit,
+                    ReceiveErrorClosed => EnumEncoding::ReceiveClosed,
+                    _ => EnumEncoding::ReceiveEmpty,
+                };
+                let variant = context
+                    .shapes
+                    .variant_with(
+                        shape_of(error).ok_or(LowerError::UnsupportedStorage {
+                            routine,
+                            detail: "a channel error is not an enum".into(),
+                        })?,
+                        encoding,
+                    )
+                    .ok_or(LowerError::UnsupportedStorage {
+                        routine,
+                        detail: "a channel error lacks its variant".into(),
+                    })?;
+                Instruction::EnumIs(register(dst)?, error, variant)
+            }
+            _ => {
+                return Err(LowerError::UnsupportedStorage {
+                    routine,
+                    detail: "a channel operation has unexpected operands".into(),
+                });
+            }
+        })
+    };
+    Some(build())
 }
 
 fn lower_input(ty: &Type) -> Option<InputKind> {
@@ -836,7 +988,7 @@ fn lower_operation(
         implementations,
     } = *context;
     let register = |index| places.register(index);
-    // A generator operand is a local's address or a loan of one.
+    // A generator or channel operand is a local's address or a loan of one.
     let generator = |index| match places.address(index) {
         Some(place) => Ok(place),
         None => places.register(index),
@@ -1015,6 +1167,12 @@ fn lower_operation(
         Op::Lookup(_, Operation::LocationStore, args) if args.len() == 2 => {
             Instruction::LocationStore(register(args[0])?, register(args[1])?)
         }
+        Op::Lookup(dst, Operation::Concurrent(operation), args)
+            if is_channel_operation(*operation) =>
+        {
+            lower_channel(*operation, *dst, args, &generator, context, sites, routine)
+                .ok_or_else(unsupported)??
+        }
         Op::Yield(dst, value) => Instruction::Yield(register(*dst)?, register(*value)?),
         Op::Lookup(dst, Operation::GeneratorStart, args) if args.len() == 1 => {
             Instruction::GeneratorStart(register(*dst)?, generator(args[0])?)
@@ -1129,6 +1287,10 @@ fn lower_operation(
             match operation {
                 Operation::IsOk | Operation::IsErr => {
                     Instruction::EnumIs(register(*dst)?, result, variant)
+                }
+                // A payload nobody can name: only the variant is checked.
+                _ if matches!(places.registers.get(*dst), Some(RegisterType::Unused)) => {
+                    Instruction::EnumExpect(result, variant)
                 }
                 _ if context.payload_needs_drop(result, variant) => {
                     Instruction::EnumTake(register(*dst)?, result, variant)

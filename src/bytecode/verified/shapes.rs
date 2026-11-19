@@ -186,6 +186,18 @@ impl Shapes {
                     .collect::<Option<Box<[_]>>>()?;
                 self.structural_shape(Shape::Tuple(fields))?
             }
+            // The two ends of a channel over an element type.
+            Type::Opaque(_, arguments, traits)
+                if (traits.sender() || traits.receiver()) && arguments.len() == 1 =>
+            {
+                let element = self.value(&arguments[0])?;
+                let managed = self.managed_id(element)?;
+                if traits.sender() {
+                    ValueType::Sender(managed)
+                } else {
+                    ValueType::Receiver(managed)
+                }
+            }
             // The empty tuple is the unit value: a composite with no fields.
             Type::Tuple(items) if items.is_empty() => {
                 self.structural_shape(Shape::Tuple(Box::new([])))?
@@ -275,6 +287,10 @@ impl Shapes {
                     .iter()
                     .map(|variant| match &variant.payload {
                         None => Some(None),
+                        // A variant that carries nothing, written `()`.
+                        Some(Type::Void) => {
+                            self.structural_shape(Shape::Tuple(Box::new([]))).map(Some)
+                        }
                         Some(payload) => self.value(payload).map(Some),
                     })
                     .collect::<Option<Box<[_]>>>();
@@ -444,7 +460,11 @@ impl Shapes {
     /// reference, directly or inside a composite.
     pub fn needs_drop(&self, ty: ValueType) -> bool {
         match ty {
-            ValueType::Rc(_) | ValueType::Weak(_) | ValueType::Generator(_) => true,
+            ValueType::Rc(_)
+            | ValueType::Weak(_)
+            | ValueType::Generator(_)
+            | ValueType::Sender(_)
+            | ValueType::Receiver(_) => true,
             ValueType::Composite(shape) => match self.shapes.get(shape.index()) {
                 Some(Shape::Tuple(fields)) => fields.iter().any(|&field| self.needs_drop(field)),
                 Some(Shape::Enum(variants)) => variants
@@ -486,6 +506,16 @@ impl Shapes {
             .iter()
             .position(|e| *e == EnumEncoding::ResultErr)?;
         Some((u32::try_from(ok).ok()?, u32::try_from(err).ok()?))
+    }
+
+    /// The variant of an enum shape that carries this encoding.
+    pub fn variant_with(&self, shape: ShapeId, encoding: EnumEncoding) -> Option<u32> {
+        let position = self
+            .encodings
+            .get(&shape)?
+            .iter()
+            .position(|e| *e == encoding)?;
+        u32::try_from(position).ok()
     }
 
     /// The `Some` and `None` variants of an option-shaped enum.

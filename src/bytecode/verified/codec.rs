@@ -1,7 +1,7 @@
 use super::{
-    BooleanOp, CallSiteId, Extremum, FloatOp, FunctionId, GlobalId, ImplementationId, InputKind,
-    Instruction, InstructionId, IntegerOp, InvalidBytecode, OperandListId, Register, Scalar,
-    TextId, TextMapOp, TextOp, TextTestOp,
+    BooleanOp, CallSiteId, ChannelVariants, Extremum, FloatOp, FunctionId, GlobalId,
+    ImplementationId, InputKind, Instruction, InstructionId, IntegerOp, InvalidBytecode,
+    OperandListId, Register, Scalar, TextId, TextMapOp, TextOp, TextTestOp,
 };
 
 // The low half of the header is the opcode and the high half is the total
@@ -166,6 +166,17 @@ opcodes! {
     GeneratorResumeUnit = 134, 3;
     GeneratorResume = 135, 4;
     GeneratorClose = 136, 2;
+    ChannelBounded = 137, 3;
+    ChannelUnbounded = 138, 2;
+    ChannelClone = 139, 3;
+    ChannelClose = 140, 2;
+    ChannelIsClosed = 141, 3;
+    ChannelSend = 142, 4;
+    ChannelTrySend = 143, 4;
+    ChannelReceive = 144, 4;
+    ChannelTryReceive = 145, 4;
+    SendErrorValue = 146, 3;
+    EnumExpect = 147, 3;
 }
 
 impl TextOp {
@@ -315,6 +326,30 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
             }
             Instruction::ToText(dst, src) => (Opcode::ToText, [dst.0, src.0, 0], 2),
             Instruction::ParseInteger(dst, text) => (Opcode::ParseInteger, [dst.0, text.0, 0], 2),
+            Instruction::ChannelBounded(dst, capacity) => {
+                (Opcode::ChannelBounded, [dst.0, capacity.0, 0], 2)
+            }
+            Instruction::ChannelUnbounded(dst) => (Opcode::ChannelUnbounded, [dst.0, 0, 0], 1),
+            Instruction::ChannelClone(dst, end) => (Opcode::ChannelClone, [dst.0, end.0, 0], 2),
+            Instruction::ChannelClose(end) => (Opcode::ChannelClose, [end.0, 0, 0], 1),
+            Instruction::ChannelIsClosed(dst, end) => {
+                (Opcode::ChannelIsClosed, [dst.0, end.0, 0], 2)
+            }
+            Instruction::ChannelSend(dst, list, variants) => {
+                (Opcode::ChannelSend, [dst.0, list.0, variants.0], 3)
+            }
+            Instruction::ChannelTrySend(dst, list, variants) => {
+                (Opcode::ChannelTrySend, [dst.0, list.0, variants.0], 3)
+            }
+            Instruction::ChannelReceive(dst, end, variants) => {
+                (Opcode::ChannelReceive, [dst.0, end.0, variants.0], 3)
+            }
+            Instruction::ChannelTryReceive(dst, end, variants) => {
+                (Opcode::ChannelTryReceive, [dst.0, end.0, variants.0], 3)
+            }
+            Instruction::SendErrorValue(dst, error) => {
+                (Opcode::SendErrorValue, [dst.0, error.0, 0], 2)
+            }
             Instruction::Yield(dst, value) => (Opcode::Yield, [dst.0, value.0, 0], 2),
             Instruction::GeneratorStart(dst, generator) => {
                 (Opcode::GeneratorStart, [dst.0, generator.0, 0], 2)
@@ -430,6 +465,7 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
             Instruction::EnumPayload(dst, src, variant) => {
                 (Opcode::EnumPayload, [dst.0, src.0, variant], 3)
             }
+            Instruction::EnumExpect(src, variant) => (Opcode::EnumExpect, [src.0, variant, 0], 2),
             Instruction::Return(None) => (Opcode::ReturnVoid, [0; 3], 0),
             Instruction::Return(Some(value)) => (Opcode::ReturnValue, [value.0, 0, 0], 1),
             Instruction::Trap => (Opcode::Trap, [0; 3], 0),
@@ -563,6 +599,24 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::TextReplace => Instruction::TextReplace(reg(0), reg(1), list(2)),
             Opcode::ToText => Instruction::ToText(reg(0), reg(1)),
             Opcode::ParseInteger => Instruction::ParseInteger(reg(0), reg(1)),
+            Opcode::ChannelBounded => Instruction::ChannelBounded(reg(0), reg(1)),
+            Opcode::ChannelUnbounded => Instruction::ChannelUnbounded(reg(0)),
+            Opcode::ChannelClone => Instruction::ChannelClone(reg(0), reg(1)),
+            Opcode::ChannelClose => Instruction::ChannelClose(reg(0)),
+            Opcode::ChannelIsClosed => Instruction::ChannelIsClosed(reg(0), reg(1)),
+            Opcode::ChannelSend => {
+                Instruction::ChannelSend(reg(0), list(1), ChannelVariants(values[2]))
+            }
+            Opcode::ChannelTrySend => {
+                Instruction::ChannelTrySend(reg(0), list(1), ChannelVariants(values[2]))
+            }
+            Opcode::ChannelReceive => {
+                Instruction::ChannelReceive(reg(0), reg(1), ChannelVariants(values[2]))
+            }
+            Opcode::ChannelTryReceive => {
+                Instruction::ChannelTryReceive(reg(0), reg(1), ChannelVariants(values[2]))
+            }
+            Opcode::SendErrorValue => Instruction::SendErrorValue(reg(0), reg(1)),
             Opcode::Yield => Instruction::Yield(reg(0), reg(1)),
             Opcode::GeneratorStart => Instruction::GeneratorStart(reg(0), reg(1)),
             Opcode::GeneratorNext => Instruction::GeneratorNext(reg(0), reg(1)),
@@ -624,6 +678,7 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::EnumWrap => Instruction::EnumWrap(reg(0), values[1], reg(2)),
             Opcode::EnumIs => Instruction::EnumIs(reg(0), reg(1), values[2]),
             Opcode::EnumPayload => Instruction::EnumPayload(reg(0), reg(1), values[2]),
+            Opcode::EnumExpect => Instruction::EnumExpect(reg(0), values[1]),
             Opcode::ReturnVoid => Instruction::Return(None),
             Opcode::ReturnValue => Instruction::Return(Some(reg(0))),
             Opcode::Trap => Instruction::Trap,
