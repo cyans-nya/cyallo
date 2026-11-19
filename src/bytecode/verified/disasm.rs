@@ -122,6 +122,10 @@ impl fmt::Display for VerifiedModule {
                     RegisterType::Gc(managed) => write!(f, "  r{index}: gc m{}", managed.0)?,
                     RegisterType::Object(id) => write!(f, "  r{index}: dyn trait{}", id.0)?,
                     RegisterType::Path => write!(f, "  r{index}: path")?,
+                    RegisterType::Allocation => write!(f, "  r{index}: allocation")?,
+                    RegisterType::Location(id) => {
+                        write!(f, "  r{index}: location managed{}", id.0)?
+                    }
                     RegisterType::Rc(managed) => write!(f, "  r{index}: rc m{}", managed.0)?,
                     RegisterType::Weak(managed) => write!(f, "  r{index}: weak m{}", managed.0)?,
                     RegisterType::Text => write!(f, "  r{index}: text")?,
@@ -312,6 +316,26 @@ impl fmt::Display for VerifiedModule {
                         write_list(f, &function.lists()[list.index()])?;
                     }
                     Instruction::ToText(dst, src) => write!(f, "r{} = to.text r{}", dst.0, src.0)?,
+                    Instruction::LayoutForRc(dst) => write!(f, "r{} = layout.rc", dst.0)?,
+                    Instruction::Allocate(dst, layout) => {
+                        write!(f, "r{} = allocate r{}", dst.0, layout.0)?
+                    }
+                    Instruction::Deallocate(allocation) => {
+                        write!(f, "deallocate r{}", allocation.0)?
+                    }
+                    Instruction::RcNewIn(dst, list, callee) => {
+                        write!(f, "r{} = rc.new_in f{}", dst.0, callee.0)?;
+                        write_list(f, &function.lists()[list.index()])?;
+                    }
+                    Instruction::LocationField(dst, owner, field) => {
+                        write!(f, "r{} = location.field r{}, {field}", dst.0, owner.0)?
+                    }
+                    Instruction::LocationLoad(dst, location) => {
+                        write!(f, "r{} = location.load r{}", dst.0, location.0)?
+                    }
+                    Instruction::LocationStore(location, value) => {
+                        write!(f, "location.store r{}, r{}", location.0, value.0)?
+                    }
                     Instruction::PathNew(dst, root) => {
                         write!(f, "r{} = path.new r{}", dst.0, root.0)?
                     }
@@ -480,6 +504,8 @@ fn value_name(ty: ValueType) -> String {
         ValueType::Gc(managed) => format!("gc m{}", managed.0),
         ValueType::Object(id) => format!("dyn trait{}", id.0),
         ValueType::Path => "path".to_owned(),
+        ValueType::Allocation => "allocation".to_owned(),
+        ValueType::Location(id) => format!("location managed{}", id.0),
         ValueType::Rc(managed) => format!("rc m{}", managed.0),
         ValueType::Weak(managed) => format!("weak m{}", managed.0),
         ValueType::Function(signature) => format!("fn sig{}", signature.0),

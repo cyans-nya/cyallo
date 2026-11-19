@@ -90,7 +90,7 @@ impl std::error::Error for Diagnostic {}
 /// (see `docs/sdk-registration.md`). These are properties, not identities. Stored as a
 /// bitset so `Type`, and every IR instruction that embeds one, stays small.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub struct OpaqueTraits(u16);
+pub struct OpaqueTraits(u32);
 macro_rules! opaque_traits {
     ($($bit:literal $name:ident $with:ident $doc:literal;)*) => {
         impl OpaqueTraits {
@@ -123,6 +123,7 @@ opaque_traits! {
     13 allocation with_allocation "The allocator protocol's block of memory, returned by `allocate`.";
     14 collection with_collection "An indexable sequence of its single argument: `v[i]`, `len`, slices, `for`.";
     15 double_ended with_double_ended "A collection that also grows and shrinks at the front.";
+    16 location with_location "A retained reference to a field of a traced record: `load` and `store` through it.";
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {

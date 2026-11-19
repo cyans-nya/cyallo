@@ -33,12 +33,12 @@ pub use run::{
 };
 pub use sdk::SdkCompileError;
 
-/// Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 24;
+pub const FORMAT_VERSION: u32 = 25;
 
 macro_rules! index {
     ($name:ident) => {
@@ -97,6 +97,12 @@ pub enum ValueType {
     Object(TraitId),
     /// A relative storage recipe: a list of projections, or the missing path.
     Path,
+    /// A retained reference to a field of a traced record. The managed type
+    /// is the field's type.
+    Location(ManagedId),
+    /// A block of memory an allocator handed out. It is a token: the engine
+    /// keeps no accounting of what it stands for.
+    Allocation,
 }
 
 /// A method a trait declares: what its receiver may do and its other types.
@@ -154,7 +160,9 @@ impl ValueType {
             | Self::Rc(_)
             | Self::Weak(_)
             | Self::Object(_)
-            | Self::Path => None,
+            | Self::Path
+            | Self::Location(_)
+            | Self::Allocation => None,
         }
     }
 }
@@ -256,6 +264,10 @@ pub enum RegisterType {
     Object(TraitId),
     /// A relative storage recipe.
     Path,
+    /// A retained reference to a field of a traced record.
+    Location(ManagedId),
+    /// A block of memory an allocator handed out.
+    Allocation,
     /// A closure that captured loans. It behaves like a loan on their root:
     /// the root stays live and borrowed while it lives, and the value cannot
     /// be stored, passed or returned by value.
@@ -286,6 +298,8 @@ impl From<ValueType> for RegisterType {
             ValueType::Weak(managed) => Self::Weak(managed),
             ValueType::Object(id) => Self::Object(id),
             ValueType::Path => Self::Path,
+            ValueType::Location(managed) => Self::Location(managed),
+            ValueType::Allocation => Self::Allocation,
         }
     }
 }
@@ -321,6 +335,8 @@ impl RegisterType {
             Self::Weak(managed) => ValueType::Weak(managed),
             Self::Object(id) => ValueType::Object(id),
             Self::Path => ValueType::Path,
+            Self::Location(managed) => ValueType::Location(managed),
+            Self::Allocation => ValueType::Allocation,
             _ => return None,
         })
     }
@@ -591,6 +607,25 @@ pub enum Instruction {
     /// space. The result is a two-variant enum: one carries the integer, the
     /// other a payload-free error.
     ParseInteger(Register, Register),
+    /// The fixed size and alignment a counted allocation asks for.
+    LayoutForRc(Register),
+    /// Ask the global allocator for a block of the layout. The result is a
+    /// two-variant enum: the allocation, or a payload-free failure.
+    Allocate(Register, Register),
+    /// Give a block back.
+    Deallocate(Register),
+    /// A counted owner whose block came from an allocator. The list holds the
+    /// allocator state, the allocation result and the value. When the last
+    /// owner is released the routine runs with a loan of the allocator state
+    /// and the allocation.
+    RcNewIn(Register, OperandListId, FunctionId),
+    /// A retained reference to a field of the traced record the handle, or a
+    /// loan of the handle, refers to.
+    LocationField(Register, Register, u32),
+    /// Copy the value the location refers to.
+    LocationLoad(Register, Register),
+    /// Replace the value the location refers to.
+    LocationStore(Register, Register),
     /// The empty storage path that starts at the root value.
     PathNew(Register, Register),
     /// The path that reaches nothing.
@@ -763,6 +798,14 @@ impl Instruction {
             }
             WriteLoan(loan, value) => ([Some(loan), Some(value)], &[], None),
             Input(dst, _) | PathMissing(dst) => ([None, None], &[], Some(dst)),
+            LayoutForRc(dst) => ([None, None], &[], Some(dst)),
+            Allocate(dst, layout) => ([Some(layout), None], &[], Some(dst)),
+            Deallocate(allocation) => ([Some(allocation), None], &[], None),
+            RcNewIn(dst, list, _) => ([None, None], &lists[list.index()], Some(dst)),
+            LocationField(dst, src, _) | LocationLoad(dst, src) => {
+                ([Some(src), None], &[], Some(dst))
+            }
+            LocationStore(location, value) => ([Some(location), Some(value)], &[], None),
             PathNew(dst, src) | PathTarget(dst, src) | PathField(dst, src, _) => {
                 ([Some(src), None], &[], Some(dst))
             }
@@ -1079,6 +1122,8 @@ impl VerifiedFunction {
             RegisterType::Weak(managed) => Ok(ValueType::Weak(managed)),
             RegisterType::Object(id) => Ok(ValueType::Object(id)),
             RegisterType::Path => Ok(ValueType::Path),
+            RegisterType::Location(managed) => Ok(ValueType::Location(managed)),
+            RegisterType::Allocation => Ok(ValueType::Allocation),
             RegisterType::BorrowingFunction { .. } => {
                 Err(InvalidBytecode::EscapingBorrow(register))
             }
@@ -1144,6 +1189,48 @@ impl VerifiedFunction {
             Ok((1, 0))
         } else {
             Err(InvalidBytecode::ExpectedEnum(register))
+        }
+    }
+
+    /// The register holds a size and an alignment.
+    fn require_layout(&self, register: Register) -> Result<(), InvalidBytecode> {
+        let count = ValueType::Scalar(ScalarType::U64);
+        let ValueType::Composite(shape) = self.value_type(register)? else {
+            return Err(InvalidBytecode::ExpectedTuple(register));
+        };
+        match self.shape(shape)? {
+            Shape::Tuple(fields) if **fields == [count, count] => Ok(()),
+            _ => Err(InvalidBytecode::ExpectedTuple(register)),
+        }
+    }
+
+    /// The variants of an allocation result: one carries the allocation and the
+    /// other is a payload-free failure.
+    fn allocation_result(&self, register: Register) -> Result<(u32, u32), InvalidBytecode> {
+        let unit_enum = |ty: Option<ValueType>| {
+            matches!(ty, Some(ValueType::Composite(shape))
+                if matches!(self.shapes.get(shape.index()), Some(Shape::Enum(v)) if v.len() == 1 && v[0].is_none()))
+        };
+        match self.enum_variants(register)? {
+            [Some(ValueType::Allocation), failure] if unit_enum(*failure) => Ok((0, 1)),
+            [failure, Some(ValueType::Allocation)] if unit_enum(*failure) => Ok((1, 0)),
+            _ => Err(InvalidBytecode::ExpectedEnum(register)),
+        }
+    }
+
+    /// [`Self::allocation_result`] for a verified register.
+    fn allocation_result_runtime(&self, register: Register) -> (u32, u32) {
+        match self.allocation_result(register) {
+            Ok(variants) => variants,
+            Err(_) => unreachable!("verified allocation result"),
+        }
+    }
+
+    /// The type of the value a register holds, or the pointee of a loan.
+    fn through(&self, register: Register) -> Result<ValueType, InvalidBytecode> {
+        match self.register_kind(register)? {
+            RegisterType::Loan { pointee, .. } => Ok(pointee),
+            _ => self.value_type(register),
         }
     }
 
@@ -1611,7 +1698,10 @@ impl ModuleImage {
                     {
                         return Err(image_error(InvalidBytecode::UnknownSignature(signature)));
                     }
-                    ValueType::Gc(managed) | ValueType::Rc(managed) | ValueType::Weak(managed)
+                    ValueType::Gc(managed)
+                    | ValueType::Rc(managed)
+                    | ValueType::Weak(managed)
+                    | ValueType::Location(managed)
                         if managed.index() >= self.managed.len() =>
                     {
                         return Err(image_error(InvalidBytecode::UnknownManaged(managed)));
@@ -1879,7 +1969,8 @@ impl VerifiedFunction {
             }
             if let RegisterType::Gc(managed)
             | RegisterType::Rc(managed)
-            | RegisterType::Weak(managed) = kind
+            | RegisterType::Weak(managed)
+            | RegisterType::Location(managed) = kind
                 && self.managed.get(managed.index()).is_none()
             {
                 return Err(error(None, InvalidBytecode::UnknownManaged(managed)));
@@ -1897,7 +1988,10 @@ impl VerifiedFunction {
                 | RegisterType::Function(_)
                 | RegisterType::Gc(_)
                 | RegisterType::Rc(_)
-                | RegisterType::Weak(_) => {}
+                | RegisterType::Weak(_)
+                | RegisterType::Path
+                | RegisterType::Location(_)
+                | RegisterType::Allocation => {}
                 RegisterType::Loan {
                     origin: LoanOrigin::Parameter { register: origin },
                     ..
@@ -2195,6 +2289,10 @@ impl VerifiedFunction {
                 RegisterType::Rc(managed) => self.require_value(arg, ValueType::Rc(managed))?,
                 RegisterType::Object(id) => self.require_value(arg, ValueType::Object(id))?,
                 RegisterType::Path => self.require_value(arg, ValueType::Path)?,
+                RegisterType::Location(managed) => {
+                    self.require_value(arg, ValueType::Location(managed))?
+                }
+                RegisterType::Allocation => self.require_value(arg, ValueType::Allocation)?,
                 RegisterType::Weak(managed) => self.require_value(arg, ValueType::Weak(managed))?,
                 RegisterType::Composite(shape) => {
                     self.require_value(arg, ValueType::Composite(shape))?;
@@ -2469,6 +2567,101 @@ impl VerifiedFunction {
                     self.register_type(src)?;
                 }
                 self.require_text(dst)
+            }
+            Instruction::LayoutForRc(dst) => self.require_layout(dst),
+            Instruction::Allocate(dst, layout) => {
+                self.allocation_result(dst)?;
+                self.require_layout(layout)
+            }
+            Instruction::Deallocate(allocation) => {
+                self.require_value(allocation, ValueType::Allocation)
+            }
+            Instruction::RcNewIn(dst, list, deallocate) => {
+                let RegisterType::Rc(managed) = self.register_kind(dst)? else {
+                    return Err(InvalidBytecode::ExpectedHandle(dst));
+                };
+                let &[allocator, allocated, value] = self.operand_list(list)? else {
+                    return Err(InvalidBytecode::ArgumentCount {
+                        expected: 3,
+                        actual: self.operand_list(list)?.len(),
+                    });
+                };
+                let declared = self
+                    .managed
+                    .get(managed.index())
+                    .copied()
+                    .ok_or(InvalidBytecode::UnknownManaged(managed))?;
+                self.require_value(value, declared)?;
+                self.allocation_result(allocated)?;
+                let state = self.value_type(allocator)?;
+                let callee = functions
+                    .get(deallocate.index())
+                    .ok_or(InvalidBytecode::UnknownFunction(deallocate))?;
+                let &[receiver, block] = &*callee.parameters else {
+                    return Err(InvalidBytecode::ArgumentCount {
+                        expected: 2,
+                        actual: callee.parameters.len(),
+                    });
+                };
+                let receives_state = matches!(
+                    callee.register_kind(receiver)?,
+                    RegisterType::Loan { access: LoanAccess::Exclusive, pointee, .. } if pointee == state
+                );
+                if !receives_state
+                    || callee.register_kind(block)? != RegisterType::Allocation
+                    || callee.result.is_some()
+                {
+                    return Err(InvalidBytecode::ResultPresence);
+                }
+                Ok(())
+            }
+            Instruction::LocationField(dst, owner, field) => {
+                let RegisterType::Location(location) = self.register_kind(dst)? else {
+                    return Err(InvalidBytecode::ExpectedHandle(dst));
+                };
+                let held = self.through(owner)?;
+                let ValueType::Gc(handle) = held else {
+                    return Err(InvalidBytecode::ExpectedHandle(owner));
+                };
+                let record = self
+                    .managed
+                    .get(handle.index())
+                    .copied()
+                    .ok_or(InvalidBytecode::UnknownManaged(handle))?;
+                let declared = self
+                    .managed
+                    .get(location.index())
+                    .copied()
+                    .ok_or(InvalidBytecode::UnknownManaged(location))?;
+                let ValueType::Composite(shape) = record else {
+                    return Err(InvalidBytecode::ExpectedTuple(owner));
+                };
+                match self.shape(shape)? {
+                    Shape::Tuple(fields) if fields.get(field as usize) == Some(&declared) => Ok(()),
+                    _ => Err(InvalidBytecode::ExpectedTuple(owner)),
+                }
+            }
+            Instruction::LocationLoad(dst, location) => {
+                let ValueType::Location(managed) = self.through(location)? else {
+                    return Err(InvalidBytecode::ExpectedHandle(location));
+                };
+                let declared = self
+                    .managed
+                    .get(managed.index())
+                    .copied()
+                    .ok_or(InvalidBytecode::UnknownManaged(managed))?;
+                self.require_value(dst, declared)
+            }
+            Instruction::LocationStore(location, value) => {
+                let ValueType::Location(managed) = self.through(location)? else {
+                    return Err(InvalidBytecode::ExpectedHandle(location));
+                };
+                let declared = self
+                    .managed
+                    .get(managed.index())
+                    .copied()
+                    .ok_or(InvalidBytecode::UnknownManaged(managed))?;
+                self.require_value(value, declared)
             }
             Instruction::PathNew(dst, root) => {
                 self.require_value(dst, ValueType::Path)?;

@@ -285,8 +285,14 @@ impl Shapes {
                 let element = self.value(&arguments[0])?;
                 self.structural_shape(Shape::Cell { element })?
             }
+            // The allocator protocol's request is a size and an alignment.
+            Type::Opaque(_, _, traits) if traits.layout() => {
+                let count = ValueType::Scalar(ScalarType::U64);
+                self.structural_shape(Shape::Tuple(Box::new([count, count])))?
+            }
+            Type::Opaque(_, _, traits) if traits.allocation() => ValueType::Allocation,
             // A failure that carries no data is one unit variant.
-            Type::Storage(StorageKind::ParseError, _) => {
+            Type::Storage(StorageKind::ParseError | StorageKind::AllocError, _) => {
                 self.structural_shape(Shape::Enum(Box::new([None])))?
             }
             Type::Storage(StorageKind::Range, element) => {
@@ -296,6 +302,10 @@ impl Shapes {
                 }
                 self.structural_shape(Shape::Tuple(Box::new([bound, bound])))?
             }
+            Type::Opaque(_, arguments, traits) if traits.location() && arguments.len() == 1 => {
+                let field = self.value(&arguments[0])?;
+                ValueType::Location(self.managed_id(field)?)
+            }
             Type::Managed {
                 kind: kind @ (MemoryKind::Gc | MemoryKind::Rc),
                 locality: Locality::Local,
@@ -303,14 +313,7 @@ impl Shapes {
                 ..
             } => {
                 let pointee = self.value(pointee)?;
-                let index = match self.managed.iter().position(|known| *known == pointee) {
-                    Some(index) => index,
-                    None => {
-                        self.managed.push(pointee);
-                        self.managed.len() - 1
-                    }
-                };
-                let id = ManagedId(u32::try_from(index).ok()?);
+                let id = self.managed_id(pointee)?;
                 match kind {
                     MemoryKind::Gc => ValueType::Gc(id),
                     MemoryKind::Rc => ValueType::Rc(id),
@@ -318,6 +321,18 @@ impl Shapes {
             }
             _ => return None,
         })
+    }
+
+    /// The entry of the managed-type table for a pointee, interned once.
+    fn managed_id(&mut self, pointee: ValueType) -> Option<ManagedId> {
+        let index = match self.managed.iter().position(|known| *known == pointee) {
+            Some(index) => index,
+            None => {
+                self.managed.push(pointee);
+                self.managed.len() - 1
+            }
+        };
+        Some(ManagedId(u32::try_from(index).ok()?))
     }
 
     /// The composite type of a structural shape, interned once.
@@ -408,7 +423,9 @@ impl Shapes {
             | ValueType::Function(_)
             | ValueType::Gc(_)
             | ValueType::Object(_)
-            | ValueType::Path => false,
+            | ValueType::Path
+            | ValueType::Location(_)
+            | ValueType::Allocation => false,
         }
     }
 

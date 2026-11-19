@@ -864,6 +864,45 @@ fn lower_operation(
             let list = new_list(routine, sites, args[1..].iter().map(|&arg| register(arg)))?;
             Instruction::TextReplace(register(*dst)?, register(args[0])?, list)
         }
+        Op::Lookup(dst, Operation::Field(field), args)
+            if args.len() == 2 && places.is_location(*dst) =>
+        {
+            Instruction::LocationField(
+                register(*dst)?,
+                register(args[0])?,
+                lower_index(routine, *field)?,
+            )
+        }
+        Op::Lookup(dst, Operation::LocationLoad, args) if args.len() == 1 => {
+            Instruction::LocationLoad(register(*dst)?, register(args[0])?)
+        }
+        Op::Lookup(_, Operation::LocationStore, args) if args.len() == 2 => {
+            Instruction::LocationStore(register(args[0])?, register(args[1])?)
+        }
+        Op::Lookup(dst, Operation::LayoutForRc, args) if args.is_empty() => {
+            Instruction::LayoutForRc(register(*dst)?)
+        }
+        Op::Lookup(dst, Operation::Allocate, args) if args.len() == 1 => {
+            Instruction::Allocate(register(*dst)?, register(args[0])?)
+        }
+        Op::Lookup(_, Operation::Deallocate, args) if args.len() == 1 => {
+            Instruction::Deallocate(register(args[0])?)
+        }
+        Op::Lookup(
+            dst,
+            Operation::RcNewIn {
+                deallocate,
+                borrowed: false,
+                fallible: false,
+            },
+            args,
+        ) if args.len() == 3 => {
+            let CallTarget::Direct(function) = call_target(*deallocate)? else {
+                return Err(unsupported());
+            };
+            let list = new_list(routine, sites, args.iter().map(|&arg| register(arg)))?;
+            Instruction::RcNewIn(register(*dst)?, list, function)
+        }
         Op::Lookup(dst, Operation::StoragePathNew, args) if args.len() == 1 => {
             Instruction::PathNew(register(*dst)?, register(args[0])?)
         }

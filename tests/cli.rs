@@ -39,9 +39,14 @@ fn bytecode_can_verify_and_show_a_selected_routine() {
             .contains("output.caie")
     );
 
-    let result = cli(&["bytecode", "examples/locations.ya", "--verified", "0"])
-        .output()
-        .unwrap();
+    let result = cli(&[
+        "bytecode",
+        "examples/concurrency/channels/buffered.ya",
+        "--verified",
+        "0",
+    ])
+    .output()
+    .unwrap();
     assert!(!result.status.success());
     assert!(result.stdout.is_empty());
     assert!(String::from_utf8_lossy(&result.stderr).contains("unsupported scalar"));
@@ -738,6 +743,8 @@ fn verified_engine_matches_the_interpreter_on_supported_programs() {
         "examples/dfs.ya",
         "examples/traits.ya",
         "examples/lookups.ya",
+        "examples/locations.ya",
+        "examples/managed.ya",
     ] {
         let run = |engine| cli(&["run", example, "--engine", engine]).output().unwrap();
         let verified = run("verified");
@@ -748,9 +755,14 @@ fn verified_engine_matches_the_interpreter_on_supported_programs() {
 
 #[test]
 fn verified_engine_refuses_unsupported_programs_before_running() {
-    let result = cli(&["run", "examples/locations.ya", "--engine", "verified"])
-        .output()
-        .unwrap();
+    let result = cli(&[
+        "run",
+        "examples/concurrency/channels/buffered.ya",
+        "--engine",
+        "verified",
+    ])
+    .output()
+    .unwrap();
     assert!(!result.status.success());
     assert!(result.stdout.is_empty());
     assert!(String::from_utf8_lossy(&result.stderr).contains("unsupported"));

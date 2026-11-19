@@ -153,6 +153,13 @@ opcodes! {
     PathTarget = 121, 3;
     PathField = 122, 4;
     PathElement = 123, 4;
+    LocationField = 124, 4;
+    LocationLoad = 125, 3;
+    LocationStore = 126, 3;
+    LayoutForRc = 127, 2;
+    Allocate = 128, 3;
+    Deallocate = 129, 2;
+    RcNewIn = 130, 4;
 }
 
 impl TextOp {
@@ -302,6 +309,21 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
             }
             Instruction::ToText(dst, src) => (Opcode::ToText, [dst.0, src.0, 0], 2),
             Instruction::ParseInteger(dst, text) => (Opcode::ParseInteger, [dst.0, text.0, 0], 2),
+            Instruction::LayoutForRc(dst) => (Opcode::LayoutForRc, [dst.0, 0, 0], 1),
+            Instruction::Allocate(dst, layout) => (Opcode::Allocate, [dst.0, layout.0, 0], 2),
+            Instruction::Deallocate(allocation) => (Opcode::Deallocate, [allocation.0, 0, 0], 1),
+            Instruction::RcNewIn(dst, list, function) => {
+                (Opcode::RcNewIn, [dst.0, list.0, function.0], 3)
+            }
+            Instruction::LocationField(dst, owner, field) => {
+                (Opcode::LocationField, [dst.0, owner.0, field], 3)
+            }
+            Instruction::LocationLoad(dst, location) => {
+                (Opcode::LocationLoad, [dst.0, location.0, 0], 2)
+            }
+            Instruction::LocationStore(location, value) => {
+                (Opcode::LocationStore, [location.0, value.0, 0], 2)
+            }
             Instruction::PathNew(dst, root) => (Opcode::PathNew, [dst.0, root.0, 0], 2),
             Instruction::PathMissing(dst) => (Opcode::PathMissing, [dst.0, 0, 0], 1),
             Instruction::PathTarget(dst, src) => (Opcode::PathTarget, [dst.0, src.0, 0], 2),
@@ -519,6 +541,13 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::TextReplace => Instruction::TextReplace(reg(0), reg(1), list(2)),
             Opcode::ToText => Instruction::ToText(reg(0), reg(1)),
             Opcode::ParseInteger => Instruction::ParseInteger(reg(0), reg(1)),
+            Opcode::LayoutForRc => Instruction::LayoutForRc(reg(0)),
+            Opcode::Allocate => Instruction::Allocate(reg(0), reg(1)),
+            Opcode::Deallocate => Instruction::Deallocate(reg(0)),
+            Opcode::RcNewIn => Instruction::RcNewIn(reg(0), list(1), FunctionId(values[2])),
+            Opcode::LocationField => Instruction::LocationField(reg(0), reg(1), values[2]),
+            Opcode::LocationLoad => Instruction::LocationLoad(reg(0), reg(1)),
+            Opcode::LocationStore => Instruction::LocationStore(reg(0), reg(1)),
             Opcode::PathNew => Instruction::PathNew(reg(0), reg(1)),
             Opcode::PathMissing => Instruction::PathMissing(reg(0)),
             Opcode::PathTarget => Instruction::PathTarget(reg(0), reg(1)),

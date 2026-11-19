@@ -85,7 +85,7 @@ std::io::Printable printable_trait
 std::io::print print
 std::lookup::Element element_type
 std::lookup::Field field_type
-std::lookup::Location opaque:clone,indirect
+std::lookup::Location opaque:clone,indirect,location
 std::lookup::Location::load location_load
 std::lookup::Location::store location_store
 std::lookup::StoragePath opaque:clone,indirect,target,path

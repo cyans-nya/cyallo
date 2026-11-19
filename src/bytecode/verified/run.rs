@@ -10,6 +10,7 @@ use crate::{
     integer::{IntegerDivision, IntegerError},
 };
 use std::{
+    collections::VecDeque,
     fmt,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
@@ -88,6 +89,12 @@ pub enum RunError {
         instruction: InstructionId,
         span: Span,
         fault: PathFault,
+    },
+    /// An allocator refused to provide the block a counted object needs.
+    AllocationRejected {
+        function: FunctionId,
+        instruction: InstructionId,
+        span: Span,
     },
     /// An input instruction found no line left.
     InputExhausted {
@@ -210,6 +217,7 @@ impl fmt::Display for RunError {
                 PathFault::OutOfBounds => "storage path projection out of bounds",
                 PathFault::Mismatch => "storage path does not fit the value it is applied to",
             }),
+            Self::AllocationRejected { .. } => f.write_str("the allocator rejected the allocation"),
             Self::InputExhausted { .. } => f.write_str("INPUT reached end of input"),
             Self::InputInvalid { kind, .. } => match kind {
                 InputKind::Text => f.write_str("INPUT line is not valid text"),
@@ -353,6 +361,8 @@ struct Frame {
     destination: Option<Register>,
     /// The value a returned storage path is applied to, for a mapped call.
     mapped: Option<Box<FrameValue>>,
+    /// The counted object whose allocator this frame deallocates for.
+    finalizing: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -367,6 +377,11 @@ enum FrameValue {
     /// A storage path: its steps, or nothing for the missing path. Steps hold
     /// indices only, so a path owns no object.
     Path(Option<Arc<[PathStep]>>),
+    /// A block an allocator handed out, by its serial number.
+    Allocation(u64),
+    /// A retained reference to a field of a heap record: a place rooted in a
+    /// heap object, which the collector keeps alive.
+    Location(BorrowedPlace),
     /// A strong owner of the counted object at this index.
     Rc(usize),
     /// A weak reference to the counted object at this index.
@@ -509,6 +524,11 @@ struct Memory {
     /// Counted objects, by index. A freed block leaves a hole.
     counted: Vec<Option<CountedBlock>>,
     free_counted: Vec<usize>,
+    /// Counted objects whose last owner is gone and whose allocator has not
+    /// yet been asked to take the block back.
+    finalizers: VecDeque<usize>,
+    /// The number of allocations handed out so far.
+    allocations: u64,
 }
 
 /// A counted object: its owners, its weak references and its payload, which
@@ -518,6 +538,19 @@ struct CountedBlock {
     strong: usize,
     weak: usize,
     payload: Option<FrameValue>,
+    /// The allocator the object came from, when it has one.
+    allocator: Option<AllocatorState>,
+    /// The deallocation routine is running; the block outlives it.
+    finalizing: bool,
+}
+
+/// An allocator and the block it handed out for a counted object. The
+/// routine gives the block back once the last owner is released.
+#[derive(Debug)]
+struct AllocatorState {
+    state: Option<FrameValue>,
+    deallocate: FunctionId,
+    allocation: u64,
 }
 
 impl Memory {
@@ -527,14 +560,22 @@ impl Memory {
             heap: Heap::new(),
             counted: Vec::new(),
             free_counted: Vec::new(),
+            finalizers: VecDeque::new(),
+            allocations: 0,
         }
     }
 
     fn new_counted(&mut self, payload: FrameValue) -> usize {
+        self.new_counted_in(payload, None)
+    }
+
+    fn new_counted_in(&mut self, payload: FrameValue, allocator: Option<AllocatorState>) -> usize {
         let block = CountedBlock {
             strong: 1,
             weak: 0,
             payload: Some(payload),
+            allocator,
+            finalizing: false,
         };
         match self.free_counted.pop() {
             Some(index) => {
@@ -566,6 +607,10 @@ impl Memory {
                     block.strong -= 1;
                     if block.strong == 0 {
                         pending.extend(block.payload.take());
+                        if block.allocator.is_some() {
+                            block.finalizing = true;
+                            self.finalizers.push_back(index);
+                        }
                         self.free_if_unused(index);
                     }
                 }
@@ -587,6 +632,8 @@ impl Memory {
                 FrameValue::Scalar(_)
                 | FrameValue::Text(_)
                 | FrameValue::Path(_)
+                | FrameValue::Location(_)
+                | FrameValue::Allocation(_)
                 | FrameValue::Loan(_)
                 | FrameValue::Closure(_)
                 | FrameValue::Handle(_)
@@ -598,10 +645,22 @@ impl Memory {
 
     fn free_if_unused(&mut self, index: usize) {
         let block = self.block(index);
-        if block.strong == 0 && block.weak == 0 {
+        if block.strong == 0 && block.weak == 0 && !block.finalizing {
             self.counted[index] = None;
             self.free_counted.push(index);
         }
+    }
+
+    /// The deallocation routine of a block has returned: release the allocator
+    /// and free the block once nothing refers to it.
+    fn finish_finalizer(&mut self, index: usize) {
+        let block = self.block(index);
+        block.finalizing = false;
+        let state = block.allocator.take().and_then(|allocator| allocator.state);
+        if let Some(state) = state {
+            self.drop_value(state);
+        }
+        self.free_if_unused(index);
     }
 
     /// A copy of a value. A counted owner or weak reference inside gains one,
@@ -667,6 +726,12 @@ impl Memory {
                     .flatten()
                     .filter_map(|block| block.payload.as_ref()),
             )
+            .chain(
+                self.counted
+                    .iter()
+                    .flatten()
+                    .filter_map(|block| block.allocator.as_ref()?.state.as_ref()),
+            )
         {
             trace(value, &mut marks, &mut pending);
         }
@@ -698,7 +763,7 @@ fn trace(value: &FrameValue, marks: &mut [bool], pending: &mut Vec<usize>) {
     while let Some(value) = stack.pop() {
         match value {
             FrameValue::Handle(object) | FrameValue::Object { heap: object, .. } => mark(*object),
-            FrameValue::Loan(place) => {
+            FrameValue::Loan(place) | FrameValue::Location(place) => {
                 if let Root::Heap(object) = place.root {
                     mark(object);
                 }
@@ -716,6 +781,7 @@ fn trace(value: &FrameValue, marks: &mut [bool], pending: &mut Vec<usize>) {
             FrameValue::Scalar(_)
             | FrameValue::Text(_)
             | FrameValue::Path(_)
+            | FrameValue::Allocation(_)
             | FrameValue::Rc(_)
             | FrameValue::Weak(_)
             | FrameValue::Moved => {}
@@ -734,6 +800,8 @@ enum Root {
     Heap(usize),
     /// The payload of the counted object at this index.
     Counted(usize),
+    /// The allocator state of the counted object at this index.
+    Allocator(usize),
 }
 
 /// One projection step into a composite value.
@@ -907,6 +975,7 @@ impl Frame {
             slots: vec![None; layout.slot_count()].into_boxed_slice(),
             destination,
             mapped: None,
+            finalizing: None,
         };
         for (&register, value) in body.parameters.iter().zip(values) {
             frame.set_value(layout, register, value);
@@ -926,6 +995,8 @@ impl Frame {
             | FrameValue::Weak(_)
             | FrameValue::Object { .. }
             | FrameValue::Path(_)
+            | FrameValue::Location(_)
+            | FrameValue::Allocation(_)
             | FrameValue::Moved => {
                 unreachable!("verified scalar operand")
             }
@@ -944,6 +1015,8 @@ impl Frame {
             | FrameValue::Weak(_)
             | FrameValue::Object { .. }
             | FrameValue::Path(_)
+            | FrameValue::Location(_)
+            | FrameValue::Allocation(_)
             | FrameValue::Moved => {
                 unreachable!("verified loan operand")
             }
@@ -1557,6 +1630,110 @@ impl VerifiedModule {
                 let spelled = spell(&frame.value(layout, src), TextStyle::Plain);
                 frame.set_value(layout, dst, FrameValue::Text(spelled.into()));
             }
+            Instruction::LayoutForRc(dst) => {
+                let size = FrameValue::Scalar(Scalar::U64(std::mem::size_of::<usize>() as u64));
+                let shape = Composite::Tuple(Box::new([size.clone(), size]));
+                frame.set_value(layout, dst, FrameValue::Composite(shape));
+            }
+            Instruction::Allocate(dst, _) => {
+                let (ok, _) = body.allocation_result_runtime(dst);
+                memory.allocations += 1;
+                let allocated = Composite::Enum {
+                    variant: ok,
+                    payload: Some(Box::new(FrameValue::Allocation(memory.allocations))),
+                };
+                frame.set_value(layout, dst, FrameValue::Composite(allocated));
+            }
+            Instruction::Deallocate(_) => {}
+            Instruction::RcNewIn(dst, list, deallocate) => {
+                let &[allocator, allocated, value] = &*body.lists[list.index()] else {
+                    unreachable!("verified allocator operands");
+                };
+                let (ok, failure) = body.allocation_result_runtime(allocated);
+                let FrameValue::Composite(Composite::Enum { variant, payload }) =
+                    frame.value(layout, allocated)
+                else {
+                    unreachable!("verified allocation result");
+                };
+                let allocator = frame.value(layout, allocator);
+                let value = frame.value(layout, value);
+                if variant == failure {
+                    memory.drop_value(value);
+                    memory.drop_value(allocator);
+                    return Err(RunError::AllocationRejected {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    });
+                }
+                debug_assert_eq!(variant, ok);
+                let Some(FrameValue::Allocation(allocation)) = payload.map(|payload| *payload)
+                else {
+                    unreachable!("verified allocation payload");
+                };
+                let block = memory.new_counted_in(
+                    value,
+                    Some(AllocatorState {
+                        state: Some(allocator),
+                        deallocate,
+                        allocation,
+                    }),
+                );
+                frame.set_value(layout, dst, FrameValue::Rc(block));
+            }
+            Instruction::LocationField(dst, owner, field) => {
+                let held = self
+                    .held_value(stack, memory, body, owner)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let Some(FrameValue::Handle(object)) = held else {
+                    unreachable!("verified handle operand");
+                };
+                let place = BorrowedPlace {
+                    root: Root::Heap(object),
+                    path: Box::new([Step::Field(field)]),
+                    window: None,
+                };
+                stack[depth - 1].set_value(layout, dst, FrameValue::Location(place));
+            }
+            Instruction::LocationLoad(dst, location) => {
+                let held = self
+                    .held_value(stack, memory, body, location)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let Some(FrameValue::Location(place)) = held else {
+                    unreachable!("verified location operand");
+                };
+                let root = self.root_value(stack, memory, &place.root).ok_or(
+                    RunError::UninitializedGlobal {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    },
+                )?;
+                let value = read_place(&root, &place.path)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let value = memory.clone_value(&value);
+                stack[depth - 1].set_value(layout, dst, value);
+            }
+            Instruction::LocationStore(location, value) => {
+                let held = self
+                    .held_value(stack, memory, body, location)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let Some(FrameValue::Location(place)) = held else {
+                    unreachable!("verified location operand");
+                };
+                let value = stack[depth - 1].value(layout, value);
+                let Root::Heap(object) = place.root else {
+                    unreachable!("a location is rooted in the heap");
+                };
+                let Some(root) = memory.heap.slots[object].as_mut() else {
+                    unreachable!("a location keeps its object alive");
+                };
+                let old = read_place(root, &place.path)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                write_place(root, &place.path, value)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                memory.drop_value(old);
+            }
             Instruction::PathNew(dst, _) => {
                 frame.set_value(layout, dst, FrameValue::Path(Some(Arc::from([]))));
             }
@@ -2038,7 +2215,11 @@ impl VerifiedModule {
                 let value = value.map(|reg| frame.value(layout, reg));
                 let destination = frame.destination;
                 let receiver = frame.mapped.take();
+                let finalizing = frame.finalizing.take();
                 stack.pop();
+                if let Some(block) = finalizing {
+                    memory.finish_finalizer(block);
+                }
                 let Some(caller) = stack.last_mut() else {
                     return Ok(StepOutcome::Returned(value.map(|value| match value {
                         FrameValue::Scalar(value) => value,
@@ -2437,6 +2618,30 @@ impl VerifiedModule {
                 });
             }
         }
+        // Objects whose last owner went away during this instruction hand
+        // their blocks back through their allocators, first released first.
+        if !memory.finalizers.is_empty() {
+            let blocks: Vec<usize> = memory.finalizers.drain(..).collect();
+            for block in blocks.into_iter().rev() {
+                if stack.len() >= max_frames {
+                    return Err(RunError::FrameLimit);
+                }
+                let Some(allocator) = memory.block(block).allocator.as_ref() else {
+                    unreachable!("a finalizing block has an allocator");
+                };
+                let (routine, allocation) = (allocator.deallocate, allocator.allocation);
+                let target = &self.functions[routine.index()];
+                let receiver = FrameValue::Loan(BorrowedPlace {
+                    root: Root::Allocator(block),
+                    path: Box::new([]),
+                    window: None,
+                });
+                let values = [receiver, FrameValue::Allocation(allocation)];
+                let mut next = Frame::new(routine, target, values.into_iter(), None);
+                next.finalizing = Some(block);
+                stack.push(next);
+            }
+        }
         Ok(StepOutcome::Continue)
     }
 
@@ -2465,6 +2670,9 @@ impl VerifiedModule {
             Root::Counted(block) => memory.counted[block]
                 .as_ref()
                 .and_then(|block| block.payload.as_ref()),
+            Root::Allocator(block) => memory.counted[block]
+                .as_ref()
+                .and_then(|block| block.allocator.as_ref()?.state.as_ref()),
         };
         match root {
             Some(root) => place_ref(root, &place.path).map(Some),
@@ -2594,6 +2802,9 @@ impl VerifiedModule {
             Root::Counted(block) => memory.counted[block]
                 .as_ref()
                 .and_then(|block| block.payload.clone()),
+            Root::Allocator(block) => memory.counted[block]
+                .as_ref()
+                .and_then(|block| block.allocator.as_ref()?.state.clone()),
         }
     }
 
@@ -2615,6 +2826,15 @@ impl VerifiedModule {
                 Some(block) => &mut block.payload,
                 None => unreachable!("a loan outlived its counted object"),
             },
+            Root::Allocator(block) => {
+                match memory.counted[block]
+                    .as_mut()
+                    .and_then(|block| block.allocator.as_mut())
+                {
+                    Some(allocator) => &mut allocator.state,
+                    None => unreachable!("a loan outlived its allocator"),
+                }
+            }
         }
     }
 
@@ -2826,7 +3046,9 @@ fn conforms(value: &FrameValue, ty: ValueType) -> bool {
         | (FrameValue::Rc(_), ValueType::Rc(_))
         | (FrameValue::Weak(_), ValueType::Weak(_))
         | (FrameValue::Object { .. }, ValueType::Object(_))
-        | (FrameValue::Path(_), ValueType::Path) => true,
+        | (FrameValue::Path(_), ValueType::Path)
+        | (FrameValue::Location(_), ValueType::Location(_))
+        | (FrameValue::Allocation(_), ValueType::Allocation) => true,
         _ => false,
     }
 }
@@ -2854,6 +3076,8 @@ fn spell(value: &FrameValue, style: TextStyle) -> String {
             | FrameValue::Weak(_)
             | FrameValue::Object { .. }
             | FrameValue::Path(_)
+            | FrameValue::Location(_)
+            | FrameValue::Allocation(_)
             | FrameValue::Moved,
         ) => unreachable!("verified text operand is a scalar or string"),
     }
