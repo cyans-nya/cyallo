@@ -123,6 +123,8 @@ impl fmt::Display for VerifiedModule {
                     RegisterType::Object(id) => write!(f, "  r{index}: dyn trait{}", id.0)?,
                     RegisterType::Path => write!(f, "  r{index}: path")?,
                     RegisterType::Allocation => write!(f, "  r{index}: allocation")?,
+                    RegisterType::Task(id) => write!(f, "  r{index}: task managed{}", id.0)?,
+                    RegisterType::Clock => write!(f, "  r{index}: clock")?,
                     RegisterType::Sender(id) => write!(f, "  r{index}: sender managed{}", id.0)?,
                     RegisterType::Receiver(id) => {
                         write!(f, "  r{index}: receiver managed{}", id.0)?
@@ -519,6 +521,23 @@ impl fmt::Display for VerifiedModule {
                     Instruction::EnumPayload(dst, src, variant) => {
                         write!(f, "r{} = enum.payload r{}, #{variant}", dst.0, src.0)?;
                     }
+                    Instruction::TaskSpawn(dst, closure) => {
+                        write!(f, "r{} = task.spawn r{}", dst.0, closure.0)?
+                    }
+                    Instruction::TaskJoin(dst, task) => {
+                        write!(f, "r{} = task.join r{}", dst.0, task.0)?
+                    }
+                    Instruction::TaskCancel(task) => write!(f, "task.cancel r{}", task.0)?,
+                    Instruction::TaskIsFinished(dst, task) => {
+                        write!(f, "r{} = task.is_finished r{}", dst.0, task.0)?
+                    }
+                    Instruction::ClockNew(dst) => write!(f, "r{} = clock.new", dst.0)?,
+                    Instruction::ClockClone(dst, clock) => {
+                        write!(f, "r{} = clock.clone r{}", dst.0, clock.0)?
+                    }
+                    Instruction::ClockSleep(clock, duration) => {
+                        write!(f, "clock.sleep r{}, r{}", clock.0, duration.0)?
+                    }
                     Instruction::EnumExpect(src, variant) => {
                         write!(f, "enum.expect r{}, #{variant}", src.0)?;
                     }
@@ -562,6 +581,8 @@ fn value_name(ty: ValueType) -> String {
         ValueType::Path => "path".to_owned(),
         ValueType::Allocation => "allocation".to_owned(),
         ValueType::Generator(id) => format!("generator sig{}", id.0),
+        ValueType::Task(id) => format!("task managed{}", id.0),
+        ValueType::Clock => "clock".to_owned(),
         ValueType::Sender(id) => format!("sender managed{}", id.0),
         ValueType::Receiver(id) => format!("receiver managed{}", id.0),
         ValueType::Location(id) => format!("location managed{}", id.0),

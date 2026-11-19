@@ -33,12 +33,12 @@ pub use run::{
 };
 pub use sdk::SdkCompileError;
 
-/// Version 27 adds channels. Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 28 adds tasks and clocks. Version 27 adds channels. Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 27;
+pub const FORMAT_VERSION: u32 = 28;
 
 macro_rules! index {
     ($name:ident) => {
@@ -115,6 +115,11 @@ pub enum ValueType {
     Sender(ManagedId),
     /// The receiving end of a channel. The managed type is the element type.
     Receiver(ManagedId),
+    /// A spawned task. The managed type is the type of its result, the unit
+    /// tuple when it returns nothing.
+    Task(ManagedId),
+    /// A capability to sleep.
+    Clock,
 }
 
 /// A method a trait declares: what its receiver may do and its other types.
@@ -177,7 +182,9 @@ impl ValueType {
             | Self::Allocation
             | Self::Generator(_)
             | Self::Sender(_)
-            | Self::Receiver(_) => None,
+            | Self::Receiver(_)
+            | Self::Task(_)
+            | Self::Clock => None,
         }
     }
 }
@@ -289,6 +296,10 @@ pub enum RegisterType {
     Sender(ManagedId),
     /// The receiving end of a channel.
     Receiver(ManagedId),
+    /// A spawned task.
+    Task(ManagedId),
+    /// A capability to sleep.
+    Clock,
     /// A closure that captured loans. It behaves like a loan on their root:
     /// the root stays live and borrowed while it lives, and the value cannot
     /// be stored, passed or returned by value.
@@ -324,6 +335,8 @@ impl From<ValueType> for RegisterType {
             ValueType::Generator(signature) => Self::Generator(signature),
             ValueType::Sender(managed) => Self::Sender(managed),
             ValueType::Receiver(managed) => Self::Receiver(managed),
+            ValueType::Task(managed) => Self::Task(managed),
+            ValueType::Clock => Self::Clock,
         }
     }
 }
@@ -364,6 +377,8 @@ impl RegisterType {
             Self::Generator(signature) => ValueType::Generator(signature),
             Self::Sender(managed) => ValueType::Sender(managed),
             Self::Receiver(managed) => ValueType::Receiver(managed),
+            Self::Task(managed) => ValueType::Task(managed),
+            Self::Clock => ValueType::Clock,
             _ => return None,
         })
     }
@@ -696,6 +711,20 @@ pub enum Instruction {
     ChannelTryReceive(Register, Register, ChannelVariants),
     /// The value a send error carries, whichever failure it reports.
     SendErrorValue(Register, Register),
+    /// Start a task that runs the closure, which takes no arguments, and
+    /// returns its handle. What the closure captured moves into the task.
+    TaskSpawn(Register, Register),
+    /// Wait for the task to end and take its outcome: a four-variant enum
+    /// holding the result of a completed task, then failed, cancelled and
+    /// stopped.
+    TaskJoin(Register, Register),
+    /// Ask the task to stop; it ends the next time it is scheduled.
+    TaskCancel(Register),
+    TaskIsFinished(Register, Register),
+    ClockNew(Register),
+    ClockClone(Register, Register),
+    /// Wait for the given number of milliseconds.
+    ClockSleep(Register, Register),
     /// Suspend the generator whose body this is, handing the value to whoever
     /// resumed it. The destination receives the value passed to the next
     /// resume.
@@ -906,6 +935,15 @@ impl Instruction {
             }
             WriteLoan(loan, value) => ([Some(loan), Some(value)], &[], None),
             Input(dst, _) | PathMissing(dst) => ([None, None], &[], Some(dst)),
+            TaskSpawn(dst, closure) | TaskJoin(dst, closure) => {
+                ([Some(closure), None], &[], Some(dst))
+            }
+            TaskCancel(task) => ([Some(task), None], &[], None),
+            TaskIsFinished(dst, task) | ClockClone(dst, task) => {
+                ([Some(task), None], &[], Some(dst))
+            }
+            ClockNew(dst) => ([None, None], &[], Some(dst)),
+            ClockSleep(clock, duration) => ([Some(clock), Some(duration)], &[], None),
             ChannelBounded(dst, capacity) => ([Some(capacity), None], &[], Some(dst)),
             ChannelUnbounded(dst) => ([None, None], &[], Some(dst)),
             ChannelClone(dst, end) | ChannelIsClosed(dst, end) | SendErrorValue(dst, end) => {
@@ -1261,6 +1299,8 @@ impl VerifiedFunction {
             RegisterType::Generator(signature) => Ok(ValueType::Generator(signature)),
             RegisterType::Sender(managed) => Ok(ValueType::Sender(managed)),
             RegisterType::Receiver(managed) => Ok(ValueType::Receiver(managed)),
+            RegisterType::Task(managed) => Ok(ValueType::Task(managed)),
+            RegisterType::Clock => Ok(ValueType::Clock),
             RegisterType::BorrowingFunction { .. } => {
                 Err(InvalidBytecode::EscapingBorrow(register))
             }
@@ -1327,6 +1367,17 @@ impl VerifiedFunction {
         } else {
             Err(InvalidBytecode::ExpectedEnum(register))
         }
+    }
+
+    /// The type a task's handle (or a loan of one) says its result has.
+    fn task_element(&self, register: Register) -> Result<ValueType, InvalidBytecode> {
+        let ValueType::Task(managed) = self.through(register)? else {
+            return Err(InvalidBytecode::ExpectedTask(register));
+        };
+        self.managed
+            .get(managed.index())
+            .copied()
+            .ok_or(InvalidBytecode::UnknownManaged(managed))
     }
 
     /// The register holds a channel's sender and receiver of one element type.
@@ -1813,6 +1864,7 @@ pub enum InvalidBytecode {
     },
     ExpectedGenerator(Register),
     ExpectedChannelEnd(Register),
+    ExpectedTask(Register),
     YieldOutsideGenerator,
     InvalidInputKind {
         word: usize,
@@ -1992,6 +2044,7 @@ impl ModuleImage {
                     | ValueType::Location(managed)
                     | ValueType::Sender(managed)
                     | ValueType::Receiver(managed)
+                    | ValueType::Task(managed)
                         if managed.index() >= self.managed.len() =>
                     {
                         return Err(image_error(InvalidBytecode::UnknownManaged(managed)));
@@ -2265,7 +2318,8 @@ impl VerifiedFunction {
             | RegisterType::Weak(managed)
             | RegisterType::Location(managed)
             | RegisterType::Sender(managed)
-            | RegisterType::Receiver(managed) = kind
+            | RegisterType::Receiver(managed)
+            | RegisterType::Task(managed) = kind
                 && self.managed.get(managed.index()).is_none()
             {
                 return Err(error(None, InvalidBytecode::UnknownManaged(managed)));
@@ -2303,7 +2357,9 @@ impl VerifiedFunction {
                 | RegisterType::Location(_)
                 | RegisterType::Allocation
                 | RegisterType::Sender(_)
-                | RegisterType::Receiver(_) => {}
+                | RegisterType::Receiver(_)
+                | RegisterType::Task(_)
+                | RegisterType::Clock => {}
                 RegisterType::Loan {
                     origin: LoanOrigin::Parameter { register: origin },
                     ..
@@ -2617,6 +2673,8 @@ impl VerifiedFunction {
                 RegisterType::Receiver(managed) => {
                     self.require_value(arg, ValueType::Receiver(managed))?
                 }
+                RegisterType::Task(managed) => self.require_value(arg, ValueType::Task(managed))?,
+                RegisterType::Clock => self.require_value(arg, ValueType::Clock)?,
                 RegisterType::Weak(managed) => self.require_value(arg, ValueType::Weak(managed))?,
                 RegisterType::Composite(shape) => {
                     self.require_value(arg, ValueType::Composite(shape))?;
@@ -2891,6 +2949,61 @@ impl VerifiedFunction {
                     self.register_type(src)?;
                 }
                 self.require_text(dst)
+            }
+            Instruction::TaskSpawn(dst, closure) => {
+                let RegisterType::Task(managed) = self.register_kind(dst)? else {
+                    return Err(InvalidBytecode::ExpectedTask(dst));
+                };
+                let RegisterType::Function(id) = self.register_kind(closure)? else {
+                    return Err(InvalidBytecode::ExpectedFunction(closure));
+                };
+                let signature = self.signature(id)?;
+                let element = self
+                    .managed
+                    .get(managed.index())
+                    .copied()
+                    .ok_or(InvalidBytecode::UnknownManaged(managed))?;
+                let returns_unit = signature.result.is_none() && self.is_unit(Some(element));
+                if !signature.parameters.is_empty()
+                    || !(returns_unit || signature.result == Some(element))
+                {
+                    return Err(InvalidBytecode::ClosureTarget(FunctionId(0)));
+                }
+                Ok(())
+            }
+            Instruction::TaskJoin(dst, task) => {
+                let element = self.task_element(task)?;
+                match self.value_type(dst)? {
+                    ValueType::Composite(shape) => match self.shape(shape)? {
+                        Shape::Enum(variants)
+                            if variants.len() == 4
+                                && variants[0] == Some(element)
+                                && variants[1..].iter().all(Option::is_none) =>
+                        {
+                            Ok(())
+                        }
+                        _ => Err(InvalidBytecode::ExpectedEnum(dst)),
+                    },
+                    _ => Err(InvalidBytecode::ExpectedEnum(dst)),
+                }
+            }
+            Instruction::TaskCancel(task) => self.task_element(task).map(|_| ()),
+            Instruction::TaskIsFinished(dst, task) => {
+                self.task_element(task)?;
+                self.require_type(dst, ScalarType::Bool)
+            }
+            Instruction::ClockNew(dst) => self.require_value(dst, ValueType::Clock),
+            Instruction::ClockClone(dst, clock) => {
+                if self.through(clock)? != ValueType::Clock {
+                    return Err(InvalidBytecode::ExpectedTask(clock));
+                }
+                self.require_value(dst, ValueType::Clock)
+            }
+            Instruction::ClockSleep(clock, duration) => {
+                if self.through(clock)? != ValueType::Clock {
+                    return Err(InvalidBytecode::ExpectedTask(clock));
+                }
+                self.require_type(duration, ScalarType::U64)
             }
             Instruction::ChannelBounded(dst, capacity) => {
                 self.require_type(capacity, ScalarType::U64)?;

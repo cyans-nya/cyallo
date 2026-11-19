@@ -306,6 +306,17 @@ fn is_channel_operation(operation: ConcurrentOperation) -> bool {
             | SendErrorLimit
             | ReceiveErrorClosed
             | ReceiveErrorEmpty
+            | Clock
+            | Sleep
+            | Spawn
+            | Join
+            | Cancel
+            | IsFinished
+            | Completed
+            | IsCompleted
+            | IsFailed
+            | IsCancelled
+            | IsStopped
     )
 }
 
@@ -348,7 +359,41 @@ fn lower_channel(
                 Instruction::ChannelBounded(register(dst)?, register(*capacity)?)
             }
             (Unbounded, []) => Instruction::ChannelUnbounded(register(dst)?),
-            (Clone, [end]) => Instruction::ChannelClone(register(dst)?, operand(*end)?),
+            (Clone, [end]) => {
+                let end = operand(*end)?;
+                if matches!(places.registers.get(end.index()), Some(RegisterType::Clock)) {
+                    Instruction::ClockClone(register(dst)?, end)
+                } else {
+                    Instruction::ChannelClone(register(dst)?, end)
+                }
+            }
+            (Clock, []) => Instruction::ClockNew(register(dst)?),
+            (Sleep, [clock, duration]) => {
+                Instruction::ClockSleep(operand(*clock)?, register(*duration)?)
+            }
+            (Spawn, [closure]) => Instruction::TaskSpawn(register(dst)?, register(*closure)?),
+            (Join, [task]) => Instruction::TaskJoin(register(dst)?, register(*task)?),
+            (Cancel, [task]) => Instruction::TaskCancel(operand(*task)?),
+            (IsFinished, [task]) => Instruction::TaskIsFinished(register(dst)?, operand(*task)?),
+            (Completed, [outcome]) => {
+                let outcome = register(*outcome)?;
+                if matches!(places.registers.get(dst), Some(RegisterType::Unused)) {
+                    Instruction::EnumExpect(outcome, 0)
+                } else if context.payload_needs_drop(outcome, 0) {
+                    Instruction::EnumTake(register(dst)?, outcome, 0)
+                } else {
+                    Instruction::EnumPayload(register(dst)?, outcome, 0)
+                }
+            }
+            (IsCompleted | IsFailed | IsCancelled | IsStopped, [outcome]) => {
+                let variant = match operation {
+                    IsCompleted => 0,
+                    IsFailed => 1,
+                    IsCancelled => 2,
+                    _ => 3,
+                };
+                Instruction::EnumIs(register(dst)?, register(*outcome)?, variant)
+            }
             (Close, [end]) => Instruction::ChannelClose(operand(*end)?),
             (IsClosed, [end]) => Instruction::ChannelIsClosed(register(dst)?, operand(*end)?),
             (Send | TrySend, [sender, value]) => {

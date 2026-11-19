@@ -41,7 +41,7 @@ fn bytecode_can_verify_and_show_a_selected_routine() {
 
     let result = cli(&[
         "bytecode",
-        "examples/concurrency/channels/mpmc.ya",
+        "examples/concurrency/modules/main.ya",
         "--verified",
         "0",
     ])
@@ -749,6 +749,12 @@ fn verified_engine_matches_the_interpreter_on_supported_programs() {
         "examples/concurrency/generators/resume-result.ya",
         "examples/concurrency/generators/delegation.ya",
         "examples/concurrency/channels/buffered.ya",
+        "examples/concurrency/channels/rendezvous.ya",
+        "examples/concurrency/channels/mpmc.ya",
+        "examples/concurrency/scheduling/cancellation.ya",
+        "examples/concurrency/scheduling/clock.ya",
+        "examples/concurrency/enums.ya",
+        "examples/concurrency/status-enums.ya",
     ] {
         let run = |engine| cli(&["run", example, "--engine", engine]).output().unwrap();
         let verified = run("verified");
@@ -761,7 +767,7 @@ fn verified_engine_matches_the_interpreter_on_supported_programs() {
 fn verified_engine_refuses_unsupported_programs_before_running() {
     let result = cli(&[
         "run",
-        "examples/concurrency/channels/mpmc.ya",
+        "examples/concurrency/modules/main.ya",
         "--engine",
         "verified",
     ])

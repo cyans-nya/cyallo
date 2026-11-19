@@ -177,6 +177,13 @@ opcodes! {
     ChannelTryReceive = 145, 4;
     SendErrorValue = 146, 3;
     EnumExpect = 147, 3;
+    TaskSpawn = 148, 3;
+    TaskJoin = 149, 3;
+    TaskCancel = 150, 2;
+    TaskIsFinished = 151, 3;
+    ClockNew = 152, 2;
+    ClockClone = 153, 3;
+    ClockSleep = 154, 3;
 }
 
 impl TextOp {
@@ -465,6 +472,17 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
             Instruction::EnumPayload(dst, src, variant) => {
                 (Opcode::EnumPayload, [dst.0, src.0, variant], 3)
             }
+            Instruction::TaskSpawn(dst, closure) => (Opcode::TaskSpawn, [dst.0, closure.0, 0], 2),
+            Instruction::TaskJoin(dst, task) => (Opcode::TaskJoin, [dst.0, task.0, 0], 2),
+            Instruction::TaskCancel(task) => (Opcode::TaskCancel, [task.0, 0, 0], 1),
+            Instruction::TaskIsFinished(dst, task) => {
+                (Opcode::TaskIsFinished, [dst.0, task.0, 0], 2)
+            }
+            Instruction::ClockNew(dst) => (Opcode::ClockNew, [dst.0, 0, 0], 1),
+            Instruction::ClockClone(dst, clock) => (Opcode::ClockClone, [dst.0, clock.0, 0], 2),
+            Instruction::ClockSleep(clock, duration) => {
+                (Opcode::ClockSleep, [clock.0, duration.0, 0], 2)
+            }
             Instruction::EnumExpect(src, variant) => (Opcode::EnumExpect, [src.0, variant, 0], 2),
             Instruction::Return(None) => (Opcode::ReturnVoid, [0; 3], 0),
             Instruction::Return(Some(value)) => (Opcode::ReturnValue, [value.0, 0, 0], 1),
@@ -678,6 +696,13 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::EnumWrap => Instruction::EnumWrap(reg(0), values[1], reg(2)),
             Opcode::EnumIs => Instruction::EnumIs(reg(0), reg(1), values[2]),
             Opcode::EnumPayload => Instruction::EnumPayload(reg(0), reg(1), values[2]),
+            Opcode::TaskSpawn => Instruction::TaskSpawn(reg(0), reg(1)),
+            Opcode::TaskJoin => Instruction::TaskJoin(reg(0), reg(1)),
+            Opcode::TaskCancel => Instruction::TaskCancel(reg(0)),
+            Opcode::TaskIsFinished => Instruction::TaskIsFinished(reg(0), reg(1)),
+            Opcode::ClockNew => Instruction::ClockNew(reg(0)),
+            Opcode::ClockClone => Instruction::ClockClone(reg(0), reg(1)),
+            Opcode::ClockSleep => Instruction::ClockSleep(reg(0), reg(1)),
             Opcode::EnumExpect => Instruction::EnumExpect(reg(0), values[1]),
             Opcode::ReturnVoid => Instruction::Return(None),
             Opcode::ReturnValue => Instruction::Return(Some(reg(0))),

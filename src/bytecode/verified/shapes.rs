@@ -186,6 +186,16 @@ impl Shapes {
                     .collect::<Option<Box<[_]>>>()?;
                 self.structural_shape(Shape::Tuple(fields))?
             }
+            // A task over its result type, and how a task ended.
+            Type::Opaque(_, arguments, traits) if traits.task() && arguments.len() == 1 => {
+                let result = self.value_or_unit(&arguments[0])?;
+                ValueType::Task(self.managed_id(result)?)
+            }
+            Type::Opaque(_, arguments, traits) if traits.task_outcome() && arguments.len() == 1 => {
+                let result = self.value_or_unit(&arguments[0])?;
+                self.structural_shape(Shape::Enum(Box::new([Some(result), None, None, None])))?
+            }
+            Type::Opaque(_, _, traits) if traits.clock() => ValueType::Clock,
             // The two ends of a channel over an element type.
             Type::Opaque(_, arguments, traits)
                 if (traits.sender() || traits.receiver()) && arguments.len() == 1 =>
@@ -378,6 +388,14 @@ impl Shapes {
         })
     }
 
+    /// The type of a value that may be absent: the unit tuple for `()`.
+    fn value_or_unit(&mut self, ty: &Type) -> Option<ValueType> {
+        match ty {
+            Type::Void => self.structural_shape(Shape::Tuple(Box::new([]))),
+            other => self.value(other),
+        }
+    }
+
     /// The entry of the managed-type table for a pointee, interned once.
     fn managed_id(&mut self, pointee: ValueType) -> Option<ManagedId> {
         let index = match self.managed.iter().position(|known| *known == pointee) {
@@ -484,7 +502,9 @@ impl Shapes {
             | ValueType::Object(_)
             | ValueType::Path
             | ValueType::Location(_)
-            | ValueType::Allocation => false,
+            | ValueType::Allocation
+            | ValueType::Task(_)
+            | ValueType::Clock => false,
         }
     }
 

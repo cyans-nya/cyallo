@@ -14,6 +14,7 @@ use std::{
     fmt,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +101,18 @@ pub enum RunError {
     /// Every task is waiting for another, or a lone task waits for a channel
     /// nobody can serve.
     Deadlock {
+        function: FunctionId,
+        instruction: InstructionId,
+        span: Span,
+    },
+    /// A task captured something that cannot cross into another task.
+    NotTransferable {
+        function: FunctionId,
+        instruction: InstructionId,
+        span: Span,
+    },
+    /// The task table is full.
+    TaskLimit {
         function: FunctionId,
         instruction: InstructionId,
         span: Span,
@@ -249,6 +262,10 @@ impl fmt::Display for RunError {
             Self::Deadlock { .. } => {
                 f.write_str("deadlock: the task waits for a channel that no other task can serve")
             }
+            Self::NotTransferable { .. } => {
+                f.write_str("a task cannot capture a value that is not transferable")
+            }
+            Self::TaskLimit { .. } => f.write_str("task limit exceeded"),
             Self::ChannelLimit { .. } => f.write_str("channel limit exceeded"),
             Self::Generator { fault, .. } => f.write_str(match fault {
                 GeneratorFault::Finished => "cannot resume a completed or closed generator",
@@ -436,6 +453,10 @@ enum FrameValue {
     Sender(usize),
     /// The receiving end of the channel at this index.
     Receiver(usize),
+    /// The task at this index of the task table.
+    Task(usize),
+    /// A capability to sleep.
+    Clock,
     /// A retained reference to a field of a heap record: a place rooted in a
     /// heap object, which the collector keeps alive.
     Location(BorrowedPlace),
@@ -592,6 +613,39 @@ struct Memory {
     /// Channels, by index. A channel with no ends left leaves a hole.
     channels: Vec<Option<Channel>>,
     free_channels: Vec<usize>,
+    /// Tasks, by index; index 0 is the entry task. The frames of the task that
+    /// is running are on the activation's stack, not here.
+    tasks: Vec<Option<TaskRecord>>,
+    free_tasks: Vec<usize>,
+    /// The task whose frames are on the stack.
+    current_task: usize,
+    /// The channel the running task is parked on, as a receiver.
+    waiting: Option<usize>,
+    /// When the running task's sleep ends.
+    sleeping_until: Option<Instant>,
+}
+
+/// More tasks than this exhaust the table.
+const MAX_TASKS: usize = 1 << 16;
+
+/// Instructions a task runs before another ready task gets a turn.
+const QUANTUM: usize = 1000;
+
+/// A task other than the one running, or one that has ended.
+#[derive(Debug)]
+struct TaskRecord {
+    stack: Vec<Frame>,
+    end: Option<TaskEnd>,
+    cancelled: bool,
+    waiting: Option<usize>,
+    sleeping_until: Option<Instant>,
+}
+
+#[derive(Debug)]
+enum TaskEnd {
+    Completed(Option<FrameValue>),
+    Failed,
+    Cancelled,
 }
 
 /// A channel: a queue, a capacity and counted ends.
@@ -677,6 +731,17 @@ impl Memory {
             free_generators: Vec::new(),
             channels: Vec::new(),
             free_channels: Vec::new(),
+            tasks: vec![Some(TaskRecord {
+                stack: Vec::new(),
+                end: None,
+                cancelled: false,
+                waiting: None,
+                sleeping_until: None,
+            })],
+            free_tasks: Vec::new(),
+            current_task: 0,
+            waiting: None,
+            sleeping_until: None,
         }
     }
 
@@ -773,6 +838,8 @@ impl Memory {
                 | FrameValue::Path(_)
                 | FrameValue::Location(_)
                 | FrameValue::Allocation(_)
+                | FrameValue::Task(_)
+                | FrameValue::Clock
                 | FrameValue::Loan(_)
                 | FrameValue::Closure(_)
                 | FrameValue::Handle(_)
@@ -788,6 +855,34 @@ impl Memory {
             self.counted[index] = None;
             self.free_counted.push(index);
         }
+    }
+
+    /// Stop counting the running task as parked on a channel.
+    fn stop_waiting(&mut self) {
+        if let Some(id) = self.waiting.take()
+            && let Some(Some(channel)) = self.channels.get_mut(id)
+        {
+            channel.waiting -= 1;
+        }
+    }
+
+    fn live_tasks(&self) -> usize {
+        self.tasks
+            .iter()
+            .flatten()
+            .filter(|task| task.end.is_none())
+            .count()
+    }
+
+    /// The earliest moment a sleeping task wakes, if any task sleeps.
+    fn earliest_wake(&self) -> Option<Instant> {
+        self.tasks
+            .iter()
+            .flatten()
+            .filter(|task| task.end.is_none())
+            .filter_map(|task| task.sleeping_until)
+            .chain(self.sleeping_until)
+            .min()
     }
 
     /// A new channel with one sender and one receiver, `None` when the table
@@ -1017,6 +1112,8 @@ fn trace(value: &FrameValue, marks: &mut [bool], pending: &mut Vec<usize>) {
             | FrameValue::Generator(_)
             | FrameValue::Sender(_)
             | FrameValue::Receiver(_)
+            | FrameValue::Task(_)
+            | FrameValue::Clock
             | FrameValue::Rc(_)
             | FrameValue::Weak(_)
             | FrameValue::Moved => {}
@@ -1236,6 +1333,8 @@ impl Frame {
             | FrameValue::Generator(_)
             | FrameValue::Sender(_)
             | FrameValue::Receiver(_)
+            | FrameValue::Task(_)
+            | FrameValue::Clock
             | FrameValue::Moved => {
                 unreachable!("verified scalar operand")
             }
@@ -1259,6 +1358,8 @@ impl Frame {
             | FrameValue::Generator(_)
             | FrameValue::Sender(_)
             | FrameValue::Receiver(_)
+            | FrameValue::Task(_)
+            | FrameValue::Clock
             | FrameValue::Moved => {
                 unreachable!("verified loan operand")
             }
@@ -1334,6 +1435,10 @@ pub struct Activation {
     module: VerifiedModule,
     output: OutputSink,
     input: InputSource,
+    /// Consecutive blocked attempts with no instruction finishing between.
+    stalled: usize,
+    /// Instructions the running task may still run before a turn passes.
+    quantum: usize,
     memory: Memory,
     limits: ExecutionLimits,
     instructions_executed: usize,
@@ -1394,10 +1499,99 @@ enum ExecutionState {
 
 enum StepOutcome {
     Continue,
-    Returned(Option<Scalar>),
+    /// The instruction could not finish yet and will be tried again.
+    Blocked,
+    Returned(Option<FrameValue>),
 }
 
 impl VerifiedModule {
+    /// Give the running task's frames to the table and run another live task
+    /// instead. `false` when no other task can run, and nothing changed.
+    fn rotate(&self, stack: &mut Vec<Frame>, memory: &mut Memory, finished: bool) -> bool {
+        let current = memory.current_task;
+        let count = memory.tasks.len();
+        for offset in 1..=count {
+            let id = (current + offset) % count;
+            if id == current {
+                continue;
+            }
+            let Some(record) = memory.tasks[id].as_ref() else {
+                continue;
+            };
+            if record.end.is_some() {
+                continue;
+            }
+            if record.cancelled {
+                self.cancel_task(memory, id);
+                continue;
+            }
+            if !finished {
+                let waiting = memory.waiting.take();
+                let sleeping_until = memory.sleeping_until.take();
+                if let Some(record) = memory.tasks[current].as_mut() {
+                    record.stack = std::mem::take(stack);
+                    record.waiting = waiting;
+                    record.sleeping_until = sleeping_until;
+                }
+            }
+            let Some(next) = memory.tasks[id].as_mut() else {
+                unreachable!("a candidate task exists");
+            };
+            *stack = std::mem::take(&mut next.stack);
+            memory.waiting = next.waiting.take();
+            memory.sleeping_until = next.sleeping_until.take();
+            memory.current_task = id;
+            return true;
+        }
+        false
+    }
+
+    /// The running task has returned or failed: record how, release what its
+    /// frames own, and run another task.
+    fn end_task(&self, stack: &mut Vec<Frame>, memory: &mut Memory, end: TaskEnd) {
+        memory.stop_waiting();
+        memory.sleeping_until = None;
+        self.release_frames(memory, std::mem::take(stack));
+        let current = memory.current_task;
+        if let Some(record) = memory.tasks[current].as_mut() {
+            record.end = Some(end);
+        }
+        if !self.rotate(stack, memory, true) {
+            unreachable!("the entry task outlives every other task");
+        }
+    }
+
+    /// End a task that is not running because it was asked to stop.
+    fn cancel_task(&self, memory: &mut Memory, id: usize) {
+        let Some(record) = memory.tasks[id].as_mut() else {
+            return;
+        };
+        let frames = std::mem::take(&mut record.stack);
+        let waiting = record.waiting.take();
+        record.sleeping_until = None;
+        record.end = Some(TaskEnd::Cancelled);
+        if let Some(channel) = waiting
+            && let Some(Some(channel)) = memory.channels.get_mut(channel)
+        {
+            channel.waiting -= 1;
+        }
+        self.release_frames(memory, frames);
+    }
+
+    /// Release the parameters of frames that will not run again. Parameters
+    /// are the values a frame owns outright; temporaries may alias them.
+    fn release_frames(&self, memory: &mut Memory, frames: Vec<Frame>) {
+        for mut frame in frames {
+            let body = &self.functions[frame.function.index()];
+            let layout = body.frame_layout();
+            for &parameter in body.parameters.iter() {
+                if let Some(value) = frame.slot_mut(layout, parameter).take() {
+                    memory.drop_value(value);
+                }
+            }
+        }
+    }
+
     pub(crate) fn restore_scalars(
         &self,
         snapshots: Vec<ScalarFrameSnapshot>,
@@ -1487,6 +1681,8 @@ impl VerifiedModule {
             module: self.clone(),
             output: OutputSink::default(),
             input: InputSource::default(),
+            stalled: 0,
+            quantum: QUANTUM,
             memory: Memory::new(self.globals.len()),
             limits,
             instructions_executed,
@@ -1548,6 +1744,8 @@ impl VerifiedModule {
             module: self.clone(),
             output: OutputSink::default(),
             input: InputSource::default(),
+            stalled: 0,
+            quantum: QUANTUM,
             memory: Memory::new(self.globals.len()),
             limits,
             instructions_executed: 0,
@@ -2573,11 +2771,8 @@ impl VerifiedModule {
                 } else if channel.has_room() {
                     None
                 } else if blocking {
-                    return Err(RunError::Deadlock {
-                        function,
-                        instruction: from,
-                        span: body.spans[pc],
-                    });
+                    stack[depth - 1].pc -= 1;
+                    return Ok(StepOutcome::Blocked);
                 } else {
                     Some(variants.failure(1))
                 };
@@ -2609,32 +2804,136 @@ impl VerifiedModule {
                 };
                 let blocking = matches!(body.instructions[pc], Instruction::ChannelReceive(..));
                 let channel = memory.channel(id);
-                let result = if let Some(value) = channel.queue.pop_front() {
-                    Composite::Enum {
+                let queued = channel.queue.pop_front();
+                let closed = channel.closed;
+                if queued.is_none() && !closed && blocking {
+                    // Park on the channel so a rendezvous send may hand over.
+                    if memory.waiting.is_none() {
+                        memory.channel(id).waiting += 1;
+                        memory.waiting = Some(id);
+                    }
+                    stack[depth - 1].pc -= 1;
+                    return Ok(StepOutcome::Blocked);
+                }
+                memory.stop_waiting();
+                let result = match queued {
+                    Some(value) => Composite::Enum {
                         variant: variants.ok(),
                         payload: Some(Box::new(value)),
-                    }
-                } else if channel.closed || !blocking {
-                    let failure = if channel.closed {
-                        variants.failure(0)
-                    } else {
-                        variants.failure(1)
-                    };
-                    Composite::Enum {
+                    },
+                    None => Composite::Enum {
                         variant: variants.err(),
                         payload: Some(Box::new(FrameValue::Composite(Composite::Enum {
-                            variant: failure,
+                            variant: variants.failure(if closed { 0 } else { 1 }),
                             payload: None,
                         }))),
-                    }
+                    },
+                };
+                stack[depth - 1].set_value(layout, dst, FrameValue::Composite(result));
+            }
+            Instruction::ClockNew(dst) => frame.set_value(layout, dst, FrameValue::Clock),
+            Instruction::ClockClone(dst, _) => frame.set_value(layout, dst, FrameValue::Clock),
+            Instruction::ClockSleep(_, duration) => {
+                let Scalar::U64(milliseconds) = frame.get(layout, duration) else {
+                    unreachable!("verified duration");
+                };
+                let now = Instant::now();
+                let deadline = *memory.sleeping_until.get_or_insert_with(|| {
+                    now + Duration::from_millis(milliseconds.min(u64::from(u32::MAX) * 1000))
+                });
+                if now < deadline {
+                    stack[depth - 1].pc -= 1;
+                    return Ok(StepOutcome::Blocked);
+                }
+                memory.sleeping_until = None;
+            }
+            Instruction::TaskSpawn(dst, closure) => {
+                let FrameValue::Closure(closure) = frame.value(layout, closure) else {
+                    unreachable!("verified closure operand");
+                };
+                let target = &self.functions[closure.function.index()];
+                let captured: Vec<FrameValue> = closure.captures.to_vec();
+                if !captured.iter().all(transferable) {
+                    return Err(RunError::NotTransferable {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    });
+                }
+                let task = Frame::new(closure.function, target, captured.into_iter(), None);
+                let record = TaskRecord {
+                    stack: vec![task],
+                    end: None,
+                    cancelled: false,
+                    waiting: None,
+                    sleeping_until: None,
+                };
+                let id = if let Some(id) = memory.free_tasks.pop() {
+                    memory.tasks[id] = Some(record);
+                    id
+                } else if memory.tasks.len() < MAX_TASKS {
+                    memory.tasks.push(Some(record));
+                    memory.tasks.len() - 1
                 } else {
-                    return Err(RunError::Deadlock {
+                    return Err(RunError::TaskLimit {
                         function,
                         instruction: from,
                         span: body.spans[pc],
                     });
                 };
-                stack[depth - 1].set_value(layout, dst, FrameValue::Composite(result));
+                stack[depth - 1].set_value(layout, dst, FrameValue::Task(id));
+            }
+            Instruction::TaskJoin(dst, task)
+            | Instruction::TaskIsFinished(dst, task)
+            | Instruction::TaskCancel(task @ dst) => {
+                let held = self
+                    .held_value(stack, memory, body, task)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let Some(FrameValue::Task(id)) = held else {
+                    unreachable!("verified task operand");
+                };
+                let finished = memory.tasks[id]
+                    .as_ref()
+                    .is_some_and(|task| task.end.is_some());
+                match body.instructions[pc] {
+                    Instruction::TaskIsFinished(..) => {
+                        stack[depth - 1].set_value(
+                            layout,
+                            dst,
+                            FrameValue::Scalar(Scalar::Bool(finished)),
+                        );
+                    }
+                    Instruction::TaskCancel(..) => {
+                        if let Some(record) = memory.tasks[id].as_mut() {
+                            record.cancelled = true;
+                        }
+                    }
+                    _ => {
+                        if !finished {
+                            stack[depth - 1].pc -= 1;
+                            return Ok(StepOutcome::Blocked);
+                        }
+                        let Some(record) = memory.tasks[id].take() else {
+                            unreachable!("a joined task exists");
+                        };
+                        memory.free_tasks.push(id);
+                        let outcome = match record.end {
+                            Some(TaskEnd::Completed(value)) => Composite::Enum {
+                                variant: 0,
+                                payload: Some(Box::new(value.unwrap_or_else(unit))),
+                            },
+                            Some(TaskEnd::Failed) => Composite::Enum {
+                                variant: 1,
+                                payload: None,
+                            },
+                            _ => Composite::Enum {
+                                variant: 2,
+                                payload: None,
+                            },
+                        };
+                        stack[depth - 1].set_value(layout, dst, FrameValue::Composite(outcome));
+                    }
+                }
             }
             Instruction::SendErrorValue(dst, error) => {
                 let held = self
@@ -2775,10 +3074,7 @@ impl VerifiedModule {
                     memory.finish_finalizer(block);
                 }
                 let Some(caller) = stack.last_mut() else {
-                    return Ok(StepOutcome::Returned(value.map(|value| match value {
-                        FrameValue::Scalar(value) => value,
-                        _ => unreachable!("verified entry result is scalar"),
-                    })));
+                    return Ok(StepOutcome::Returned(value));
                 };
                 let caller_body = &self.functions[caller.function.index()];
                 let layout = caller_body.frame_layout();
@@ -3560,6 +3856,27 @@ fn read_input(line: &str, kind: InputKind) -> Option<FrameValue> {
     })
 }
 
+/// Whether a value may move into another task: plain data and channel ends.
+fn transferable(value: &FrameValue) -> bool {
+    match value {
+        FrameValue::Scalar(_)
+        | FrameValue::Text(_)
+        | FrameValue::Sender(_)
+        | FrameValue::Receiver(_)
+        | FrameValue::Clock => true,
+        FrameValue::Composite(Composite::Tuple(fields)) => fields.iter().all(transferable),
+        FrameValue::Composite(Composite::Enum { payload, .. }) => {
+            payload.as_deref().is_none_or(transferable)
+        }
+        FrameValue::Composite(Composite::Array(elements)) => {
+            elements.iter().flatten().all(transferable)
+        }
+        FrameValue::Composite(Composite::Vec(items)) => items.iter().all(transferable),
+        FrameValue::Composite(Composite::Cell(inner)) => transferable(inner),
+        _ => false,
+    }
+}
+
 /// The unit value: a tuple without fields.
 fn unit() -> FrameValue {
     FrameValue::Composite(Composite::Tuple(Box::new([])))
@@ -3661,6 +3978,8 @@ fn spell(value: &FrameValue, style: TextStyle) -> String {
             | FrameValue::Generator(_)
             | FrameValue::Sender(_)
             | FrameValue::Receiver(_)
+            | FrameValue::Task(_)
+            | FrameValue::Clock
             | FrameValue::Moved,
         ) => unreachable!("verified text operand is a scalar or string"),
     }
@@ -3753,18 +4072,69 @@ impl Activation {
         let available = self.limits.fuel - self.instructions_executed;
         for _ in 0..budget.min(available) {
             self.instructions_executed += 1;
-            self.state = match self.module.step(
+            let outcome = self.module.step(
                 stack,
                 &mut self.memory,
                 self.limits.frames,
                 &mut self.output,
                 &mut self.input,
-            ) {
-                Ok(StepOutcome::Continue) => continue,
-                Ok(StepOutcome::Returned(value)) => ExecutionState::Returned(value),
-                Err(error) => ExecutionState::Failed(error),
-            };
-            return self.status();
+            );
+            let entry = self.memory.current_task == 0;
+            match outcome {
+                Ok(StepOutcome::Continue) => {
+                    self.stalled = 0;
+                    self.quantum -= 1;
+                    if self.quantum == 0 {
+                        self.quantum = QUANTUM;
+                        self.module.rotate(stack, &mut self.memory, false);
+                    }
+                }
+                Ok(StepOutcome::Blocked) => {
+                    self.stalled += 1;
+                    if self.stalled > self.memory.live_tasks() {
+                        // Every live task was tried and none could go on.
+                        if let Some(wake) = self.memory.earliest_wake() {
+                            std::thread::sleep(wake.saturating_duration_since(Instant::now()));
+                            self.stalled = 0;
+                        } else {
+                            let Some(frame) = stack.last() else {
+                                unreachable!("active execution has a frame");
+                            };
+                            let body = &self.module.functions[frame.function.index()];
+                            self.state = ExecutionState::Failed(RunError::Deadlock {
+                                function: frame.function,
+                                instruction: instruction_id(frame.pc),
+                                span: body.spans[frame.pc],
+                            });
+                            return self.status();
+                        }
+                    } else {
+                        self.module.rotate(stack, &mut self.memory, false);
+                    }
+                }
+                Ok(StepOutcome::Returned(value)) if entry => {
+                    let scalar = value.map(|value| match value {
+                        FrameValue::Scalar(value) => value,
+                        _ => unreachable!("verified entry result is scalar"),
+                    });
+                    self.state = ExecutionState::Returned(scalar);
+                    return self.status();
+                }
+                Err(error) if entry => {
+                    self.state = ExecutionState::Failed(error);
+                    return self.status();
+                }
+                Ok(StepOutcome::Returned(value)) => {
+                    self.module
+                        .end_task(stack, &mut self.memory, TaskEnd::Completed(value));
+                    self.stalled = 0;
+                }
+                Err(_) => {
+                    self.module
+                        .end_task(stack, &mut self.memory, TaskEnd::Failed);
+                    self.stalled = 0;
+                }
+            }
         }
         if self.instructions_executed == self.limits.fuel {
             self.state = ExecutionState::Failed(RunError::FuelExhausted);
