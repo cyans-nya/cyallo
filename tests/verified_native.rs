@@ -22,8 +22,8 @@ const LIMITS: ExecutionLimits = ExecutionLimits {
 };
 const TIERS: [NativeTier; 3] = [
     NativeTier::Winch,
-    NativeTier::Cranelift(CraneliftProfile::Fast),
-    NativeTier::Cranelift(CraneliftProfile::Speed),
+    NativeTier::Cranelift(CraneliftProfile::LowLatency),
+    NativeTier::Cranelift(CraneliftProfile::Optimized),
 ];
 
 fn verified(source: &str) -> VerifiedModule {
@@ -256,7 +256,7 @@ fn mixed_scalar_callee_recovers_both_frames_and_exact_fuel() {
     }
     let source = "fn leaf(a: i64, b: i64) -> i64 { return (a / b) * 2 }\nfn entry(a: i64, b: i64) -> i64 { let saved = a + 3; return leaf(a, b) + saved }\n";
     let module = verified(source);
-    let optimized = NativeTier::Cranelift(CraneliftProfile::Speed);
+    let optimized = NativeTier::Cranelift(CraneliftProfile::Optimized);
     for (caller_tier, callee_tier) in [
         (NativeTier::Winch, optimized),
         (optimized, NativeTier::Winch),
@@ -352,13 +352,13 @@ fn a_retired_transitive_callee_stays_executable_through_the_caller_pin() {
     publish(
         &mut store,
         leaf,
-        NativeTier::Cranelift(CraneliftProfile::Speed),
+        NativeTier::Cranelift(CraneliftProfile::Optimized),
     );
     publish(&mut store, middle, NativeTier::Winch);
     let root_pin = publish(
         &mut store,
         root,
-        NativeTier::Cranelift(CraneliftProfile::Fast),
+        NativeTier::Cranelift(CraneliftProfile::LowLatency),
     );
     let args = [Scalar::I64(39)];
     let Dispatch::Interpreter(mut interpreted) = store
@@ -624,8 +624,8 @@ fn both_adapters_emit_the_same_versioned_plan_with_final_machine_ranges() {
     for plan in [caller, callee] {
         for tier in [
             NativeTier::Winch,
-            NativeTier::Cranelift(CraneliftProfile::Fast),
-            NativeTier::Cranelift(CraneliftProfile::Speed),
+            NativeTier::Cranelift(CraneliftProfile::LowLatency),
+            NativeTier::Cranelift(CraneliftProfile::Optimized),
         ] {
             let image = tier.emit(plan.clone()).unwrap();
             let again = tier.emit(plan.clone()).unwrap();

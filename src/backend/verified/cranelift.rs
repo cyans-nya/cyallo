@@ -39,8 +39,8 @@ pub(super) fn emit(
         .set(
             "opt_level",
             match profile {
-                CraneliftProfile::Fast => "none",
-                CraneliftProfile::Speed => "speed",
+                CraneliftProfile::LowLatency => "none",
+                CraneliftProfile::Optimized => "speed",
             },
         )
         .map_err(EmitError::Configuration)?;

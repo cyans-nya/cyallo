@@ -12,8 +12,10 @@ pub enum NativeTier {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CraneliftProfile {
-    Fast,
-    Speed,
+    /// Quick to compile: no Cranelift optimization passes.
+    LowLatency,
+    /// Quick to run: Cranelift's speed optimizations.
+    Optimized,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
