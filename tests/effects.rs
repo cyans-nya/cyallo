@@ -1,6 +1,5 @@
-use cyallo::{
-    CompileOptions, Dialect, Session, Status, compile, compile_with_options, ir::RoutineKind,
-};
+use cyallo::{CompileOptions, Dialect, compile, compile_with_options, ir::RoutineKind};
+use cyallo::vm::{Session, Status};
 use std::sync::Arc;
 #[test]
 fn returning_procedures_and_private_mutation() {
