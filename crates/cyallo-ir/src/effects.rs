@@ -57,290 +57,382 @@ pub fn analyze(
     functions: &mut [Function],
     services: &crate::services::Metadata,
 ) -> Result<(), Diagnostic> {
-    analyze_selected(functions, None, services)
+    analyze_all(functions, services)
 }
+/// Effects of one forced routine. `headers` are the shared declaration contracts of
+/// every routine after the entry (routine `i` is `headers[i - 1]`); `globals` are
+/// the entry's locals. They are borrowed, never copied, so forcing a body costs
+/// what that body costs, not what the program costs.
 pub fn analyze_one(
-    functions: &mut [Function],
-    function: usize,
+    function: &mut Function,
+    index: usize,
+    globals: &[crate::ir::Local],
+    headers: &[Function],
     services: &crate::services::Metadata,
 ) -> Result<(), Diagnostic> {
-    analyze_selected(functions, Some(function), services)
+    let mut calls = vec![];
+    let (mut effect, violation) = {
+        let env = Forced {
+            index,
+            function,
+            globals,
+            headers,
+        };
+        scan(index, function, &env, services, &mut calls)
+    };
+    // Only this routine has outgoing edges, so the only cycle through it is a
+    // direct self-call, and every other callee keeps its default (empty) summary.
+    effect.may_diverge |= calls.iter().any(|(to, _)| *to == index);
+    if function.pure {
+        if let Some((span, message)) = violation {
+            return Err(Diagnostic::new("E120", message, span)
+                .with_related(function.span, "declared pure function"));
+        }
+        if !effect.is_observably_pure() {
+            let (to, span) = calls
+                .iter()
+                .find(|(to, _)| *to == index && !effect.is_observably_pure())
+                .expect("effect originates in call");
+            let _ = to;
+            let diagnostic = Diagnostic::new(
+                "E120",
+                format!(
+                    "pure fn {} calls effectful function {}",
+                    function.name, function.name
+                ),
+                *span,
+            )
+            .with_related(function.span, "effects originate through this routine");
+            return Err(diagnostic);
+        }
+    }
+    function.effects = effect;
+    function.effects.transitive_complete = !function.code.iter().any(|i| {
+        matches!(
+            i.op,
+            Op::Invoke(..)
+                | Op::TraitCall(..)
+                | Op::Service(..)
+                | Op::Lookup(_, crate::lookup::Operation::Mapped, _)
+        )
+    });
+    Ok(())
 }
-fn analyze_selected(
+/// What the scan of one routine needs to know about everything else: the global
+/// slots and the declaration contracts of call targets.
+trait Program {
+    fn global(&self, index: usize) -> &crate::ir::Local;
+    fn callee(&self, to: usize) -> (RoutineKind, &str, Span);
+}
+impl Program for [Function] {
+    fn global(&self, index: usize) -> &crate::ir::Local {
+        &self[0].locals[index]
+    }
+    fn callee(&self, to: usize) -> (RoutineKind, &str, Span) {
+        let f = &self[to];
+        (f.kind, &f.name, f.span)
+    }
+}
+/// One forced body against shared, immutable header contracts. Routine `i` is
+/// `headers[i - 1]` (routine 0 is the entry); the selected routine itself is
+/// `function`. Nothing here is proportional to the number of routines.
+struct Forced<'a> {
+    index: usize,
+    function: &'a Function,
+    globals: &'a [crate::ir::Local],
+    headers: &'a [Function],
+}
+impl Program for Forced<'_> {
+    fn global(&self, index: usize) -> &crate::ir::Local {
+        if self.index == 0 {
+            &self.function.locals[index]
+        } else {
+            &self.globals[index]
+        }
+    }
+    fn callee(&self, to: usize) -> (RoutineKind, &str, Span) {
+        let f = if to == self.index || to == 0 {
+            self.function
+        } else {
+            &self.headers[to - 1]
+        };
+        (f.kind, &f.name, f.span)
+    }
+}
+fn scan(
+    fi: usize,
+    f: &Function,
+    env: &(impl Program + ?Sized),
+    services: &crate::services::Metadata,
+    calls: &mut Vec<(usize, Span)>,
+) -> (EffectSummary, Option<(Span, String)>) {
+    let mut summary = EffectSummary::default();
+    let effect = &mut summary;
+    let mut first_violation = None;
+    effect.may_allocate = !f.locals.is_empty();
+    effect.may_fail = effect.may_allocate;
+    let mut addresses: Vec<Option<Slot>> = vec![None; f.registers.len()];
+    let mut reference_targets = std::collections::HashMap::new();
+    for (pc, inst) in f.code.iter().enumerate() {
+        let mut violation = None;
+        match &inst.op {
+            Op::Dynamic(_, op, _) => {
+                effect.may_allocate = true;
+                effect.may_fail = true;
+                if !matches!(
+                    op,
+                    crate::dynamic::Operation::Erase | crate::dynamic::Operation::Object(..)
+                ) {
+                    effect.writes_references = true;
+                    violation = Some("pure fn cannot perform unchecked dynamic operations".into());
+                }
+            }
+            Op::Lookup(destination, op, arguments) => {
+                // The operation's contract; operations without a single origin
+                // carry the conservative contract (allocates and fails).
+                let contract = op.contract().effects;
+                effect.may_allocate |= contract.allocates;
+                effect.may_fail |= contract.may_fail || contract.allocates;
+                if matches!(
+                    op,
+                    crate::lookup::Operation::Concurrent(_) | crate::lookup::Operation::ModuleLoad
+                ) {
+                    effect.nondeterministic = true;
+                    effect.writes_references = true;
+                    violation = Some("pure fn cannot perform concurrent operations".into());
+                }
+                if matches!(op, crate::lookup::Operation::CloneValue)
+                    && crate::ownership::effectful_lifecycle(&f.registers[*destination])
+                {
+                    effect.writes_references = true;
+                    violation =
+                        Some("pure fn cannot clone a value with effectful lifecycle".into());
+                }
+                if matches!(
+                    op,
+                    crate::lookup::Operation::Allocate
+                        | crate::lookup::Operation::Deallocate
+                        | crate::lookup::Operation::RcNewIn { .. }
+                        | crate::lookup::Operation::ManagedNew(cyallo_ast::MemoryKind::Rc, _)
+                        | crate::lookup::Operation::RcClone
+                        | crate::lookup::Operation::RcDowngrade
+                        | crate::lookup::Operation::RcUpgrade
+                        | crate::lookup::Operation::RcStrongCount
+                        | crate::lookup::Operation::RcWeakCount
+                ) {
+                    effect.writes_references = true;
+                    violation = Some("pure fn cannot construct, clone or observe mutable reference-counted ownership".into());
+                }
+                if matches!(op, crate::lookup::Operation::DropValue)
+                    && arguments.first().is_some_and(|argument| {
+                        crate::ownership::effectful_lifecycle(&f.registers[*argument])
+                    })
+                {
+                    effect.writes_references = true;
+                    violation =
+                        Some("pure fn cannot destroy a value with effectful lifecycle".into());
+                }
+                effect.reads_managed |= matches!(
+                    op,
+                    crate::lookup::Operation::CellRead
+                        | crate::lookup::Operation::LocationLoad
+                        | crate::lookup::Operation::Mapped
+                );
+                effect.may_diverge |= matches!(op, crate::lookup::Operation::Mapped);
+                effect.nondeterministic |= matches!(op, crate::lookup::Operation::Symbol);
+                if effect.reads_managed {
+                    violation = Some("pure fn cannot read mutable managed storage; use a proc or pass an immutable value snapshot".into());
+                }
+                if matches!(
+                    op,
+                    crate::lookup::Operation::CollectionPush(_)
+                        | crate::lookup::Operation::CollectionPop(_)
+                ) {
+                    let receiver = arguments[0];
+                    record_store(fi, addresses[receiver], f, effect);
+                    if effect.writes_references || effect.writes_globals {
+                        violation =
+                            Some("pure fn cannot mutate a borrowed collection or global".into());
+                    }
+                } else if op.writes() {
+                    effect.writes_references = true;
+                    violation =
+                        Some("pure fn cannot mutate managed storage or create symbols".into());
+                }
+            }
+            Op::ServiceKey(..) => {}
+            Op::TraitBox(..) => {
+                effect.may_allocate = true;
+                effect.may_fail = true;
+            }
+            Op::TraitCall(_, receiver, method, _) if matches!(&f.registers[*receiver],Type::TraitObject(name) if services.trait_id(name).is_some_and(|id|services.traits[id].methods[*method].kind==RoutineKind::Function)) =>
+            {
+                effect.reads_managed = true;
+                effect.may_allocate = true;
+                effect.may_fail = true;
+                effect.may_diverge = true;
+                violation = Some("pure fn cannot read through a mutable erased receiver".into());
+            }
+            Op::Service(..) | Op::TraitCall(..) => {
+                effect.may_allocate = true;
+                effect.may_fail = true;
+                effect.may_diverge = true;
+                effect.reads_mutable_globals = true;
+                effect.writes_references = true;
+                violation = Some(
+                    "pure fn cannot resolve services or invoke an effectful erased method".into(),
+                );
+            }
+            Op::Address(r, slot) => {
+                addresses[*r] = Some(*slot);
+                if slot.global || fi == 0 {
+                    let global = env.global(slot.index);
+                    if global.constant {
+                        effect.reads_immutable = true;
+                    } else {
+                        effect.reads_mutable_globals = true;
+                        violation = Some(format!(
+                            "pure fn cannot access mutable global {}",
+                            global.name
+                        ));
+                    }
+                }
+            }
+            Op::Index(r, a, _, write) => {
+                addresses[*r] = addresses[*a];
+                effect.may_fail = true;
+                effect.may_allocate |= *write;
+                if *write {
+                    record_store(fi, addresses[*a], f, effect);
+                }
+            }
+            Op::EnumPayload(r, a, _, crate::enums::Projection::Address, _) | Op::Field(r, a, _) => {
+                addresses[*r] = addresses[*a];
+                effect.may_fail = true;
+            }
+            Op::Extract(..) => effect.may_fail = true,
+            Op::Invoke(_, callee, _) => {
+                effect.transitive_complete = false;
+                effect.may_allocate = true;
+                effect.may_fail = true;
+                effect.may_diverge = true;
+                if cyallo_ast::callable(&f.registers[*callee])
+                    .is_some_and(|(k, _, _)| k == RoutineKind::Procedure)
+                {
+                    effect.io = true;
+                    effect.nondeterministic = true;
+                    effect.reads_mutable_globals = true;
+                    effect.writes_globals = true;
+                    effect.writes_references = true;
+                    violation = Some("pure fn cannot call an effectful procedure value".into());
+                }
+            }
+            Op::Store(a, value) => {
+                if matches!(f.registers[*value], Type::Reference { .. })
+                    && let Some(slot) = addresses[*a]
+                {
+                    reference_targets.insert((slot.global, slot.index), addresses[*value]);
+                }
+                record_store(fi, addresses[*a], f, effect);
+                if effect.writes_references {
+                    violation = Some("pure fn cannot mutate a ref capture".into());
+                }
+            }
+            Op::Load(result, a) | Op::Take(result, a) | Op::Length(result, a) => {
+                if matches!(f.registers[*result], Type::Reference { .. }) {
+                    addresses[*result] = addresses[*a].and_then(|slot| {
+                        reference_targets
+                            .get(&(slot.global, slot.index))
+                            .copied()
+                            .flatten()
+                    });
+                }
+                effect.may_fail = true;
+                effect.reads_managed |= addresses[*a]
+                    .is_some_and(|s| !s.global && f.params.get(s.index) == Some(&true));
+                if effect.reads_managed {
+                    violation = Some("pure fn cannot read a mutable ref capture".into());
+                }
+            }
+            Op::CheckStep(_) => effect.may_fail = true,
+            Op::ManagedAddress(_, _) => effect.may_fail = true,
+            Op::Drop(a) => {
+                if crate::ownership::effectful_lifecycle(&f.registers[*a]) {
+                    effect.writes_references = true;
+                    violation =
+                        Some("pure fn cannot destroy a value with effectful lifecycle".into());
+                }
+            }
+            Op::Input(a, _) => {
+                effect.io = true;
+                effect.may_fail = true;
+                record_store(fi, addresses[*a], f, effect);
+                violation = Some("pure fn cannot read input".into());
+            }
+            Op::FrameInput(..) => {
+                effect.io = true;
+                effect.may_fail = true;
+                violation = Some("pure fn cannot read input".into());
+            }
+            Op::Output(..) => {
+                effect.io = true;
+                violation = Some("pure fn cannot produce output".into());
+            }
+            Op::ArrayLiteral(..)
+            | Op::Frozen(..)
+            | Op::EnumConstruct(..)
+            | Op::Aggregate(..)
+            | Op::FunctionValue(..)
+            | Op::LiteralString(..) => effect.may_allocate = true,
+            Op::Unary(..) | Op::Binary(..) => effect.may_fail = true,
+            Op::Builtin(r, name, _) => {
+                // The intrinsic's contract states what it can do. Allocation can
+                // exhaust resources, so it still counts as a possible failure.
+                let contract = name.contract().effects;
+                effect.may_fail |= contract.may_fail || contract.allocates;
+                effect.may_allocate |= contract.allocates
+                    || matches!(
+                        f.registers[*r],
+                        Type::String | Type::Array(..) | Type::SparseArray(_)
+                    );
+                effect.io |= contract.io;
+                if !contract.is_pure() {
+                    effect.nondeterministic = true;
+                    violation = Some(format!("pure fn cannot call effectful builtin `{name}`"));
+                }
+            }
+            Op::Call(_, to, _) => {
+                calls.push((*to, inst.span));
+                effect.may_fail = true;
+                let (kind, name, _) = env.callee(*to);
+                if kind == RoutineKind::Procedure {
+                    violation = Some(format!("pure fn cannot call procedure {name}"));
+                }
+            }
+            Op::Jump(to) if *to <= pc => effect.may_diverge = true,
+            Op::Branch(_, yes, no) if *yes <= pc || *no <= pc => effect.may_diverge = true,
+            Op::Move(r, a) => addresses[*r] = addresses[*a],
+            _ => {}
+        }
+        if let Some(message) = violation {
+            first_violation.get_or_insert((inst.span, message));
+        }
+    }
+    (summary, first_violation)
+}
+fn analyze_all(
     functions: &mut [Function],
-    selected: Option<usize>,
     services: &crate::services::Metadata,
 ) -> Result<(), Diagnostic> {
     let mut effects = vec![EffectSummary::default(); functions.len()];
     let mut violations = vec![None; functions.len()];
     let mut calls = vec![vec![]; functions.len()];
     for (fi, f) in functions.iter().enumerate() {
-        if selected.is_some_and(|wanted| wanted != fi) {
-            continue;
-        }
-        let effect = &mut effects[fi];
-        effect.may_allocate = !f.locals.is_empty();
-        effect.may_fail = effect.may_allocate;
-        let mut addresses: Vec<Option<Slot>> = vec![None; f.registers.len()];
-        let mut reference_targets = std::collections::HashMap::new();
-        for (pc, inst) in f.code.iter().enumerate() {
-            let mut violation = None;
-            match &inst.op {
-                Op::Dynamic(_, op, _) => {
-                    effect.may_allocate = true;
-                    effect.may_fail = true;
-                    if !matches!(
-                        op,
-                        crate::dynamic::Operation::Erase | crate::dynamic::Operation::Object(..)
-                    ) {
-                        effect.writes_references = true;
-                        violation =
-                            Some("pure fn cannot perform unchecked dynamic operations".into());
-                    }
-                }
-                Op::Lookup(destination, op, arguments) => {
-                    // The operation's contract; operations without a single origin
-                    // carry the conservative contract (allocates and fails).
-                    let contract = op.contract().effects;
-                    effect.may_allocate |= contract.allocates;
-                    effect.may_fail |= contract.may_fail || contract.allocates;
-                    if matches!(
-                        op,
-                        crate::lookup::Operation::Concurrent(_)
-                            | crate::lookup::Operation::ModuleLoad
-                    ) {
-                        effect.nondeterministic = true;
-                        effect.writes_references = true;
-                        violation = Some("pure fn cannot perform concurrent operations".into());
-                    }
-                    if matches!(op, crate::lookup::Operation::CloneValue)
-                        && crate::ownership::effectful_lifecycle(&f.registers[*destination])
-                    {
-                        effect.writes_references = true;
-                        violation =
-                            Some("pure fn cannot clone a value with effectful lifecycle".into());
-                    }
-                    if matches!(
-                        op,
-                        crate::lookup::Operation::Allocate
-                            | crate::lookup::Operation::Deallocate
-                            | crate::lookup::Operation::RcNewIn { .. }
-                            | crate::lookup::Operation::ManagedNew(cyallo_ast::MemoryKind::Rc, _)
-                            | crate::lookup::Operation::RcClone
-                            | crate::lookup::Operation::RcDowngrade
-                            | crate::lookup::Operation::RcUpgrade
-                            | crate::lookup::Operation::RcStrongCount
-                            | crate::lookup::Operation::RcWeakCount
-                    ) {
-                        effect.writes_references = true;
-                        violation = Some("pure fn cannot construct, clone or observe mutable reference-counted ownership".into());
-                    }
-                    if matches!(op, crate::lookup::Operation::DropValue)
-                        && arguments.first().is_some_and(|argument| {
-                            crate::ownership::effectful_lifecycle(&f.registers[*argument])
-                        })
-                    {
-                        effect.writes_references = true;
-                        violation =
-                            Some("pure fn cannot destroy a value with effectful lifecycle".into());
-                    }
-                    effect.reads_managed |= matches!(
-                        op,
-                        crate::lookup::Operation::CellRead
-                            | crate::lookup::Operation::LocationLoad
-                            | crate::lookup::Operation::Mapped
-                    );
-                    effect.may_diverge |= matches!(op, crate::lookup::Operation::Mapped);
-                    effect.nondeterministic |= matches!(op, crate::lookup::Operation::Symbol);
-                    if effect.reads_managed {
-                        violation = Some("pure fn cannot read mutable managed storage; use a proc or pass an immutable value snapshot".into());
-                    }
-                    if matches!(
-                        op,
-                        crate::lookup::Operation::CollectionPush(_)
-                            | crate::lookup::Operation::CollectionPop(_)
-                    ) {
-                        let receiver = arguments[0];
-                        record_store(fi, addresses[receiver], f, effect);
-                        if effect.writes_references || effect.writes_globals {
-                            violation = Some(
-                                "pure fn cannot mutate a borrowed collection or global".into(),
-                            );
-                        }
-                    } else if op.writes() {
-                        effect.writes_references = true;
-                        violation =
-                            Some("pure fn cannot mutate managed storage or create symbols".into());
-                    }
-                }
-                Op::ServiceKey(..) => {}
-                Op::TraitBox(..) => {
-                    effect.may_allocate = true;
-                    effect.may_fail = true;
-                }
-                Op::TraitCall(_, receiver, method, _) if matches!(&f.registers[*receiver],Type::TraitObject(name) if services.trait_id(name).is_some_and(|id|services.traits[id].methods[*method].kind==RoutineKind::Function)) =>
-                {
-                    effect.reads_managed = true;
-                    effect.may_allocate = true;
-                    effect.may_fail = true;
-                    effect.may_diverge = true;
-                    violation =
-                        Some("pure fn cannot read through a mutable erased receiver".into());
-                }
-                Op::Service(..) | Op::TraitCall(..) => {
-                    effect.may_allocate = true;
-                    effect.may_fail = true;
-                    effect.may_diverge = true;
-                    effect.reads_mutable_globals = true;
-                    effect.writes_references = true;
-                    violation = Some(
-                        "pure fn cannot resolve services or invoke an effectful erased method"
-                            .into(),
-                    );
-                }
-                Op::Address(r, slot) => {
-                    addresses[*r] = Some(*slot);
-                    if slot.global || fi == 0 {
-                        let global = &functions[0].locals[slot.index];
-                        if global.constant {
-                            effect.reads_immutable = true;
-                        } else {
-                            effect.reads_mutable_globals = true;
-                            violation = Some(format!(
-                                "pure fn cannot access mutable global {}",
-                                global.name
-                            ));
-                        }
-                    }
-                }
-                Op::Index(r, a, _, write) => {
-                    addresses[*r] = addresses[*a];
-                    effect.may_fail = true;
-                    effect.may_allocate |= *write;
-                    if *write {
-                        record_store(fi, addresses[*a], f, effect);
-                    }
-                }
-                Op::EnumPayload(r, a, _, crate::enums::Projection::Address, _)
-                | Op::Field(r, a, _) => {
-                    addresses[*r] = addresses[*a];
-                    effect.may_fail = true;
-                }
-                Op::Extract(..) => effect.may_fail = true,
-                Op::Invoke(_, callee, _) => {
-                    effect.transitive_complete = false;
-                    effect.may_allocate = true;
-                    effect.may_fail = true;
-                    effect.may_diverge = true;
-                    if cyallo_ast::callable(&f.registers[*callee])
-                        .is_some_and(|(k, _, _)| k == RoutineKind::Procedure)
-                    {
-                        effect.io = true;
-                        effect.nondeterministic = true;
-                        effect.reads_mutable_globals = true;
-                        effect.writes_globals = true;
-                        effect.writes_references = true;
-                        violation = Some("pure fn cannot call an effectful procedure value".into());
-                    }
-                }
-                Op::Store(a, value) => {
-                    if matches!(f.registers[*value], Type::Reference { .. })
-                        && let Some(slot) = addresses[*a]
-                    {
-                        reference_targets.insert((slot.global, slot.index), addresses[*value]);
-                    }
-                    record_store(fi, addresses[*a], f, effect);
-                    if effect.writes_references {
-                        violation = Some("pure fn cannot mutate a ref capture".into());
-                    }
-                }
-                Op::Load(result, a) | Op::Take(result, a) | Op::Length(result, a) => {
-                    if matches!(f.registers[*result], Type::Reference { .. }) {
-                        addresses[*result] = addresses[*a].and_then(|slot| {
-                            reference_targets
-                                .get(&(slot.global, slot.index))
-                                .copied()
-                                .flatten()
-                        });
-                    }
-                    effect.may_fail = true;
-                    effect.reads_managed |= addresses[*a]
-                        .is_some_and(|s| !s.global && f.params.get(s.index) == Some(&true));
-                    if effect.reads_managed {
-                        violation = Some("pure fn cannot read a mutable ref capture".into());
-                    }
-                }
-                Op::CheckStep(_) => effect.may_fail = true,
-                Op::ManagedAddress(_, _) => effect.may_fail = true,
-                Op::Drop(a) => {
-                    if crate::ownership::effectful_lifecycle(&f.registers[*a]) {
-                        effect.writes_references = true;
-                        violation =
-                            Some("pure fn cannot destroy a value with effectful lifecycle".into());
-                    }
-                }
-                Op::Input(a, _) => {
-                    effect.io = true;
-                    effect.may_fail = true;
-                    record_store(fi, addresses[*a], f, effect);
-                    violation = Some("pure fn cannot read input".into());
-                }
-                Op::FrameInput(..) => {
-                    effect.io = true;
-                    effect.may_fail = true;
-                    violation = Some("pure fn cannot read input".into());
-                }
-                Op::Output(..) => {
-                    effect.io = true;
-                    violation = Some("pure fn cannot produce output".into());
-                }
-                Op::ArrayLiteral(..)
-                | Op::Frozen(..)
-                | Op::EnumConstruct(..)
-                | Op::Aggregate(..)
-                | Op::FunctionValue(..)
-                | Op::LiteralString(..) => effect.may_allocate = true,
-                Op::Unary(..) | Op::Binary(..) => effect.may_fail = true,
-                Op::Builtin(r, name, _) => {
-                    // The intrinsic's contract states what it can do. Allocation can
-                    // exhaust resources, so it still counts as a possible failure.
-                    let contract = name.contract().effects;
-                    effect.may_fail |= contract.may_fail || contract.allocates;
-                    effect.may_allocate |= contract.allocates
-                        || matches!(
-                            f.registers[*r],
-                            Type::String | Type::Array(..) | Type::SparseArray(_)
-                        );
-                    effect.io |= contract.io;
-                    if !contract.is_pure() {
-                        effect.nondeterministic = true;
-                        violation = Some(format!("pure fn cannot call effectful builtin `{name}`"));
-                    }
-                }
-                Op::Call(_, to, _) => {
-                    calls[fi].push((*to, inst.span));
-                    effect.may_fail = true;
-                    if functions[*to].kind == RoutineKind::Procedure {
-                        violation = Some(format!(
-                            "pure fn cannot call procedure {}",
-                            functions[*to].name
-                        ));
-                    }
-                }
-                Op::Jump(to) if *to <= pc => effect.may_diverge = true,
-                Op::Branch(_, yes, no) if *yes <= pc || *no <= pc => effect.may_diverge = true,
-                Op::Move(r, a) => addresses[*r] = addresses[*a],
-                _ => {}
-            }
-            if let Some(message) = violation {
-                violations[fi].get_or_insert((inst.span, message));
-            }
-        }
+        let (effect, violation) = scan(fi, f, &*functions, services, &mut calls[fi]);
+        effects[fi] = effect;
+        violations[fi] = violation;
     }
     for (fi, effect) in effects.iter_mut().enumerate() {
-        if selected.is_some_and(|wanted| wanted != fi) {
-            continue;
-        }
         effect.may_diverge |= cycle(fi, fi, &calls, &mut vec![false; functions.len()]);
     }
     loop {
@@ -355,9 +447,6 @@ fn analyze_selected(
         }
     }
     for (fi, f) in functions.iter().enumerate().filter(|(_, f)| f.pure) {
-        if selected.is_some_and(|wanted| wanted != fi) {
-            continue;
-        }
         if let Some((span, message)) = &violations[fi] {
             return Err(Diagnostic::new("E120", message.clone(), *span)
                 .with_related(f.span, "declared pure function"));
@@ -425,6 +514,5 @@ pub fn readonly_body(
             instruction.op = Op::Nop;
         }
     }
-    let mut bodies = vec![main.clone(), body];
-    analyze_one(&mut bodies, 1, services).is_ok() && bodies[1].effects.is_readonly()
+    analyze_one(&mut body, 1, &main.locals, &[], services).is_ok() && body.effects.is_readonly()
 }

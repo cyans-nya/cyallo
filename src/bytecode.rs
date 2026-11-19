@@ -81,7 +81,19 @@ pub struct Routine {
 impl std::ops::Deref for Routine {
     type Target = Function;
     fn deref(&self) -> &Function {
-        self.lowered.get_or_init(|| Function::lower(&self.source))
+        self.lowered.get_or_init(|| {
+            // Force checked analysis first so translation time excludes it.
+            let _ = &*self.source;
+            let _translate =
+                cyallo_startup_profile::stage(cyallo_startup_profile::Stage::BytecodeTranslate);
+            let function = Function::lower(&self.source);
+            cyallo_startup_profile::count(cyallo_startup_profile::Counter::BodiesTranslated, 1);
+            cyallo_startup_profile::count(
+                cyallo_startup_profile::Counter::BytecodeWords,
+                function.instructions.len(),
+            );
+            function
+        })
     }
 }
 fn scalar(ty: &Type) -> ScalarType {
@@ -116,6 +128,7 @@ impl Module {
         out
     }
     pub(crate) fn lower(functions: &[ir::Routine], jobs: cyallo_compile_jobs::Jobs) -> Self {
+        let _module = cyallo_startup_profile::stage(cyallo_startup_profile::Stage::BytecodeModule);
         Self {
             functions: jobs
                 .map(functions, 4, |_, _, f| {

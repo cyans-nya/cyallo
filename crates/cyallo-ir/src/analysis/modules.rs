@@ -1,5 +1,6 @@
 //! Independent checked module jobs and executable linking.
 use super::*;
+use cyallo_startup_profile::{Counter, Stage, count, stage};
 
 /// A checked module is retained after linking. Its routines refer to the frozen
 /// declaration catalogue; only the executable linker assigns storage/entry work.
@@ -30,13 +31,9 @@ pub fn analyze_modules(
     options: CompileOptions,
     deferred: bool,
 ) -> Result<CheckedProgram> {
-    analyze_modules_cached(
-        source_len,
-        graph,
-        options,
-        deferred,
-        &crate::module_cache::ModuleCache::default(),
-    )
+    // No cache survives this call, so no key could ever match or be looked up:
+    // keys are not computed at all.
+    analyze_modules_with(source_len, graph, options, deferred, None)
 }
 pub fn analyze_modules_cached(
     source_len: usize,
@@ -45,6 +42,16 @@ pub fn analyze_modules_cached(
     deferred: bool,
     cache: &crate::module_cache::ModuleCache,
 ) -> Result<CheckedProgram> {
+    analyze_modules_with(source_len, graph, options, deferred, Some(cache))
+}
+fn analyze_modules_with(
+    source_len: usize,
+    graph: &mut crate::module_graph::ResolvedProgram,
+    options: CompileOptions,
+    deferred: bool,
+    cache: Option<&crate::module_cache::ModuleCache>,
+) -> Result<CheckedProgram> {
+    let _analysis = stage(Stage::ModuleAnalysis);
     let identity = crate::module_graph::ResolvedProgram {
         worlds: graph.worlds.clone(),
         interface: graph.interface.clone(),
@@ -70,6 +77,7 @@ pub fn analyze_modules_cached(
     let source_names = graph.source_names.clone();
     graph
         .with_sources(|asts| {
+            let declarations = stage(Stage::ModuleDeclarations);
             let mut types = crate::declarations::TypeEnvironment::new(
                 crate::composites::resolve_modules(asts, &native)?,
                 native,
@@ -176,6 +184,7 @@ pub fn analyze_modules_cached(
                     .collect();
             }
             let services = std::sync::Arc::new(metadata);
+            drop(declarations);
             let initializers: Vec<_> = asts
                 .iter()
                 .enumerate()
@@ -210,14 +219,23 @@ pub fn analyze_modules_cached(
                 source_files: identity.source_files.clone(),
                 source_len,
             });
-            let keys = crate::module_cache::keys(
-                &identity,
-                asts,
-                &context.routine_types,
-                &globals,
-                &services,
-            );
-            let cached: Vec<_> = keys.iter().map(|key| cache.get(key, &layout)).collect();
+            let keys = match cache {
+                Some(_) => {
+                    let _keys = stage(Stage::ModuleKeys);
+                    crate::module_cache::keys(
+                        &identity,
+                        asts,
+                        &context.routine_types,
+                        &globals,
+                        &services,
+                    )
+                }
+                None => vec![],
+            };
+            let cached: Vec<_> = match cache {
+                Some(cache) => keys.iter().map(|key| cache.get(key, &layout)).collect(),
+                None => vec![None; asts.len()],
+            };
             // One wave spans all routine bodies, so a large single module can
             // use every worker while results retain module ownership and order.
             #[derive(Clone, Copy)]
@@ -237,6 +255,7 @@ pub fn analyze_modules_cached(
                     (0..ast.functions.len()).map(|function| (module, BodyJob::Routine(function))),
                 );
             }
+            let wave = stage(Stage::ModuleBodyWave);
             let lowered = crate::Jobs(options.jobs).map(
                 &work,
                 2,
@@ -245,6 +264,7 @@ pub fn analyze_modules_cached(
                     // Lower only this module's initializer. Global slots are references
                     // into the link layout; there is no imported statement list here.
                     if let BodyJob::Initializer = job {
+                        let _entry = stage(Stage::EntryLowering);
                         let id = if module == entry {
                             0
                         } else {
@@ -283,12 +303,14 @@ pub fn analyze_modules_cached(
                         )?;
                         lower.block(&ast.body)?;
                         lower.emit(Op::Return(None));
-                        let mut checked = context.headers.clone();
-                        checked.insert(0, empty_entry(source_len));
-                        checked[0].locals = globals.clone();
-                        checked[id] = lower.function;
-                        crate::effects::analyze_one(&mut checked, id, &services)?;
-                        let mut function = checked.swap_remove(id);
+                        let mut function = lower.function;
+                        crate::effects::analyze_one(
+                            &mut function,
+                            id,
+                            &globals,
+                            &context.headers,
+                            &services,
+                        )?;
                         conservative_calls(&mut function);
                         finish_lowering(&mut function, id == 0);
                         return Ok((module, id, ir::Routine::ready(function)));
@@ -297,6 +319,7 @@ pub fn analyze_modules_cached(
                     let BodyJob::Routine(function) = job else {
                         unreachable!()
                     };
+                    let _setup = stage(Stage::DeferredSetup);
                     let f = &ast.functions[function];
                     let id = routine_ids[module][function];
                     let body = DeferredBody {
@@ -306,6 +329,7 @@ pub fn analyze_modules_cached(
                     };
                     let estimate = crate::admission::estimate(f);
                     let routine = if deferred {
+                        count(Counter::BodiesDeferredCopied, 1);
                         ir::Routine::deferred(
                             body,
                             estimate.eager_candidate(),
@@ -328,6 +352,8 @@ pub fn analyze_modules_cached(
                     Ok((module, id, routine))
                 },
             );
+            drop(wave);
+            let _link = stage(Stage::ModuleLink);
             let mut owned: Vec<Vec<_>> = cached
                 .iter()
                 .map(|unit| {
@@ -391,7 +417,10 @@ pub fn analyze_modules_cached(
                 crate::effects::analyze(&mut checked, &services)?;
                 functions = checked.into_iter().map(ir::Routine::ready).collect();
             }
-            let requires_tracing = asts.iter().any(requires_tracing);
+            let requires_tracing = {
+                let _tracing = stage(Stage::RequiresTracing);
+                asts.iter().any(requires_tracing)
+            };
             Ok((
                 ir::Module {
                     records,
@@ -425,7 +454,7 @@ pub fn analyze_modules_cached(
                         initializer,
                         routines,
                     });
-                    if cached[i].is_none() {
+                    if let (Some(cache), None) = (cache, &cached[i]) {
                         cache.insert(keys[i].clone(), unit.clone(), layout.clone());
                     }
                     unit
@@ -460,6 +489,7 @@ fn empty_entry(source_len: usize) -> ir::Function {
     }
 }
 fn requires_tracing(ast: &Ast) -> bool {
+    count(Counter::BodiesTracingCopied, ast.functions.len());
     let mut found = false;
     let mut visit = |body: &[Stmt]| {
         let mut body = body.to_vec();

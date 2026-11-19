@@ -1,0 +1,37 @@
+mod m0;
+mod m1;
+mod m2;
+mod m3;
+mod m4;
+mod m5;
+mod m6;
+mod m7;
+mod m8;
+mod m9;
+mod m10;
+mod m11;
+mod m12;
+mod m13;
+mod m14;
+mod m15;
+use crate::m0::r0
+use crate::m1::r1
+use crate::m2::r2
+use crate::m3::r3
+use crate::m4::r4
+use crate::m5::r5
+use crate::m6::r6
+use crate::m7::r7
+use crate::m8::r8
+use crate::m9::r9
+use crate::m10::r10
+use crate::m11::r11
+use crate::m12::r12
+use crate::m13::r13
+use crate::m14::r14
+use crate::m15::r15
+
+let mut answer = ""
+std::io::print("ready")
+std::runtime::caie::input(&mut answer)
+std::io::print("done")

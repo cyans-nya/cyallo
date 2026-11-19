@@ -158,7 +158,7 @@ impl ModuleCache {
 }
 pub(crate) fn keys(
     graph: &crate::module_graph::ResolvedProgram,
-    asts: &[Ast],
+    asts: &mut [Ast],
     types: &crate::declarations::TypeEnvironment,
     globals: &[ir::Local],
     services: &Metadata,
@@ -166,7 +166,7 @@ pub(crate) fn keys(
     let mut native = graph.native.clone();
     native.import_policy = None;
     let native = normalized(
-        &Ast {
+        &mut Ast {
             native,
             ..Ast::default()
         },
@@ -193,22 +193,23 @@ pub(crate) fn keys(
             )
         })
         .collect();
-    let routine_symbols: Vec<_> = std::iter::once("<main>")
+    // Owned, so the loop below can relocate each AST in place while hashing it.
+    let routine_symbols: Vec<Box<str>> = std::iter::once("<main>".into())
         .chain(
             asts.iter()
-                .flat_map(|a| a.functions.iter().map(|f| f.name.as_ref())),
+                .flat_map(|a| a.functions.iter().map(|f| f.name.clone())),
         )
         .collect();
-    asts.iter()
+    asts.iter_mut()
         .zip(&graph.modules)
         .map(|(ast, module)| {
             let mut names = HashSet::<Box<str>>::new();
             let mut requesters = HashSet::new();
             let mut type_references = vec![];
             let mut visit = |body: &[Stmt]| {
-                let mut body = body.to_vec();
-                cyallo_ast::visit::visit_block(
-                    &mut body,
+                // Read-only: a body is inspected where it lives, never copied.
+                cyallo_ast::visit::inspect_block(
+                    body,
                     &mut |e| {
                         match &e.kind {
                             ExprKind::Name(n)
@@ -231,14 +232,9 @@ pub(crate) fn keys(
                         {
                             requesters.insert(*id);
                         }
-                        Ok(())
                     },
-                    &mut |ty, _| {
-                        type_references.push(ty.clone());
-                        Ok(())
-                    },
-                )
-                .expect("infallible dependency traversal");
+                    &mut |ty, _| type_references.push(ty.clone()),
+                );
             };
             visit(&ast.body);
             for f in &ast.functions {
@@ -343,7 +339,7 @@ pub(crate) fn keys(
                             &services.traits[imp.trait_id],
                             imp.methods
                                 .iter()
-                                .map(|&id| routine_symbols[id])
+                                .map(|&id| &routine_symbols[id])
                                 .collect::<Vec<_>>(),
                         )),
                     ));
@@ -384,19 +380,39 @@ pub(crate) fn keys(
         .collect()
 }
 
-fn normalized(ast: &Ast, files: &[crate::module_graph::SourceFile]) -> crate::sdk::Digest {
-    let mut ast = ast.clone();
+/// Digest of an AST with every coordinate relative to its file. The relocation is
+/// applied in place and undone before returning, so the tree is never copied: the
+/// span walk visits the same coordinates in the same order both times.
+fn normalized(ast: &mut Ast, files: &[crate::module_graph::SourceFile]) -> crate::sdk::Digest {
+    // Each coordinate is file-relative plus the identity of its file. The identity
+    // is a first-use ordinal into `ids`, hashed once: hashing the path string with
+    // every span made the digest input several times larger than the tree itself.
+    // Equal (ordinals, ids) sequences are exactly equal (identity, span) sequences.
+    let mut ids = vec![];
+    let mut ordinals = vec![None; files.len()];
     let mut coordinates = vec![];
-    cyallo_ast::spans::visit_spans(&mut ast, |span| {
-        if let Some(file) = files
+    let mut originals = vec![];
+    cyallo_ast::spans::visit_spans(ast, |span| {
+        originals.push(*span);
+        if let Some(index) = files
             .iter()
-            .find(|f| span.start >= f.span.start && span.end <= f.span.end)
+            .position(|f| span.start >= f.span.start && span.end <= f.span.end)
         {
+            let file = &files[index];
             *span = Span::new(span.start - file.span.start, span.end - file.span.start);
-            coordinates.push((file.id.clone(), *span));
+            let ordinal = *ordinals[index].get_or_insert_with(|| {
+                ids.push(&file.id);
+                ids.len() - 1
+            });
+            coordinates.push((ordinal, *span));
         }
     });
-    fingerprint(&(&ast, &coordinates))
+    let digest = fingerprint(&(&*ast, &ids, &coordinates));
+    let mut originals = originals.into_iter();
+    cyallo_ast::spans::visit_spans(ast, |span| {
+        *span = originals.next().expect("one original per coordinate");
+    });
+    digest
 }
 
 #[cfg(test)]
@@ -447,5 +463,66 @@ mod tests {
             fingerprint(&vec![vec![1u8], vec![]]),
             fingerprint(&vec![vec![], vec![1u8]])
         );
+    }
+    fn file(path: &str, start: u32, end: u32) -> crate::module_graph::SourceFile {
+        crate::module_graph::SourceFile {
+            id: crate::module_graph::SourceFileId {
+                path: path.into(),
+                trust: SourceTrust::User,
+            },
+            span: Span::new(start, end),
+        }
+    }
+    const SOURCE: &str = "fn f(x: i64) -> i64 { return x + 1 }\nlet v = f(2)\n";
+    #[test]
+    fn normalizing_restores_every_coordinate() {
+        let mut ast = cyallo_parser::parse(SOURCE).unwrap();
+        cyallo_ast::spans::shift_ast(&mut ast, 40).unwrap();
+        let before = format!("{ast:?}");
+        let files = [file("a.ya", 40, 40 + SOURCE.len() as u32)];
+        normalized(&mut ast, &files);
+        assert_eq!(before, format!("{ast:?}"));
+    }
+    #[test]
+    fn digest_ignores_placement_but_not_file_identity_or_content() {
+        let digest = |source: &str, path: &str, offset: u32| {
+            let mut ast = cyallo_parser::parse(source).unwrap();
+            cyallo_ast::spans::shift_ast(&mut ast, offset).unwrap();
+            normalized(
+                &mut ast,
+                &[file(path, offset, offset + source.len() as u32)],
+            )
+        };
+        let base = digest(SOURCE, "a.ya", 0);
+        assert_eq!(base, digest(SOURCE, "a.ya", 1000));
+        assert_ne!(base, digest(SOURCE, "b.ya", 0));
+        assert_ne!(base, digest(&SOURCE.replace("x + 1", "x + 2"), "a.ya", 0));
+    }
+    #[test]
+    fn read_only_traversal_matches_the_mutating_one() {
+        let source = "fn f(x: i64) -> i64 {\n let mut t = [1, 2, x]\n for i in 0..2 { t[i] = g(i) }\n if x > 1 { return h(t[0]) } else { while x < 3 { t[1] += 1 } }\n return match x { 0 => 1, _ => k(x) }\n}\n";
+        let ast = cyallo_parser::parse(source).unwrap();
+        let mutating = std::cell::RefCell::new(vec![]);
+        let reading = std::cell::RefCell::new(vec![]);
+        let mut owned = ast.functions[0].body.clone();
+        cyallo_ast::visit::visit_block(
+            &mut owned,
+            &mut |e| {
+                mutating.borrow_mut().push(format!("{:?}", e.kind));
+                Ok(())
+            },
+            &mut |t, _| {
+                mutating.borrow_mut().push(format!("{t:?}"));
+                Ok(())
+            },
+        )
+        .unwrap();
+        cyallo_ast::visit::inspect_block(
+            &ast.functions[0].body,
+            &mut |e| reading.borrow_mut().push(format!("{:?}", e.kind)),
+            &mut |t, _| reading.borrow_mut().push(format!("{t:?}")),
+        );
+        assert!(!reading.borrow().is_empty());
+        assert_eq!(mutating, reading);
     }
 }

@@ -257,8 +257,19 @@ pub(crate) fn compile_resolved_with_cache(
     cache: std::sync::Arc<cyallo_ir::module_cache::ModuleCache>,
 ) -> Result<ir::Program> {
     let native = graph.native.clone();
-    graph.with_sources(|asts| cyallo_ir::generics::specialize_modules(asts, &native, options))?;
-    crate::constants::evaluate_modules(source, &mut graph, options)?;
+    {
+        let _specialize = cyallo_startup_profile::stage(cyallo_startup_profile::Stage::Specialize);
+        graph
+            .with_sources(|asts| cyallo_ir::generics::specialize_modules(asts, &native, options))?;
+    }
+    {
+        let _constants = cyallo_startup_profile::stage(cyallo_startup_profile::Stage::ConstEval);
+        crate::constants::evaluate_modules(source, &mut graph, options)?;
+    }
+    cyallo_startup_profile::count(
+        cyallo_startup_profile::Counter::BodiesResolved,
+        graph.modules.iter().map(|m| m.source.functions.len()).sum(),
+    );
     compile_resolved_unfolded_cached(source, graph, options, deferred, cache)
 }
 pub(crate) fn compile_resolved_unfolded(
