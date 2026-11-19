@@ -148,6 +148,139 @@ pub fn visit_block(
     })
 }
 
+/// Read-only postorder walk over every expression in `body`, in the same order
+/// as [`visit_block`]. Analyses that only inspect a body use this so they need
+/// not copy it to obtain the `&mut` access `visit_block` requires.
+pub fn walk_block(body: &[Stmt], f: &mut impl FnMut(&Expr)) {
+    crate::with_stack(|| {
+        for s in body {
+            match &s.kind {
+                StmtKind::Binding(_, _, _, _, e)
+                | StmtKind::Constant(_, e)
+                | StmtKind::Evaluate(e)
+                | StmtKind::Return(e)
+                | StmtKind::Input(e) => walk_expr(e, f),
+                StmtKind::Assign(a, b) | StmtKind::Compound(a, _, b) => {
+                    walk_expr(a, f);
+                    walk_expr(b, f);
+                }
+                StmtKind::Output(es) | StmtKind::Call(_, es) => {
+                    for e in es {
+                        walk_expr(e, f);
+                    }
+                }
+                StmtKind::If(e, a, b) | StmtKind::IfLet(_, e, a, b) => {
+                    walk_expr(e, f);
+                    walk_block(a, f);
+                    walk_block(b, f);
+                }
+                StmtKind::While(e, b) | StmtKind::Repeat(b, e) => {
+                    walk_expr(e, f);
+                    walk_block(b, f);
+                }
+                StmtKind::For(_, a, b, step, body) => {
+                    walk_expr(a, f);
+                    walk_expr(b, f);
+                    if let Some(e) = step {
+                        walk_expr(e, f);
+                    }
+                    walk_block(body, f);
+                }
+                StmtKind::ForIn(_, iterable, body) => {
+                    walk_expr(iterable, f);
+                    walk_block(body, f);
+                }
+                StmtKind::Case(e, arms, b) => {
+                    walk_expr(e, f);
+                    for (label, body) in arms {
+                        walk_expr(&label.lower, f);
+                        if let Some(e) = &label.upper {
+                            walk_expr(e, f);
+                        }
+                        walk_block(body, f);
+                    }
+                    walk_block(b, f);
+                }
+                _ => {}
+            }
+        }
+    })
+}
+/// Read-only postorder walk over `e` and its subexpressions; see [`walk_block`].
+pub fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
+    crate::with_stack(|| {
+        match &e.kind {
+            ExprKind::EnumConstruct(_, _, payload) => {
+                if let Some(payload) = payload {
+                    walk_expr(payload, f);
+                }
+            }
+            ExprKind::Match(value, arms) => {
+                walk_expr(value, f);
+                for arm in arms {
+                    if let Some(guard) = &arm.guard {
+                        walk_expr(guard, f);
+                    }
+                    match &arm.body {
+                        MatchBody::Expression(value) => walk_expr(value, f),
+                        MatchBody::Block(body, tail) => {
+                            walk_block(body, f);
+                            if let Some(tail) = tail {
+                                walk_expr(tail, f);
+                            }
+                        }
+                    }
+                }
+            }
+            ExprKind::ManagedNew(_, _, allocator, value) => {
+                if let Some(allocator) = allocator {
+                    walk_expr(allocator, f);
+                }
+                walk_expr(value, f);
+            }
+            ExprKind::ArrayLiteral(es)
+            | ExprKind::IntrinsicCall(_, _, es)
+            | ExprKind::Tuple(es)
+            | ExprKind::Call(_, es)
+            | ExprKind::TypedCollection(_, _, es)
+            | ExprKind::GenericCall(_, _, es) => {
+                for e in es {
+                    walk_expr(e, f);
+                }
+            }
+            ExprKind::AnonymousRecord(fs)
+            | ExprKind::VariantPayload(fs)
+            | ExprKind::Record(_, fs)
+            | ExprKind::GenericRecord(_, _, fs)
+            | ExprKind::ObjectLiteral(_, fs) => {
+                for (_, e) in fs {
+                    walk_expr(e, f);
+                }
+            }
+            ExprKind::DeleteProperty(a)
+            | ExprKind::Yield(a, _)
+            | ExprKind::Parenthesized(a)
+            | ExprKind::Unary(_, a)
+            | ExprKind::Field(a, _)
+            | ExprKind::ExtensionField(a, _, _)
+            | ExprKind::Cast(a, _)
+            | ExprKind::TupleField(a, _) => walk_expr(a, f),
+            ExprKind::Binary(_, a, b) | ExprKind::NativeCoerce(a, b) => {
+                walk_expr(a, f);
+                walk_expr(b, f);
+            }
+            ExprKind::Index(a, es) | ExprKind::Invoke(a, es) => {
+                walk_expr(a, f);
+                for e in es {
+                    walk_expr(e, f);
+                }
+            }
+            _ => {}
+        }
+        f(e)
+    })
+}
+
 /// Postorder traversal of a type contract, shared by declaration instantiation
 /// and native-family resolution. No interpretation of source names occurs here.
 pub fn visit_type(ty: &mut Type, f: &mut impl FnMut(&mut Type)) {

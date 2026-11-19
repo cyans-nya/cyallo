@@ -197,19 +197,12 @@ impl ResolvedProgram {
             }
         }
         fn references(body: &[Stmt]) -> Vec<Box<str>> {
-            let mut body = body.to_vec();
             let mut names = vec![];
-            cyallo_ast::visit::visit_block(
-                &mut body,
-                &mut |e| {
-                    if let ExprKind::Name(name) | ExprKind::Call(name, _) = &e.kind {
-                        names.push(name.clone());
-                    }
-                    Ok(())
-                },
-                &mut |_, _| Ok(()),
-            )
-            .expect("infallible dependency traversal");
+            cyallo_ast::visit::walk_block(body, &mut |e| {
+                if let ExprKind::Name(name) | ExprKind::Call(name, _) = &e.kind {
+                    names.push(name.clone());
+                }
+            });
             names
         }
         let routines: HashMap<_, _> = self
