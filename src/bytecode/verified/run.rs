@@ -130,6 +130,13 @@ pub enum RunError {
         span: Span,
         fault: GeneratorFault,
     },
+    /// A service operation failed.
+    Service {
+        function: FunctionId,
+        instruction: InstructionId,
+        span: Span,
+        fault: ServiceFault,
+    },
     /// An object operation failed.
     Object {
         function: FunctionId,
@@ -266,6 +273,13 @@ impl fmt::Display for RunError {
                 "division by zero in function {} at instruction {}",
                 function.0, instruction.0
             ),
+            Self::Service { fault, .. } => f.write_str(match fault {
+                ServiceFault::InactiveContext => "the service context was disposed",
+                ServiceFault::NotInjected => "the context has no provider for the service",
+                ServiceFault::Unavailable => "the service provider was withdrawn",
+                ServiceFault::ProviderConflict => "the service already has a provider here",
+                ServiceFault::Limit => "too many service contexts or registrations",
+            }),
             Self::Object { fault, .. } => f.write_str(match fault {
                 ObjectFault::Missing => "the object has no such property",
                 ObjectFault::Readonly => "the object is readonly",
@@ -448,6 +462,10 @@ struct Frame {
     wrap: Option<Option<ValueType>>,
     /// The loaded module whose namespace this frame builds.
     namespace: Option<usize>,
+    /// The service context this frame runs the setup or cleanup of.
+    scope: Option<usize>,
+    /// The provider binding whose method this frame runs.
+    lease: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -485,6 +503,14 @@ enum FrameValue {
     Failure(Arc<FailureData>),
     /// An owned value with its type: it owns what it holds.
     Any(Box<(ValueType, FrameValue)>),
+    /// The service context at this index.
+    Context(usize),
+    /// The registration of the provider binding at this index.
+    Registration(usize),
+    /// The service key at this index of the linked keys.
+    ServiceKey(usize),
+    /// A live reference to a key's service in a context.
+    ServiceRef(usize, usize),
     /// A retained reference to a field of a heap record: a place rooted in a
     /// heap object, which the collector keeps alive.
     Location(BorrowedPlace),
@@ -499,6 +525,229 @@ enum FrameValue {
         heap: usize,
         implementation: u32,
     },
+}
+
+/// Why a service operation failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceFault {
+    /// The context was disposed.
+    InactiveContext,
+    /// The context sees no provider for the key.
+    NotInjected,
+    /// The provider was withdrawn.
+    Unavailable,
+    /// The key already has a provider in this realm.
+    ProviderConflict,
+    /// Too many contexts or registrations.
+    Limit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceState {
+    Active,
+    Retiring,
+    Inactive,
+}
+
+#[derive(Debug)]
+struct ServiceBinding {
+    owner: usize,
+    key: usize,
+    realm: u64,
+    state: ServiceState,
+    value: Option<FrameValue>,
+    /// Calls in flight on the provider.
+    leases: usize,
+}
+
+#[derive(Debug)]
+struct ServiceView {
+    parent: Option<usize>,
+    realms: HashMap<usize, u64>,
+    provided: HashMap<usize, usize>,
+    admitted: HashMap<usize, usize>,
+    state: ServiceState,
+    /// An injected view sees only what it was admitted to.
+    checked: bool,
+    cleanups: Vec<FrameValue>,
+}
+
+/// Service contexts, providers and what depends on them.
+#[derive(Debug, Default)]
+struct Services {
+    active: HashMap<(usize, u64), usize>,
+    views: Vec<ServiceView>,
+    bindings: Vec<ServiceBinding>,
+    next_realm: u64,
+    retirement_pending: bool,
+}
+
+const MAX_SERVICE_OBJECTS: usize = 1 << 20;
+
+impl Services {
+    fn new_view(&mut self, parent: Option<usize>) -> Option<usize> {
+        if self.views.len() >= MAX_SERVICE_OBJECTS {
+            return None;
+        }
+        let (realms, checked, admitted) = match parent {
+            Some(parent) => (
+                self.views[parent].realms.clone(),
+                self.views[parent].checked,
+                self.views[parent].admitted.clone(),
+            ),
+            None => (HashMap::new(), false, HashMap::new()),
+        };
+        self.views.push(ServiceView {
+            parent,
+            realms,
+            provided: HashMap::new(),
+            admitted,
+            state: ServiceState::Active,
+            checked,
+            cleanups: Vec::new(),
+        });
+        Some(self.views.len() - 1)
+    }
+
+    fn realm(&self, view: usize, key: usize) -> u64 {
+        self.views[view].realms.get(&key).copied().unwrap_or(0)
+    }
+
+    /// The binding a context resolves a key to, or why none.
+    fn selected(&self, view: usize, key: usize, cleanup: bool) -> Result<usize, ServiceFault> {
+        let v = &self.views[view];
+        if v.state == ServiceState::Inactive || (v.state == ServiceState::Retiring && !cleanup) {
+            return Err(ServiceFault::InactiveContext);
+        }
+        let own = v.provided.get(&key).copied().filter(|&binding| {
+            self.bindings[binding].state == ServiceState::Active
+                || (cleanup && self.bindings[binding].state == ServiceState::Retiring)
+        });
+        let admitted = v.admitted.get(&key).copied();
+        let routed = self.active.get(&(key, self.realm(view, key))).copied();
+        let binding = if v.checked {
+            own.or(admitted)
+        } else {
+            own.or(routed)
+        }
+        .ok_or(ServiceFault::NotInjected)?;
+        let state = self.bindings[binding].state;
+        if state == ServiceState::Inactive
+            || (state == ServiceState::Retiring
+                && !(cleanup
+                    && (admitted == Some(binding)
+                        || v.provided.get(&key).copied() == Some(binding))))
+        {
+            return Err(ServiceFault::Unavailable);
+        }
+        Ok(binding)
+    }
+
+    fn collect_binding_cleanup(&mut self, binding: usize, plan: &mut Vec<(usize, FrameValue)>) {
+        if self.bindings[binding].state != ServiceState::Active {
+            return;
+        }
+        self.retirement_pending = true;
+        self.bindings[binding].state = ServiceState::Retiring;
+        let (key, realm) = (self.bindings[binding].key, self.bindings[binding].realm);
+        self.active.remove(&(key, realm));
+        let dependents: Vec<usize> = self
+            .views
+            .iter()
+            .enumerate()
+            .filter(|(_, view)| {
+                view.admitted.get(&key).copied() == Some(binding)
+                    && view.state == ServiceState::Active
+            })
+            .map(|(id, _)| id)
+            .collect();
+        for view in dependents {
+            self.collect_view_cleanup(view, plan);
+        }
+    }
+
+    fn collect_view_cleanup(&mut self, view: usize, plan: &mut Vec<(usize, FrameValue)>) {
+        if self.views[view].state != ServiceState::Active {
+            return;
+        }
+        self.retirement_pending = true;
+        self.views[view].state = ServiceState::Retiring;
+        let children: Vec<usize> = self
+            .views
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.parent == Some(view) && v.state == ServiceState::Active)
+            .map(|(id, _)| id)
+            .collect();
+        for child in children {
+            self.collect_view_cleanup(child, plan);
+        }
+        let provided: Vec<usize> = self
+            .bindings
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.owner == view && b.state == ServiceState::Active)
+            .map(|(id, _)| id)
+            .collect();
+        for binding in provided {
+            self.collect_binding_cleanup(binding, plan);
+        }
+        for callback in self.views[view].cleanups.iter().rev() {
+            plan.push((view, callback.clone()));
+        }
+    }
+
+    /// Release views and providers that nothing needs any more. `scopes` are
+    /// the contexts that frames are running setup or cleanup of.
+    fn release_retired(&mut self, scopes: &HashSet<usize>) {
+        if !self.retirement_pending {
+            return;
+        }
+        for (id, view) in self.views.iter_mut().enumerate() {
+            if view.state == ServiceState::Retiring && !scopes.contains(&id) {
+                view.state = ServiceState::Inactive;
+                view.cleanups.clear();
+                view.admitted.clear();
+            }
+        }
+        for binding in 0..self.bindings.len() {
+            let b = &self.bindings[binding];
+            if b.state == ServiceState::Retiring
+                && b.leases == 0
+                && !scopes.contains(&b.owner)
+                && !self.views.iter().any(|view| {
+                    view.state != ServiceState::Inactive
+                        && view.admitted.values().any(|&admitted| admitted == binding)
+                })
+            {
+                self.bindings[binding].value = None;
+                self.bindings[binding].state = ServiceState::Inactive;
+            }
+        }
+        self.retirement_pending = self
+            .views
+            .iter()
+            .any(|view| view.state == ServiceState::Retiring)
+            || self
+                .bindings
+                .iter()
+                .any(|binding| binding.state == ServiceState::Retiring);
+    }
+}
+
+/// The contexts frames are running setup or cleanup of, in every task.
+fn service_scopes(stack: &[Frame], memory: &Memory) -> HashSet<usize> {
+    stack
+        .iter()
+        .chain(
+            memory
+                .tasks
+                .iter()
+                .flatten()
+                .flat_map(|task| task.stack.iter()),
+        )
+        .filter_map(|frame| frame.scope)
+        .collect()
 }
 
 /// Why a load or a view failed, as the program can ask.
@@ -739,6 +988,7 @@ struct Memory {
     namespaces: HashMap<usize, FrameValue>,
     /// The loaded modules whose initializers have run.
     initialized: HashSet<usize>,
+    services: Services,
 }
 
 /// More tasks than this exhaust the table.
@@ -860,6 +1110,7 @@ impl Memory {
             sleeping_until: None,
             namespaces: HashMap::new(),
             initialized: HashSet::new(),
+            services: Services::default(),
         }
     }
 
@@ -936,6 +1187,10 @@ impl Memory {
                     self.free_channel_if_unused(index);
                 }
                 FrameValue::Any(erased) => pending.push(erased.1),
+                FrameValue::Context(_)
+                | FrameValue::Registration(_)
+                | FrameValue::ServiceKey(_)
+                | FrameValue::ServiceRef(..) => {}
                 FrameValue::Generator(index) => {
                     self.close_generator(index);
                     self.generators[index] = None;
@@ -1186,6 +1441,18 @@ impl Memory {
                     .flat_map(|channel| channel.queue.iter()),
             )
             .chain(self.namespaces.values())
+            .chain(
+                self.services
+                    .bindings
+                    .iter()
+                    .filter_map(|binding| binding.value.as_ref()),
+            )
+            .chain(
+                self.services
+                    .views
+                    .iter()
+                    .flat_map(|view| view.cleanups.iter()),
+            )
         {
             trace(value, &mut marks, &mut pending);
         }
@@ -1223,6 +1490,10 @@ fn trace(value: &FrameValue, marks: &mut [bool], pending: &mut Vec<usize>) {
                 stack.extend(data.properties.iter().map(|property| &property.value.1));
             }
             FrameValue::Dynamic(erased) | FrameValue::Any(erased) => stack.push(&erased.1),
+            FrameValue::Context(_)
+            | FrameValue::Registration(_)
+            | FrameValue::ServiceKey(_)
+            | FrameValue::ServiceRef(..) => {}
             FrameValue::Loan(place) | FrameValue::Location(place) => {
                 if let Root::Heap(object) = place.root {
                     mark(object);
@@ -1445,6 +1716,8 @@ impl Frame {
             generator: None,
             wrap: None,
             namespace: None,
+            scope: None,
+            lease: None,
         };
         for (&register, value) in body.parameters.iter().zip(values) {
             frame.set_value(layout, register, value);
@@ -1476,6 +1749,10 @@ impl Frame {
             | FrameValue::Dynamic(_)
             | FrameValue::Failure(_)
             | FrameValue::Any(_)
+            | FrameValue::Context(_)
+            | FrameValue::Registration(_)
+            | FrameValue::ServiceKey(_)
+            | FrameValue::ServiceRef(..)
             | FrameValue::Moved => {
                 unreachable!("verified scalar operand")
             }
@@ -1506,6 +1783,10 @@ impl Frame {
             | FrameValue::Dynamic(_)
             | FrameValue::Failure(_)
             | FrameValue::Any(_)
+            | FrameValue::Context(_)
+            | FrameValue::Registration(_)
+            | FrameValue::ServiceKey(_)
+            | FrameValue::ServiceRef(..)
             | FrameValue::Moved => {
                 unreachable!("verified loan operand")
             }
@@ -2791,10 +3072,35 @@ impl VerifiedModule {
                         if depth == max_frames {
                             return Err(RunError::FrameLimit);
                         }
+                        // A service reference finds the provider the context sees
+                        // now and holds it for the length of the call.
+                        let mut lease = None;
+                        let provider = match frame.value(layout, object) {
+                            FrameValue::ServiceRef(view, key) => {
+                                let scopes = service_scopes(stack, memory);
+                                let binding = memory
+                                    .services
+                                    .selected(view, key, scopes.contains(&view))
+                                    .map_err(|fault| RunError::Service {
+                                        function,
+                                        instruction: from,
+                                        span: body.spans[pc],
+                                        fault,
+                                    })?;
+                                memory.services.bindings[binding].leases += 1;
+                                lease = Some(binding);
+                                match memory.services.bindings[binding].value.clone() {
+                                    Some(provider) => provider,
+                                    None => unreachable!("an available provider has a value"),
+                                }
+                            }
+                            other => other,
+                        };
+                        let frame = &mut stack[depth - 1];
                         let FrameValue::Object {
                             heap,
                             implementation,
-                        } = frame.value(layout, object)
+                        } = provider
                         else {
                             unreachable!("verified object operand");
                         };
@@ -2802,7 +3108,7 @@ impl VerifiedModule {
                             self.implementations[implementation as usize].methods[method as usize];
                         let callee = &self.functions[target.index()];
                         let by_value = match body.registers()[object.index()] {
-                            RegisterType::Object(trait_id) => {
+                            RegisterType::Object(trait_id) | RegisterType::ServiceRef(trait_id) => {
                                 body.traits[trait_id.index()].methods[method as usize].by_value
                             }
                             _ => unreachable!("verified object operand"),
@@ -2823,7 +3129,8 @@ impl VerifiedModule {
                         };
                         let values = std::iter::once(receiver)
                             .chain(call.arguments.iter().map(|&reg| frame.value(layout, reg)));
-                        let next = Frame::new(target, callee, values, call.destination);
+                        let mut next = Frame::new(target, callee, values, call.destination);
+                        next.lease = lease;
                         stack.push(next);
                     }
                     CallTarget::Bound(binding) => self.call_bound(
@@ -3408,6 +3715,190 @@ impl VerifiedModule {
                 };
                 frame.set(layout, dst, result);
             }
+            Instruction::ServiceContext(..)
+            | Instruction::ServiceExtend(..)
+            | Instruction::ServiceIsolate(..)
+            | Instruction::ServiceKeyConst(..)
+            | Instruction::ServiceReference(..)
+            | Instruction::ServiceProvide(..)
+            | Instruction::ServiceAvailable(..)
+            | Instruction::ServiceInject(..)
+            | Instruction::ServiceOnDispose(..)
+            | Instruction::ServiceDispose(..) => {
+                let fault = |fault| RunError::Service {
+                    function,
+                    instruction: from,
+                    span: body.spans[pc],
+                    fault,
+                };
+                let instruction = body.instructions[pc];
+                // Contexts, keys and registrations may be held directly or
+                // through a loan of the place that holds them.
+                let held = |memory: &Memory, register: Register, stack: &[Frame]| {
+                    self.held_value(stack, memory, body, register)
+                        .map_err(|fault| place_error(fault, function, from, body.spans[pc]))
+                };
+                let context_of = |value: Option<FrameValue>| match value {
+                    Some(FrameValue::Context(view)) => view,
+                    _ => unreachable!("verified context operand"),
+                };
+                let key_of = |value: Option<FrameValue>| match value {
+                    Some(FrameValue::ServiceKey(key)) => key,
+                    _ => unreachable!("verified service key operand"),
+                };
+                let mut plan: Vec<(usize, FrameValue)> = Vec::new();
+                match instruction {
+                    Instruction::ServiceContext(dst) => {
+                        let Some(view) = memory.services.new_view(None) else {
+                            return Err(fault(ServiceFault::Limit));
+                        };
+                        stack[depth - 1].set_value(layout, dst, FrameValue::Context(view));
+                    }
+                    Instruction::ServiceKeyConst(dst, key) => {
+                        frame.set_value(layout, dst, FrameValue::ServiceKey(key as usize));
+                    }
+                    Instruction::ServiceReference(dst, ctx, key) => {
+                        let view = context_of(held(memory, ctx, stack)?);
+                        let key = key_of(held(memory, key, stack)?);
+                        stack[depth - 1].set_value(layout, dst, FrameValue::ServiceRef(view, key));
+                    }
+                    Instruction::ServiceAvailable(dst, ctx, key) => {
+                        let view = context_of(held(memory, ctx, stack)?);
+                        let key = key_of(held(memory, key, stack)?);
+                        let scopes = service_scopes(stack, memory);
+                        let available = memory
+                            .services
+                            .selected(view, key, scopes.contains(&view))
+                            .is_ok();
+                        stack[depth - 1].set(layout, dst, Scalar::Bool(available));
+                    }
+                    Instruction::ServiceExtend(dst, ctx)
+                    | Instruction::ServiceIsolate(dst, ctx, _) => {
+                        let view = context_of(held(memory, ctx, stack)?);
+                        if memory.services.views[view].state != ServiceState::Active {
+                            return Err(fault(ServiceFault::InactiveContext));
+                        }
+                        let Some(child) = memory.services.new_view(Some(view)) else {
+                            return Err(fault(ServiceFault::Limit));
+                        };
+                        if let Instruction::ServiceIsolate(_, _, key) = instruction {
+                            let key = key_of(held(memory, key, stack)?);
+                            memory.services.next_realm += 1;
+                            let realm = memory.services.next_realm;
+                            let child_view = &mut memory.services.views[child];
+                            child_view.realms.insert(key, realm);
+                            child_view.admitted.remove(&key);
+                        }
+                        stack[depth - 1].set_value(layout, dst, FrameValue::Context(child));
+                    }
+                    Instruction::ServiceProvide(dst, list) => {
+                        let &[ctx, key, value] = &*body.lists[list.index()] else {
+                            unreachable!("verified provide operands");
+                        };
+                        let view = context_of(held(memory, ctx, stack)?);
+                        let key = key_of(held(memory, key, stack)?);
+                        let value = stack[depth - 1].value(layout, value);
+                        if memory.services.views[view].state != ServiceState::Active {
+                            return Err(fault(ServiceFault::InactiveContext));
+                        }
+                        let realm = memory.services.realm(view, key);
+                        if memory.services.active.contains_key(&(key, realm)) {
+                            return Err(fault(ServiceFault::ProviderConflict));
+                        }
+                        if memory.services.bindings.len() >= MAX_SERVICE_OBJECTS {
+                            return Err(fault(ServiceFault::Limit));
+                        }
+                        let binding = memory.services.bindings.len();
+                        memory.services.bindings.push(ServiceBinding {
+                            owner: view,
+                            key,
+                            realm,
+                            state: ServiceState::Active,
+                            value: Some(value),
+                            leases: 0,
+                        });
+                        memory.services.views[view].provided.insert(key, binding);
+                        memory.services.active.insert((key, realm), binding);
+                        stack[depth - 1].set_value(layout, dst, FrameValue::Registration(binding));
+                    }
+                    Instruction::ServiceOnDispose(ctx, callback) => {
+                        let view = context_of(held(memory, ctx, stack)?);
+                        if memory.services.views[view].state != ServiceState::Active {
+                            return Err(fault(ServiceFault::InactiveContext));
+                        }
+                        let callback = stack[depth - 1].value(layout, callback);
+                        memory.services.views[view].cleanups.push(callback);
+                    }
+                    Instruction::ServiceInject(list) => {
+                        let &[ctx, key, callback] = &*body.lists[list.index()] else {
+                            unreachable!("verified inject operands");
+                        };
+                        let view = context_of(held(memory, ctx, stack)?);
+                        let key = key_of(held(memory, key, stack)?);
+                        let FrameValue::Closure(callback) =
+                            stack[depth - 1].value(layout, callback)
+                        else {
+                            unreachable!("verified callback");
+                        };
+                        if memory.services.views[view].state != ServiceState::Active {
+                            return Err(fault(ServiceFault::InactiveContext));
+                        }
+                        let scopes = service_scopes(stack, memory);
+                        let binding = memory
+                            .services
+                            .selected(view, key, scopes.contains(&view))
+                            .map_err(fault)?;
+                        let Some(child) = memory.services.new_view(Some(view)) else {
+                            return Err(fault(ServiceFault::Limit));
+                        };
+                        let child_view = &mut memory.services.views[child];
+                        child_view.checked = true;
+                        child_view.admitted.insert(key, binding);
+                        if depth == max_frames {
+                            return Err(RunError::FrameLimit);
+                        }
+                        let target = &self.functions[callback.function.index()];
+                        let values = callback
+                            .captures
+                            .iter()
+                            .cloned()
+                            .chain(std::iter::once(FrameValue::Context(child)));
+                        let mut next = Frame::new(callback.function, target, values, None);
+                        next.scope = Some(child);
+                        stack.push(next);
+                    }
+                    Instruction::ServiceDispose(target) => {
+                        match held(memory, target, stack)? {
+                            Some(FrameValue::Registration(binding)) => {
+                                memory.services.collect_binding_cleanup(binding, &mut plan);
+                            }
+                            Some(FrameValue::Context(view)) => {
+                                memory.services.collect_view_cleanup(view, &mut plan);
+                            }
+                            _ => unreachable!("verified disposal target"),
+                        }
+                        // Cleanups run in the order the plan was collected: the
+                        // last pushed runs first.
+                        let count = plan.len();
+                        if stack.len() + count > max_frames {
+                            return Err(RunError::FrameLimit);
+                        }
+                        for (view, callback) in plan.into_iter().rev() {
+                            let FrameValue::Closure(callback) = callback else {
+                                unreachable!("a cleanup is a closure");
+                            };
+                            let target = &self.functions[callback.function.index()];
+                            let values = callback.captures.iter().cloned();
+                            let mut next = Frame::new(callback.function, target, values, None);
+                            next.scope = Some(view);
+                            stack.push(next);
+                        }
+                        let scopes = service_scopes(stack, memory);
+                        memory.services.release_retired(&scopes);
+                    }
+                    _ => unreachable!("matched service instruction"),
+                }
+            }
             Instruction::FrozenValue(dst, id) => {
                 fn build(frozen: &Frozen) -> FrameValue {
                     match frozen {
@@ -3695,7 +4186,16 @@ impl VerifiedModule {
                 let destination = frame.destination;
                 let receiver = frame.mapped.take();
                 let finalizing = frame.finalizing.take();
+                let leased = frame.lease.take();
+                let scoped = frame.scope.is_some();
                 stack.pop();
+                if leased.is_some() || scoped {
+                    if let Some(binding) = leased {
+                        memory.services.bindings[binding].leases -= 1;
+                    }
+                    let scopes = service_scopes(stack, memory);
+                    memory.services.release_retired(&scopes);
+                }
                 if let Some(block) = finalizing {
                     memory.finish_finalizer(block);
                 }
@@ -4710,6 +5210,10 @@ fn spell(value: &FrameValue, style: TextStyle) -> String {
             | FrameValue::Properties(_)
             | FrameValue::Failure(_)
             | FrameValue::Any(_)
+            | FrameValue::Context(_)
+            | FrameValue::Registration(_)
+            | FrameValue::ServiceKey(_)
+            | FrameValue::ServiceRef(..)
             | FrameValue::Moved,
         ) => unreachable!("verified text operand is a scalar or string"),
     }

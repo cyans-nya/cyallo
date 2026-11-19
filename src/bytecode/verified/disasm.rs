@@ -127,6 +127,12 @@ impl fmt::Display for VerifiedModule {
                     RegisterType::Dynamic => write!(f, "  r{index}: dynamic")?,
                     RegisterType::Failure => write!(f, "  r{index}: failure")?,
                     RegisterType::Any => write!(f, "  r{index}: any")?,
+                    RegisterType::Context => write!(f, "  r{index}: context")?,
+                    RegisterType::Registration => write!(f, "  r{index}: registration")?,
+                    RegisterType::ServiceKey => write!(f, "  r{index}: service key")?,
+                    RegisterType::ServiceRef(id) => {
+                        write!(f, "  r{index}: service ref trait{}", id.0)?
+                    }
                     RegisterType::Task(id) => write!(f, "  r{index}: task managed{}", id.0)?,
                     RegisterType::Clock => write!(f, "  r{index}: clock")?,
                     RegisterType::Sender(id) => write!(f, "  r{index}: sender managed{}", id.0)?,
@@ -573,6 +579,36 @@ impl fmt::Display for VerifiedModule {
                     Instruction::Count(op, dst, lhs, rhs) => {
                         write!(f, "r{} = count.{op:?} r{}, r{}", dst.0, lhs.0, rhs.0)?
                     }
+                    Instruction::ServiceContext(dst) => write!(f, "r{} = service.context", dst.0)?,
+                    Instruction::ServiceExtend(dst, ctx) => {
+                        write!(f, "r{} = service.extend r{}", dst.0, ctx.0)?
+                    }
+                    Instruction::ServiceIsolate(dst, ctx, key) => {
+                        write!(f, "r{} = service.isolate r{}, r{}", dst.0, ctx.0, key.0)?
+                    }
+                    Instruction::ServiceKeyConst(dst, key) => {
+                        write!(f, "r{} = service.key #{key}", dst.0)?
+                    }
+                    Instruction::ServiceReference(dst, ctx, key) => {
+                        write!(f, "r{} = service.ref r{}, r{}", dst.0, ctx.0, key.0)?
+                    }
+                    Instruction::ServiceProvide(dst, list) => {
+                        write!(f, "r{} = service.provide", dst.0)?;
+                        write_list(f, &function.lists()[list.index()])?;
+                    }
+                    Instruction::ServiceAvailable(dst, ctx, key) => {
+                        write!(f, "r{} = service.available r{}, r{}", dst.0, ctx.0, key.0)?
+                    }
+                    Instruction::ServiceInject(list) => {
+                        write!(f, "service.inject")?;
+                        write_list(f, &function.lists()[list.index()])?;
+                    }
+                    Instruction::ServiceOnDispose(ctx, callback) => {
+                        write!(f, "service.on_dispose r{}, r{}", ctx.0, callback.0)?
+                    }
+                    Instruction::ServiceDispose(target) => {
+                        write!(f, "service.dispose r{}", target.0)?
+                    }
                     Instruction::FrozenValue(dst, id) => {
                         write!(f, "r{} = frozen f{}", dst.0, id.0)?
                     }
@@ -658,6 +694,10 @@ fn value_name(ty: ValueType) -> String {
         ValueType::Dynamic => "dynamic".to_owned(),
         ValueType::Failure => "failure".to_owned(),
         ValueType::Any => "any".to_owned(),
+        ValueType::Context => "context".to_owned(),
+        ValueType::Registration => "registration".to_owned(),
+        ValueType::ServiceKey => "service key".to_owned(),
+        ValueType::ServiceRef(id) => format!("service ref trait{}", id.0),
         ValueType::Task(id) => format!("task managed{}", id.0),
         ValueType::Clock => "clock".to_owned(),
         ValueType::Sender(id) => format!("sender managed{}", id.0),

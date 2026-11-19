@@ -29,16 +29,16 @@ pub(crate) use run::ScalarFrameSnapshot;
 pub use run::ScalarRecoveryError;
 pub use run::{
     Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, GeneratorFault, HeapStats,
-    InputSource, ObjectFault, OutputSink, PathFault, RunError,
+    InputSource, ObjectFault, OutputSink, PathFault, RunError, ServiceFault,
 };
 pub use sdk::SdkCompileError;
 
-/// Version 32 adds owned erased values, constant aggregates and count arithmetic. Version 31 adds run-time module loading. Version 30 adds by-value trait receivers. Version 29 adds open objects and erased values. Version 28 adds tasks and clocks. Version 27 adds channels. Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 33 adds service contexts. Version 32 adds owned erased values, constant aggregates and count arithmetic. Version 31 adds run-time module loading. Version 30 adds by-value trait receivers. Version 29 adds open objects and erased values. Version 28 adds tasks and clocks. Version 27 adds channels. Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 32;
+pub const FORMAT_VERSION: u32 = 33;
 
 macro_rules! index {
     ($name:ident) => {
@@ -133,6 +133,15 @@ pub enum ValueType {
     /// An owned value of any type together with its type. Unlike `Dynamic` it
     /// may own counted values, so it is released and moved like an owner.
     Any,
+    /// A service context: a view of which providers are visible.
+    Context,
+    /// The registration of a provider, which withdraws it.
+    Registration,
+    /// The identity of a service, by its linked declaration.
+    ServiceKey,
+    /// A live reference to a service the trait describes: each call finds the
+    /// provider the context sees at that moment.
+    ServiceRef(TraitId),
 }
 
 /// A method a trait declares: what its receiver may do and its other types.
@@ -246,7 +255,11 @@ impl ValueType {
             | Self::OpenObject
             | Self::Dynamic
             | Self::Failure
-            | Self::Any => None,
+            | Self::Any
+            | Self::Context
+            | Self::Registration
+            | Self::ServiceKey
+            | Self::ServiceRef(_) => None,
         }
     }
 }
@@ -370,6 +383,14 @@ pub enum RegisterType {
     Failure,
     /// An owned erased value.
     Any,
+    /// A service context.
+    Context,
+    /// A provider's registration.
+    Registration,
+    /// A service's identity.
+    ServiceKey,
+    /// A live reference to a service.
+    ServiceRef(TraitId),
     /// A closure that captured loans. It behaves like a loan on their root:
     /// the root stays live and borrowed while it lives, and the value cannot
     /// be stored, passed or returned by value.
@@ -411,6 +432,10 @@ impl From<ValueType> for RegisterType {
             ValueType::Dynamic => Self::Dynamic,
             ValueType::Failure => Self::Failure,
             ValueType::Any => Self::Any,
+            ValueType::Context => Self::Context,
+            ValueType::Registration => Self::Registration,
+            ValueType::ServiceKey => Self::ServiceKey,
+            ValueType::ServiceRef(id) => Self::ServiceRef(id),
         }
     }
 }
@@ -457,6 +482,10 @@ impl RegisterType {
             Self::Dynamic => ValueType::Dynamic,
             Self::Failure => ValueType::Failure,
             Self::Any => ValueType::Any,
+            Self::Context => ValueType::Context,
+            Self::Registration => ValueType::Registration,
+            Self::ServiceKey => ValueType::ServiceKey,
+            Self::ServiceRef(id) => ValueType::ServiceRef(id),
             _ => return None,
         })
     }
@@ -821,6 +850,29 @@ pub enum Instruction {
     DynamicInvoke(Register, Register, OperandListId),
     /// Wrap the value with its type.
     Erase(Register, Register),
+    /// A new root service context.
+    ServiceContext(Register),
+    /// A context that sees what its parent sees.
+    ServiceExtend(Register, Register),
+    /// A context that gives the key its own, separate providers.
+    ServiceIsolate(Register, Register, Register),
+    /// The key at this index of the linked service keys.
+    ServiceKeyConst(Register, u32),
+    /// A live reference to the key's service in the context.
+    ServiceReference(Register, Register, Register),
+    /// Provide a value for the key in the context. The list holds the context,
+    /// the key and the value; the result is the registration.
+    ServiceProvide(Register, OperandListId),
+    ServiceAvailable(Register, Register, Register),
+    /// Run the callback in a context that sees the provider the key resolves to
+    /// now and keeps seeing it. The list holds the context, the key and the
+    /// callback.
+    ServiceInject(OperandListId),
+    /// Run the callback when the context is disposed.
+    ServiceOnDispose(Register, Register),
+    /// Withdraw the registration or dispose the context, running the cleanup
+    /// of everything that depended on it.
+    ServiceDispose(Register),
     /// A constant aggregate.
     FrozenValue(Register, FrozenId),
     /// Arithmetic and comparison on counts, checked like integer arithmetic.
@@ -1074,6 +1126,15 @@ impl Instruction {
             DynamicInvoke(dst, callee, list) => {
                 ([Some(callee), None], &lists[list.index()], Some(dst))
             }
+            ServiceContext(dst) | ServiceKeyConst(dst, _) => ([None, None], &[], Some(dst)),
+            ServiceExtend(dst, ctx) => ([Some(ctx), None], &[], Some(dst)),
+            ServiceIsolate(dst, ctx, key)
+            | ServiceReference(dst, ctx, key)
+            | ServiceAvailable(dst, ctx, key) => ([Some(ctx), Some(key)], &[], Some(dst)),
+            ServiceProvide(dst, list) => ([None, None], &lists[list.index()], Some(dst)),
+            ServiceInject(list) => ([None, None], &lists[list.index()], None),
+            ServiceOnDispose(ctx, callback) => ([Some(ctx), Some(callback)], &[], None),
+            ServiceDispose(target) => ([Some(target), None], &[], None),
             FrozenValue(dst, _) => ([None, None], &[], Some(dst)),
             Count(_, dst, lhs, rhs) => ([Some(lhs), Some(rhs)], &[], Some(dst)),
             AnyErase(dst, source) | AnyChecked(dst, source) => {
@@ -1462,6 +1523,10 @@ impl VerifiedFunction {
             RegisterType::Dynamic => Ok(ValueType::Dynamic),
             RegisterType::Failure => Ok(ValueType::Failure),
             RegisterType::Any => Ok(ValueType::Any),
+            RegisterType::Context => Ok(ValueType::Context),
+            RegisterType::Registration => Ok(ValueType::Registration),
+            RegisterType::ServiceKey => Ok(ValueType::ServiceKey),
+            RegisterType::ServiceRef(id) => Ok(ValueType::ServiceRef(id)),
             RegisterType::BorrowingFunction { .. } => {
                 Err(InvalidBytecode::EscapingBorrow(register))
             }
@@ -1557,6 +1622,23 @@ impl VerifiedFunction {
         match self.failure_result(register) {
             Ok(variants) => variants,
             Err(_) => unreachable!("verified failure result"),
+        }
+    }
+
+    /// The register holds a service context, or a loan of one.
+    fn require_context(&self, register: Register) -> Result<(), InvalidBytecode> {
+        if self.through(register)? == ValueType::Context {
+            Ok(())
+        } else {
+            Err(InvalidBytecode::ExpectedHandle(register))
+        }
+    }
+
+    fn require_key(&self, register: Register) -> Result<(), InvalidBytecode> {
+        if self.through(register)? == ValueType::ServiceKey {
+            Ok(())
+        } else {
+            Err(InvalidBytecode::ExpectedHandle(register))
         }
     }
 
@@ -2731,7 +2813,11 @@ impl VerifiedFunction {
                 | RegisterType::Failure
                 | RegisterType::Any
                 | RegisterType::Object(_)
-                | RegisterType::Generator(_) => {}
+                | RegisterType::Generator(_)
+                | RegisterType::Context
+                | RegisterType::Registration
+                | RegisterType::ServiceKey
+                | RegisterType::ServiceRef(_) => {}
                 RegisterType::Loan {
                     origin: LoanOrigin::Parameter { register: origin },
                     ..
@@ -2927,7 +3013,9 @@ impl VerifiedFunction {
                 Some(binding.result.into())
             }
             CallTarget::Method { object, method } => {
-                let RegisterType::Object(trait_id) = self.register_kind(object)? else {
+                let (RegisterType::Object(trait_id) | RegisterType::ServiceRef(trait_id)) =
+                    self.register_kind(object)?
+                else {
                     return Err(InvalidBytecode::ExpectedHandle(object));
                 };
                 let description = self
@@ -3054,6 +3142,12 @@ impl VerifiedFunction {
                 RegisterType::Dynamic => self.require_value(arg, ValueType::Dynamic)?,
                 RegisterType::Failure => self.require_value(arg, ValueType::Failure)?,
                 RegisterType::Any => self.require_value(arg, ValueType::Any)?,
+                RegisterType::Context => self.require_value(arg, ValueType::Context)?,
+                RegisterType::Registration => self.require_value(arg, ValueType::Registration)?,
+                RegisterType::ServiceKey => self.require_value(arg, ValueType::ServiceKey)?,
+                RegisterType::ServiceRef(id) => {
+                    self.require_value(arg, ValueType::ServiceRef(id))?
+                }
                 RegisterType::Weak(managed) => self.require_value(arg, ValueType::Weak(managed))?,
                 RegisterType::Composite(shape) => {
                     self.require_value(arg, ValueType::Composite(shape))?;
@@ -3426,6 +3520,69 @@ impl VerifiedFunction {
                 }
                 Ok(())
             }
+            Instruction::ServiceContext(dst) => self.require_value(dst, ValueType::Context),
+            Instruction::ServiceExtend(dst, ctx) => {
+                self.require_context(ctx)?;
+                self.require_value(dst, ValueType::Context)
+            }
+            Instruction::ServiceIsolate(dst, ctx, key) => {
+                self.require_context(ctx)?;
+                self.require_key(key)?;
+                self.require_value(dst, ValueType::Context)
+            }
+            Instruction::ServiceKeyConst(dst, _) => self.require_value(dst, ValueType::ServiceKey),
+            Instruction::ServiceReference(dst, ctx, key) => {
+                self.require_context(ctx)?;
+                self.require_key(key)?;
+                match self.value_type(dst)? {
+                    ValueType::ServiceRef(_) => Ok(()),
+                    _ => Err(InvalidBytecode::ExpectedHandle(dst)),
+                }
+            }
+            Instruction::ServiceProvide(dst, list) => {
+                let &[ctx, key, value] = self.operand_list(list)? else {
+                    return Err(InvalidBytecode::ArgumentCount {
+                        expected: 3,
+                        actual: self.operand_list(list)?.len(),
+                    });
+                };
+                self.require_context(ctx)?;
+                self.require_key(key)?;
+                if !matches!(self.value_type(value)?, ValueType::Object(_)) {
+                    return Err(InvalidBytecode::ExpectedHandle(value));
+                }
+                self.require_value(dst, ValueType::Registration)
+            }
+            Instruction::ServiceAvailable(dst, ctx, key) => {
+                self.require_context(ctx)?;
+                self.require_key(key)?;
+                self.require_type(dst, ScalarType::Bool)
+            }
+            Instruction::ServiceInject(list) => {
+                let &[ctx, key, callback] = self.operand_list(list)? else {
+                    return Err(InvalidBytecode::ArgumentCount {
+                        expected: 3,
+                        actual: self.operand_list(list)?.len(),
+                    });
+                };
+                self.require_context(ctx)?;
+                self.require_key(key)?;
+                match self.value_type(callback)? {
+                    ValueType::Function(_) => Ok(()),
+                    _ => Err(InvalidBytecode::ExpectedFunction(callback)),
+                }
+            }
+            Instruction::ServiceOnDispose(ctx, callback) => {
+                self.require_context(ctx)?;
+                match self.value_type(callback)? {
+                    ValueType::Function(_) => Ok(()),
+                    _ => Err(InvalidBytecode::ExpectedFunction(callback)),
+                }
+            }
+            Instruction::ServiceDispose(target) => match self.through(target)? {
+                ValueType::Context | ValueType::Registration => Ok(()),
+                _ => Err(InvalidBytecode::ExpectedHandle(target)),
+            },
             Instruction::Count(op, dst, lhs, rhs) => {
                 self.require_type(lhs, ScalarType::U64)?;
                 self.require_type(rhs, ScalarType::U64)?;

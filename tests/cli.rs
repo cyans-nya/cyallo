@@ -754,6 +754,8 @@ fn verified_engine_matches_the_interpreter_on_supported_programs() {
         "examples/objects/native-ic.ya",
         "examples/modules/static/main.ya",
         "examples/modules/dynamic/main.ya",
+        "examples/services/main.ya",
+        "examples/lookup-services/main.ya",
         "examples/lookup-services/main.ya",
         "examples/concurrency/modules/main.ya",
     ] {

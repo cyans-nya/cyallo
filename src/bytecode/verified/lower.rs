@@ -1528,6 +1528,35 @@ fn lower_operation(
                 _ => return Err(unsupported()),
             }
         }
+        Op::ServiceKey(dst, key) => {
+            Instruction::ServiceKeyConst(register(*dst)?, lower_index(routine, *key)?)
+        }
+        Op::Service(dst, operation, args) => {
+            use cyallo_ir::services::Operation as S;
+            let arg = |index: usize| register(args[index]);
+            match (operation, args.len()) {
+                (S::Context, 0) => Instruction::ServiceContext(register(*dst)?),
+                (S::Extend, 1) => Instruction::ServiceExtend(register(*dst)?, arg(0)?),
+                (S::Isolate, 2) => Instruction::ServiceIsolate(register(*dst)?, arg(0)?, arg(1)?),
+                (S::Reference, 2) => {
+                    Instruction::ServiceReference(register(*dst)?, arg(0)?, arg(1)?)
+                }
+                (S::Available, 2) => {
+                    Instruction::ServiceAvailable(register(*dst)?, arg(0)?, arg(1)?)
+                }
+                (S::Provide, 3) => {
+                    let list = new_list(routine, sites, args.iter().map(|&a| register(a)))?;
+                    Instruction::ServiceProvide(register(*dst)?, list)
+                }
+                (S::Inject, 3) => {
+                    let list = new_list(routine, sites, args.iter().map(|&a| register(a)))?;
+                    Instruction::ServiceInject(list)
+                }
+                (S::OnDispose, 2) => Instruction::ServiceOnDispose(arg(0)?, arg(1)?),
+                (S::Dispose, 1) => Instruction::ServiceDispose(arg(0)?),
+                _ => return Err(unsupported()),
+            }
+        }
         Op::Lookup(dst, Operation::Erase, args) if args.len() == 1 => {
             Instruction::AnyErase(register(*dst)?, register(args[0])?)
         }

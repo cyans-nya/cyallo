@@ -218,6 +218,16 @@ opcodes! {
     AnyErase = 186, 3;
     AnyChecked = 187, 3;
     FrozenValue = 188, 3;
+    ServiceContext = 200, 2;
+    ServiceExtend = 201, 3;
+    ServiceIsolate = 202, 4;
+    ServiceKeyConst = 203, 3;
+    ServiceReference = 204, 4;
+    ServiceProvide = 205, 3;
+    ServiceAvailable = 206, 4;
+    ServiceInject = 207, 2;
+    ServiceOnDispose = 208, 3;
+    ServiceDispose = 209, 2;
     CountAdd = 189, 4;
     CountSubtract = 190, 4;
     CountMultiply = 191, 4;
@@ -556,6 +566,26 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
             }
             Instruction::ObjectFreeze(object) => (Opcode::ObjectFreeze, [object.0, 0, 0], 1),
             Instruction::Count(op, dst, lhs, rhs) => (count_opcode(op), [dst.0, lhs.0, rhs.0], 3),
+            Instruction::ServiceContext(dst) => (Opcode::ServiceContext, [dst.0, 0, 0], 1),
+            Instruction::ServiceExtend(dst, ctx) => (Opcode::ServiceExtend, [dst.0, ctx.0, 0], 2),
+            Instruction::ServiceIsolate(dst, ctx, key) => {
+                (Opcode::ServiceIsolate, [dst.0, ctx.0, key.0], 3)
+            }
+            Instruction::ServiceKeyConst(dst, key) => (Opcode::ServiceKeyConst, [dst.0, key, 0], 2),
+            Instruction::ServiceReference(dst, ctx, key) => {
+                (Opcode::ServiceReference, [dst.0, ctx.0, key.0], 3)
+            }
+            Instruction::ServiceProvide(dst, list) => {
+                (Opcode::ServiceProvide, [dst.0, list.0, 0], 2)
+            }
+            Instruction::ServiceAvailable(dst, ctx, key) => {
+                (Opcode::ServiceAvailable, [dst.0, ctx.0, key.0], 3)
+            }
+            Instruction::ServiceInject(list) => (Opcode::ServiceInject, [list.0, 0, 0], 1),
+            Instruction::ServiceOnDispose(ctx, callback) => {
+                (Opcode::ServiceOnDispose, [ctx.0, callback.0, 0], 2)
+            }
+            Instruction::ServiceDispose(target) => (Opcode::ServiceDispose, [target.0, 0, 0], 1),
             Instruction::FrozenValue(dst, id) => (Opcode::FrozenValue, [dst.0, id.0, 0], 2),
             Instruction::AnyErase(dst, source) => (Opcode::AnyErase, [dst.0, source.0, 0], 2),
             Instruction::AnyChecked(dst, source) => (Opcode::AnyChecked, [dst.0, source.0, 0], 2),
@@ -830,6 +860,16 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::CountNotEqual => {
                 Instruction::Count(IntegerOp::NotEqual, reg(0), reg(1), reg(2))
             }
+            Opcode::ServiceContext => Instruction::ServiceContext(reg(0)),
+            Opcode::ServiceExtend => Instruction::ServiceExtend(reg(0), reg(1)),
+            Opcode::ServiceIsolate => Instruction::ServiceIsolate(reg(0), reg(1), reg(2)),
+            Opcode::ServiceKeyConst => Instruction::ServiceKeyConst(reg(0), values[1]),
+            Opcode::ServiceReference => Instruction::ServiceReference(reg(0), reg(1), reg(2)),
+            Opcode::ServiceProvide => Instruction::ServiceProvide(reg(0), list(1)),
+            Opcode::ServiceAvailable => Instruction::ServiceAvailable(reg(0), reg(1), reg(2)),
+            Opcode::ServiceInject => Instruction::ServiceInject(list(0)),
+            Opcode::ServiceOnDispose => Instruction::ServiceOnDispose(reg(0), reg(1)),
+            Opcode::ServiceDispose => Instruction::ServiceDispose(reg(0)),
             Opcode::FrozenValue => Instruction::FrozenValue(reg(0), FrozenId(values[1])),
             Opcode::AnyErase => Instruction::AnyErase(reg(0), reg(1)),
             Opcode::AnyChecked => Instruction::AnyChecked(reg(0), reg(1)),

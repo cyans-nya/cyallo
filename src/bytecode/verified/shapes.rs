@@ -254,6 +254,14 @@ impl Shapes {
             }
             // A failure to load a module or to view an object.
             Type::Storage(StorageKind::LoadError | StorageKind::ViewError, _) => ValueType::Failure,
+            // Service contexts, registrations, keys and live references.
+            Type::Context => ValueType::Context,
+            Type::Registration => ValueType::Registration,
+            Type::ServiceKey(_) => ValueType::ServiceKey,
+            Type::ServiceRef(inner) => match self.value(inner)? {
+                ValueType::Object(id) => ValueType::ServiceRef(id),
+                _ => return None,
+            },
             // An owned value of any type.
             Type::Any => ValueType::Any,
             // An object, open or typed, and a value of any type.
@@ -581,7 +589,11 @@ impl Shapes {
             | ValueType::Clock
             | ValueType::OpenObject
             | ValueType::Dynamic
-            | ValueType::Failure => false,
+            | ValueType::Failure
+            | ValueType::Context
+            | ValueType::Registration
+            | ValueType::ServiceKey
+            | ValueType::ServiceRef(_) => false,
         }
     }
 
