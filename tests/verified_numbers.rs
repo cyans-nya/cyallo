@@ -173,6 +173,7 @@ mod images {
             traits: Box::new([]),
             implementations: Box::new([]),
             functions: Box::new([FunctionImage {
+                contracts: Box::new([]),
                 generator: None,
                 registers: registers.into_iter().map(RegisterType::Scalar).collect(),
                 parameters: Box::new([]),

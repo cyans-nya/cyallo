@@ -1,6 +1,6 @@
 use super::{
-    BooleanOp, CallSiteId, ChannelVariants, Extremum, FloatOp, FunctionId, GlobalId,
-    ImplementationId, InputKind, Instruction, InstructionId, IntegerOp, InvalidBytecode,
+    BooleanOp, CallSiteId, ChannelVariants, ContractId, DynamicOp, Extremum, FloatOp, FunctionId,
+    GlobalId, ImplementationId, InputKind, Instruction, InstructionId, IntegerOp, InvalidBytecode,
     OperandListId, Register, Scalar, TextId, TextMapOp, TextOp, TextTestOp,
 };
 
@@ -184,6 +184,32 @@ opcodes! {
     ClockNew = 152, 2;
     ClockClone = 153, 3;
     ClockSleep = 154, 3;
+    ObjectNew = 155, 4;
+    ObjectGet = 156, 4;
+    ObjectGetKey = 157, 4;
+    ObjectSet = 158, 4;
+    ObjectSetKey = 159, 3;
+    ObjectDelete = 160, 4;
+    ObjectDeleteKey = 161, 4;
+    ObjectView = 162, 4;
+    ObjectFreeze = 163, 2;
+    Erase = 164, 3;
+    DynamicCast = 165, 3;
+    DynamicAdd = 166, 4;
+    DynamicSubtract = 167, 4;
+    DynamicMultiply = 168, 4;
+    DynamicDivide = 169, 4;
+    DynamicRemainder = 170, 4;
+    DynamicEqual = 171, 4;
+    DynamicNotEqual = 172, 4;
+    DynamicLess = 173, 4;
+    DynamicGreater = 174, 4;
+    DynamicLessEqual = 175, 4;
+    DynamicGreaterEqual = 176, 4;
+    DynamicAnd = 177, 4;
+    DynamicOr = 178, 4;
+    DynamicNegate = 179, 3;
+    DynamicNot = 180, 3;
 }
 
 impl TextOp {
@@ -472,6 +498,39 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
             Instruction::EnumPayload(dst, src, variant) => {
                 (Opcode::EnumPayload, [dst.0, src.0, variant], 3)
             }
+            Instruction::ObjectNew(dst, list, contract) => {
+                (Opcode::ObjectNew, [dst.0, list.0, contract.0], 3)
+            }
+            Instruction::ObjectGet(dst, object, name) => {
+                (Opcode::ObjectGet, [dst.0, object.0, name.0], 3)
+            }
+            Instruction::ObjectGetKey(dst, object, key) => {
+                (Opcode::ObjectGetKey, [dst.0, object.0, key.0], 3)
+            }
+            Instruction::ObjectSet(object, name, value) => {
+                (Opcode::ObjectSet, [object.0, name.0, value.0], 3)
+            }
+            Instruction::ObjectSetKey(object, list) => {
+                (Opcode::ObjectSetKey, [object.0, list.0, 0], 2)
+            }
+            Instruction::ObjectDelete(dst, object, name) => {
+                (Opcode::ObjectDelete, [dst.0, object.0, name.0], 3)
+            }
+            Instruction::ObjectDeleteKey(dst, object, key) => {
+                (Opcode::ObjectDeleteKey, [dst.0, object.0, key.0], 3)
+            }
+            Instruction::ObjectView(dst, source, contract) => {
+                (Opcode::ObjectView, [dst.0, source.0, contract.0], 3)
+            }
+            Instruction::ObjectFreeze(object) => (Opcode::ObjectFreeze, [object.0, 0, 0], 1),
+            Instruction::Erase(dst, source) => (Opcode::Erase, [dst.0, source.0, 0], 2),
+            Instruction::DynamicCast(dst, source) => (Opcode::DynamicCast, [dst.0, source.0, 0], 2),
+            Instruction::DynamicBinary(op, dst, lhs, rhs) => {
+                (dynamic_opcode(op), [dst.0, lhs.0, rhs.0], 3)
+            }
+            Instruction::DynamicUnary(op, dst, source) => {
+                (dynamic_opcode(op), [dst.0, source.0, 0], 2)
+            }
             Instruction::TaskSpawn(dst, closure) => (Opcode::TaskSpawn, [dst.0, closure.0, 0], 2),
             Instruction::TaskJoin(dst, task) => (Opcode::TaskJoin, [dst.0, task.0, 0], 2),
             Instruction::TaskCancel(task) => (Opcode::TaskCancel, [task.0, 0, 0], 1),
@@ -696,6 +755,56 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::EnumWrap => Instruction::EnumWrap(reg(0), values[1], reg(2)),
             Opcode::EnumIs => Instruction::EnumIs(reg(0), reg(1), values[2]),
             Opcode::EnumPayload => Instruction::EnumPayload(reg(0), reg(1), values[2]),
+            Opcode::ObjectNew => Instruction::ObjectNew(reg(0), list(1), ContractId(values[2])),
+            Opcode::ObjectGet => Instruction::ObjectGet(reg(0), reg(1), TextId(values[2])),
+            Opcode::ObjectGetKey => Instruction::ObjectGetKey(reg(0), reg(1), reg(2)),
+            Opcode::ObjectSet => Instruction::ObjectSet(reg(0), TextId(values[1]), reg(2)),
+            Opcode::ObjectSetKey => Instruction::ObjectSetKey(reg(0), list(1)),
+            Opcode::ObjectDelete => Instruction::ObjectDelete(reg(0), reg(1), TextId(values[2])),
+            Opcode::ObjectDeleteKey => Instruction::ObjectDeleteKey(reg(0), reg(1), reg(2)),
+            Opcode::ObjectView => Instruction::ObjectView(reg(0), reg(1), ContractId(values[2])),
+            Opcode::ObjectFreeze => Instruction::ObjectFreeze(reg(0)),
+            Opcode::Erase => Instruction::Erase(reg(0), reg(1)),
+            Opcode::DynamicCast => Instruction::DynamicCast(reg(0), reg(1)),
+            Opcode::DynamicNegate => Instruction::DynamicUnary(DynamicOp::Negate, reg(0), reg(1)),
+            Opcode::DynamicNot => Instruction::DynamicUnary(DynamicOp::Not, reg(0), reg(1)),
+            Opcode::DynamicAdd => {
+                Instruction::DynamicBinary(DynamicOp::Add, reg(0), reg(1), reg(2))
+            }
+            Opcode::DynamicSubtract => {
+                Instruction::DynamicBinary(DynamicOp::Subtract, reg(0), reg(1), reg(2))
+            }
+            Opcode::DynamicMultiply => {
+                Instruction::DynamicBinary(DynamicOp::Multiply, reg(0), reg(1), reg(2))
+            }
+            Opcode::DynamicDivide => {
+                Instruction::DynamicBinary(DynamicOp::Divide, reg(0), reg(1), reg(2))
+            }
+            Opcode::DynamicRemainder => {
+                Instruction::DynamicBinary(DynamicOp::Remainder, reg(0), reg(1), reg(2))
+            }
+            Opcode::DynamicEqual => {
+                Instruction::DynamicBinary(DynamicOp::Equal, reg(0), reg(1), reg(2))
+            }
+            Opcode::DynamicNotEqual => {
+                Instruction::DynamicBinary(DynamicOp::NotEqual, reg(0), reg(1), reg(2))
+            }
+            Opcode::DynamicLess => {
+                Instruction::DynamicBinary(DynamicOp::Less, reg(0), reg(1), reg(2))
+            }
+            Opcode::DynamicGreater => {
+                Instruction::DynamicBinary(DynamicOp::Greater, reg(0), reg(1), reg(2))
+            }
+            Opcode::DynamicLessEqual => {
+                Instruction::DynamicBinary(DynamicOp::LessEqual, reg(0), reg(1), reg(2))
+            }
+            Opcode::DynamicGreaterEqual => {
+                Instruction::DynamicBinary(DynamicOp::GreaterEqual, reg(0), reg(1), reg(2))
+            }
+            Opcode::DynamicAnd => {
+                Instruction::DynamicBinary(DynamicOp::And, reg(0), reg(1), reg(2))
+            }
+            Opcode::DynamicOr => Instruction::DynamicBinary(DynamicOp::Or, reg(0), reg(1), reg(2)),
             Opcode::TaskSpawn => Instruction::TaskSpawn(reg(0), reg(1)),
             Opcode::TaskJoin => Instruction::TaskJoin(reg(0), reg(1)),
             Opcode::TaskCancel => Instruction::TaskCancel(reg(0)),
@@ -731,4 +840,24 @@ fn input_kind(word: usize, code: u32) -> Result<InputKind, InvalidBytecode> {
         3 => InputKind::Bool,
         value => return Err(InvalidBytecode::InvalidInputKind { word, value }),
     })
+}
+
+fn dynamic_opcode(op: DynamicOp) -> Opcode {
+    match op {
+        DynamicOp::Add => Opcode::DynamicAdd,
+        DynamicOp::Subtract => Opcode::DynamicSubtract,
+        DynamicOp::Multiply => Opcode::DynamicMultiply,
+        DynamicOp::Divide => Opcode::DynamicDivide,
+        DynamicOp::Remainder => Opcode::DynamicRemainder,
+        DynamicOp::Equal => Opcode::DynamicEqual,
+        DynamicOp::NotEqual => Opcode::DynamicNotEqual,
+        DynamicOp::Less => Opcode::DynamicLess,
+        DynamicOp::Greater => Opcode::DynamicGreater,
+        DynamicOp::LessEqual => Opcode::DynamicLessEqual,
+        DynamicOp::GreaterEqual => Opcode::DynamicGreaterEqual,
+        DynamicOp::And => Opcode::DynamicAnd,
+        DynamicOp::Or => Opcode::DynamicOr,
+        DynamicOp::Negate => Opcode::DynamicNegate,
+        DynamicOp::Not => Opcode::DynamicNot,
+    }
 }

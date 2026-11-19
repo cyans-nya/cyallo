@@ -190,6 +190,7 @@ mod images {
             traits: Box::new([]),
             implementations: Box::new([]),
             functions: Box::new([FunctionImage {
+                contracts: Box::new([]),
                 generator: None,
                 registers: registers.into(),
                 parameters: Box::new([]),

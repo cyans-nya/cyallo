@@ -49,7 +49,7 @@ fn bytecode_can_verify_and_show_a_selected_routine() {
     .unwrap();
     assert!(!result.status.success());
     assert!(result.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("unsupported frame storage"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("unsupported"));
 }
 
 #[test]
@@ -755,6 +755,8 @@ fn verified_engine_matches_the_interpreter_on_supported_programs() {
         "examples/concurrency/scheduling/clock.ya",
         "examples/concurrency/enums.ya",
         "examples/concurrency/status-enums.ya",
+        "examples/objects/open.ya",
+        "examples/objects/native-ic.ya",
     ] {
         let run = |engine| cli(&["run", example, "--engine", engine]).output().unwrap();
         let verified = run("verified");

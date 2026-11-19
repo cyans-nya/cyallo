@@ -488,6 +488,7 @@ fn recovery_preserves_the_taken_statement_edge_at_a_shared_pc() {
         traits: Box::new([]),
         implementations: Box::new([]),
         functions: Box::new([FunctionImage {
+            contracts: Box::new([]),
             generator: None,
             registers: Box::new([ScalarType::Bool.into()]),
             parameters: Box::new([condition]),

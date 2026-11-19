@@ -60,6 +60,7 @@ fn image(
     instructions: &[Instruction],
 ) -> FunctionImage {
     FunctionImage {
+        contracts: Box::new([]),
         generator: None,
         registers: registers.into(),
         parameters: parameters.into(),

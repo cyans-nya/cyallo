@@ -209,6 +209,7 @@ mod tests {
             traits: Box::new([]),
             implementations: Box::new([]),
             functions: Box::new([FunctionImage {
+                contracts: Box::new([]),
                 generator: None,
                 registers: Box::new(registers),
                 parameters: Box::new([condition]),

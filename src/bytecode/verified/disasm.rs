@@ -123,6 +123,8 @@ impl fmt::Display for VerifiedModule {
                     RegisterType::Object(id) => write!(f, "  r{index}: dyn trait{}", id.0)?,
                     RegisterType::Path => write!(f, "  r{index}: path")?,
                     RegisterType::Allocation => write!(f, "  r{index}: allocation")?,
+                    RegisterType::OpenObject => write!(f, "  r{index}: object")?,
+                    RegisterType::Dynamic => write!(f, "  r{index}: dynamic")?,
                     RegisterType::Task(id) => write!(f, "  r{index}: task managed{}", id.0)?,
                     RegisterType::Clock => write!(f, "  r{index}: clock")?,
                     RegisterType::Sender(id) => write!(f, "  r{index}: sender managed{}", id.0)?,
@@ -521,6 +523,45 @@ impl fmt::Display for VerifiedModule {
                     Instruction::EnumPayload(dst, src, variant) => {
                         write!(f, "r{} = enum.payload r{}, #{variant}", dst.0, src.0)?;
                     }
+                    Instruction::ObjectNew(dst, list, contract) => {
+                        write!(f, "r{} = object.new c{}", dst.0, contract.0)?;
+                        write_list(f, &function.lists()[list.index()])?;
+                    }
+                    Instruction::ObjectGet(dst, object, name) => {
+                        write!(f, "r{} = object.get r{}, t{}", dst.0, object.0, name.0)?
+                    }
+                    Instruction::ObjectGetKey(dst, object, key) => {
+                        write!(f, "r{} = object.get r{}[r{}]", dst.0, object.0, key.0)?
+                    }
+                    Instruction::ObjectSet(object, name, value) => {
+                        write!(f, "object.set r{}, t{}, r{}", object.0, name.0, value.0)?
+                    }
+                    Instruction::ObjectSetKey(object, list) => {
+                        write!(f, "object.set r{}", object.0)?;
+                        write_list(f, &function.lists()[list.index()])?;
+                    }
+                    Instruction::ObjectDelete(dst, object, name) => {
+                        write!(f, "r{} = object.delete r{}, t{}", dst.0, object.0, name.0)?
+                    }
+                    Instruction::ObjectDeleteKey(dst, object, key) => {
+                        write!(f, "r{} = object.delete r{}[r{}]", dst.0, object.0, key.0)?
+                    }
+                    Instruction::ObjectView(dst, source, contract) => {
+                        write!(f, "r{} = object.view r{}, c{}", dst.0, source.0, contract.0)?
+                    }
+                    Instruction::ObjectFreeze(object) => write!(f, "object.freeze r{}", object.0)?,
+                    Instruction::Erase(dst, source) => {
+                        write!(f, "r{} = erase r{}", dst.0, source.0)?
+                    }
+                    Instruction::DynamicCast(dst, source) => {
+                        write!(f, "r{} = dynamic.cast r{}", dst.0, source.0)?
+                    }
+                    Instruction::DynamicBinary(op, dst, lhs, rhs) => {
+                        write!(f, "r{} = dynamic.{op:?} r{}, r{}", dst.0, lhs.0, rhs.0)?
+                    }
+                    Instruction::DynamicUnary(op, dst, source) => {
+                        write!(f, "r{} = dynamic.{op:?} r{}", dst.0, source.0)?
+                    }
                     Instruction::TaskSpawn(dst, closure) => {
                         write!(f, "r{} = task.spawn r{}", dst.0, closure.0)?
                     }
@@ -581,6 +622,8 @@ fn value_name(ty: ValueType) -> String {
         ValueType::Path => "path".to_owned(),
         ValueType::Allocation => "allocation".to_owned(),
         ValueType::Generator(id) => format!("generator sig{}", id.0),
+        ValueType::OpenObject => "object".to_owned(),
+        ValueType::Dynamic => "dynamic".to_owned(),
         ValueType::Task(id) => format!("task managed{}", id.0),
         ValueType::Clock => "clock".to_owned(),
         ValueType::Sender(id) => format!("sender managed{}", id.0),

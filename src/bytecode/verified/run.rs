@@ -1,7 +1,7 @@
 use super::{
-    BooleanOp, CallSite, CallTarget, Extremum, FloatOp, FrameLayout, FunctionId, GlobalId,
-    HostBindingId, HostFailure, InputKind, Instruction, InstructionId, IntegerOp, OutputPiece,
-    OutputTemplate, Register, RegisterType, Scalar, ScalarType, StatementArrival,
+    BooleanOp, CallSite, CallTarget, DynamicOp, Extremum, FloatOp, FrameLayout, FunctionId,
+    GlobalId, HostBindingId, HostFailure, InputKind, Instruction, InstructionId, IntegerOp,
+    OutputPiece, OutputTemplate, Register, RegisterType, Scalar, ScalarType, StatementArrival,
     StatementBoundary, TextFailure, TextMapOp, TextOp, TextStyle, TextTestOp, ValueType,
     VerifiedFunction, VerifiedModule, array_len,
 };
@@ -129,6 +129,13 @@ pub enum RunError {
         instruction: InstructionId,
         span: Span,
         fault: GeneratorFault,
+    },
+    /// An object operation failed.
+    Object {
+        function: FunctionId,
+        instruction: InstructionId,
+        span: Span,
+        fault: ObjectFault,
     },
     /// A storage path does not lead anywhere in the value it is applied to.
     Path {
@@ -259,6 +266,12 @@ impl fmt::Display for RunError {
                 "division by zero in function {} at instruction {}",
                 function.0, instruction.0
             ),
+            Self::Object { fault, .. } => f.write_str(match fault {
+                ObjectFault::Missing => "the object has no such property",
+                ObjectFault::Readonly => "the object is readonly",
+                ObjectFault::Contract => "the write breaks the type a property is required to keep",
+                ObjectFault::Type => "the erased value is not of the type it is read as",
+            }),
             Self::Deadlock { .. } => {
                 f.write_str("deadlock: the task waits for a channel that no other task can serve")
             }
@@ -457,6 +470,12 @@ enum FrameValue {
     Task(usize),
     /// A capability to sleep.
     Clock,
+    /// The object whose properties are at this index of the heap.
+    OpenObject(usize),
+    /// The properties of an object, as the heap holds them.
+    Properties(Box<ObjectData>),
+    /// A value with the type it had when it was erased.
+    Dynamic(Box<(ValueType, FrameValue)>),
     /// A retained reference to a field of a heap record: a place rooted in a
     /// heap object, which the collector keeps alive.
     Location(BorrowedPlace),
@@ -471,6 +490,43 @@ enum FrameValue {
         heap: usize,
         implementation: u32,
     },
+}
+
+/// The properties of an object. A readonly object accepts no writes.
+#[derive(Debug, Clone)]
+struct ObjectData {
+    readonly: bool,
+    properties: Vec<Property>,
+}
+
+#[derive(Debug, Clone)]
+struct Property {
+    name: Arc<str>,
+    /// The value and the type it was stored with, never `Dynamic`.
+    value: (ValueType, FrameValue),
+    /// The type every write must keep, when a literal or a view requires one.
+    required: Option<ValueType>,
+}
+
+impl ObjectData {
+    fn find(&self, name: &str) -> Option<usize> {
+        self.properties
+            .iter()
+            .position(|property| &*property.name == name)
+    }
+}
+
+/// Why an object operation failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectFault {
+    /// The property does not exist.
+    Missing,
+    /// The object is readonly.
+    Readonly,
+    /// The write or view would break a required property's type.
+    Contract,
+    /// An erased value is not of the type it is read as.
+    Type,
 }
 
 /// One projection of a storage path.
@@ -840,6 +896,9 @@ impl Memory {
                 | FrameValue::Allocation(_)
                 | FrameValue::Task(_)
                 | FrameValue::Clock
+                | FrameValue::OpenObject(_)
+                | FrameValue::Properties(_)
+                | FrameValue::Dynamic(_)
                 | FrameValue::Loan(_)
                 | FrameValue::Closure(_)
                 | FrameValue::Handle(_)
@@ -1089,7 +1148,13 @@ fn trace(value: &FrameValue, marks: &mut [bool], pending: &mut Vec<usize>) {
     let mut stack = vec![value];
     while let Some(value) = stack.pop() {
         match value {
-            FrameValue::Handle(object) | FrameValue::Object { heap: object, .. } => mark(*object),
+            FrameValue::Handle(object)
+            | FrameValue::OpenObject(object)
+            | FrameValue::Object { heap: object, .. } => mark(*object),
+            FrameValue::Properties(data) => {
+                stack.extend(data.properties.iter().map(|property| &property.value.1));
+            }
+            FrameValue::Dynamic(erased) => stack.push(&erased.1),
             FrameValue::Loan(place) | FrameValue::Location(place) => {
                 if let Root::Heap(object) = place.root {
                     mark(object);
@@ -1335,6 +1400,9 @@ impl Frame {
             | FrameValue::Receiver(_)
             | FrameValue::Task(_)
             | FrameValue::Clock
+            | FrameValue::OpenObject(_)
+            | FrameValue::Properties(_)
+            | FrameValue::Dynamic(_)
             | FrameValue::Moved => {
                 unreachable!("verified scalar operand")
             }
@@ -1360,6 +1428,9 @@ impl Frame {
             | FrameValue::Receiver(_)
             | FrameValue::Task(_)
             | FrameValue::Clock
+            | FrameValue::OpenObject(_)
+            | FrameValue::Properties(_)
+            | FrameValue::Dynamic(_)
             | FrameValue::Moved => {
                 unreachable!("verified loan operand")
             }
@@ -2831,6 +2902,296 @@ impl VerifiedModule {
                 };
                 stack[depth - 1].set_value(layout, dst, FrameValue::Composite(result));
             }
+            Instruction::ObjectNew(dst, list, contract) => {
+                let contract = &body.contracts[contract.index()];
+                let values = &body.lists[list.index()];
+                let properties = contract
+                    .fields
+                    .iter()
+                    .zip(values.iter())
+                    .map(|((name, ty), &register)| Property {
+                        name: name.clone(),
+                        value: erased_parts(frame.value(layout, register), *ty),
+                        required: contract.required.then_some(*ty),
+                    })
+                    .collect();
+                let data = FrameValue::Properties(Box::new(ObjectData {
+                    readonly: false,
+                    properties,
+                }));
+                if memory.heap.should_collect() {
+                    memory.collect(stack);
+                }
+                let handle = memory.heap.allocate(data).ok_or(RunError::HeapExhausted {
+                    function,
+                    instruction: from,
+                    span: body.spans[pc],
+                })?;
+                let object = FrameValue::OpenObject(handle);
+                let value = if body.registers()[dst.index()].value() == Some(ValueType::Dynamic) {
+                    FrameValue::Dynamic(Box::new((ValueType::OpenObject, object)))
+                } else {
+                    object
+                };
+                stack[depth - 1].set_value(layout, dst, value);
+            }
+            Instruction::ObjectGet(..)
+            | Instruction::ObjectGetKey(..)
+            | Instruction::ObjectSet(..)
+            | Instruction::ObjectSetKey(..)
+            | Instruction::ObjectDelete(..)
+            | Instruction::ObjectDeleteKey(..)
+            | Instruction::ObjectView(..)
+            | Instruction::ObjectFreeze(..) => {
+                let fault = |fault| RunError::Object {
+                    function,
+                    instruction: from,
+                    span: body.spans[pc],
+                    fault,
+                };
+                let instruction = body.instructions[pc];
+                let (object, name) = match instruction {
+                    Instruction::ObjectGet(_, object, name)
+                    | Instruction::ObjectDelete(_, object, name)
+                    | Instruction::ObjectSet(object, name, _) => {
+                        (object, Some(body.texts[name.index()].clone()))
+                    }
+                    Instruction::ObjectGetKey(_, object, key)
+                    | Instruction::ObjectDeleteKey(_, object, key) => {
+                        (object, Some(stack[depth - 1].text(layout, key).clone()))
+                    }
+                    Instruction::ObjectSetKey(object, list) => {
+                        let key = body.lists[list.index()][0];
+                        (object, Some(stack[depth - 1].text(layout, key).clone()))
+                    }
+                    Instruction::ObjectView(_, object, _) | Instruction::ObjectFreeze(object) => {
+                        (object, None)
+                    }
+                    _ => unreachable!("matched object instruction"),
+                };
+                let held = self
+                    .held_value(stack, memory, body, object)
+                    .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
+                let id = match held {
+                    Some(FrameValue::OpenObject(id)) => id,
+                    Some(FrameValue::Dynamic(erased)) => match erased.1 {
+                        FrameValue::OpenObject(id) => id,
+                        _ => return Err(fault(ObjectFault::Type)),
+                    },
+                    _ => unreachable!("verified object operand"),
+                };
+                let value_register = match instruction {
+                    Instruction::ObjectSet(_, _, value) => Some(value),
+                    Instruction::ObjectSetKey(_, list) => Some(body.lists[list.index()][1]),
+                    _ => None,
+                };
+                let stored = value_register.map(|register| {
+                    let ty = body.registers()[register.index()]
+                        .value()
+                        .unwrap_or(ValueType::Dynamic);
+                    erased_parts(stack[depth - 1].value(layout, register), ty)
+                });
+                let Some(FrameValue::Properties(data)) = memory.heap.slots[id].as_mut() else {
+                    unreachable!("an object handle names its properties");
+                };
+                match instruction {
+                    Instruction::ObjectGet(dst, ..) | Instruction::ObjectGetKey(dst, ..) => {
+                        let name = name.expect("a property name");
+                        let at = data.find(&name).ok_or(fault(ObjectFault::Missing))?;
+                        let (ty, value) = data.properties[at].value.clone();
+                        let wanted = body.registers()[dst.index()].value();
+                        let result = if wanted == Some(ValueType::Dynamic) {
+                            FrameValue::Dynamic(Box::new((ty, memory.clone_value(&value))))
+                        } else if wanted == Some(ty) {
+                            memory.clone_value(&value)
+                        } else {
+                            return Err(fault(ObjectFault::Type));
+                        };
+                        stack[depth - 1].set_value(layout, dst, result);
+                    }
+                    Instruction::ObjectSet(..) | Instruction::ObjectSetKey(..) => {
+                        let name = name.expect("a property name");
+                        let Some(new) = stored else {
+                            unreachable!("a write has a value");
+                        };
+                        if data.readonly {
+                            return Err(fault(ObjectFault::Readonly));
+                        }
+                        match data.find(&name) {
+                            Some(at) => {
+                                let property = &mut data.properties[at];
+                                if let Some(required) = property.required
+                                    && required != ValueType::Dynamic
+                                    && required != new.0
+                                {
+                                    return Err(fault(ObjectFault::Contract));
+                                }
+                                property.value = new;
+                            }
+                            None => data.properties.push(Property {
+                                name,
+                                value: new,
+                                required: None,
+                            }),
+                        }
+                    }
+                    Instruction::ObjectDelete(dst, ..) | Instruction::ObjectDeleteKey(dst, ..) => {
+                        let name = name.expect("a property name");
+                        if data.readonly {
+                            return Err(fault(ObjectFault::Readonly));
+                        }
+                        let existed = match data.find(&name) {
+                            Some(at) => {
+                                if data.properties[at].required.is_some() {
+                                    return Err(fault(ObjectFault::Contract));
+                                }
+                                data.properties.remove(at);
+                                true
+                            }
+                            None => false,
+                        };
+                        stack[depth - 1].set(layout, dst, Scalar::Bool(existed));
+                    }
+                    Instruction::ObjectView(dst, _, contract) => {
+                        let contract = &body.contracts[contract.index()];
+                        let mut requirements = Vec::with_capacity(contract.fields.len());
+                        for (name, expected) in contract.fields.iter() {
+                            let at = data.find(name).ok_or(fault(ObjectFault::Missing))?;
+                            let property = &data.properties[at];
+                            if *expected != ValueType::Dynamic && property.value.0 != *expected {
+                                return Err(fault(ObjectFault::Type));
+                            }
+                            if !data.readonly
+                                && let Some(old) = property.required
+                                && old != ValueType::Dynamic
+                                && *expected != ValueType::Dynamic
+                                && old != *expected
+                            {
+                                return Err(fault(ObjectFault::Contract));
+                            }
+                            requirements.push((at, *expected));
+                        }
+                        if !data.readonly {
+                            for (at, expected) in requirements {
+                                data.properties[at].required = Some(expected);
+                            }
+                        }
+                        stack[depth - 1].set_value(layout, dst, FrameValue::OpenObject(id));
+                    }
+                    _ => data.readonly = true,
+                }
+            }
+            Instruction::Erase(dst, source) => {
+                let ty = body.registers()[source.index()]
+                    .value()
+                    .unwrap_or(ValueType::Dynamic);
+                let value = frame.value(layout, source);
+                let erased = match value {
+                    FrameValue::Dynamic(erased) => FrameValue::Dynamic(erased),
+                    value => FrameValue::Dynamic(Box::new((ty, value))),
+                };
+                frame.set_value(layout, dst, erased);
+            }
+            Instruction::DynamicCast(dst, source) => {
+                let FrameValue::Dynamic(erased) = frame.value(layout, source) else {
+                    unreachable!("verified erased operand");
+                };
+                if body.registers()[dst.index()].value() != Some(erased.0) {
+                    return Err(RunError::Object {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                        fault: ObjectFault::Type,
+                    });
+                }
+                frame.set_value(layout, dst, erased.1);
+            }
+            Instruction::DynamicBinary(op, dst, lhs, rhs) => {
+                let (FrameValue::Dynamic(left), FrameValue::Dynamic(right)) =
+                    (frame.value(layout, lhs), frame.value(layout, rhs))
+                else {
+                    unreachable!("verified erased operands");
+                };
+                let result =
+                    dynamic_binary(op, &left, &right).map_err(|failure| match failure {
+                        DynamicFailure::Type => RunError::Object {
+                            function,
+                            instruction: from,
+                            span: body.spans[pc],
+                            fault: ObjectFault::Type,
+                        },
+                        DynamicFailure::Overflow => RunError::IntegerOverflow {
+                            function,
+                            instruction: from,
+                            span: body.spans[pc],
+                        },
+                        DynamicFailure::Zero => RunError::DivisionByZero {
+                            function,
+                            instruction: from,
+                            span: body.spans[pc],
+                        },
+                    })?;
+                let value = match (&result, body.registers()[dst.index()]) {
+                    (
+                        (ValueType::Scalar(ScalarType::Bool), FrameValue::Scalar(bool_)),
+                        RegisterType::Scalar(_),
+                    ) => FrameValue::Scalar(*bool_),
+                    _ => FrameValue::Dynamic(Box::new(result)),
+                };
+                frame.set_value(layout, dst, value);
+            }
+            Instruction::DynamicUnary(op, dst, source) => {
+                let FrameValue::Dynamic(operand) = frame.value(layout, source) else {
+                    unreachable!("verified erased operand");
+                };
+                let result = match (op, &*operand) {
+                    (
+                        DynamicOp::Negate,
+                        (
+                            ValueType::Scalar(ScalarType::I64),
+                            FrameValue::Scalar(Scalar::I64(value)),
+                        ),
+                    ) => value
+                        .checked_neg()
+                        .map(|value| {
+                            (
+                                ValueType::Scalar(ScalarType::I64),
+                                FrameValue::Scalar(Scalar::I64(value)),
+                            )
+                        })
+                        .ok_or(RunError::IntegerOverflow {
+                            function,
+                            instruction: from,
+                            span: body.spans[pc],
+                        })?,
+                    (
+                        DynamicOp::Negate,
+                        (ValueType::Scalar(ScalarType::F64), FrameValue::Scalar(Scalar::F64(bits))),
+                    ) => (
+                        ValueType::Scalar(ScalarType::F64),
+                        FrameValue::Scalar(Scalar::F64((-f64::from_bits(*bits)).to_bits())),
+                    ),
+                    (
+                        DynamicOp::Not,
+                        (
+                            ValueType::Scalar(ScalarType::Bool),
+                            FrameValue::Scalar(Scalar::Bool(value)),
+                        ),
+                    ) => (
+                        ValueType::Scalar(ScalarType::Bool),
+                        FrameValue::Scalar(Scalar::Bool(!value)),
+                    ),
+                    _ => {
+                        return Err(RunError::Object {
+                            function,
+                            instruction: from,
+                            span: body.spans[pc],
+                            fault: ObjectFault::Type,
+                        });
+                    }
+                };
+                frame.set_value(layout, dst, FrameValue::Dynamic(Box::new(result)));
+            }
             Instruction::ClockNew(dst) => frame.set_value(layout, dst, FrameValue::Clock),
             Instruction::ClockClone(dst, _) => frame.set_value(layout, dst, FrameValue::Clock),
             Instruction::ClockSleep(_, duration) => {
@@ -3856,6 +4217,97 @@ fn read_input(line: &str, kind: InputKind) -> Option<FrameValue> {
     })
 }
 
+/// A value and its type as an object stores them: an erased value is opened,
+/// so what is kept is never `Dynamic`.
+fn erased_parts(value: FrameValue, ty: ValueType) -> (ValueType, FrameValue) {
+    match value {
+        FrameValue::Dynamic(erased) => *erased,
+        value => (ty, value),
+    }
+}
+
+enum DynamicFailure {
+    Type,
+    Overflow,
+    Zero,
+}
+
+/// A binary operator on two erased values of the same type.
+fn dynamic_binary(
+    op: DynamicOp,
+    left: &(ValueType, FrameValue),
+    right: &(ValueType, FrameValue),
+) -> Result<(ValueType, FrameValue), DynamicFailure> {
+    use super::DynamicOp::*;
+    let int = ValueType::Scalar(ScalarType::I64);
+    let float = ValueType::Scalar(ScalarType::F64);
+    let boolean = ValueType::Scalar(ScalarType::Bool);
+    let flag = |value: bool| (boolean, FrameValue::Scalar(Scalar::Bool(value)));
+    match (&left.1, &right.1) {
+        (FrameValue::Scalar(Scalar::I64(a)), FrameValue::Scalar(Scalar::I64(b))) => {
+            let number = |value: Option<i64>| {
+                value
+                    .map(|value| (int, FrameValue::Scalar(Scalar::I64(value))))
+                    .ok_or(DynamicFailure::Overflow)
+            };
+            match op {
+                Add => number(a.checked_add(*b)),
+                Subtract => number(a.checked_sub(*b)),
+                Multiply => number(a.checked_mul(*b)),
+                Divide | Remainder if *b == 0 => Err(DynamicFailure::Zero),
+                Divide => number(a.checked_div(*b)),
+                Remainder => number(a.checked_rem(*b)),
+                Equal => Ok(flag(a == b)),
+                NotEqual => Ok(flag(a != b)),
+                Less => Ok(flag(a < b)),
+                Greater => Ok(flag(a > b)),
+                LessEqual => Ok(flag(a <= b)),
+                GreaterEqual => Ok(flag(a >= b)),
+                _ => Err(DynamicFailure::Type),
+            }
+        }
+        (FrameValue::Scalar(Scalar::F64(a)), FrameValue::Scalar(Scalar::F64(b))) => {
+            let (a, b) = (f64::from_bits(*a), f64::from_bits(*b));
+            let number = |value: f64| (float, FrameValue::Scalar(Scalar::F64(value.to_bits())));
+            match op {
+                Add => Ok(number(a + b)),
+                Subtract => Ok(number(a - b)),
+                Multiply => Ok(number(a * b)),
+                Divide => Ok(number(a / b)),
+                Equal => Ok(flag(a == b)),
+                NotEqual => Ok(flag(a != b)),
+                Less => Ok(flag(a < b)),
+                Greater => Ok(flag(a > b)),
+                LessEqual => Ok(flag(a <= b)),
+                GreaterEqual => Ok(flag(a >= b)),
+                _ => Err(DynamicFailure::Type),
+            }
+        }
+        (FrameValue::Scalar(Scalar::Bool(a)), FrameValue::Scalar(Scalar::Bool(b))) => match op {
+            And => Ok(flag(*a && *b)),
+            Or => Ok(flag(*a || *b)),
+            Equal => Ok(flag(a == b)),
+            NotEqual => Ok(flag(a != b)),
+            _ => Err(DynamicFailure::Type),
+        },
+        (FrameValue::Text(a), FrameValue::Text(b)) => match op {
+            Equal => Ok(flag(a == b)),
+            NotEqual => Ok(flag(a != b)),
+            Less => Ok(flag(a < b)),
+            Greater => Ok(flag(a > b)),
+            LessEqual => Ok(flag(a <= b)),
+            GreaterEqual => Ok(flag(a >= b)),
+            _ => Err(DynamicFailure::Type),
+        },
+        (FrameValue::OpenObject(a), FrameValue::OpenObject(b)) => match op {
+            Equal => Ok(flag(a == b)),
+            NotEqual => Ok(flag(a != b)),
+            _ => Err(DynamicFailure::Type),
+        },
+        _ => Err(DynamicFailure::Type),
+    }
+}
+
 /// Whether a value may move into another task: plain data and channel ends.
 fn transferable(value: &FrameValue) -> bool {
     match value {
@@ -3945,7 +4397,9 @@ fn conforms(value: &FrameValue, ty: ValueType) -> bool {
         | (FrameValue::Object { .. }, ValueType::Object(_))
         | (FrameValue::Path(_), ValueType::Path)
         | (FrameValue::Location(_), ValueType::Location(_))
-        | (FrameValue::Allocation(_), ValueType::Allocation) => true,
+        | (FrameValue::Allocation(_), ValueType::Allocation)
+        | (FrameValue::OpenObject(_), ValueType::OpenObject)
+        | (FrameValue::Dynamic(_), ValueType::Dynamic) => true,
         _ => false,
     }
 }
@@ -3953,6 +4407,8 @@ fn conforms(value: &FrameValue, ty: ValueType) -> bool {
 /// How a scalar or string is written in text.
 fn spell(value: &FrameValue, style: TextStyle) -> String {
     match (style, value) {
+        (_, FrameValue::Dynamic(erased)) => spell(&erased.1, style),
+        (_, FrameValue::OpenObject(_)) => "object".to_owned(),
         (_, FrameValue::Text(text)) => text.to_string(),
         (_, FrameValue::Scalar(Scalar::I64(value))) => value.to_string(),
         (_, FrameValue::Scalar(Scalar::U64(value))) => value.to_string(),
@@ -3980,6 +4436,7 @@ fn spell(value: &FrameValue, style: TextStyle) -> String {
             | FrameValue::Receiver(_)
             | FrameValue::Task(_)
             | FrameValue::Clock
+            | FrameValue::Properties(_)
             | FrameValue::Moved,
         ) => unreachable!("verified text operand is a scalar or string"),
     }

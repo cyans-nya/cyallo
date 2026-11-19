@@ -29,16 +29,16 @@ pub(crate) use run::ScalarFrameSnapshot;
 pub use run::ScalarRecoveryError;
 pub use run::{
     Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, GeneratorFault, HeapStats,
-    InputSource, OutputSink, PathFault, RunError,
+    InputSource, ObjectFault, OutputSink, PathFault, RunError,
 };
 pub use sdk::SdkCompileError;
 
-/// Version 28 adds tasks and clocks. Version 27 adds channels. Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 29 adds open objects and erased values. Version 28 adds tasks and clocks. Version 27 adds channels. Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 28;
+pub const FORMAT_VERSION: u32 = 29;
 
 macro_rules! index {
     ($name:ident) => {
@@ -59,6 +59,7 @@ index!(FunctionId);
 index!(CallSiteId);
 index!(HostBindingId);
 index!(OutputId);
+index!(ContractId);
 index!(ShapeId);
 index!(OperandListId);
 index!(TextId);
@@ -120,6 +121,12 @@ pub enum ValueType {
     Task(ManagedId),
     /// A capability to sleep.
     Clock,
+    /// An object with named properties and shared identity. Copies of the
+    /// value are the same object.
+    OpenObject,
+    /// A value of any erasable type together with its type. What it holds is
+    /// checked when it is read back.
+    Dynamic,
 }
 
 /// A method a trait declares: what its receiver may do and its other types.
@@ -143,6 +150,35 @@ pub struct Implementation {
     pub trait_id: TraitId,
     pub receiver: ValueType,
     pub methods: Box<[FunctionId]>,
+}
+
+/// A set of named properties with a type each. An object literal makes its
+/// properties required, a dynamic literal makes them configurable, and a view
+/// requires the named properties to hold the given types (`Dynamic` accepts any).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Contract {
+    pub required: bool,
+    pub fields: Box<[(Arc<str>, ValueType)]>,
+}
+
+/// An operator on erased values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Remainder,
+    Equal,
+    NotEqual,
+    Less,
+    Greater,
+    LessEqual,
+    GreaterEqual,
+    And,
+    Or,
+    Negate,
+    Not,
 }
 
 /// A callable's parameter and result types, without its captures.
@@ -184,7 +220,9 @@ impl ValueType {
             | Self::Sender(_)
             | Self::Receiver(_)
             | Self::Task(_)
-            | Self::Clock => None,
+            | Self::Clock
+            | Self::OpenObject
+            | Self::Dynamic => None,
         }
     }
 }
@@ -300,6 +338,10 @@ pub enum RegisterType {
     Task(ManagedId),
     /// A capability to sleep.
     Clock,
+    /// An object with named properties.
+    OpenObject,
+    /// An erased value.
+    Dynamic,
     /// A closure that captured loans. It behaves like a loan on their root:
     /// the root stays live and borrowed while it lives, and the value cannot
     /// be stored, passed or returned by value.
@@ -337,6 +379,8 @@ impl From<ValueType> for RegisterType {
             ValueType::Receiver(managed) => Self::Receiver(managed),
             ValueType::Task(managed) => Self::Task(managed),
             ValueType::Clock => Self::Clock,
+            ValueType::OpenObject => Self::OpenObject,
+            ValueType::Dynamic => Self::Dynamic,
         }
     }
 }
@@ -379,6 +423,8 @@ impl RegisterType {
             Self::Receiver(managed) => ValueType::Receiver(managed),
             Self::Task(managed) => ValueType::Task(managed),
             Self::Clock => ValueType::Clock,
+            Self::OpenObject => ValueType::OpenObject,
+            Self::Dynamic => ValueType::Dynamic,
             _ => return None,
         })
     }
@@ -711,6 +757,30 @@ pub enum Instruction {
     ChannelTryReceive(Register, Register, ChannelVariants),
     /// The value a send error carries, whichever failure it reports.
     SendErrorValue(Register, Register),
+    /// A new object with the contract's properties, valued by the list.
+    ObjectNew(Register, OperandListId, ContractId),
+    /// Read a property into a register of its type, or of `Dynamic`.
+    ObjectGet(Register, Register, TextId),
+    /// Read a property by a computed name.
+    ObjectGetKey(Register, Register, Register),
+    /// Write a property, adding it to a configurable object.
+    ObjectSet(Register, TextId, Register),
+    /// Write a property by a computed name; the list holds the name and the value.
+    ObjectSetKey(Register, OperandListId),
+    /// Remove a configurable property; the result says whether it existed.
+    ObjectDelete(Register, Register, TextId),
+    ObjectDeleteKey(Register, Register, Register),
+    /// Check that the object has the contract's properties with those types
+    /// and require them from now on, through every alias.
+    ObjectView(Register, Register, ContractId),
+    /// Make the object readonly through every alias.
+    ObjectFreeze(Register),
+    /// Wrap the value with its type.
+    Erase(Register, Register),
+    /// Read an erased value as the destination's type, which it must have.
+    DynamicCast(Register, Register),
+    DynamicBinary(DynamicOp, Register, Register, Register),
+    DynamicUnary(DynamicOp, Register, Register),
     /// Start a task that runs the closure, which takes no arguments, and
     /// returns its handle. What the closure captured moves into the task.
     TaskSpawn(Register, Register),
@@ -935,6 +1005,21 @@ impl Instruction {
             }
             WriteLoan(loan, value) => ([Some(loan), Some(value)], &[], None),
             Input(dst, _) | PathMissing(dst) => ([None, None], &[], Some(dst)),
+            ObjectNew(dst, list, _) => ([None, None], &lists[list.index()], Some(dst)),
+            ObjectGet(dst, object, _) | ObjectDelete(dst, object, _) => {
+                ([Some(object), None], &[], Some(dst))
+            }
+            ObjectGetKey(dst, object, key) | ObjectDeleteKey(dst, object, key) => {
+                ([Some(object), Some(key)], &[], Some(dst))
+            }
+            ObjectSet(object, _, value) => ([Some(object), Some(value)], &[], None),
+            ObjectSetKey(object, list) => ([Some(object), None], &lists[list.index()], None),
+            ObjectView(dst, source, _) | Erase(dst, source) | DynamicCast(dst, source) => {
+                ([Some(source), None], &[], Some(dst))
+            }
+            DynamicUnary(_, dst, source) => ([Some(source), None], &[], Some(dst)),
+            DynamicBinary(_, dst, lhs, rhs) => ([Some(lhs), Some(rhs)], &[], Some(dst)),
+            ObjectFreeze(object) => ([Some(object), None], &[], None),
             TaskSpawn(dst, closure) | TaskJoin(dst, closure) => {
                 ([Some(closure), None], &[], Some(dst))
             }
@@ -1100,6 +1185,8 @@ impl StorageState {
 /// instruction number, independent of variable-width word offsets.
 #[derive(Debug, Clone)]
 pub struct FunctionImage {
+    /// Property sets that objects are made with and viewed through.
+    pub contracts: Box<[Contract]>,
     /// The description of the generator this routine is the body of, if any.
     /// Calling a closure of such a routine makes a generator instead of
     /// running it; the routine's result is what the generator returns.
@@ -1136,6 +1223,7 @@ pub struct ModuleImage {
 /// Read-only input for execution and future backend preparation.
 #[derive(Debug)]
 pub struct VerifiedFunction {
+    contracts: Box<[Contract]>,
     generator: Option<SignatureId>,
     registers: Box<[RegisterType]>,
     parameters: Box<[Register]>,
@@ -1301,6 +1389,8 @@ impl VerifiedFunction {
             RegisterType::Receiver(managed) => Ok(ValueType::Receiver(managed)),
             RegisterType::Task(managed) => Ok(ValueType::Task(managed)),
             RegisterType::Clock => Ok(ValueType::Clock),
+            RegisterType::OpenObject => Ok(ValueType::OpenObject),
+            RegisterType::Dynamic => Ok(ValueType::Dynamic),
             RegisterType::BorrowingFunction { .. } => {
                 Err(InvalidBytecode::EscapingBorrow(register))
             }
@@ -1366,6 +1456,61 @@ impl VerifiedFunction {
             Ok((1, 0))
         } else {
             Err(InvalidBytecode::ExpectedEnum(register))
+        }
+    }
+
+    fn contract(&self, id: ContractId) -> Result<&Contract, InvalidBytecode> {
+        self.contracts
+            .get(id.index())
+            .ok_or(InvalidBytecode::UnknownContract(id))
+    }
+
+    fn text(&self, id: TextId) -> Result<&Arc<str>, InvalidBytecode> {
+        self.texts
+            .get(id.index())
+            .ok_or(InvalidBytecode::UnknownText(id))
+    }
+
+    /// The register holds an object, or an erased value that may hold one.
+    fn require_object(&self, register: Register) -> Result<(), InvalidBytecode> {
+        match self.through(register)? {
+            ValueType::OpenObject | ValueType::Dynamic => Ok(()),
+            _ => Err(InvalidBytecode::ExpectedObject(register)),
+        }
+    }
+
+    /// Whether a value of this type may be erased or stored in an object:
+    /// nothing in it is a counted or channel owner, which an object could
+    /// neither release nor move.
+    fn erasable_type(&self, ty: ValueType) -> bool {
+        match ty {
+            ValueType::Rc(_)
+            | ValueType::Weak(_)
+            | ValueType::Generator(_)
+            | ValueType::Sender(_)
+            | ValueType::Receiver(_)
+            | ValueType::Task(_) => false,
+            ValueType::Composite(shape) => match self.shapes.get(shape.index()) {
+                Some(Shape::Tuple(fields)) => fields.iter().all(|&field| self.erasable_type(field)),
+                Some(Shape::Enum(variants)) => variants
+                    .iter()
+                    .flatten()
+                    .all(|&payload| self.erasable_type(payload)),
+                Some(
+                    Shape::Array { element, .. } | Shape::Vec { element } | Shape::Cell { element },
+                ) => self.erasable_type(*element),
+                Some(Shape::Slice { .. }) | None => false,
+            },
+            _ => true,
+        }
+    }
+
+    fn require_erasable(&self, register: Register) -> Result<(), InvalidBytecode> {
+        let ty = self.value_type(register)?;
+        if self.erasable_type(ty) {
+            Ok(())
+        } else {
+            Err(InvalidBytecode::NotErasable(register))
         }
     }
 
@@ -1864,6 +2009,10 @@ pub enum InvalidBytecode {
     },
     ExpectedGenerator(Register),
     ExpectedChannelEnd(Register),
+    ExpectedObject(Register),
+    ExpectedDynamic(Register),
+    NotErasable(Register),
+    UnknownContract(ContractId),
     ExpectedTask(Register),
     YieldOutsideGenerator,
     InvalidInputKind {
@@ -2111,6 +2260,7 @@ impl ModuleImage {
                 managed: managed.clone(),
                 traits: traits.clone(),
                 implementations: implementations.clone(),
+                contracts: image.contracts,
                 generator: image.generator,
                 registers: image.registers,
                 parameters: image.parameters,
@@ -2359,7 +2509,9 @@ impl VerifiedFunction {
                 | RegisterType::Sender(_)
                 | RegisterType::Receiver(_)
                 | RegisterType::Task(_)
-                | RegisterType::Clock => {}
+                | RegisterType::Clock
+                | RegisterType::OpenObject
+                | RegisterType::Dynamic => {}
                 RegisterType::Loan {
                     origin: LoanOrigin::Parameter { register: origin },
                     ..
@@ -2620,7 +2772,10 @@ impl VerifiedFunction {
                     }
                 }
                 for &argument in call.arguments.iter() {
-                    if self.value_type(argument)? != ValueType::Text {
+                    if !matches!(
+                        self.value_type(argument)?,
+                        ValueType::Text | ValueType::Dynamic
+                    ) {
                         self.register_type(argument)?;
                     }
                 }
@@ -2675,6 +2830,8 @@ impl VerifiedFunction {
                 }
                 RegisterType::Task(managed) => self.require_value(arg, ValueType::Task(managed))?,
                 RegisterType::Clock => self.require_value(arg, ValueType::Clock)?,
+                RegisterType::OpenObject => self.require_value(arg, ValueType::OpenObject)?,
+                RegisterType::Dynamic => self.require_value(arg, ValueType::Dynamic)?,
                 RegisterType::Weak(managed) => self.require_value(arg, ValueType::Weak(managed))?,
                 RegisterType::Composite(shape) => {
                     self.require_value(arg, ValueType::Composite(shape))?;
@@ -2949,6 +3106,106 @@ impl VerifiedFunction {
                     self.register_type(src)?;
                 }
                 self.require_text(dst)
+            }
+            Instruction::ObjectNew(dst, list, contract) => {
+                if self.value_type(dst)? != ValueType::Dynamic {
+                    self.require_value(dst, ValueType::OpenObject)?;
+                }
+                let fields = &self.contract(contract)?.fields;
+                let values = self.operand_list(list)?;
+                if fields.len() != values.len() {
+                    return Err(InvalidBytecode::ArgumentCount {
+                        expected: fields.len(),
+                        actual: values.len(),
+                    });
+                }
+                for (&value, (_, ty)) in values.iter().zip(fields.iter()) {
+                    self.require_erasable(value)?;
+                    self.require_value(value, *ty)?;
+                }
+                Ok(())
+            }
+            Instruction::ObjectGet(dst, object, name) => {
+                self.require_object(object)?;
+                self.text(name)?;
+                self.require_erasable(dst)
+            }
+            Instruction::ObjectGetKey(dst, object, key) => {
+                self.require_object(object)?;
+                self.require_text(key)?;
+                self.require_erasable(dst)
+            }
+            Instruction::ObjectSet(object, name, value) => {
+                self.require_object(object)?;
+                self.text(name)?;
+                self.require_erasable(value)
+            }
+            Instruction::ObjectSetKey(object, list) => {
+                self.require_object(object)?;
+                let &[key, value] = self.operand_list(list)? else {
+                    return Err(InvalidBytecode::ArgumentCount {
+                        expected: 2,
+                        actual: self.operand_list(list)?.len(),
+                    });
+                };
+                self.require_text(key)?;
+                self.require_erasable(value)
+            }
+            Instruction::ObjectDelete(dst, object, name) => {
+                self.require_object(object)?;
+                self.text(name)?;
+                self.require_type(dst, ScalarType::Bool)
+            }
+            Instruction::ObjectDeleteKey(dst, object, key) => {
+                self.require_object(object)?;
+                self.require_text(key)?;
+                self.require_type(dst, ScalarType::Bool)
+            }
+            Instruction::ObjectView(dst, source, contract) => {
+                self.require_value(dst, ValueType::OpenObject)?;
+                self.require_object(source)?;
+                for (_, ty) in self.contract(contract)?.fields.iter() {
+                    if !self.erasable_type(*ty) {
+                        return Err(InvalidBytecode::NotErasable(source));
+                    }
+                }
+                Ok(())
+            }
+            Instruction::ObjectFreeze(object) => self.require_object(object),
+            Instruction::Erase(dst, source) => {
+                self.require_value(dst, ValueType::Dynamic)?;
+                self.require_erasable(source)
+            }
+            Instruction::DynamicCast(dst, source) => {
+                self.require_value(source, ValueType::Dynamic)?;
+                self.require_erasable(dst)
+            }
+            Instruction::DynamicBinary(op, dst, lhs, rhs) => {
+                if matches!(op, DynamicOp::Negate | DynamicOp::Not) {
+                    return Err(InvalidBytecode::ExpectedDynamic(dst));
+                }
+                self.require_value(lhs, ValueType::Dynamic)?;
+                self.require_value(rhs, ValueType::Dynamic)?;
+                let comparison = matches!(
+                    op,
+                    DynamicOp::Equal
+                        | DynamicOp::NotEqual
+                        | DynamicOp::Less
+                        | DynamicOp::Greater
+                        | DynamicOp::LessEqual
+                        | DynamicOp::GreaterEqual
+                );
+                if comparison && self.value_type(dst)? == ValueType::Scalar(ScalarType::Bool) {
+                    return Ok(());
+                }
+                self.require_value(dst, ValueType::Dynamic)
+            }
+            Instruction::DynamicUnary(op, dst, source) => {
+                if !matches!(op, DynamicOp::Negate | DynamicOp::Not) {
+                    return Err(InvalidBytecode::ExpectedDynamic(dst));
+                }
+                self.require_value(source, ValueType::Dynamic)?;
+                self.require_value(dst, ValueType::Dynamic)
             }
             Instruction::TaskSpawn(dst, closure) => {
                 let RegisterType::Task(managed) = self.register_kind(dst)? else {

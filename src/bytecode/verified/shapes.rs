@@ -120,6 +120,23 @@ impl Shapes {
             _ => None,
         }
     }
+    /// The verified type of a type that needs no new table entry: scalars,
+    /// strings, objects, erased values and shapes already interned.
+    pub fn value_of(&self, ty: &Type) -> Option<ValueType> {
+        Some(match ty {
+            Type::Integer => ScalarType::I64.into(),
+            Type::Real => ScalarType::F64.into(),
+            Type::Numeric(NumberKind::Usize | NumberKind::U64) => ScalarType::U64.into(),
+            Type::Numeric(NumberKind::I64) => ScalarType::I64.into(),
+            Type::Numeric(NumberKind::F64) => ScalarType::F64.into(),
+            Type::String => ValueType::Text,
+            Type::Boolean => ScalarType::Bool.into(),
+            Type::Object(_) => ValueType::OpenObject,
+            Type::Dynamic => ValueType::Dynamic,
+            other => ValueType::Composite(*self.by_type.get(other)?),
+        })
+    }
+
     /// The verified type of a checked type, or `None` while it has no verified
     /// representation. Components are interned first, which numbers them below
     /// the composite that contains them.
@@ -186,6 +203,9 @@ impl Shapes {
                     .collect::<Option<Box<[_]>>>()?;
                 self.structural_shape(Shape::Tuple(fields))?
             }
+            // An object, open or typed, and a value of any type.
+            Type::Object(_) => ValueType::OpenObject,
+            Type::Dynamic => ValueType::Dynamic,
             // A task over its result type, and how a task ended.
             Type::Opaque(_, arguments, traits) if traits.task() && arguments.len() == 1 => {
                 let result = self.value_or_unit(&arguments[0])?;
@@ -504,7 +524,9 @@ impl Shapes {
             | ValueType::Location(_)
             | ValueType::Allocation
             | ValueType::Task(_)
-            | ValueType::Clock => false,
+            | ValueType::Clock
+            | ValueType::OpenObject
+            | ValueType::Dynamic => false,
         }
     }
 

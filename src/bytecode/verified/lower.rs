@@ -1,9 +1,10 @@
 use super::{
-    BooleanOp, CallSite, CallSiteId, CallTarget, ChannelVariants, Extremum, FORMAT_VERSION,
-    FloatOp, FunctionId, FunctionImage, HostBindingId, Implementation, ImplementationId, InputKind,
-    Instruction, InstructionId, IntegerOp, LoanAccess, ModuleImage, OperandListId, OutputId,
-    OutputPiece, OutputTemplate, Register, RegisterType, Scalar, ScalarHostBinding, ScalarType,
-    TextId, TextMapOp, TextOp, TextTestOp, TraitId, ValueType, VerifiedModule, VerifyError,
+    BooleanOp, CallSite, CallSiteId, CallTarget, ChannelVariants, Contract, ContractId, DynamicOp,
+    Extremum, FORMAT_VERSION, FloatOp, FunctionId, FunctionImage, HostBindingId, Implementation,
+    ImplementationId, InputKind, Instruction, InstructionId, IntegerOp, LoanAccess, ModuleImage,
+    OperandListId, OutputId, OutputPiece, OutputTemplate, Register, RegisterType, Scalar,
+    ScalarHostBinding, ScalarType, TextId, TextMapOp, TextOp, TextTestOp, TraitId, ValueType,
+    VerifiedModule, VerifyError,
     cfg::{self, Block, Exit, Located, Statement},
     encode, layout, lifetimes,
     loans::Places,
@@ -13,9 +14,12 @@ use crate::{
     Diagnostic, Span, Type,
     ir::{Function, Op, Program, Routine},
 };
-use cyallo_ast::{ConstantValue, EnumEncoding, Literal, MemoryKind, NumberKind, Operator};
+use cyallo_ast::{
+    ConstantValue, EnumEncoding, Literal, MemoryKind, NumberKind, ObjectKind, Operator,
+};
 use cyallo_ir::{
     concurrent::Operation as ConcurrentOperation,
+    dynamic::Operation as DynamicOperation,
     enums::Projection,
     intrinsic::Intrinsic,
     lookup::{Operation, ResumeInput},
@@ -285,6 +289,160 @@ pub(super) fn lower_type(ty: &Type) -> Option<ScalarType> {
         Type::Boolean => Some(ScalarType::Bool),
         _ => None,
     }
+}
+
+/// One operation on objects and erased values. `None` when it has no verified
+/// form.
+fn lower_dynamic(
+    operation: &DynamicOperation,
+    dst: usize,
+    args: &[usize],
+    context: &Context<'_>,
+    sites: &mut Sites,
+    routine: usize,
+) -> Option<Result<Instruction, LowerError>> {
+    let places = context.places;
+    let register = |index| places.register(index);
+    let value_of = |index: usize| places.registers.get(index)?.value();
+    let contract = |sites: &mut Sites, required: bool, fields: Vec<(Arc<str>, ValueType)>| {
+        sites.contracts.push(Contract {
+            required,
+            fields: fields.into_boxed_slice(),
+        });
+        lower_index(routine, sites.contracts.len() - 1).map(ContractId)
+    };
+    let op = |operator: Operator| {
+        Some(match operator {
+            Operator::Add => DynamicOp::Add,
+            Operator::Subtract => DynamicOp::Subtract,
+            Operator::Multiply => DynamicOp::Multiply,
+            Operator::Divide => DynamicOp::Divide,
+            Operator::Remainder => DynamicOp::Remainder,
+            Operator::Equal => DynamicOp::Equal,
+            Operator::NotEqual => DynamicOp::NotEqual,
+            Operator::Less => DynamicOp::Less,
+            Operator::Greater => DynamicOp::Greater,
+            Operator::LessEqual => DynamicOp::LessEqual,
+            Operator::GreaterEqual => DynamicOp::GreaterEqual,
+            Operator::And => DynamicOp::And,
+            Operator::Or => DynamicOp::Or,
+            _ => return None,
+        })
+    };
+    (|| -> Option<Result<Instruction, LowerError>> {
+        Some(match (operation, args) {
+            (DynamicOperation::Object(kind, names), values) if names.len() == values.len() => {
+                let mut fields = Vec::with_capacity(values.len());
+                for (name, &value) in names.iter().zip(values) {
+                    fields.push((Arc::from(&**name), value_of(value)?));
+                }
+                let required = matches!(kind, ObjectKind::Typed);
+                let id = match contract(sites, required, fields) {
+                    Ok(id) => id,
+                    Err(error) => return Some(Err(error)),
+                };
+                let list = new_list(routine, sites, values.iter().map(|&value| register(value)));
+                let list = match list {
+                    Ok(list) => list,
+                    Err(error) => return Some(Err(error)),
+                };
+                register(dst).map(|dst| Instruction::ObjectNew(dst, list, id))
+            }
+            (DynamicOperation::Get(name), [object]) => {
+                let text = intern_text(routine, sites, &Arc::from(&**name));
+                match (register(dst), register(*object), text) {
+                    (Ok(dst), Ok(object), Ok(text)) => {
+                        Ok(Instruction::ObjectGet(dst, object, text))
+                    }
+                    (Err(error), ..) | (_, Err(error), _) | (.., Err(error)) => Err(error),
+                }
+            }
+            (DynamicOperation::GetKey, [object, key]) => (|| {
+                Ok(Instruction::ObjectGetKey(
+                    register(dst)?,
+                    register(*object)?,
+                    register(*key)?,
+                ))
+            })(),
+            (DynamicOperation::Set(name), [object, value]) => (|| {
+                let text = intern_text(routine, sites, &Arc::from(&**name))?;
+                Ok(Instruction::ObjectSet(
+                    register(*object)?,
+                    text,
+                    register(*value)?,
+                ))
+            })(),
+            (DynamicOperation::SetKey, [object, key, value]) => (|| {
+                let list = new_list(routine, sites, [*key, *value].into_iter().map(register))?;
+                Ok(Instruction::ObjectSetKey(register(*object)?, list))
+            })(),
+            (DynamicOperation::Delete(name), [object]) => (|| {
+                let text = intern_text(routine, sites, &Arc::from(&**name))?;
+                Ok(Instruction::ObjectDelete(
+                    register(dst)?,
+                    register(*object)?,
+                    text,
+                ))
+            })(),
+            (DynamicOperation::DeleteKey, [object, key]) => (|| {
+                Ok(Instruction::ObjectDeleteKey(
+                    register(dst)?,
+                    register(*object)?,
+                    register(*key)?,
+                ))
+            })(),
+            (DynamicOperation::Erase, [source]) => {
+                (|| Ok(Instruction::Erase(register(dst)?, register(*source)?)))()
+            }
+            (DynamicOperation::Check(Type::Object(fields)), [source]) => {
+                let mut required = Vec::with_capacity(fields.len());
+                for (name, ty) in fields {
+                    required.push((Arc::from(&**name), context.shapes.value_of(ty)?));
+                }
+                (|| {
+                    let id = contract(sites, true, required)?;
+                    Ok(Instruction::ObjectView(
+                        register(dst)?,
+                        register(*source)?,
+                        id,
+                    ))
+                })()
+            }
+            (DynamicOperation::Check(_), [source]) => (|| {
+                if matches!(places.registers.get(dst), Some(RegisterType::Dynamic)) {
+                    Ok(Instruction::Erase(register(dst)?, register(*source)?))
+                } else {
+                    Ok(Instruction::DynamicCast(register(dst)?, register(*source)?))
+                }
+            })(),
+            (DynamicOperation::Binary(operator), [lhs, rhs]) => {
+                let operator = op(*operator)?;
+                (|| {
+                    Ok(Instruction::DynamicBinary(
+                        operator,
+                        register(dst)?,
+                        register(*lhs)?,
+                        register(*rhs)?,
+                    ))
+                })()
+            }
+            (DynamicOperation::Unary(operator), [source]) => {
+                let operator = match operator {
+                    Operator::Subtract => DynamicOp::Negate,
+                    Operator::Not => DynamicOp::Not,
+                    _ => return None,
+                };
+                (|| {
+                    Ok(Instruction::DynamicUnary(
+                        operator,
+                        register(dst)?,
+                        register(*source)?,
+                    ))
+                })()
+            }
+            _ => return None,
+        })
+    })()
 }
 
 fn is_channel_operation(operation: ConcurrentOperation) -> bool {
@@ -866,6 +1024,7 @@ fn lower_function(
     );
     let body = layout::assign(prologue, blocks, routine)?;
     Ok(FunctionImage {
+        contracts: sites.contracts.into_boxed_slice(),
         generator,
         registers,
         parameters,
@@ -962,6 +1121,7 @@ fn release_owned_at_returns(
 /// Call sites and output templates built while lowering one function.
 #[derive(Default)]
 struct Sites {
+    contracts: Vec<Contract>,
     texts: Vec<Arc<str>>,
     calls: Vec<CallSite>,
     lists: Vec<Box<[Register]>>,
@@ -1217,6 +1377,13 @@ fn lower_operation(
         {
             lower_channel(*operation, *dst, args, &generator, context, sites, routine)
                 .ok_or_else(unsupported)??
+        }
+        Op::Dynamic(dst, operation, args) => {
+            lower_dynamic(operation, *dst, args, context, sites, routine)
+                .ok_or_else(unsupported)??
+        }
+        Op::Lookup(_, Operation::ObjectFreeze, args) if args.len() == 1 => {
+            Instruction::ObjectFreeze(register(args[0])?)
         }
         Op::Yield(dst, value) => Instruction::Yield(register(*dst)?, register(*value)?),
         Op::Lookup(dst, Operation::GeneratorStart, args) if args.len() == 1 => {
