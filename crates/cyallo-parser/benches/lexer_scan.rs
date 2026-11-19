@@ -4,12 +4,13 @@ use cyallo_parser::{ScanVariant, lex_variant};
 use std::hint::black_box;
 use std::time::Instant;
 
-const VARIANTS: [(&str, ScanVariant); 7] = [
+const VARIANTS: [(&str, ScanVariant); 8] = [
     ("original", ScanVariant::Original),
     ("scalar-runs", ScanVariant::ScalarRuns),
     ("comment-simd", ScanVariant::CommentSimd),
     ("ws-simd", ScanVariant::WhitespaceSimd),
     ("both-simd", ScanVariant::BothSimd),
+    ("comment+hash-kw", ScanVariant::CommentSimdHashed),
     ("both-hybrid", ScanVariant::BothHybrid),
     ("comment-memchr", ScanVariant::CommentMemchr),
 ];

@@ -16,3 +16,7 @@ memchr-control = ["dep:memchr"]
 name = "lexer_scan"
 harness = false
 required-features = ["memchr-control"]
+
+[[bench]]
+name = "startup_share"
+harness = false

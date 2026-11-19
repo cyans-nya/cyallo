@@ -95,6 +95,8 @@ pub enum ScanVariant {
     CommentSimd,
     WhitespaceSimd,
     BothSimd,
+    /// Comment SIMD plus perfect-hash keyword lookup.
+    CommentSimdHashed,
     /// Comment SIMD plus a whitespace scan that fast-paths a single blank.
     BothHybrid,
     /// Comment bodies via `memchr`, scalar whitespace (benchmark control).
@@ -110,6 +112,7 @@ pub fn lex_variant(source: &str, variant: ScanVariant) -> Result<Lexed<'_>, Diag
         ScanVariant::CommentSimd => lex_with::<scan::CommentSimd>(source),
         ScanVariant::WhitespaceSimd => lex_with::<scan::WhitespaceSimd>(source),
         ScanVariant::BothSimd => lex_with::<scan::BothSimd>(source),
+        ScanVariant::CommentSimdHashed => lex_with::<scan::CommentSimdHashed>(source),
         ScanVariant::BothHybrid => lex_with::<scan::BothHybrid>(source),
         #[cfg(feature = "memchr-control")]
         ScanVariant::CommentMemchr => lex_with::<scan::CommentMemchr>(source),
@@ -118,6 +121,7 @@ pub fn lex_variant(source: &str, variant: ScanVariant) -> Result<Lexed<'_>, Diag
 
 #[doc(hidden)]
 pub mod scan {
+    use crate::TokenKind;
     use std::simd::{cmp::SimdPartialEq, u8x16};
 
     /// Block width in bytes for the vector scans.
@@ -178,6 +182,11 @@ pub mod scan {
         fn blank(bytes: &[u8]) -> usize;
         /// Comment body bytes to skip after `//`.
         fn comment(bytes: &[u8]) -> usize;
+        /// Classify the ASCII word `source[start..end]`.
+        #[inline(always)]
+        fn keyword(source: &str, start: usize, end: usize) -> TokenKind {
+            TokenKind::from_word(&source[start..end])
+        }
     }
     macro_rules! scanner {
         ($name:ident, $blank:expr, $comment:expr) => {
@@ -199,6 +208,21 @@ pub mod scan {
     scanner!(CommentSimd, |_: &[u8]| 1, line_comment_len_simd);
     scanner!(WhitespaceSimd, blank_run_len_simd, line_comment_len_scalar);
     scanner!(BothSimd, blank_run_len_simd, line_comment_len_simd);
+    pub(super) struct CommentSimdHashed;
+    impl Scanner for CommentSimdHashed {
+        #[inline(always)]
+        fn blank(_: &[u8]) -> usize {
+            1
+        }
+        #[inline(always)]
+        fn comment(bytes: &[u8]) -> usize {
+            line_comment_len_simd(bytes)
+        }
+        #[inline(always)]
+        fn keyword(source: &str, start: usize, end: usize) -> TokenKind {
+            TokenKind::from_word_at(source.as_bytes(), start, end - start)
+        }
+    }
     scanner!(BothHybrid, blank_run_len_hybrid, line_comment_len_simd);
     #[cfg(feature = "memchr-control")]
     scanner!(
@@ -206,7 +230,7 @@ pub mod scan {
         blank_run_len_scalar,
         |b: &[u8]| memchr::memchr(b'\n', b).unwrap_or(b.len())
     );
-    pub(super) type Adopted = CommentSimd;
+    pub(super) type Adopted = CommentSimdHashed;
 }
 
 fn lex_with<S: scan::Scanner>(source: &str) -> Result<Lexed<'_>, Diagnostic> {
@@ -350,8 +374,7 @@ fn lex_with<S: scan::Scanner>(source: &str) -> Result<Lexed<'_>, Diagnostic> {
                 {
                     pos += 1;
                 }
-                let word = &source[start..pos];
-                TokenKind::from_word(word)
+                S::keyword(source, start, pos)
             }
             _ => {
                 let two = match (bytes[pos], bytes.get(pos + 1)) {
@@ -436,7 +459,8 @@ mod tests {
     use super::scan::*;
     use super::*;
 
-    const VARIANTS: [ScanVariant; 6] = [
+    const VARIANTS: [ScanVariant; 7] = [
+        ScanVariant::CommentSimdHashed,
         ScanVariant::BothHybrid,
         ScanVariant::Original,
         ScanVariant::ScalarRuns,
