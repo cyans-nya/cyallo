@@ -732,6 +732,7 @@ dependencies = [
  "cyallo-ast",
  "cyallo-compile-jobs",
  "cyallo-startup-profile",
+ "memchr",
 ]
 
 [[package]]

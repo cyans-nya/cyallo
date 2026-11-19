@@ -85,3 +85,35 @@ Both SIMD scans improved long-run throughput in these probes. Short-run costs we
 1. Compare the candidate with the current lexer on `.ya` sources and generated valid UTF-8. Compare token kinds, spans, source slices, EOF, and diagnostic code, message, and span. Exercise empty input, all-trivia input, LF and CRLF, lone CR inside and outside comments, a comment at EOF, slash operators, and strings containing `//`. Place separators, malformed literals, and non-ASCII bytes before, on, and after vector boundaries. Vary source-prefix alignment and test lengths around one and two vectors, including the final scalar tail. Preserve the smallest source reproducer for any mismatch. [Lexer](../crates/cyallo-parser/src/lexer.rs) · [Compiler and runtime rules](compiler-and-runtime-rules.md#readability-and-correctness)
 2. Profile release lexing and file indexing. Benchmark the current lexer, scalar runs, comment SIMD only, whitespace SIMD only, and both together with the same compiler and flags. Include small real files, a larger multi-file source set, and generated cases with short and long comments or whitespace. Compare per-file latency and bytes per second, and record the architecture, `rustc -Vv`, flags, corpus, and repetitions. Inspect optimized code if either target gives surprising results. Check x86-64 and AArch64 before generalizing a speedup. [Existing Cyallo benchmark methodology](benchmarks.md) · [Native CI](../.github/workflows/native.yml)
 3. If a variant improves representative lexing without a meaningful small-file regression, test it through the normal parser entry points with `cargo +nightly test -p cyallo-parser --locked`. Use the built release CLI to measure fresh-process time to first output on a `.ya` program with a fixed printing entry. Time full checking separately, including `cyallo check examples/modules/static/main.ya --jobs 4`. Report lexer and CLI results separately. Use the measured workload to justify the final vector width and any minimum run threshold. [Parser entry points](../crates/cyallo-parser/src/lib.rs) · [Module check command](modules.md) · [Compiler and runtime rules](compiler-and-runtime-rules.md#readability-and-correctness)
+
+## Experiment results (2026-11-19)
+
+Host `aarch64-apple-darwin`, Apple M4 Max, `rustc 1.101.0-nightly (07e526db9 2026-10-19)`, LLVM 23.1.4, `cargo +nightly bench -p cyallo-parser --features memchr-control --bench lexer_scan` (release profile defaults, no extra flags; `u8x16`). Variants rotate across 15 samples; medians. The real corpus is every `.ya` under `examples`, `std`, `tests` plus `std.ya`: 87 files, 55 KB, average 640 B. Differential tests (`lexer::tests`) compare token kinds, spans, text and diagnostics for every variant against the original lexer on boundary, edge, 20,000 random and repository sources at every prefix alignment.
+
+Lexer speed relative to the original lexer (>1 is faster; real-source figures vary about ±4% between runs):
+
+| Input | scalar runs | comment SIMD | whitespace SIMD | both SIMD | comment `memchr` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Real `.ya`, per file | 0.97 | 1.02–1.05 | 0.90 | 0.92 | 0.94–0.96 |
+| Real, smallest 10 files | 0.94–0.96 | 0.99–1.01 | 0.87–0.92 | 0.92–0.94 | 0.89–0.94 |
+| 200 comments of 2 B | 0.91–0.94 | 0.96–1.04 | 0.80–0.91 | 0.78–0.84 | 0.94–1.00 |
+| 200 comments of 16 B | 0.95 | 1.5 | 0.92 | 1.0 | 1.25 |
+| 200 comments of 64 B | 0.98 | 2.7 | 0.95 | 2.0–2.1 | 2.5 |
+| 200 comments of 4096 B | 1.0 | 9.6 | 1.0 | 9.3 | 19.8 |
+| Blank runs of 1–4 B | 0.88–1.04 | ~1.0 | 0.81–1.13 | 0.87–1.12 | 0.9–1.0 |
+| Blank runs of 16 B | 1.24–1.36 | 1.0 | 1.7–1.8 | 1.4–1.7 | 1.2 |
+| Blank runs of 64 B | 1.7 | 0.9–1.0 | 3.7–4.2 | 3.9–4.2 | 1.7 |
+
+A hybrid whitespace scan that returns after one compare for a single blank (`blank_run_len_hybrid`) tracked the real-source baseline within noise but not better.
+
+**Adopted: comment SIMD (plus the perfect-hash keywords below).** It never measurably regresses real or short-comment inputs and is 1.5–10× faster on comments of 16 B or more. Whitespace SIMD regressed real sources by about 10%, because real whitespace is mostly single separators and short indentation, so it is not adopted. `memchr` is a benchmark control only (optional `memchr-control` feature); it is faster than `u8x16` for very long comments but not for the 16–64 B range, and adds a dependency to the parser crate. Real comments are short, so the whole-corpus gain is small (about 2–5%).
+
+CLI fresh-process time (hyperfine `-N`, 300 runs, warmup 20), original lexer vs comment SIMD: `run examples/fib.ya` 23.0 ms vs 23.0 ms; `check examples/modules/static/main.ya --jobs 4` 7.4 ms vs 7.3 ms. No measurable change: lexing 55 KB takes under 0.1 ms, far below process startup. The remaining startup cost is not in the lexer. x86-64 has not been measured.
+
+### Keyword perfect hash and front-end share of startup
+
+The 27 keywords are at most 8 bytes, so a word is packed into a zero-padded little-endian `u64` (identifier bytes are never NUL, so packing is unique). `from_packed_word` multiplies by a searched constant, takes the top 6 bits as the slot, and compares one `u64`. The table is built in a `const` block; a slot collision fails the build. A test checks it against the `match` classifier on keywords, near-keywords and every short identifier-like string, both mid-source and at EOF.
+
+Measured relative to the original lexer (two runs agree within about 3%): real `.ya` 1.10× (comment SIMD alone 1.03×), smallest 10 files 1.07×, largest 5 files 1.13×, concatenated 1.12×; generated comment/blank cases gain 1.0–1.2×, with the long-comment cases unchanged. Whole-corpus time went from about 970 ns to 868 ns per file. This is adopted. Whitespace SIMD and the hybrid remain unadopted: they lose 3–10% on real files (they win only on blank runs of 16 B or more).
+
+Front-end cost on the standard library (`std.ya` plus `std/*.ya`: 25 files, 11.7 KB; `cargo +nightly bench -p cyallo-parser --bench startup_share`, same host): lex 22 µs, lex + parse-unit index 24 µs, full `parse` 1,234 µs, `examples/fib.ya` parse 2.9 µs. Against 23 ms for `run examples/fib.ya` and 7 ms for `check`, the lexer is about 0.1% and indexing about 0.01%. Even a complete parse of all std is about 5% of the `run` wall time (an upper bound; the CLI may not parse all of it). Parsing into the AST costs about 50× lexing, so a further front-end speedup would come from the parser/AST, not the lexer.

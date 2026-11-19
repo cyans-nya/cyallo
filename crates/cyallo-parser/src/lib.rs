@@ -1,3 +1,4 @@
+#![feature(portable_simd)]
 //! Source-preserving parser for the Cyallo language.
 mod lexer;
 mod modern;
@@ -7,6 +8,8 @@ mod token;
 mod units;
 use cyallo_ast::*;
 pub use lexer::{Lexed, lex, lex_modern};
+#[doc(hidden)]
+pub use lexer::{ScanVariant, lex_variant, scan};
 pub use token::{Token, TokenKind};
 pub use units::{
     BodyHandle, IndexedSource, ParseUnit, ParsedFile, ParsedUnit, SourceSnapshot, index_modern,
