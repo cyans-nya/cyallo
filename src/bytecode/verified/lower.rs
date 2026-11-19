@@ -864,6 +864,36 @@ fn lower_operation(
             let list = new_list(routine, sites, args[1..].iter().map(|&arg| register(arg)))?;
             Instruction::TextReplace(register(*dst)?, register(args[0])?, list)
         }
+        Op::Lookup(dst, Operation::StoragePathNew, args) if args.len() == 1 => {
+            Instruction::PathNew(register(*dst)?, register(args[0])?)
+        }
+        Op::Lookup(dst, Operation::Missing, args) if args.is_empty() => {
+            Instruction::PathMissing(register(*dst)?)
+        }
+        Op::Lookup(dst, Operation::Target, args) if args.len() == 1 && places.is_path(args[0]) => {
+            Instruction::PathTarget(register(*dst)?, register(args[0])?)
+        }
+        Op::Lookup(dst, Operation::Field(field), args)
+            if args.len() == 2 && places.is_path(args[0]) =>
+        {
+            Instruction::PathField(
+                register(*dst)?,
+                register(args[0])?,
+                lower_index(routine, *field)?,
+            )
+        }
+        Op::Lookup(dst, Operation::Element, args) if args.len() == 2 && places.is_path(args[0]) => {
+            Instruction::PathElement(register(*dst)?, register(args[0])?, register(args[1])?)
+        }
+        Op::Lookup(dst, Operation::Mapped, args) if args.len() == 3 => {
+            let site = CallSiteId(lower_index(routine, sites.calls.len())?);
+            sites.calls.push(CallSite {
+                target: CallTarget::Mapped(register(args[2])?),
+                arguments: Box::new([register(args[0])?, register(args[1])?]),
+                destination: Some(register(*dst)?),
+            });
+            Instruction::Call(site)
+        }
         Op::Lookup(dst, Operation::Parse(NumberKind::I64), args) if args.len() == 1 => {
             Instruction::ParseInteger(register(*dst)?, register(args[0])?)
         }

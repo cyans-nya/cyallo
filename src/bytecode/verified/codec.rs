@@ -148,6 +148,11 @@ opcodes! {
     TraitBox = 116, 4;
     Input = 117, 3;
     InputLoan = 118, 3;
+    PathNew = 119, 3;
+    PathMissing = 120, 2;
+    PathTarget = 121, 3;
+    PathField = 122, 4;
+    PathElement = 123, 4;
 }
 
 impl TextOp {
@@ -297,6 +302,15 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
             }
             Instruction::ToText(dst, src) => (Opcode::ToText, [dst.0, src.0, 0], 2),
             Instruction::ParseInteger(dst, text) => (Opcode::ParseInteger, [dst.0, text.0, 0], 2),
+            Instruction::PathNew(dst, root) => (Opcode::PathNew, [dst.0, root.0, 0], 2),
+            Instruction::PathMissing(dst) => (Opcode::PathMissing, [dst.0, 0, 0], 1),
+            Instruction::PathTarget(dst, src) => (Opcode::PathTarget, [dst.0, src.0, 0], 2),
+            Instruction::PathField(dst, src, field) => {
+                (Opcode::PathField, [dst.0, src.0, field], 3)
+            }
+            Instruction::PathElement(dst, src, index) => {
+                (Opcode::PathElement, [dst.0, src.0, index.0], 3)
+            }
             Instruction::Input(dst, kind) => (Opcode::Input, [dst.0, input_code(kind), 0], 2),
             Instruction::InputLoan(loan, kind) => {
                 (Opcode::InputLoan, [loan.0, input_code(kind), 0], 2)
@@ -505,6 +519,11 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::TextReplace => Instruction::TextReplace(reg(0), reg(1), list(2)),
             Opcode::ToText => Instruction::ToText(reg(0), reg(1)),
             Opcode::ParseInteger => Instruction::ParseInteger(reg(0), reg(1)),
+            Opcode::PathNew => Instruction::PathNew(reg(0), reg(1)),
+            Opcode::PathMissing => Instruction::PathMissing(reg(0)),
+            Opcode::PathTarget => Instruction::PathTarget(reg(0), reg(1)),
+            Opcode::PathField => Instruction::PathField(reg(0), reg(1), values[2]),
+            Opcode::PathElement => Instruction::PathElement(reg(0), reg(1), reg(2)),
             Opcode::Input => Instruction::Input(reg(0), input_kind(word, values[1])?),
             Opcode::InputLoan => Instruction::InputLoan(reg(0), input_kind(word, values[1])?),
             Opcode::CountToInteger => Instruction::CountToInteger(reg(0), reg(1)),

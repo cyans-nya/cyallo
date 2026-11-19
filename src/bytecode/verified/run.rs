@@ -2,8 +2,8 @@ use super::{
     BooleanOp, CallSite, CallTarget, Extremum, FloatOp, FrameLayout, FunctionId, GlobalId,
     HostBindingId, HostFailure, InputKind, Instruction, InstructionId, IntegerOp, OutputPiece,
     OutputTemplate, Register, RegisterType, Scalar, ScalarType, StatementArrival,
-    StatementBoundary, TextFailure, TextMapOp, TextOp, TextStyle, TextTestOp, VerifiedFunction,
-    VerifiedModule, array_len,
+    StatementBoundary, TextFailure, TextMapOp, TextOp, TextStyle, TextTestOp, ValueType,
+    VerifiedFunction, VerifiedModule, array_len,
 };
 use crate::{
     Span,
@@ -40,6 +40,14 @@ pub enum ExecutionStatus {
     Failed(RunError),
 }
 
+/// Why a storage path cannot be applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathFault {
+    NegativeIndex,
+    OutOfBounds,
+    Mismatch,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunError {
     ArgumentCount {
@@ -73,6 +81,13 @@ pub enum RunError {
         function: FunctionId,
         instruction: InstructionId,
         span: Span,
+    },
+    /// A storage path does not lead anywhere in the value it is applied to.
+    Path {
+        function: FunctionId,
+        instruction: InstructionId,
+        span: Span,
+        fault: PathFault,
     },
     /// An input instruction found no line left.
     InputExhausted {
@@ -190,6 +205,11 @@ impl fmt::Display for RunError {
                 "division by zero in function {} at instruction {}",
                 function.0, instruction.0
             ),
+            Self::Path { fault, .. } => f.write_str(match fault {
+                PathFault::NegativeIndex => "storage path index must not be negative",
+                PathFault::OutOfBounds => "storage path projection out of bounds",
+                PathFault::Mismatch => "storage path does not fit the value it is applied to",
+            }),
             Self::InputExhausted { .. } => f.write_str("INPUT reached end of input"),
             Self::InputInvalid { kind, .. } => match kind {
                 InputKind::Text => f.write_str("INPUT line is not valid text"),
@@ -331,6 +351,8 @@ struct Frame {
     arrival: StatementArrival,
     slots: Box<[Option<FrameValue>]>,
     destination: Option<Register>,
+    /// The value a returned storage path is applied to, for a mapped call.
+    mapped: Option<Box<FrameValue>>,
 }
 
 #[derive(Debug, Clone)]
@@ -342,6 +364,9 @@ enum FrameValue {
     Closure(Arc<Closure>),
     /// A traced reference to the heap object at this index.
     Handle(usize),
+    /// A storage path: its steps, or nothing for the missing path. Steps hold
+    /// indices only, so a path owns no object.
+    Path(Option<Arc<[PathStep]>>),
     /// A strong owner of the counted object at this index.
     Rc(usize),
     /// A weak reference to the counted object at this index.
@@ -353,6 +378,15 @@ enum FrameValue {
         heap: usize,
         implementation: u32,
     },
+}
+
+/// One projection of a storage path.
+#[derive(Debug, Clone, Copy)]
+enum PathStep {
+    /// Into the contents of a cell, handle or counted owner.
+    Target,
+    Field(u32),
+    Element(usize),
 }
 
 /// A routine and the values it captured by copy or move. The captures become
@@ -552,6 +586,7 @@ impl Memory {
                 FrameValue::Composite(Composite::Cell(inner)) => pending.push(*inner),
                 FrameValue::Scalar(_)
                 | FrameValue::Text(_)
+                | FrameValue::Path(_)
                 | FrameValue::Loan(_)
                 | FrameValue::Closure(_)
                 | FrameValue::Handle(_)
@@ -680,6 +715,7 @@ fn trace(value: &FrameValue, marks: &mut [bool], pending: &mut Vec<usize>) {
             FrameValue::Closure(closure) => stack.extend(closure.captures.iter()),
             FrameValue::Scalar(_)
             | FrameValue::Text(_)
+            | FrameValue::Path(_)
             | FrameValue::Rc(_)
             | FrameValue::Weak(_)
             | FrameValue::Moved => {}
@@ -870,6 +906,7 @@ impl Frame {
             arrival: StatementArrival::Entry,
             slots: vec![None; layout.slot_count()].into_boxed_slice(),
             destination,
+            mapped: None,
         };
         for (&register, value) in body.parameters.iter().zip(values) {
             frame.set_value(layout, register, value);
@@ -888,6 +925,7 @@ impl Frame {
             | FrameValue::Rc(_)
             | FrameValue::Weak(_)
             | FrameValue::Object { .. }
+            | FrameValue::Path(_)
             | FrameValue::Moved => {
                 unreachable!("verified scalar operand")
             }
@@ -905,6 +943,7 @@ impl Frame {
             | FrameValue::Rc(_)
             | FrameValue::Weak(_)
             | FrameValue::Object { .. }
+            | FrameValue::Path(_)
             | FrameValue::Moved => {
                 unreachable!("verified loan operand")
             }
@@ -1518,6 +1557,43 @@ impl VerifiedModule {
                 let spelled = spell(&frame.value(layout, src), TextStyle::Plain);
                 frame.set_value(layout, dst, FrameValue::Text(spelled.into()));
             }
+            Instruction::PathNew(dst, _) => {
+                frame.set_value(layout, dst, FrameValue::Path(Some(Arc::from([]))));
+            }
+            Instruction::PathMissing(dst) => frame.set_value(layout, dst, FrameValue::Path(None)),
+            Instruction::PathTarget(dst, src)
+            | Instruction::PathField(dst, src, _)
+            | Instruction::PathElement(dst, src, _) => {
+                let step = match body.instructions[pc] {
+                    Instruction::PathField(_, _, field) => PathStep::Field(field),
+                    Instruction::PathElement(_, _, index) => {
+                        let Scalar::I64(index) = frame.get(layout, index) else {
+                            unreachable!("verified integer index");
+                        };
+                        let fault = |fault| RunError::Path {
+                            function,
+                            instruction: from,
+                            span: body.spans[pc],
+                            fault,
+                        };
+                        PathStep::Element(
+                            usize::try_from(index).map_err(|_| fault(PathFault::NegativeIndex))?,
+                        )
+                    }
+                    _ => PathStep::Target,
+                };
+                let FrameValue::Path(path) = frame.value(layout, src) else {
+                    unreachable!("verified path operand");
+                };
+                let extended = path.map(|steps| {
+                    steps
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(step))
+                        .collect::<Arc<[_]>>()
+                });
+                frame.set_value(layout, dst, FrameValue::Path(extended));
+            }
             Instruction::Input(..) | Instruction::InputLoan(..) => {
                 let (Instruction::Input(target, kind) | Instruction::InputLoan(target, kind)) =
                     body.instructions[pc]
@@ -1900,7 +1976,7 @@ impl VerifiedModule {
                             .collect();
                         output.write_line(&render_output(template, &arguments));
                     }
-                    CallTarget::Closure(callee) => {
+                    CallTarget::Closure(callee) | CallTarget::Mapped(callee) => {
                         if depth == max_frames {
                             return Err(RunError::FrameLimit);
                         }
@@ -1913,7 +1989,11 @@ impl VerifiedModule {
                             .iter()
                             .cloned()
                             .chain(call.arguments.iter().map(|&reg| frame.value(layout, reg)));
-                        let next = Frame::new(closure.function, target, values, call.destination);
+                        let mut next =
+                            Frame::new(closure.function, target, values, call.destination);
+                        if matches!(call.target, CallTarget::Mapped(_)) {
+                            next.mapped = Some(Box::new(frame.value(layout, call.arguments[0])));
+                        }
                         stack.push(next);
                     }
                     CallTarget::Method { object, method } => {
@@ -1957,6 +2037,7 @@ impl VerifiedModule {
             Instruction::Return(value) => {
                 let value = value.map(|reg| frame.value(layout, reg));
                 let destination = frame.destination;
+                let receiver = frame.mapped.take();
                 stack.pop();
                 let Some(caller) = stack.last_mut() else {
                     return Ok(StepOutcome::Returned(value.map(|value| match value {
@@ -1964,8 +2045,48 @@ impl VerifiedModule {
                         _ => unreachable!("verified entry result is scalar"),
                     })));
                 };
-                if let Some((dst, value)) = destination.zip(value) {
-                    let layout = self.functions[caller.function.index()].frame_layout();
+                let caller_body = &self.functions[caller.function.index()];
+                let layout = caller_body.frame_layout();
+                if let Some(receiver) = receiver {
+                    let (Some(dst), Some(FrameValue::Path(path))) = (destination, value) else {
+                        unreachable!("verified mapped call");
+                    };
+                    let call = caller.pc - 1;
+                    let (function, instruction, span) = (
+                        caller.function,
+                        instruction_id(call),
+                        caller_body.spans[call],
+                    );
+                    let fail = |fault| RunError::Path {
+                        function,
+                        instruction,
+                        span,
+                        fault,
+                    };
+                    let (some, none) = caller_body.option_variants(dst);
+                    let expected = caller_body.option_payload_runtime(dst);
+                    let found = match &path {
+                        None => None,
+                        Some(steps) => {
+                            let reached = apply_path(memory, &receiver, steps).map_err(fail)?;
+                            if !conforms(reached, expected) {
+                                return Err(fail(PathFault::Mismatch));
+                            }
+                            Some(reached.clone())
+                        }
+                    };
+                    let option = match found {
+                        Some(value) => Composite::Enum {
+                            variant: some,
+                            payload: Some(Box::new(memory.clone_value(&value))),
+                        },
+                        None => Composite::Enum {
+                            variant: none,
+                            payload: None,
+                        },
+                    };
+                    caller.set_value(layout, dst, FrameValue::Composite(option));
+                } else if let Some((dst, value)) = destination.zip(value) {
                     caller.set_value(layout, dst, value);
                 }
             }
@@ -2653,6 +2774,63 @@ fn read_input(line: &str, kind: InputKind) -> Option<FrameValue> {
     })
 }
 
+/// The value a storage path reaches from a root value.
+fn apply_path<'a>(
+    memory: &'a Memory,
+    root: &'a FrameValue,
+    steps: &[PathStep],
+) -> Result<&'a FrameValue, PathFault> {
+    let mut cursor = root;
+    for step in steps {
+        cursor = match (step, cursor) {
+            (PathStep::Target, FrameValue::Handle(object)) => memory
+                .heap
+                .slots
+                .get(*object)
+                .and_then(Option::as_ref)
+                .ok_or(PathFault::Mismatch)?,
+            (PathStep::Target, FrameValue::Rc(block)) => memory
+                .counted
+                .get(*block)
+                .and_then(Option::as_ref)
+                .and_then(|block| block.payload.as_ref())
+                .ok_or(PathFault::Mismatch)?,
+            (PathStep::Target, FrameValue::Composite(Composite::Cell(inner))) => inner,
+            (PathStep::Field(field), FrameValue::Composite(Composite::Tuple(fields))) => {
+                fields.get(*field as usize).ok_or(PathFault::Mismatch)?
+            }
+            (PathStep::Element(index), FrameValue::Composite(Composite::Vec(items))) => {
+                items.get(*index).ok_or(PathFault::OutOfBounds)?
+            }
+            (PathStep::Element(index), FrameValue::Composite(Composite::Array(elements))) => {
+                elements
+                    .get(*index)
+                    .and_then(Option::as_ref)
+                    .ok_or(PathFault::OutOfBounds)?
+            }
+            _ => return Err(PathFault::Mismatch),
+        };
+    }
+    Ok(cursor)
+}
+
+/// Whether a value has the kind of a type. A storage path is checked when it
+/// is applied, because it names its target by position only.
+fn conforms(value: &FrameValue, ty: ValueType) -> bool {
+    match (value, ty) {
+        (FrameValue::Scalar(scalar), ValueType::Scalar(expected)) => scalar.ty() == expected,
+        (FrameValue::Text(_), ValueType::Text)
+        | (FrameValue::Composite(_), ValueType::Composite(_))
+        | (FrameValue::Closure(_), ValueType::Function(_))
+        | (FrameValue::Handle(_), ValueType::Gc(_))
+        | (FrameValue::Rc(_), ValueType::Rc(_))
+        | (FrameValue::Weak(_), ValueType::Weak(_))
+        | (FrameValue::Object { .. }, ValueType::Object(_))
+        | (FrameValue::Path(_), ValueType::Path) => true,
+        _ => false,
+    }
+}
+
 /// How a scalar or string is written in text.
 fn spell(value: &FrameValue, style: TextStyle) -> String {
     match (style, value) {
@@ -2675,6 +2853,7 @@ fn spell(value: &FrameValue, style: TextStyle) -> String {
             | FrameValue::Rc(_)
             | FrameValue::Weak(_)
             | FrameValue::Object { .. }
+            | FrameValue::Path(_)
             | FrameValue::Moved,
         ) => unreachable!("verified text operand is a scalar or string"),
     }

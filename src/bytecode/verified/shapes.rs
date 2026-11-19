@@ -269,6 +269,10 @@ impl Shapes {
                 };
                 ValueType::Weak(managed)
             }
+            // A relative storage recipe is its declared kind of opaque type.
+            Type::Opaque(_, arguments, traits) if traits.path() && arguments.len() == 1 => {
+                ValueType::Path
+            }
             // A growable collection, a mutable cell and a range are described
             // by the traits and kinds their declarations carry.
             Type::Opaque(_, arguments, traits)
@@ -403,7 +407,8 @@ impl Shapes {
             | ValueType::Text
             | ValueType::Function(_)
             | ValueType::Gc(_)
-            | ValueType::Object(_) => false,
+            | ValueType::Object(_)
+            | ValueType::Path => false,
         }
     }
 

@@ -121,6 +121,7 @@ impl fmt::Display for VerifiedModule {
                     )?,
                     RegisterType::Gc(managed) => write!(f, "  r{index}: gc m{}", managed.0)?,
                     RegisterType::Object(id) => write!(f, "  r{index}: dyn trait{}", id.0)?,
+                    RegisterType::Path => write!(f, "  r{index}: path")?,
                     RegisterType::Rc(managed) => write!(f, "  r{index}: rc m{}", managed.0)?,
                     RegisterType::Weak(managed) => write!(f, "  r{index}: weak m{}", managed.0)?,
                     RegisterType::Text => write!(f, "  r{index}: text")?,
@@ -194,6 +195,7 @@ impl fmt::Display for VerifiedModule {
                             CallTarget::Closure(callee) => {
                                 write!(f, "call.closure r{}(", callee.0)?
                             }
+                            CallTarget::Mapped(callee) => write!(f, "call.mapped r{}(", callee.0)?,
                             CallTarget::Method { object, method } => {
                                 write!(f, "call.method r{}#{method}(", object.0)?;
                             }
@@ -310,6 +312,19 @@ impl fmt::Display for VerifiedModule {
                         write_list(f, &function.lists()[list.index()])?;
                     }
                     Instruction::ToText(dst, src) => write!(f, "r{} = to.text r{}", dst.0, src.0)?,
+                    Instruction::PathNew(dst, root) => {
+                        write!(f, "r{} = path.new r{}", dst.0, root.0)?
+                    }
+                    Instruction::PathMissing(dst) => write!(f, "r{} = path.missing", dst.0)?,
+                    Instruction::PathTarget(dst, src) => {
+                        write!(f, "r{} = path.target r{}", dst.0, src.0)?
+                    }
+                    Instruction::PathField(dst, src, field) => {
+                        write!(f, "r{} = path.field r{}, {field}", dst.0, src.0)?
+                    }
+                    Instruction::PathElement(dst, src, index) => {
+                        write!(f, "r{} = path.element r{}, r{}", dst.0, src.0, index.0)?
+                    }
                     Instruction::Input(dst, kind) => write!(f, "r{} = input.{kind:?}", dst.0)?,
                     Instruction::InputLoan(loan, kind) => {
                         write!(f, "loan.input.{kind:?} r{}", loan.0)?
@@ -464,6 +479,7 @@ fn value_name(ty: ValueType) -> String {
         ValueType::Text => "text".to_owned(),
         ValueType::Gc(managed) => format!("gc m{}", managed.0),
         ValueType::Object(id) => format!("dyn trait{}", id.0),
+        ValueType::Path => "path".to_owned(),
         ValueType::Rc(managed) => format!("rc m{}", managed.0),
         ValueType::Weak(managed) => format!("weak m{}", managed.0),
         ValueType::Function(signature) => format!("fn sig{}", signature.0),

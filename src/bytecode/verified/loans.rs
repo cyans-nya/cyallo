@@ -472,6 +472,10 @@ impl Places {
         self.projected.get(index).copied().unwrap_or(false)
     }
 
+    pub fn is_path(&self, index: usize) -> bool {
+        matches!(self.registers.get(index), Some(RegisterType::Path))
+    }
+
     pub fn is_text(&self, index: usize) -> bool {
         matches!(self.registers.get(index), Some(RegisterType::Text))
     }

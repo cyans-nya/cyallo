@@ -29,16 +29,16 @@ pub(crate) use run::ScalarFrameSnapshot;
 pub use run::ScalarRecoveryError;
 pub use run::{
     Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, HeapStats, InputSource,
-    OutputSink, RunError,
+    OutputSink, PathFault, RunError,
 };
 pub use sdk::SdkCompileError;
 
-/// Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 23;
+pub const FORMAT_VERSION: u32 = 24;
 
 macro_rules! index {
     ($name:ident) => {
@@ -95,6 +95,8 @@ pub enum ValueType {
     Weak(ManagedId),
     /// A shared, erased object that implements the trait.
     Object(TraitId),
+    /// A relative storage recipe: a list of projections, or the missing path.
+    Path,
 }
 
 /// A method a trait declares: what its receiver may do and its other types.
@@ -151,7 +153,8 @@ impl ValueType {
             | Self::Gc(_)
             | Self::Rc(_)
             | Self::Weak(_)
-            | Self::Object(_) => None,
+            | Self::Object(_)
+            | Self::Path => None,
         }
     }
 }
@@ -251,6 +254,8 @@ pub enum RegisterType {
     Weak(ManagedId),
     /// A shared, erased object that implements a trait.
     Object(TraitId),
+    /// A relative storage recipe.
+    Path,
     /// A closure that captured loans. It behaves like a loan on their root:
     /// the root stays live and borrowed while it lives, and the value cannot
     /// be stored, passed or returned by value.
@@ -280,6 +285,7 @@ impl From<ValueType> for RegisterType {
             ValueType::Rc(managed) => Self::Rc(managed),
             ValueType::Weak(managed) => Self::Weak(managed),
             ValueType::Object(id) => Self::Object(id),
+            ValueType::Path => Self::Path,
         }
     }
 }
@@ -314,6 +320,7 @@ impl RegisterType {
             Self::Rc(managed) => ValueType::Rc(managed),
             Self::Weak(managed) => ValueType::Weak(managed),
             Self::Object(id) => ValueType::Object(id),
+            Self::Path => ValueType::Path,
             _ => return None,
         })
     }
@@ -584,6 +591,16 @@ pub enum Instruction {
     /// space. The result is a two-variant enum: one carries the integer, the
     /// other a payload-free error.
     ParseInteger(Register, Register),
+    /// The empty storage path that starts at the root value.
+    PathNew(Register, Register),
+    /// The path that reaches nothing.
+    PathMissing(Register),
+    /// Append a step into the contents of a cell, handle or counted owner.
+    PathTarget(Register, Register),
+    /// Append a step into a field of a record.
+    PathField(Register, Register, u32),
+    /// Append a step to an element of a vector or array.
+    PathElement(Register, Register, Register),
     /// Read one line from the input source into the register.
     Input(Register, InputKind),
     /// Read one line from the input source through an exclusive loan.
@@ -676,6 +693,10 @@ pub enum CallTarget {
     },
     /// Write one line of text. The template lives in the owning function.
     Output(OutputId),
+    /// Call the mapper closure held by the register with the arguments, then
+    /// apply the storage path it returns to the first argument. The
+    /// destination receives an option of the value the path reaches.
+    Mapped(Register),
 }
 
 /// One piece of an output line, in print order.
@@ -741,7 +762,11 @@ impl Instruction {
                 ([Some(src), None], &[], Some(dst))
             }
             WriteLoan(loan, value) => ([Some(loan), Some(value)], &[], None),
-            Input(dst, _) => ([None, None], &[], Some(dst)),
+            Input(dst, _) | PathMissing(dst) => ([None, None], &[], Some(dst)),
+            PathNew(dst, src) | PathTarget(dst, src) | PathField(dst, src, _) => {
+                ([Some(src), None], &[], Some(dst))
+            }
+            PathElement(dst, src, index) => ([Some(src), Some(index)], &[], Some(dst)),
             InputLoan(loan, _) => ([Some(loan), None], &[], None),
             BorrowGlobal(dst, _) => ([None, None], &[], Some(dst)),
             Clone(dst, src)
@@ -798,6 +823,7 @@ impl Instruction {
                 let call = &calls[site.index()];
                 let callee = match call.target {
                     CallTarget::Closure(register)
+                    | CallTarget::Mapped(register)
                     | CallTarget::Method {
                         object: register, ..
                     } => Some(register),
@@ -1052,6 +1078,7 @@ impl VerifiedFunction {
             RegisterType::Rc(managed) => Ok(ValueType::Rc(managed)),
             RegisterType::Weak(managed) => Ok(ValueType::Weak(managed)),
             RegisterType::Object(id) => Ok(ValueType::Object(id)),
+            RegisterType::Path => Ok(ValueType::Path),
             RegisterType::BorrowingFunction { .. } => {
                 Err(InvalidBytecode::EscapingBorrow(register))
             }
@@ -1117,6 +1144,24 @@ impl VerifiedFunction {
             Ok((1, 0))
         } else {
             Err(InvalidBytecode::ExpectedEnum(register))
+        }
+    }
+
+    /// The variant that carries a value and the empty one, of an option-shaped
+    /// enum.
+    fn option_enum(&self, register: Register) -> Result<(u32, u32), InvalidBytecode> {
+        match self.enum_variants(register)? {
+            [Some(_), None] => Ok((0, 1)),
+            [None, Some(_)] => Ok((1, 0)),
+            _ => Err(InvalidBytecode::ExpectedEnum(register)),
+        }
+    }
+
+    /// The type of the value an option-shaped enum carries.
+    fn option_payload_runtime(&self, register: Register) -> ValueType {
+        match self.enum_variants(register) {
+            Ok([Some(payload), None] | [None, Some(payload)]) => *payload,
+            _ => unreachable!("verified option register"),
         }
     }
 
@@ -2076,6 +2121,27 @@ impl VerifiedFunction {
                 )?;
                 signature.result
             }
+            CallTarget::Mapped(callee) => {
+                let (RegisterType::Function(id)
+                | RegisterType::BorrowingFunction { signature: id, .. }) =
+                    self.register_kind(callee)?
+                else {
+                    return Err(InvalidBytecode::ExpectedFunction(callee));
+                };
+                let signature = self.signature(id)?;
+                self.verify_arguments(
+                    &call.arguments,
+                    signature.parameters.iter().map(|&ty| Ok(ty)),
+                )?;
+                if signature.result != Some(ValueType::Path) || call.arguments.is_empty() {
+                    return Err(InvalidBytecode::ResultPresence);
+                }
+                let Some(destination) = call.destination else {
+                    return Err(InvalidBytecode::ResultPresence);
+                };
+                self.option_enum(destination)?;
+                return Ok(());
+            }
             CallTarget::Output(id) => {
                 let template = self
                     .outputs
@@ -2128,6 +2194,7 @@ impl VerifiedFunction {
                 RegisterType::Gc(managed) => self.require_value(arg, ValueType::Gc(managed))?,
                 RegisterType::Rc(managed) => self.require_value(arg, ValueType::Rc(managed))?,
                 RegisterType::Object(id) => self.require_value(arg, ValueType::Object(id))?,
+                RegisterType::Path => self.require_value(arg, ValueType::Path)?,
                 RegisterType::Weak(managed) => self.require_value(arg, ValueType::Weak(managed))?,
                 RegisterType::Composite(shape) => {
                     self.require_value(arg, ValueType::Composite(shape))?;
@@ -2402,6 +2469,20 @@ impl VerifiedFunction {
                     self.register_type(src)?;
                 }
                 self.require_text(dst)
+            }
+            Instruction::PathNew(dst, root) => {
+                self.require_value(dst, ValueType::Path)?;
+                self.value_type(root).map(|_| ())
+            }
+            Instruction::PathMissing(dst) => self.require_value(dst, ValueType::Path),
+            Instruction::PathTarget(dst, src) | Instruction::PathField(dst, src, _) => {
+                self.require_value(dst, ValueType::Path)?;
+                self.require_value(src, ValueType::Path)
+            }
+            Instruction::PathElement(dst, src, index) => {
+                self.require_value(dst, ValueType::Path)?;
+                self.require_value(src, ValueType::Path)?;
+                self.require_type(index, ScalarType::I64)
             }
             Instruction::Input(dst, kind) => self.require_value(dst, kind.value_type()),
             Instruction::InputLoan(loan, kind) => {
