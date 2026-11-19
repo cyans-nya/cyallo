@@ -1,0 +1,5 @@
+
+let mut answer = ""
+std::io::print("ready")
+std::runtime::caie::input(&mut answer)
+std::io::print("done")
