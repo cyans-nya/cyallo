@@ -310,6 +310,10 @@ impl fmt::Display for VerifiedModule {
                         write_list(f, &function.lists()[list.index()])?;
                     }
                     Instruction::ToText(dst, src) => write!(f, "r{} = to.text r{}", dst.0, src.0)?,
+                    Instruction::Input(dst, kind) => write!(f, "r{} = input.{kind:?}", dst.0)?,
+                    Instruction::InputLoan(loan, kind) => {
+                        write!(f, "loan.input.{kind:?} r{}", loan.0)?
+                    }
                     Instruction::ParseInteger(dst, text) => {
                         write!(f, "r{} = parse.i64 r{}", dst.0, text.0)?;
                     }

@@ -28,8 +28,8 @@ pub use lower::LowerError;
 pub(crate) use run::ScalarFrameSnapshot;
 pub use run::ScalarRecoveryError;
 pub use run::{
-    Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, HeapStats, OutputSink,
-    RunError,
+    Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, HeapStats, InputSource,
+    OutputSink, RunError,
 };
 pub use sdk::SdkCompileError;
 
@@ -38,7 +38,7 @@ pub use sdk::SdkCompileError;
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 22;
+pub const FORMAT_VERSION: u32 = 23;
 
 macro_rules! index {
     ($name:ident) => {
@@ -454,6 +454,30 @@ pub enum TextFailure {
     RangeOutOfBounds,
 }
 
+/// What one line of input becomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputKind {
+    /// The line itself, without its terminator.
+    Text,
+    /// A decimal 64-bit integer; surrounding white space is ignored.
+    Integer,
+    /// A finite decimal number; surrounding white space is ignored.
+    Float,
+    /// `TRUE` or `FALSE` in any letter case; surrounding white space is ignored.
+    Bool,
+}
+
+impl InputKind {
+    pub(crate) fn value_type(self) -> ValueType {
+        match self {
+            Self::Text => ValueType::Text,
+            Self::Integer => ValueType::Scalar(ScalarType::I64),
+            Self::Float => ValueType::Scalar(ScalarType::F64),
+            Self::Bool => ValueType::Scalar(ScalarType::Bool),
+        }
+    }
+}
+
 /// A string transformation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextMapOp {
@@ -560,6 +584,10 @@ pub enum Instruction {
     /// space. The result is a two-variant enum: one carries the integer, the
     /// other a payload-free error.
     ParseInteger(Register, Register),
+    /// Read one line from the input source into the register.
+    Input(Register, InputKind),
+    /// Read one line from the input source through an exclusive loan.
+    InputLoan(Register, InputKind),
     Extremum(Extremum, Register, Register, Register),
     /// View the elements of an array, or of another slice, through a loan.
     SliceOf(Register, Register),
@@ -713,6 +741,8 @@ impl Instruction {
                 ([Some(src), None], &[], Some(dst))
             }
             WriteLoan(loan, value) => ([Some(loan), Some(value)], &[], None),
+            Input(dst, _) => ([None, None], &[], Some(dst)),
+            InputLoan(loan, _) => ([Some(loan), None], &[], None),
             BorrowGlobal(dst, _) => ([None, None], &[], Some(dst)),
             Clone(dst, src)
             | TextMap(_, dst, src)
@@ -1361,6 +1391,10 @@ pub enum InvalidBytecode {
         word: usize,
     },
     InvalidBoolean {
+        word: usize,
+        value: u32,
+    },
+    InvalidInputKind {
         word: usize,
         value: u32,
     },
@@ -2368,6 +2402,21 @@ impl VerifiedFunction {
                     self.register_type(src)?;
                 }
                 self.require_text(dst)
+            }
+            Instruction::Input(dst, kind) => self.require_value(dst, kind.value_type()),
+            Instruction::InputLoan(loan, kind) => {
+                let (access, _, ty) = self.loan_type(loan)?;
+                if access != LoanAccess::Exclusive {
+                    return Err(InvalidBytecode::ExpectedExclusiveLoan(loan));
+                }
+                if ty != kind.value_type() {
+                    return Err(InvalidBytecode::ValueType {
+                        register: loan,
+                        expected: kind.value_type(),
+                        actual: ty,
+                    });
+                }
+                Ok(())
             }
             Instruction::ParseInteger(dst, text) => {
                 self.require_text(text)?;

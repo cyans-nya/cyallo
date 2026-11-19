@@ -1,9 +1,9 @@
 use super::{
     BooleanOp, CallSite, CallSiteId, CallTarget, Extremum, FORMAT_VERSION, FloatOp, FunctionId,
-    FunctionImage, HostBindingId, Implementation, ImplementationId, Instruction, InstructionId,
-    IntegerOp, LoanAccess, ModuleImage, OperandListId, OutputId, OutputPiece, OutputTemplate,
-    Register, RegisterType, Scalar, ScalarHostBinding, ScalarType, TextId, TextMapOp, TextOp,
-    TextTestOp, TraitId, ValueType, VerifiedModule, VerifyError,
+    FunctionImage, HostBindingId, Implementation, ImplementationId, InputKind, Instruction,
+    InstructionId, IntegerOp, LoanAccess, ModuleImage, OperandListId, OutputId, OutputPiece,
+    OutputTemplate, Register, RegisterType, Scalar, ScalarHostBinding, ScalarType, TextId,
+    TextMapOp, TextOp, TextTestOp, TraitId, ValueType, VerifiedModule, VerifyError,
     cfg::{self, Block, Exit, Located, Statement},
     encode, layout, lifetimes,
     loans::Places,
@@ -253,6 +253,16 @@ pub(super) fn lower_type(ty: &Type) -> Option<ScalarType> {
         Type::Integer => Some(ScalarType::I64),
         Type::Real => Some(ScalarType::F64),
         Type::Boolean => Some(ScalarType::Bool),
+        _ => None,
+    }
+}
+
+fn lower_input(ty: &Type) -> Option<InputKind> {
+    match ty {
+        Type::String => Some(InputKind::Text),
+        Type::Integer | Type::Numeric(NumberKind::I64) => Some(InputKind::Integer),
+        Type::Real => Some(InputKind::Float),
+        Type::Boolean => Some(InputKind::Bool),
         _ => None,
     }
 }
@@ -1031,6 +1041,16 @@ fn lower_operation(
                 }
                 _ => Instruction::EnumPayload(register(*dst)?, option, some),
             }
+        }
+        Op::Input(addr, ty) => {
+            let kind = lower_input(ty).ok_or_else(unsupported)?;
+            match places.address(*addr) {
+                Some(place) => Instruction::Input(place, kind),
+                None => Instruction::InputLoan(register(*addr)?, kind),
+            }
+        }
+        Op::FrameInput(dst, ty) => {
+            Instruction::Input(register(*dst)?, lower_input(ty).ok_or_else(unsupported)?)
         }
         Op::Load(dst, addr) => match places.address(*addr) {
             Some(place) => Instruction::Copy(register(*dst)?, place),

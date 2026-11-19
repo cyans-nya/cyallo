@@ -143,7 +143,7 @@ impl Places {
         }
         for op in &all_ops {
             match op {
-                Op::Store(addr, _) => written[*addr] = true,
+                Op::Store(addr, _) | Op::Input(addr, _) => written[*addr] = true,
                 // Taking an owner out of a projected place empties that place.
                 Op::Take(_, addr)
                     if projects[*addr]

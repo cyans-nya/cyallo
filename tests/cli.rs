@@ -39,7 +39,7 @@ fn bytecode_can_verify_and_show_a_selected_routine() {
             .contains("output.caie")
     );
 
-    let result = cli(&["bytecode", "examples/input.psc", "--verified", "0"])
+    let result = cli(&["bytecode", "examples/locations.ya", "--verified", "0"])
         .output()
         .unwrap();
     assert!(!result.status.success());
@@ -167,6 +167,43 @@ fn input_and_eof_are_reported() {
         assert!(error.contains("INPUT reached end of input"));
         assert!(!error.contains("src/main.rs"));
     }
+}
+#[test]
+fn verified_engine_reads_standard_input() {
+    for (example, input, expected) in [
+        ("examples/input.psc", "42\n", "Number?\n42\n"),
+        (
+            "examples/secret-number.ya",
+            "50\nabc\n10\n42\n",
+            "Guess a whole number from 1 to 100.\nTry lower.\nPlease enter a whole number.\nTry higher.\nCorrect!\n",
+        ),
+    ] {
+        let mut child = cli(&["run", example, "--engine", "verified"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(result.status.success(), "{example}");
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout),
+            expected,
+            "{example}"
+        );
+    }
+    let eof = cli(&["run", "examples/input.psc", "--engine", "verified"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!eof.status.success());
+    assert!(String::from_utf8_lossy(&eof.stderr).contains("INPUT reached end of input"));
 }
 fn piped_repl(engine: &str, source: &str, extra: &[&str]) -> std::process::Output {
     let mut command = cli(&["repl", "--engine", engine]);
@@ -710,7 +747,7 @@ fn verified_engine_matches_the_interpreter_on_supported_programs() {
 
 #[test]
 fn verified_engine_refuses_unsupported_programs_before_running() {
-    let result = cli(&["run", "examples/input.psc", "--engine", "verified"])
+    let result = cli(&["run", "examples/locations.ya", "--engine", "verified"])
         .output()
         .unwrap();
     assert!(!result.status.success());

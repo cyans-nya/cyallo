@@ -1,8 +1,9 @@
 use super::{
     BooleanOp, CallSite, CallTarget, Extremum, FloatOp, FrameLayout, FunctionId, GlobalId,
-    HostBindingId, HostFailure, Instruction, InstructionId, IntegerOp, OutputPiece, OutputTemplate,
-    Register, RegisterType, Scalar, ScalarType, StatementArrival, StatementBoundary, TextFailure,
-    TextMapOp, TextOp, TextStyle, TextTestOp, VerifiedFunction, VerifiedModule, array_len,
+    HostBindingId, HostFailure, InputKind, Instruction, InstructionId, IntegerOp, OutputPiece,
+    OutputTemplate, Register, RegisterType, Scalar, ScalarType, StatementArrival,
+    StatementBoundary, TextFailure, TextMapOp, TextOp, TextStyle, TextTestOp, VerifiedFunction,
+    VerifiedModule, array_len,
 };
 use crate::{
     Span,
@@ -72,6 +73,19 @@ pub enum RunError {
         function: FunctionId,
         instruction: InstructionId,
         span: Span,
+    },
+    /// An input instruction found no line left.
+    InputExhausted {
+        function: FunctionId,
+        instruction: InstructionId,
+        span: Span,
+    },
+    /// The line does not spell a value of the requested kind.
+    InputInvalid {
+        function: FunctionId,
+        instruction: InstructionId,
+        span: Span,
+        kind: InputKind,
     },
     EnumVariant {
         function: FunctionId,
@@ -176,6 +190,13 @@ impl fmt::Display for RunError {
                 "division by zero in function {} at instruction {}",
                 function.0, instruction.0
             ),
+            Self::InputExhausted { .. } => f.write_str("INPUT reached end of input"),
+            Self::InputInvalid { kind, .. } => match kind {
+                InputKind::Text => f.write_str("INPUT line is not valid text"),
+                InputKind::Integer => f.write_str("INPUT is not a valid integer"),
+                InputKind::Float => f.write_str("INPUT is not a valid number"),
+                InputKind::Bool => f.write_str("INPUT is not TRUE or FALSE"),
+            },
             Self::ZeroStep {
                 function,
                 instruction,
@@ -958,6 +979,7 @@ fn instruction_id(pc: usize) -> InstructionId {
 pub struct Activation {
     module: VerifiedModule,
     output: OutputSink,
+    input: InputSource,
     memory: Memory,
     limits: ExecutionLimits,
     instructions_executed: usize,
@@ -1110,6 +1132,7 @@ impl VerifiedModule {
         Ok(Activation {
             module: self.clone(),
             output: OutputSink::default(),
+            input: InputSource::default(),
             memory: Memory::new(self.globals.len()),
             limits,
             instructions_executed,
@@ -1170,6 +1193,7 @@ impl VerifiedModule {
         Ok(Activation {
             module: self.clone(),
             output: OutputSink::default(),
+            input: InputSource::default(),
             memory: Memory::new(self.globals.len()),
             limits,
             instructions_executed: 0,
@@ -1209,6 +1233,7 @@ impl VerifiedModule {
         memory: &mut Memory,
         max_frames: usize,
         output: &mut OutputSink,
+        input: &mut InputSource,
     ) -> Result<StepOutcome, RunError> {
         let depth = stack.len();
         let Some(frame) = stack.last_mut() else {
@@ -1492,6 +1517,50 @@ impl VerifiedModule {
             Instruction::ToText(dst, src) => {
                 let spelled = spell(&frame.value(layout, src), TextStyle::Plain);
                 frame.set_value(layout, dst, FrameValue::Text(spelled.into()));
+            }
+            Instruction::Input(..) | Instruction::InputLoan(..) => {
+                let (Instruction::Input(target, kind) | Instruction::InputLoan(target, kind)) =
+                    body.instructions[pc]
+                else {
+                    unreachable!("matched input instruction");
+                };
+                let read_error = |exhausted: bool| {
+                    let (instruction, span) = (from, body.spans[pc]);
+                    if exhausted {
+                        RunError::InputExhausted {
+                            function,
+                            instruction,
+                            span,
+                        }
+                    } else {
+                        RunError::InputInvalid {
+                            function,
+                            instruction,
+                            span,
+                            kind,
+                        }
+                    }
+                };
+                let line = input.next_line().ok_or_else(|| read_error(true))?;
+                let value = read_input(&line, kind).ok_or_else(|| read_error(false))?;
+                if matches!(body.instructions[pc], Instruction::Input(..)) {
+                    frame.set_value(layout, target, value);
+                } else {
+                    let place = frame.loan(layout, target);
+                    let slot = self.root_slot(stack, memory, &place.root);
+                    match (slot, place.path.is_empty()) {
+                        (slot, true) => *slot = Some(value),
+                        (Some(root), false) => write_place(root, &place.path, value)
+                            .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?,
+                        (None, false) => {
+                            return Err(RunError::UninitializedGlobal {
+                                function,
+                                instruction: from,
+                                span: body.spans[pc],
+                            });
+                        }
+                    }
+                }
             }
             Instruction::ParseInteger(dst, text) => {
                 let (ok, err) = body.parse_variants_runtime(dst);
@@ -2517,6 +2586,73 @@ impl fmt::Debug for OutputSink {
     }
 }
 
+/// Supplies input lines, without their terminators. A line is consumed
+/// exactly once, when its input instruction executes; `None` is the end of input.
+pub struct InputSource(Box<dyn FnMut() -> Option<String> + Send>);
+
+impl InputSource {
+    pub fn new(next: impl FnMut() -> Option<String> + Send + 'static) -> Self {
+        Self(Box::new(next))
+    }
+
+    /// Read lines from standard input.
+    pub fn stdin() -> Self {
+        Self::new(|| {
+            let mut line = String::new();
+            match std::io::stdin().read_line(&mut line) {
+                Ok(0) | Err(_) => None,
+                Ok(_) => {
+                    let kept = line.trim_end_matches(['\n', '\r']).len();
+                    line.truncate(kept);
+                    Some(line)
+                }
+            }
+        })
+    }
+
+    /// Hand out the given lines in order, then end the input.
+    pub fn lines(lines: impl IntoIterator<Item = String, IntoIter: Send + 'static>) -> Self {
+        let mut lines = lines.into_iter();
+        Self::new(move || lines.next())
+    }
+
+    fn next_line(&mut self) -> Option<String> {
+        (self.0)()
+    }
+}
+
+impl Default for InputSource {
+    fn default() -> Self {
+        Self::stdin()
+    }
+}
+
+impl fmt::Debug for InputSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("InputSource")
+    }
+}
+
+/// The value one input line spells, if it spells one.
+fn read_input(line: &str, kind: InputKind) -> Option<FrameValue> {
+    Some(match kind {
+        InputKind::Text => FrameValue::Text(line.into()),
+        InputKind::Integer => FrameValue::Scalar(Scalar::I64(line.trim().parse().ok()?)),
+        InputKind::Float => {
+            let value: f64 = line.trim().parse().ok()?;
+            if !value.is_finite() {
+                return None;
+            }
+            FrameValue::Scalar(Scalar::F64(value.to_bits()))
+        }
+        InputKind::Bool => match line.trim().to_ascii_uppercase().as_str() {
+            "TRUE" => FrameValue::Scalar(Scalar::Bool(true)),
+            "FALSE" => FrameValue::Scalar(Scalar::Bool(false)),
+            _ => return None,
+        },
+    })
+}
+
 /// How a scalar or string is written in text.
 fn spell(value: &FrameValue, style: TextStyle) -> String {
     match (style, value) {
@@ -2572,6 +2708,11 @@ impl Activation {
             collections: self.memory.heap.collections,
             counted: self.memory.counted.iter().flatten().count(),
         }
+    }
+
+    /// Replace the origin of input lines. Set before the first slice.
+    pub fn set_input(&mut self, source: InputSource) {
+        self.input = source;
     }
 
     /// Replace the destination of output lines. Set before the first slice.
@@ -2631,6 +2772,7 @@ impl Activation {
                 &mut self.memory,
                 self.limits.frames,
                 &mut self.output,
+                &mut self.input,
             ) {
                 Ok(StepOutcome::Continue) => continue,
                 Ok(StepOutcome::Returned(value)) => ExecutionState::Returned(value),

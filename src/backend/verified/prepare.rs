@@ -495,6 +495,8 @@ fn legalize(
         | Instruction::CountToInteger(..)
         | Instruction::IntegerToCount(..)
         | Instruction::ParseInteger(..)
+        | Instruction::Input(..)
+        | Instruction::InputLoan(..)
         | Instruction::Extremum(..)
         | Instruction::SliceOf(..)
         | Instruction::SliceLength(..)

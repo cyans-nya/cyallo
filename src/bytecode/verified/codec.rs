@@ -1,7 +1,7 @@
 use super::{
-    BooleanOp, CallSiteId, Extremum, FloatOp, FunctionId, GlobalId, ImplementationId, Instruction,
-    InstructionId, IntegerOp, InvalidBytecode, OperandListId, Register, Scalar, TextId, TextMapOp,
-    TextOp, TextTestOp,
+    BooleanOp, CallSiteId, Extremum, FloatOp, FunctionId, GlobalId, ImplementationId, InputKind,
+    Instruction, InstructionId, IntegerOp, InvalidBytecode, OperandListId, Register, Scalar,
+    TextId, TextMapOp, TextOp, TextTestOp,
 };
 
 // The low half of the header is the opcode and the high half is the total
@@ -146,6 +146,8 @@ opcodes! {
     CountToInteger = 114, 3;
     IntegerToCount = 115, 3;
     TraitBox = 116, 4;
+    Input = 117, 3;
+    InputLoan = 118, 3;
 }
 
 impl TextOp {
@@ -295,6 +297,10 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
             }
             Instruction::ToText(dst, src) => (Opcode::ToText, [dst.0, src.0, 0], 2),
             Instruction::ParseInteger(dst, text) => (Opcode::ParseInteger, [dst.0, text.0, 0], 2),
+            Instruction::Input(dst, kind) => (Opcode::Input, [dst.0, input_code(kind), 0], 2),
+            Instruction::InputLoan(loan, kind) => {
+                (Opcode::InputLoan, [loan.0, input_code(kind), 0], 2)
+            }
             Instruction::CountToInteger(dst, src) => (Opcode::CountToInteger, [dst.0, src.0, 0], 2),
             Instruction::IntegerToCount(dst, src) => (Opcode::IntegerToCount, [dst.0, src.0, 0], 2),
             Instruction::TraitBox(dst, value, implementation) => {
@@ -499,6 +505,8 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::TextReplace => Instruction::TextReplace(reg(0), reg(1), list(2)),
             Opcode::ToText => Instruction::ToText(reg(0), reg(1)),
             Opcode::ParseInteger => Instruction::ParseInteger(reg(0), reg(1)),
+            Opcode::Input => Instruction::Input(reg(0), input_kind(word, values[1])?),
+            Opcode::InputLoan => Instruction::InputLoan(reg(0), input_kind(word, values[1])?),
             Opcode::CountToInteger => Instruction::CountToInteger(reg(0), reg(1)),
             Opcode::IntegerToCount => Instruction::IntegerToCount(reg(0), reg(1)),
             Opcode::TraitBox => Instruction::TraitBox(reg(0), reg(1), ImplementationId(values[2])),
@@ -548,4 +556,23 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
         word = end;
     }
     Ok(decoded.into_boxed_slice())
+}
+
+fn input_code(kind: InputKind) -> u32 {
+    match kind {
+        InputKind::Text => 0,
+        InputKind::Integer => 1,
+        InputKind::Float => 2,
+        InputKind::Bool => 3,
+    }
+}
+
+fn input_kind(word: usize, code: u32) -> Result<InputKind, InvalidBytecode> {
+    Ok(match code {
+        0 => InputKind::Text,
+        1 => InputKind::Integer,
+        2 => InputKind::Float,
+        3 => InputKind::Bool,
+        value => return Err(InvalidBytecode::InvalidInputKind { word, value }),
+    })
 }
