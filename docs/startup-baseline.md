@@ -462,3 +462,27 @@ Test status: `cargo test --workspace --no-fail-fast` has the same 28 failing tes
 after this change (pre-existing at the baseline revision, e.g. `tests/attributes.rs`,
 `tests/effects.rs`, `deferred::declaration_errors_are_eager_and_analysis_is_shared_between_workers`);
 the new tests pass.
+
+## Update: resolver indexing (before/after)
+
+Cause of the superlinear `resolve` stage: `Resolver::declarations` ran a linear `find` over the
+function, record, enum, trait and alias lists, and a linear scan of the `exports` vector, for
+every declared name (quadratic in routine count). It now indexes each list once per module
+(first declaration wins, as before). `constant_order` also stopped cloning every function body
+(new read-only `cyallo_ast::visit::walk_block`).
+
+`unused` workloads, `--jobs 1`, release, no profile feature, 15 interleaved fresh-process runs
+per binary on a machine shared with other builds; median ms to first output.
+
+| Routines | Before | After |
+| ---: | ---: | ---: |
+| 4096 | 368.3 | 333.8 |
+| 16384 | 1682.3 | 1338.4 |
+
+`resolve` stage (profile build, single run): n=4096 66.5 → 41.9 ms; n=16384 559 → 166 ms
+(×4 for ×4 routines, no longer superlinear). Remaining body copies are unchanged
+(`bodies_materialized`, `bodies_tracing_copied`, `bodies_deferred_copied` still N+2): the
+tracing, deferred and key copies sit in `analysis/modules.rs` and `module_cache.rs`, and sharing
+`DeferredBody` needs a shared `Function.body` representation. Tests: `tests/resolution_bindings.rs`
+(passes on old and new resolver). The workspace has 29 failing tests that fail identically
+without these changes.

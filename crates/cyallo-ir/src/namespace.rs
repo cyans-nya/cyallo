@@ -7,7 +7,7 @@ use crate::internal::{InternalSemantic, NativeType};
 use crate::intrinsic::Intrinsic;
 use crate::module_graph::{BindingKind, ModuleBinding, ModuleId, ResolvedModule, ResolvedProgram};
 use cyallo_ast::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 type Result<T> = std::result::Result<T, Diagnostic>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -301,109 +301,81 @@ impl Resolver {
         let mut canonical = HashMap::new();
         let mut next_declaration = self.next_declaration;
         for (index, node) in self.nodes.iter_mut().enumerate().skip(start) {
+            // Declaration lookup below is by name, once per declared item. Index each
+            // declaration list and the export list once per module, keeping the first
+            // declaration for a repeated name as the former linear `find` did.
+            let exports: HashSet<&str> = node.ast.exports.iter().map(|e| &**e).collect();
+            let exported = |prefix: &str, name: &str| exports.contains(format!("{prefix}{name}").as_str());
             let mut definitions: Vec<(Box<str>, Kind, bool)> = node
                 .ast
                 .functions
                 .iter()
-                .map(|f| {
-                    (
-                        f.name.clone(),
-                        Kind::Value,
-                        node.ast.exports.contains(&f.name),
-                    )
-                })
+                .map(|f| (f.name.clone(), Kind::Value, exports.contains(&*f.name)))
                 .collect();
             definitions.extend(node.ast.type_aliases.iter().map(|alias| {
-                (
-                    alias.name.clone(),
-                    Kind::Type,
-                    node.ast
-                        .exports
-                        .contains(&format!("$type${}", alias.name).into_boxed_str()),
-                )
+                (alias.name.clone(), Kind::Type, exported("$type$", &alias.name))
             }));
-            definitions.extend(node.ast.enums.iter().map(|e| {
-                (
-                    e.name.clone(),
-                    Kind::Type,
-                    node.ast
-                        .exports
-                        .iter()
-                        .any(|n| n.as_ref() == format!("$type${}", e.name)),
-                )
-            }));
-            definitions.extend(node.ast.records.iter().map(|r| {
-                (
-                    r.name.clone(),
-                    Kind::Type,
-                    node.ast
-                        .exports
-                        .iter()
-                        .any(|e| e.as_ref() == format!("$type${}", r.name)),
-                )
-            }));
-            definitions.extend(node.ast.worlds.iter().map(|w| {
-                (
-                    w.name.clone(),
-                    Kind::World,
-                    node.ast
-                        .exports
-                        .iter()
-                        .any(|e| e.as_ref() == format!("$world${}", w.name)),
-                )
-            }));
-            definitions.extend(node.ast.traits.iter().map(|t| {
-                (
-                    t.name.clone(),
-                    Kind::Type,
-                    node.ast
-                        .exports
-                        .iter()
-                        .any(|e| e.as_ref() == format!("$type${}", t.name)),
-                )
-            }));
+            definitions.extend(
+                node.ast
+                    .enums
+                    .iter()
+                    .map(|e| (e.name.clone(), Kind::Type, exported("$type$", &e.name))),
+            );
+            definitions.extend(
+                node.ast
+                    .records
+                    .iter()
+                    .map(|r| (r.name.clone(), Kind::Type, exported("$type$", &r.name))),
+            );
+            definitions.extend(
+                node.ast
+                    .worlds
+                    .iter()
+                    .map(|w| (w.name.clone(), Kind::World, exported("$world$", &w.name))),
+            );
+            definitions.extend(
+                node.ast
+                    .traits
+                    .iter()
+                    .map(|t| (t.name.clone(), Kind::Type, exported("$type$", &t.name))),
+            );
             definitions.extend(node.ast.properties.iter().map(|p| {
-                (
-                    p.name.clone(),
-                    Kind::Property,
-                    node.ast
-                        .exports
-                        .iter()
-                        .any(|e| e.as_ref() == format!("$property${}", p.name)),
-                )
+                (p.name.clone(), Kind::Property, exported("$property$", &p.name))
             }));
             definitions.extend(node.ast.body.iter().filter_map(|s| match &s.kind {
                 StmtKind::Constant(n, _) | StmtKind::Declare(n, _) => {
-                    Some((n.clone(), Kind::Value, node.ast.exports.contains(n)))
+                    Some((n.clone(), Kind::Value, exports.contains(&**n)))
                 }
                 _ => None,
             }));
+            let functions = first_by_name(&node.ast.functions, |f| &f.name);
+            let records = first_by_name(&node.ast.records, |r| &r.name);
+            let enums = first_by_name(&node.ast.enums, |e| &e.name);
+            let traits = first_by_name(&node.ast.traits, |t| &t.name);
+            let aliases = first_by_name(&node.ast.type_aliases, |a| &a.name);
+            let opaque_records: HashSet<&str> = node
+                .ast
+                .records
+                .iter()
+                .filter(|r| r.opaque)
+                .map(|r| &*r.name)
+                .collect();
             for (name, kind, public) in definitions {
                 let (annotations, declaration_kind, span) = match kind {
-                    Kind::Value => node
-                        .ast
-                        .functions
-                        .iter()
-                        .find(|f| f.name == name)
+                    Kind::Value => functions
+                        .get(&*name)
                         .map(|f| (&f.annotations[..], DeclarationKind::Function, f.span)),
-                    Kind::Type => node
-                        .ast
-                        .records
-                        .iter()
-                        .find(|r| r.name == name)
+                    Kind::Type => records
+                        .get(&*name)
                         .map(|r| (&r.annotations[..], DeclarationKind::Record, r.span))
                         .or_else(|| {
-                            node.ast
-                                .enums
-                                .iter()
-                                .find(|e| e.name == name)
+                            enums
+                                .get(&*name)
                                 .map(|e| (&e.annotations[..], DeclarationKind::Enum, e.span))
                         })
                         .or_else(|| {
-                            node.ast
-                                .traits
-                                .iter()
-                                .find(|t| t.name == name)
+                            traits
+                                .get(&*name)
                                 .map(|t| (&t.annotations[..], DeclarationKind::Trait, t.span))
                         }),
                     _ => None,
@@ -426,7 +398,7 @@ impl Resolver {
                             .with_related(previous, "first declaration"),
                     );
                 }
-                if let Some(record) = node.ast.records.iter().find(|r| r.name == name) {
+                if let Some(record) = records.get(&*name) {
                     let expected = match semantic {
                         Some(InternalSemantic::Type(NativeType::Opaque(_))) => {
                             Some(record.type_params.len())
@@ -455,7 +427,7 @@ impl Resolver {
                         }
                     }
                 }
-                if let Some(function) = node.ast.functions.iter().find(|f| f.name == name) {
+                if let Some(function) = functions.get(&*name) {
                     if function.body_kind == FunctionBodyKind::Source
                         && (function.params.iter().any(|param| {
                             param.passing != ParameterPassing::Value
@@ -485,12 +457,11 @@ impl Resolver {
                 }
                 let id = DeclarationId(next_declaration);
                 next_declaration += 1;
-                if kind == Kind::Type && node.ast.records.iter().any(|r| r.name == name && r.opaque)
-                {
+                if kind == Kind::Type && opaque_records.contains(&*name) {
                     self.opaque.insert(id);
                 }
                 if let Some(InternalSemantic::Type(NativeType::Opaque(_))) = semantic
-                    && let Some(record) = node.ast.records.iter().find(|r| r.name == name)
+                    && let Some(record) = records.get(&*name)
                 {
                     self.opaque_arity.insert(id, record.type_params.len());
                 }
@@ -503,12 +474,7 @@ impl Resolver {
                 }
                 let target: Box<str> = format!("$module{index}${kind:?}${name}").into();
                 self.source_names.insert(target.clone(), name.clone());
-                if let Some(alias) = node
-                    .ast
-                    .type_aliases
-                    .iter()
-                    .find(|alias| alias.name == name)
-                {
+                if let Some(alias) = aliases.get(&*name) {
                     self.aliases
                         .insert(target.clone(), (index, alias.ty.clone()));
                 }
@@ -2917,6 +2883,17 @@ impl Resolver {
             .map_err(crate::module_graph::module_diagnostic)?;
         Ok(graph)
     }
+}
+/// First item for each name, matching a linear `find` over `items`.
+fn first_by_name<'a, T>(
+    items: &'a [T],
+    name: impl Fn(&'a T) -> &'a str,
+) -> HashMap<&'a str, &'a T> {
+    let mut first = HashMap::with_capacity(items.len());
+    for item in items {
+        first.entry(name(item)).or_insert(item);
+    }
+    first
 }
 pub fn link(asts: Vec<Ast>, paths: &[String], entry: usize) -> Result<ResolvedProgram> {
     link_with_policy(
