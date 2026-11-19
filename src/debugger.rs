@@ -1,5 +1,8 @@
 //! Rendering-independent source debugger with bounded execution.
-use crate::{Session, SourceFile, Status};
+use crate::{
+    SourceFile,
+    vm::{Session, Status},
+};
 use std::collections::BTreeSet;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {

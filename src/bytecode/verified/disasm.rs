@@ -580,6 +580,9 @@ impl fmt::Display for VerifiedModule {
                     Instruction::Count(op, dst, lhs, rhs) => {
                         write!(f, "r{} = count.{op:?} r{}, r{}", dst.0, lhs.0, rhs.0)?
                     }
+                    Instruction::Random(dst, bound) => {
+                        write!(f, "r{} = random r{}", dst.0, bound.0)?
+                    }
                     Instruction::NativeCallableConst(dst, declaration) => {
                         write!(f, "r{} = native.callable #{declaration}", dst.0)?
                     }

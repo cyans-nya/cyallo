@@ -60,6 +60,7 @@ fn image(
     instructions: &[Instruction],
 ) -> FunctionImage {
     FunctionImage {
+        locals: Box::new([]),
         frozen: Box::new([]),
         contracts: Box::new([]),
         generator: None,

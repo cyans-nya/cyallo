@@ -566,22 +566,23 @@ fn main() -> color_eyre::Result<()> {
             }
         }
         Command::Debug { .. } => {
-            let session = match Session::with_context(program.clone(), runtime.context()) {
-                Ok(session) => session,
-                Err(d) => {
-                    eprintln!(
-                        "{}",
-                        cyallo::diagnostics::render_program(
-                            &source_name,
-                            &program,
-                            &d,
-                            diagnostic_color,
-                            options.dialect,
-                        )
-                    );
-                    std::process::exit(1);
-                }
-            };
+            let session =
+                match cyallo::vm::Session::with_context(program.clone(), runtime.context()) {
+                    Ok(session) => session,
+                    Err(d) => {
+                        eprintln!(
+                            "{}",
+                            cyallo::diagnostics::render_program(
+                                &source_name,
+                                &program,
+                                &d,
+                                diagnostic_color,
+                                options.dialect,
+                            )
+                        );
+                        std::process::exit(1);
+                    }
+                };
             tui(Debugger::new(session))?;
         }
         _ => unreachable!("non-file commands handled above"),
@@ -1350,7 +1351,7 @@ mod tests {
     #[test]
     fn debugger_renders_source_and_variables() {
         let p = Arc::new(cyallo::compile("let mut x = 0\nx = 1\nstd::io::print(x)\n").unwrap());
-        let d = Debugger::new(Session::new(p).unwrap());
+        let d = Debugger::new(cyallo::vm::Session::new(p).unwrap());
         let mut t = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
         t.draw(|f| draw(f, &d, "", 1)).unwrap();
         let b = t.backend().buffer();

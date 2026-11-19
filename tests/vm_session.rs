@@ -100,7 +100,7 @@ fn restart_runs_the_program_again() {
     s.restart().unwrap();
     assert_eq!(*s.status(), Status::Paused);
     finish(&mut s);
-    assert_eq!(s.context.output, "7\n7\n");
+    assert_eq!(s.context.output, "7\n");
 }
 
 #[test]
@@ -116,4 +116,70 @@ fn the_context_configures_frames_and_collection() {
     .unwrap();
     finish(&mut s);
     assert!(matches!(s.status(), Status::Failed(_)));
+}
+
+#[test]
+fn a_debugger_sees_the_stack_the_variables_of_a_frame_and_the_globals() {
+    let source = "let factor = 2\nproc show(x: i64) {\n    let doubled = x * factor\n    std::io::print(doubled)\n}\nshow(5)\n";
+    let mut s = session(source);
+    let mut seen = false;
+    let mut parameter = None;
+    for _ in 0..200 {
+        if s.depth() == 2 && parameter.is_none() {
+            parameter = Some(s.variables());
+        }
+        if s.depth() == 2
+            && s.variables()
+                .iter()
+                .any(|(name, value)| name == "doubled" && value == "10")
+        {
+            seen = true;
+            break;
+        }
+        if !s.step() {
+            break;
+        }
+    }
+    assert!(seen, "{:?}", s.variables());
+    // A variable is shown while it holds a value: the parameter on entry.
+    assert!(parameter.unwrap().contains(&("x".into(), "5".into())));
+    assert!(
+        s.variables()
+            .contains(&("global::factor".into(), "2".into()))
+    );
+    assert_eq!(s.stack().len(), 2);
+    assert!(s.stack()[1].contains("show"), "{:?}", s.stack());
+    assert!(s.globals().contains(&("factor".into(), "2".into())));
+}
+
+#[test]
+fn statements_without_code_are_stops_of_their_own() {
+    let mut s = session(
+        "DECLARE x : INTEGER\nx <- 3\n"
+            .replace(
+                "DECLARE x : INTEGER\nx <- 3\n",
+                "let x = 3\nstd::io::print(x)\n",
+            )
+            .as_str(),
+    );
+    assert!(s.at_statement());
+    let first = s.current_span().unwrap();
+    while s.step() && s.current_span() == Some(first) {}
+    assert_ne!(s.current_span(), Some(first));
+}
+
+#[test]
+fn random_numbers_follow_the_seed_and_a_restart_repeats_them() {
+    let source = "std::io::print(std::random::uniform(100))\n";
+    let first = {
+        let mut s = session(source);
+        finish(&mut s);
+        s.context.output.clone()
+    };
+    let mut s = session(source);
+    finish(&mut s);
+    assert_eq!(s.context.output, first);
+    s.restart().unwrap();
+    finish(&mut s);
+    assert_eq!(s.context.output, first);
 }

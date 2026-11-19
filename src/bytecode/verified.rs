@@ -33,12 +33,12 @@ pub use run::{
 };
 pub use sdk::SdkCompileError;
 
-/// Version 34 adds native callables in erased values. Version 33 adds service contexts. Version 32 adds owned erased values, constant aggregates and count arithmetic. Version 31 adds run-time module loading. Version 30 adds by-value trait receivers. Version 29 adds open objects and erased values. Version 28 adds tasks and clocks. Version 27 adds channels. Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
+/// Version 35 adds debug locals and pseudo-random numbers. Version 34 adds native callables in erased values. Version 33 adds service contexts. Version 32 adds owned erased values, constant aggregates and count arithmetic. Version 31 adds run-time module loading. Version 30 adds by-value trait receivers. Version 29 adds open objects and erased values. Version 28 adds tasks and clocks. Version 27 adds channels. Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
 /// Version 13 adds closures: construction and indirect calls. Version 12 adds strings and fixed-size arrays. Version 11 adds integer real division. Version 10 adds binary64 values, unary operators and numeric conversion.
 /// Version 9 adds composite registers: tuples and enums. Version 8 added
 /// output call targets and the loop step check. Version 7
 /// carried scalar loans and borrowed call parameters.
-pub const FORMAT_VERSION: u32 = 34;
+pub const FORMAT_VERSION: u32 = 35;
 
 macro_rules! index {
     ($name:ident) => {
@@ -180,6 +180,22 @@ pub struct Implementation {
 pub struct Contract {
     pub required: bool,
     pub fields: Box<[(Arc<str>, ValueType)]>,
+}
+
+/// Where a source variable lives while its routine runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugPlace {
+    /// A register of the frame, readable while the register is initialized.
+    Register(Register),
+    /// A module-level variable.
+    Module(GlobalId),
+}
+
+/// A named source variable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugLocal {
+    pub name: Arc<str>,
+    pub place: DebugPlace,
 }
 
 /// A constant value known when the routine is lowered: scalars, strings and
@@ -883,6 +899,8 @@ pub enum Instruction {
     /// Withdraw the registration or dispose the context, running the cleanup
     /// of everything that depended on it.
     ServiceDispose(Register),
+    /// A pseudo-random real in `[0, bound)`, from the activation's seed.
+    Random(Register, Register),
     /// A constant aggregate.
     FrozenValue(Register, FrozenId),
     /// Arithmetic and comparison on counts, checked like integer arithmetic.
@@ -1148,6 +1166,7 @@ impl Instruction {
             ServiceOnDispose(ctx, callback) => ([Some(ctx), Some(callback)], &[], None),
             ServiceDispose(target) => ([Some(target), None], &[], None),
             FrozenValue(dst, _) => ([None, None], &[], Some(dst)),
+            Random(dst, bound) => ([Some(bound), None], &[], Some(dst)),
             Count(_, dst, lhs, rhs) => ([Some(lhs), Some(rhs)], &[], Some(dst)),
             AnyErase(dst, source) | AnyChecked(dst, source) => {
                 ([Some(source), None], &[], Some(dst))
@@ -1324,6 +1343,8 @@ impl StorageState {
 /// instruction number, independent of variable-width word offsets.
 #[derive(Debug, Clone)]
 pub struct FunctionImage {
+    /// The source variables of the routine and where each lives, for debuggers.
+    pub locals: Box<[DebugLocal]>,
     /// Constant aggregates, built whole.
     pub frozen: Box<[Frozen]>,
     /// Property sets that objects are made with and viewed through.
@@ -1364,6 +1385,7 @@ pub struct ModuleImage {
 /// Read-only input for execution and future backend preparation.
 #[derive(Debug)]
 pub struct VerifiedFunction {
+    locals: Box<[DebugLocal]>,
     frozen: Box<[Frozen]>,
     contracts: Box<[Contract]>,
     generator: Option<SignatureId>,
@@ -1395,6 +1417,32 @@ struct StorageEntry {
 }
 
 impl VerifiedFunction {
+    /// The source variables of the routine.
+    pub fn debug_locals(&self) -> &[DebugLocal] {
+        &self.locals
+    }
+
+    /// The registers that hold a value just before this instruction runs.
+    pub fn initialized_at(&self, instruction: InstructionId) -> Vec<Register> {
+        let pc = instruction.index();
+        let Some(entry) = self.storage_entry(pc) else {
+            return Vec::new();
+        };
+        let mut state = vec![StorageState::Dead; self.registers.len()];
+        for &(index, value) in &entry.live {
+            state[index] = value;
+        }
+        for index in entry.start..pc {
+            self.update_storage(self.instructions[index], &mut state);
+        }
+        state
+            .iter()
+            .enumerate()
+            .filter(|(_, state)| **state == StorageState::Initialized)
+            .filter_map(|(index, _)| u32::try_from(index).ok().map(Register))
+            .collect()
+    }
+
     pub fn registers(&self) -> &[RegisterType] {
         &self.registers
     }
@@ -2273,6 +2321,14 @@ impl VerifiedModule {
         Ok(module)
     }
 
+    /// The checked routine a verified routine was lowered from.
+    pub fn routine_of(&self, function: FunctionId) -> Option<usize> {
+        self.routine_ids
+            .iter()
+            .find(|&(_, &lowered)| lowered == function)
+            .map(|(&routine, _)| routine)
+    }
+
     /// The verified routine a checked routine was lowered to.
     pub(crate) fn lowered(&self, routine: usize) -> Option<FunctionId> {
         self.routine_ids.get(&routine).copied()
@@ -2562,6 +2618,7 @@ impl ModuleImage {
                 managed: managed.clone(),
                 traits: traits.clone(),
                 implementations: implementations.clone(),
+                locals: image.locals,
                 frozen: image.frozen,
                 contracts: image.contracts,
                 generator: image.generator,
@@ -3603,6 +3660,15 @@ impl VerifiedFunction {
                 ValueType::Context | ValueType::Registration => Ok(()),
                 _ => Err(InvalidBytecode::ExpectedHandle(target)),
             },
+            Instruction::Random(dst, bound) => {
+                if !matches!(
+                    self.register_type(bound)?,
+                    ScalarType::I64 | ScalarType::F64
+                ) {
+                    return Err(InvalidBytecode::ExpectedScalar(bound));
+                }
+                self.require_type(dst, ScalarType::F64)
+            }
             Instruction::Count(op, dst, lhs, rhs) => {
                 self.require_type(lhs, ScalarType::U64)?;
                 self.require_type(rhs, ScalarType::U64)?;

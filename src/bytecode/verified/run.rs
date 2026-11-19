@@ -1,9 +1,9 @@
 use super::{
-    BooleanOp, CallSite, CallTarget, Contract, DynamicOp, Extremum, FloatOp, FrameLayout, Frozen,
-    FunctionId, GlobalId, HostBindingId, HostFailure, InputKind, Instruction, InstructionId,
-    IntegerOp, OutputPiece, OutputTemplate, Register, RegisterType, Scalar, ScalarType,
-    StatementArrival, StatementBoundary, TextFailure, TextMapOp, TextOp, TextStyle, TextTestOp,
-    ValueType, VerifiedFunction, VerifiedModule, array_len,
+    BooleanOp, CallSite, CallTarget, Contract, DebugPlace, DynamicOp, Extremum, FloatOp,
+    FrameLayout, Frozen, FunctionId, GlobalId, HostBindingId, HostFailure, InputKind, Instruction,
+    InstructionId, IntegerOp, OutputPiece, OutputTemplate, Register, RegisterType, Scalar,
+    ScalarType, StatementArrival, StatementBoundary, TextFailure, TextMapOp, TextOp, TextStyle,
+    TextTestOp, ValueType, VerifiedFunction, VerifiedModule, array_len,
 };
 use crate::{
     Span,
@@ -130,6 +130,12 @@ pub enum RunError {
         span: Span,
         fault: GeneratorFault,
     },
+    /// `random` was asked for a bound that is not a positive finite number.
+    RandomBound {
+        function: FunctionId,
+        instruction: InstructionId,
+        span: Span,
+    },
     /// A service operation failed.
     Service {
         function: FunctionId,
@@ -242,7 +248,8 @@ impl RunError {
     /// The source span of the failing instruction, when the failure has one.
     pub fn span(&self) -> Option<Span> {
         match self {
-            Self::IntegerOverflow { span, .. }
+            Self::RandomBound { span, .. }
+            | Self::IntegerOverflow { span, .. }
             | Self::DivisionByZero { span, .. }
             | Self::ZeroStep { span, .. }
             | Self::Deadlock { span, .. }
@@ -305,6 +312,7 @@ impl fmt::Display for RunError {
                 "division by zero in function {} at instruction {}",
                 function.0, instruction.0
             ),
+            Self::RandomBound { .. } => f.write_str("random bound must be a positive number"),
             Self::Service { fault, .. } => f.write_str(match fault {
                 ServiceFault::InactiveContext => "the service context was disposed",
                 ServiceFault::NotInjected => "the context has no provider for the service",
@@ -1018,6 +1026,8 @@ struct Memory {
     waiting: Option<usize>,
     /// When the running task's sleep ends.
     sleeping_until: Option<Instant>,
+    /// The state of the pseudo-random generator.
+    random_seed: u64,
     /// The namespace object of each module loaded so far, by load key.
     namespaces: HashMap<usize, FrameValue>,
     /// The adapter routine of each native function and argument types called
@@ -1145,6 +1155,7 @@ impl Memory {
             current_task: 0,
             waiting: None,
             sleeping_until: None,
+            random_seed: 0x9e37_79b9_7f4a_7c15,
             namespaces: HashMap::new(),
             adapters: HashMap::new(),
             initialized: HashSet::new(),
@@ -3800,6 +3811,31 @@ impl VerifiedModule {
                 };
                 frame.set(layout, dst, result);
             }
+            Instruction::Random(dst, bound) => {
+                let bound = match frame.get(layout, bound) {
+                    Scalar::I64(value) => value as f64,
+                    Scalar::F64(bits) => f64::from_bits(bits),
+                    _ => unreachable!("verified number operand"),
+                };
+                if !bound.is_finite() || bound <= 0.0 {
+                    return Err(RunError::RandomBound {
+                        function,
+                        instruction: from,
+                        span: body.spans[pc],
+                    });
+                }
+                memory.random_seed = memory
+                    .random_seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let value = (memory.random_seed >> 11) as f64 / 9_007_199_254_740_992.0 * bound;
+                let value = if value < bound {
+                    value
+                } else {
+                    f64::from_bits(bound.to_bits() - 1)
+                };
+                frame.set(layout, dst, Scalar::F64(value.to_bits()));
+            }
             Instruction::NativeCallableConst(dst, declaration) => {
                 frame.set_value(layout, dst, FrameValue::NativeCallable(declaration));
             }
@@ -5204,6 +5240,65 @@ fn scalar_index(scalar: Scalar) -> i64 {
     }
 }
 
+/// A value as a debugger shows it. Handles show what they point at, a few
+/// levels deep, and long sequences are cut.
+fn render_value(value: &FrameValue, memory: &Memory, depth: usize) -> String {
+    const LIMIT: usize = 32;
+    let again = |value: &FrameValue| render_value(value, memory, depth + 1);
+    let list = |items: &mut dyn Iterator<Item = String>, total: usize| {
+        let mut shown: Vec<String> = items.take(LIMIT).collect();
+        if total > LIMIT {
+            shown.push("…".into());
+        }
+        shown.join(", ")
+    };
+    match value {
+        FrameValue::Scalar(Scalar::I64(value)) => value.to_string(),
+        FrameValue::Scalar(Scalar::U64(value)) => value.to_string(),
+        FrameValue::Scalar(Scalar::F64(bits)) => f64::from_bits(*bits).to_string(),
+        FrameValue::Scalar(Scalar::Bool(value)) => value.to_string(),
+        FrameValue::Text(text) => text.to_string(),
+        FrameValue::Composite(Composite::Tuple(fields)) => {
+            format!("({})", list(&mut fields.iter().map(again), fields.len()))
+        }
+        FrameValue::Composite(Composite::Enum { variant, payload }) => match payload {
+            Some(payload) => format!("#{variant}({})", again(payload)),
+            None => format!("#{variant}"),
+        },
+        FrameValue::Composite(Composite::Array(items)) => format!(
+            "[{}]",
+            list(
+                &mut items
+                    .iter()
+                    .map(|item| item.as_ref().map_or("?".to_owned(), again)),
+                items.len()
+            )
+        ),
+        FrameValue::Composite(Composite::Vec(items)) => {
+            format!("[{}]", list(&mut items.iter().map(again), items.len()))
+        }
+        FrameValue::Composite(Composite::Cell(inner)) => format!("cell({})", again(inner)),
+        FrameValue::Handle(object) if depth < 4 => match memory.heap.slots.get(*object) {
+            Some(Some(pointee)) => format!("gc({})", again(pointee)),
+            _ => "gc(?)".to_owned(),
+        },
+        FrameValue::Handle(_) => "gc(…)".to_owned(),
+        FrameValue::Rc(block) if depth < 4 => match memory.counted.get(*block) {
+            Some(Some(counted)) => match &counted.payload {
+                Some(payload) => format!("rc({})", again(payload)),
+                None => "rc(released)".to_owned(),
+            },
+            _ => "rc(?)".to_owned(),
+        },
+        FrameValue::Rc(_) => "rc(…)".to_owned(),
+        FrameValue::Dynamic(erased) | FrameValue::Any(erased) => again(&erased.1),
+        FrameValue::Closure(_) => "<function>".to_owned(),
+        FrameValue::OpenObject(_) => "<object>".to_owned(),
+        FrameValue::Moved => "<moved>".to_owned(),
+        _ => "<value>".to_owned(),
+    }
+}
+
 /// The unit value: a tuple without fields.
 fn unit() -> FrameValue {
     FrameValue::Composite(Composite::Tuple(Box::new([])))
@@ -5354,6 +5449,11 @@ impl Activation {
         }
     }
 
+    /// The state the pseudo-random generator starts from.
+    pub fn set_random_seed(&mut self, seed: u64) {
+        self.memory.random_seed = seed;
+    }
+
     /// Stop waiting for input: an input instruction that finds no line fails
     /// with the end of input.
     pub fn end_input(&mut self) {
@@ -5376,6 +5476,88 @@ impl Activation {
     }
 
     /// Instructions started across all slices, including a failing instruction.
+    /// The routines of the running task's frames, outermost first.
+    pub fn call_stack(&self) -> Vec<FunctionId> {
+        match &self.state {
+            ExecutionState::Active(stack) => stack.iter().map(|frame| frame.function).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The source variables of the innermost frame that hold a value now, with
+    /// the module variables when that frame is not the entry's.
+    pub fn frame_variables(&self) -> Vec<(String, String)> {
+        let ExecutionState::Active(stack) = &self.state else {
+            return Vec::new();
+        };
+        let Some(frame) = stack.last() else {
+            return Vec::new();
+        };
+        let body = &self.module.functions[frame.function.index()];
+        let layout = body.frame_layout();
+        let live = body.initialized_at(instruction_id(frame.pc));
+        let mut variables: Vec<(String, String)> = body
+            .debug_locals()
+            .iter()
+            .map(|local| {
+                // A variable with no value yet, or none any more, shows as such.
+                let value = match local.place {
+                    DebugPlace::Register(register) if live.contains(&register) => {
+                        frame.slots[slot(layout, register)].as_ref()
+                    }
+                    DebugPlace::Module(global) => self.memory.globals[global.index()].as_ref(),
+                    DebugPlace::Register(_) => None,
+                };
+                let shown = value.map_or_else(
+                    || "uninitialized".to_owned(),
+                    |value| render_value(value, &self.memory, 0),
+                );
+                (local.name.to_string(), shown)
+            })
+            .collect();
+        if frame.function != self.module.entry {
+            variables.extend(
+                self.module_variables()
+                    .into_iter()
+                    .map(|(name, value)| (format!("global::{name}"), value)),
+            );
+        }
+        variables
+    }
+
+    /// The variables of the entry routine that hold a value, by their source
+    /// names: the module-level ones, and the ones its frame keeps in registers
+    /// while it is still running.
+    pub fn module_variables(&self) -> Vec<(String, String)> {
+        let entry = &self.module.functions[self.module.entry.index()];
+        let frame = match &self.state {
+            ExecutionState::Active(stack) => {
+                stack.first().filter(|f| f.function == self.module.entry)
+            }
+            _ => None,
+        };
+        let live = frame.map(|frame| entry.initialized_at(instruction_id(frame.pc)));
+        entry
+            .debug_locals()
+            .iter()
+            .filter_map(|local| {
+                let value = match local.place {
+                    DebugPlace::Module(global) => {
+                        self.memory.globals.get(global.index())?.as_ref()?
+                    }
+                    DebugPlace::Register(register) => {
+                        let (frame, live) = (frame?, live.as_ref()?);
+                        if !live.contains(&register) {
+                            return None;
+                        }
+                        frame.slots[slot(entry.frame_layout(), register)].as_ref()?
+                    }
+                };
+                Some((local.name.to_string(), render_value(value, &self.memory, 0)))
+            })
+            .collect()
+    }
+
     /// Frames on the running task's stack.
     pub fn depth(&self) -> usize {
         match &self.state {

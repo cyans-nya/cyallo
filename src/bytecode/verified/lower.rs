@@ -1,10 +1,10 @@
 use super::{
-    BooleanOp, CallSite, CallSiteId, CallTarget, ChannelVariants, Contract, ContractId, DynamicOp,
-    Extremum, FORMAT_VERSION, FloatOp, Frozen, FrozenId, FunctionId, FunctionImage, HostBindingId,
-    Implementation, ImplementationId, InputKind, Instruction, InstructionId, IntegerOp, LoanAccess,
-    ModuleImage, OperandListId, OutputId, OutputPiece, OutputTemplate, Register, RegisterType,
-    Scalar, ScalarHostBinding, ScalarType, TextId, TextMapOp, TextOp, TextTestOp, TraitId,
-    ValueType, VerifiedModule, VerifyError,
+    BooleanOp, CallSite, CallSiteId, CallTarget, ChannelVariants, Contract, ContractId, DebugLocal,
+    DebugPlace, DynamicOp, Extremum, FORMAT_VERSION, FloatOp, Frozen, FrozenId, FunctionId,
+    FunctionImage, GlobalId, HostBindingId, Implementation, ImplementationId, InputKind,
+    Instruction, InstructionId, IntegerOp, LoanAccess, ModuleImage, OperandListId, OutputId,
+    OutputPiece, OutputTemplate, Register, RegisterType, Scalar, ScalarHostBinding, ScalarType,
+    TextId, TextMapOp, TextOp, TextTestOp, TraitId, ValueType, VerifiedModule, VerifyError,
     cfg::{self, Block, Exit, Located, Statement},
     encode, layout, lifetimes,
     loans::Places,
@@ -1089,6 +1089,26 @@ fn lower_function(
         blocks.push(lowered);
     }
     release_owned_at_returns(&mut blocks, &parameters, &places, &context, &sites);
+    let debug_locals: Box<[DebugLocal]> = function
+        .locals
+        .iter()
+        .enumerate()
+        .filter_map(|(position, local)| {
+            let name = local.display_name.as_ref()?;
+            let register = *places.locals.get(position)?;
+            let place = match places.registers.get(register.index()) {
+                Some(RegisterType::Unused) if globals.pointee(position).is_some() => {
+                    DebugPlace::Module(GlobalId(u32::try_from(position).ok()?))
+                }
+                Some(RegisterType::Unused) | None => return None,
+                Some(_) => DebugPlace::Register(register),
+            };
+            Some(DebugLocal {
+                name: Arc::from(&**name),
+                place,
+            })
+        })
+        .collect();
     let registers = places.registers.into_boxed_slice();
     let prologue = lifetimes::insert(
         &mut blocks,
@@ -1099,6 +1119,7 @@ fn lower_function(
     );
     let body = layout::assign(prologue, blocks, routine)?;
     Ok(FunctionImage {
+        locals: debug_locals,
         frozen: sites.frozen.into_boxed_slice(),
         contracts: sites.contracts.into_boxed_slice(),
         generator,
@@ -1556,6 +1577,9 @@ fn lower_operation(
                 (S::Dispose, 1) => Instruction::ServiceDispose(arg(0)?),
                 _ => return Err(unsupported()),
             }
+        }
+        Op::Builtin(dst, Intrinsic::Random, args) if args.len() == 1 => {
+            Instruction::Random(register(*dst)?, register(args[0])?)
         }
         Op::Lookup(dst, Operation::NativeCallable(declaration), args) if args.is_empty() => {
             Instruction::NativeCallableConst(register(*dst)?, declaration.0)

@@ -132,6 +132,7 @@ mod images {
     /// `f1(self: &i64) -> i64`.
     fn reader(access: LoanAccess, result: Option<ValueType>) -> FunctionImage {
         FunctionImage {
+            locals: Box::new([]),
             frozen: Box::new([]),
             contracts: Box::new([]),
             generator: None,
@@ -154,6 +155,7 @@ mod images {
 
     fn entry(call: Vec<CallSite>, code: Vec<Instruction>) -> FunctionImage {
         FunctionImage {
+            locals: Box::new([]),
             frozen: Box::new([]),
             contracts: Box::new([]),
             generator: None,

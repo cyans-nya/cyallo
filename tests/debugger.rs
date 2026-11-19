@@ -1,6 +1,7 @@
 use cyallo::{
-    CompileOptions, Dialect, Session, Status, compile_with_options,
+    CompileOptions, Dialect, compile_with_options,
     debugger::{Debugger, Mode},
+    vm::{Session, Status},
 };
 use std::sync::Arc;
 fn debugger(source: &str) -> Debugger {

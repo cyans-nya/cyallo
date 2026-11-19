@@ -219,6 +219,7 @@ opcodes! {
     AnyChecked = 187, 3;
     FrozenValue = 188, 3;
     NativeCallableConst = 210, 3;
+    Random = 211, 3;
     ServiceContext = 200, 2;
     ServiceExtend = 201, 3;
     ServiceIsolate = 202, 4;
@@ -567,6 +568,7 @@ pub fn encode(instructions: impl IntoIterator<Item = Instruction>) -> Box<[u32]>
             }
             Instruction::ObjectFreeze(object) => (Opcode::ObjectFreeze, [object.0, 0, 0], 1),
             Instruction::Count(op, dst, lhs, rhs) => (count_opcode(op), [dst.0, lhs.0, rhs.0], 3),
+            Instruction::Random(dst, bound) => (Opcode::Random, [dst.0, bound.0, 0], 2),
             Instruction::NativeCallableConst(dst, declaration) => {
                 (Opcode::NativeCallableConst, [dst.0, declaration, 0], 2)
             }
@@ -864,6 +866,7 @@ pub(super) fn decode(words: &[u32]) -> Result<Box<[Instruction]>, InvalidBytecod
             Opcode::CountNotEqual => {
                 Instruction::Count(IntegerOp::NotEqual, reg(0), reg(1), reg(2))
             }
+            Opcode::Random => Instruction::Random(reg(0), reg(1)),
             Opcode::NativeCallableConst => Instruction::NativeCallableConst(reg(0), values[1]),
             Opcode::ServiceContext => Instruction::ServiceContext(reg(0)),
             Opcode::ServiceExtend => Instruction::ServiceExtend(reg(0), reg(1)),

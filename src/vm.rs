@@ -33,6 +33,10 @@ pub struct Session {
     status: Status,
     written: Arc<Mutex<String>>,
     queued: Arc<Mutex<VecDeque<String>>>,
+    /// Which of the statements that begin at the next instruction a debugger
+    /// is stopped at: statements without code share an instruction with the
+    /// next one that has code, and each is a stop of its own.
+    cursor: usize,
 }
 
 impl Session {
@@ -54,6 +58,7 @@ impl Session {
             status: Status::Paused,
             written,
             queued,
+            cursor: 0,
         })
     }
 
@@ -71,6 +76,7 @@ impl Session {
             .start(&[], limits)
             .map_err(|error| Diagnostic::new("R900", error.to_string(), Span::default()))?;
         activation.set_gc_stress(context.gc.stress);
+        activation.set_random_seed(context.random_seed);
         let written = written.clone();
         activation.set_output(OutputSink::new(move |line| {
             let mut text = written.lock().unwrap();
@@ -106,7 +112,12 @@ impl Session {
     pub fn current_span(&self) -> Option<Span> {
         match (&self.status, self.activation.status()) {
             (Status::Failed(failure), _) => Some(failure.span),
-            (_, ExecutionStatus::Paused(position)) => Some(position.span),
+            (_, ExecutionStatus::Paused(position)) => Some(
+                self.activation
+                    .statement_boundaries()
+                    .nth(self.cursor)
+                    .map_or(position.span, |statement| statement.span),
+            ),
             _ => None,
         }
     }
@@ -123,6 +134,7 @@ impl Session {
                 queue.push_back(line);
             }
         }
+        self.cursor = 0;
         let outcome = self.activation.resume(budget);
         self.context
             .output
@@ -150,15 +162,59 @@ impl Session {
         }
     }
 
+    /// Whether the next instruction begins a source statement.
+    pub fn at_statement(&self) -> bool {
+        self.activation
+            .statement_boundaries()
+            .nth(self.cursor)
+            .is_some()
+    }
+
+    /// The names of the routines on the stack, outermost first.
+    pub fn stack(&self) -> Vec<String> {
+        self.activation
+            .call_stack()
+            .into_iter()
+            .map(|function| {
+                self.module
+                    .routine_of(function)
+                    .and_then(|routine| self.program.functions().get(routine))
+                    .map_or_else(|| "?".to_owned(), |routine| routine.name.to_string())
+            })
+            .collect()
+    }
+
+    /// The source variables of the innermost frame, with their values.
+    pub fn variables(&self) -> Vec<(String, String)> {
+        self.activation.frame_variables()
+    }
+
+    /// The module-level variables, which outlive the entry routine's frame.
+    pub fn globals(&self) -> Vec<(String, String)> {
+        self.activation.module_variables()
+    }
+
     /// Run one instruction. `true` while the program can go on.
     pub fn step(&mut self) -> bool {
+        // Passing a statement that has no code of its own runs nothing.
+        if self
+            .activation
+            .statement_boundaries()
+            .nth(self.cursor + 1)
+            .is_some()
+        {
+            self.cursor += 1;
+            return true;
+        }
         matches!(self.run(1), Status::Paused)
     }
 
     /// Start again from the entry routine; queued input and output are kept.
     pub fn restart(&mut self) -> Result<(), Diagnostic> {
         self.activation = Self::start(&self.module, &self.context, &self.written, &self.queued)?;
+        self.context.output.clear();
         self.status = Status::Paused;
+        self.cursor = 0;
         Ok(())
     }
 }
@@ -174,6 +230,7 @@ fn translate(error: RunError) -> RuntimeError {
             RuntimeError::Arithmetic(ArithmeticError::DivisionByZero)
         }
         RunError::ZeroStep { .. } => RuntimeError::Arithmetic(ArithmeticError::ZeroStep),
+        RunError::RandomBound { .. } => RuntimeError::Arithmetic(ArithmeticError::RandomBound),
         RunError::InputExhausted { .. } => RuntimeError::Input(InputError::EndOfInput),
         RunError::FrameLimit => RuntimeError::Limit(ResourceLimit::CallDepth),
         RunError::Generator { fault, .. } => RuntimeError::Generator(match fault {

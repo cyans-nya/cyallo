@@ -479,6 +479,7 @@ fn legalize(
         | Instruction::Erase(..)
         | Instruction::FrozenValue(..)
         | Instruction::NativeCallableConst(..)
+        | Instruction::Random(..)
         | Instruction::ServiceContext(..)
         | Instruction::ServiceExtend(..)
         | Instruction::ServiceIsolate(..)

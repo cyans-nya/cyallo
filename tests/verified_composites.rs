@@ -165,6 +165,7 @@ mod images {
             traits: Box::new([]),
             implementations: Box::new([]),
             functions: Box::new([FunctionImage {
+                locals: Box::new([]),
                 frozen: Box::new([]),
                 contracts: Box::new([]),
                 generator: None,

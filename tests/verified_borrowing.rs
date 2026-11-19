@@ -123,6 +123,7 @@ mod images {
         code: Vec<Instruction>,
     ) -> FunctionImage {
         FunctionImage {
+            locals: Box::new([]),
             frozen: Box::new([]),
             contracts: Box::new([]),
             generator: None,
