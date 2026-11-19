@@ -266,6 +266,8 @@ impl<'a> CorePackage<'a> {
     /// Parses only this trusted provider's sources, shifting ASTs and parse
     /// diagnostics into the layout produced by append_to at `base`.
     pub fn parse(&self, base: u32) -> Result<ParsedCore, Diagnostic> {
+        let _core_parse =
+            cyallo_startup_profile::stage(cyallo_startup_profile::Stage::CorePackageParse);
         let layout = self.layout(base).map_err(invalid_core_source)?;
         let mut asts = Vec::with_capacity(self.sources.len());
         let mut paths = Vec::with_capacity(self.sources.len());

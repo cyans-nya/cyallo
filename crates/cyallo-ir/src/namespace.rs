@@ -2949,6 +2949,7 @@ pub fn link_with_core(
     package: &crate::core_package::CorePackage<'_>,
     core_offset: u32,
 ) -> Result<ResolvedProgram> {
+    let _resolve = cyallo_startup_profile::stage(cyallo_startup_profile::Stage::Resolve);
     let mut files: Vec<_> = asts.into_iter().map(Some).collect();
     let root = files[entry]
         .take()

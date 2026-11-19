@@ -2,6 +2,7 @@
 use super::*;
 use cyallo_ast::indexed::{FunctionNode, Id, IndexedAst, index_diagnostic};
 use cyallo_compile_jobs::Jobs;
+use cyallo_startup_profile::{Counter, Stage, count, stage};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -28,7 +29,9 @@ impl<'src> IndexedSource<'src> {
             .units
             .get(index)
             .ok_or_else(|| Diagnostic::new("E002", "invalid parse unit", Span::default()))?;
-        Parser {
+        let _parse = stage(Stage::Parse);
+        count(Counter::ParseUnits, 1);
+        let tree = Parser {
             tokens: self.tokens.fragment(unit.tokens.clone()),
             pos: 0,
             expression_statements: repl,
@@ -36,13 +39,17 @@ impl<'src> IndexedSource<'src> {
             depth: 0,
             condition: false,
         }
-        .program()
+        .program()?;
+        count(Counter::BodiesParsed, tree.functions.len());
+        Ok(tree)
     }
     pub fn parse(&self, repl: bool, jobs: Jobs) -> Result<Ast, Diagnostic> {
         self.assemble(self.parse_units(repl, jobs))
     }
     fn freeze_unit(&self, index: usize, repl: bool) -> Result<IndexedAst, Diagnostic> {
         let tree = self.parse_unit(index, repl)?;
+        let _freeze = stage(Stage::Freeze);
+        count(Counter::BodiesFrozen, tree.functions.len());
         IndexedAst::from_source_tree(tree)
             .map_err(|error| index_diagnostic(error, self.units[index].span))
     }
@@ -87,7 +94,11 @@ fn append_unit(out: &mut Ast, mut unit: Ast) {
         .append(&mut unit.inherent_implementations);
 }
 pub fn index_modern(source: &str) -> Result<IndexedSource<'_>, Diagnostic> {
+    let _lex = stage(Stage::Lex);
     let tokens = lex_modern(source)?;
+    count(Counter::Files, 1);
+    count(Counter::SourceBytes, source.len());
+    count(Counter::Tokens, tokens.len());
     let whole = || {
         vec![ParseUnit {
             tokens: 0..tokens.len() - 1,
@@ -324,6 +335,7 @@ fn publish_snapshot(
     units: Vec<ParseUnit>,
     parsed: Vec<Result<IndexedAst, Diagnostic>>,
 ) -> Result<ParsedFile, Diagnostic> {
+    let _publish = stage(Stage::Publish);
     // Lexing rejects sources larger than the u32 span range.
     let line_starts = std::iter::once(0)
         .chain(

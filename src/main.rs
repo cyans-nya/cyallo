@@ -1,7 +1,12 @@
 mod report;
 mod tracer;
+#[cfg(not(feature = "startup-profile"))]
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[cfg(feature = "startup-profile")]
+#[global_allocator]
+static ALLOCATOR: cyallo_startup_profile::Counting<mimalloc::MiMalloc> =
+    cyallo_startup_profile::Counting(mimalloc::MiMalloc);
 use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use cyallo::{
@@ -296,6 +301,7 @@ fn compile_engine(
     })
 }
 fn main() -> color_eyre::Result<()> {
+    cyallo_startup_profile::init();
     color_eyre::install()?;
     let cli = Cli::parse();
     let stderr_tty = io::stderr().is_terminal();
@@ -680,6 +686,9 @@ fn run(
             written = session.context.output.len();
         }
         io::stdout().flush()?;
+        if output_pending {
+            cyallo_startup_profile::mark_first_output();
+        }
         live.refresh(output_pending, || {
             report::live_frame(&artifact, &program, &session, origin, &timings, style)
         });
@@ -735,6 +744,7 @@ fn run(
         }
     };
     live.finish();
+    cyallo_startup_profile::finish();
     let program = session.program().clone();
     finish_inspection(&artifact, &program)?;
     if runtime.jit_notices {

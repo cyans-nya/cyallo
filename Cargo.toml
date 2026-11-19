@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/cyallo-shapes", "crates/cyallo-modules", "crates/cyallo-compile-jobs", "crates/cyallo-ast", "crates/cyallo-parser", "crates/caie-int-parser", "crates/cyallo-ir", "crates/cyallo-values", "crates/cyallo-concurrent-values", "crates/cyallo-scheduler", "crates/cyallo-channel", "crates/cyallo-io", "crates/cyallo-clock", "crates/cyallo-host", "xtask"]
+members = ["crates/cyallo-shapes", "crates/cyallo-startup-profile", "crates/cyallo-modules", "crates/cyallo-compile-jobs", "crates/cyallo-ast", "crates/cyallo-parser", "crates/caie-int-parser", "crates/cyallo-ir", "crates/cyallo-values", "crates/cyallo-concurrent-values", "crates/cyallo-scheduler", "crates/cyallo-channel", "crates/cyallo-io", "crates/cyallo-clock", "crates/cyallo-host", "xtask"]
 exclude = ["vendor/winch-codegen"]
 resolver = "3"
 
@@ -13,6 +13,7 @@ cyallo-ir = { path = "crates/cyallo-ir" }
 caie-int-parser = { path = "crates/caie-int-parser" }
 cyallo-compile-jobs = { path = "crates/cyallo-compile-jobs" }
 cyallo-shapes = { path = "crates/cyallo-shapes" }
+cyallo-startup-profile = { path = "crates/cyallo-startup-profile" }
 cyallo-values = { path = "crates/cyallo-values" }
 cyallo-modules = { path = "crates/cyallo-modules" }
 cyallo-concurrent-values = { path = "crates/cyallo-concurrent-values" }
@@ -36,6 +37,8 @@ wasmtime = { version = "50.0.1", optional = true, default-features = false, feat
 
 [features]
 wasm-adapter = ["dep:wasmtime"]
+# Stage timers, counters and a counting allocator; see cyallo-startup-profile.
+startup-profile = ["cyallo-startup-profile/enabled"]
 
 [[bench]]
 name = "engines"
