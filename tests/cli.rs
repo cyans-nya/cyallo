@@ -49,7 +49,7 @@ fn bytecode_can_verify_and_show_a_selected_routine() {
     .unwrap();
     assert!(!result.status.success());
     assert!(result.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("unsupported scalar"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("unsupported frame storage"));
 }
 
 #[test]

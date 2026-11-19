@@ -3,7 +3,7 @@
 use super::{
     GlobalId, LoanAccess, LoanOrigin, Register, RegisterType, ScalarType, ValueType,
     cfg::CheckedBlock,
-    lower::{Globals, LowerError, lower_index},
+    lower::{Globals, LowerError, describe, lower_index, storage as storage_error},
     shapes::Shapes,
 };
 use crate::{
@@ -63,9 +63,11 @@ impl Places {
             .iter()
             .map(|ty| matches!(ty, Type::Borrowed(_)) && borrowing_closure(ty, shapes).is_some())
             .collect();
-        let storage_error = || LowerError::UnsupportedStorage { routine };
         if function.local_storage.len() != function.locals.len() {
-            return Err(storage_error());
+            return Err(storage_error(
+                routine,
+                "locals and their storage differ in number",
+            ));
         }
         let mut locals = Vec::with_capacity(function.locals.len());
         for (position, (local, storage)) in function
@@ -93,7 +95,10 @@ impl Places {
                             && borrowing_closure(&local.ty, shapes).is_some(),
                     );
                     if ty == RegisterType::Unused && loan.is_none() {
-                        return Err(storage_error());
+                        return Err(storage_error(
+                            routine,
+                            format!("local {position} has type {}", describe(&local.ty)),
+                        ));
                     }
                     let index = lower_index(routine, registers.len())?;
                     registers.push(ty);
@@ -119,7 +124,9 @@ impl Places {
             } else if let Op::Address(dst, slot) = *op
                 && !slot.global
             {
-                let place = *locals.get(slot.index).ok_or_else(storage_error)?;
+                let place = *locals.get(slot.index).ok_or_else(|| {
+                    storage_error(routine, format!("address of unknown local {}", slot.index))
+                })?;
                 addresses[dst] = Some(place);
                 registers[dst] = RegisterType::Unused;
                 loan_types[dst] = None;
@@ -218,7 +225,12 @@ impl Places {
         }
         for (dst, global) in global_addresses.iter().enumerate() {
             let Some(global) = *global else { continue };
-            let pointee = globals.pointee(global.index()).ok_or_else(storage_error)?;
+            let pointee = globals.pointee(global.index()).ok_or_else(|| {
+                storage_error(
+                    routine,
+                    format!("module variable {} has no verified type", global.index()),
+                )
+            })?;
             let access = if written[dst] || moved_mut[dst] {
                 LoanAccess::Exclusive
             } else {

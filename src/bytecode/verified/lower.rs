@@ -29,6 +29,8 @@ pub enum LowerError {
     },
     UnsupportedStorage {
         routine: usize,
+        /// What has no verified representation, for the person reading it.
+        detail: String,
     },
     UnsupportedRegister {
         routine: usize,
@@ -42,6 +44,8 @@ pub enum LowerError {
         routine: usize,
         instruction: usize,
         span: Span,
+        /// The checked operation that has no verified form.
+        operation: String,
     },
     IndexOverflow {
         routine: usize,
@@ -68,8 +72,11 @@ impl fmt::Display for LowerError {
             Self::UnsupportedSignature { routine } => {
                 write!(f, "unsupported scalar signature for routine {routine}")
             }
-            Self::UnsupportedStorage { routine } => {
-                write!(f, "unsupported scalar frame storage in routine {routine}")
+            Self::UnsupportedStorage { routine, detail } => {
+                write!(
+                    f,
+                    "unsupported frame storage in routine {routine}: {detail}"
+                )
             }
             Self::UnsupportedRegister { routine, register } => write!(
                 f,
@@ -82,10 +89,11 @@ impl fmt::Display for LowerError {
             Self::UnsupportedOperation {
                 routine,
                 instruction,
+                operation,
                 ..
             } => write!(
                 f,
-                "unsupported scalar operation {instruction} in routine {routine}"
+                "unsupported operation {instruction} in routine {routine}: {operation}"
             ),
             Self::IndexOverflow { routine } => {
                 write!(f, "bytecode index overflow in routine {routine}")
@@ -244,6 +252,22 @@ impl VerifiedModule {
     }
 }
 
+pub(super) fn storage(routine: usize, detail: impl Into<String>) -> LowerError {
+    LowerError::UnsupportedStorage {
+        routine,
+        detail: detail.into(),
+    }
+}
+
+/// A checked type or operation as text, short enough for a message.
+pub(super) fn describe(value: &impl fmt::Debug) -> String {
+    let text = format!("{value:?}");
+    match text.char_indices().nth(160) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text,
+    }
+}
+
 pub(super) fn lower_index(routine: usize, index: usize) -> Result<u32, LowerError> {
     u32::try_from(index).map_err(|_| LowerError::IndexOverflow { routine })
 }
@@ -321,15 +345,25 @@ impl Implementations {
             return Ok(found);
         };
         for declared in used {
-            let unsupported = LowerError::UnsupportedStorage { routine: 0 };
             let implementation = services
                 .implementations
                 .get(declared)
-                .ok_or(LowerError::UnsupportedStorage { routine: 0 })?;
-            let trait_id = shapes
-                .trait_of(implementation.trait_id)
-                .ok_or(LowerError::UnsupportedStorage { routine: 0 })?;
-            let receiver = shapes.value(&implementation.receiver).ok_or(unsupported)?;
+                .ok_or_else(|| storage(0, format!("implementation {declared} is not declared")))?;
+            let trait_id = shapes.trait_of(implementation.trait_id).ok_or_else(|| {
+                storage(
+                    0,
+                    format!("the trait of implementation {declared} has no verified form"),
+                )
+            })?;
+            let receiver = shapes.value(&implementation.receiver).ok_or_else(|| {
+                storage(
+                    0,
+                    format!(
+                        "the receiver of implementation {declared} is {}",
+                        describe(&implementation.receiver)
+                    ),
+                )
+            })?;
             let id = ImplementationId(lower_index(0, found.drafts.len())?);
             found.ids.insert(declared, id);
             found.drafts.push(ImplementationDraft {
@@ -387,10 +421,13 @@ impl Globals {
             let local = main
                 .locals
                 .get(index)
-                .ok_or(LowerError::UnsupportedStorage { routine: 0 })?;
-            globals.types[index] = shapes
-                .value(&local.ty)
-                .ok_or(LowerError::UnsupportedStorage { routine: 0 })?;
+                .ok_or_else(|| storage(0, format!("module variable {index} does not exist")))?;
+            globals.types[index] = shapes.value(&local.ty).ok_or_else(|| {
+                storage(
+                    0,
+                    format!("module variable {index} has type {}", describe(&local.ty)),
+                )
+            })?;
             globals.present[index] = true;
         }
         Ok(globals)
@@ -539,7 +576,7 @@ fn lower_function(
     let parameters: Box<[_]> = places
         .locals
         .get(..function.params.len())
-        .ok_or(LowerError::UnsupportedStorage { routine })?
+        .ok_or_else(|| storage(routine, "the routine has fewer locals than parameters"))?
         .into();
 
     let mut blocks = Vec::new();
@@ -710,6 +747,7 @@ fn lower_operation(
         routine,
         instruction,
         span,
+        operation: describe(op),
     };
     Ok(match op {
         Op::Literal(dst, Literal::Integer(value)) => {

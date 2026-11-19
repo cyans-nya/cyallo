@@ -29,6 +29,12 @@ pub(super) fn emit(
     settings
         .set("machine_code_cfg_info", "true")
         .map_err(EmitError::Configuration)?;
+    // The higher-quality allocator for both profiles; `single_pass` compiles
+    // faster but produces slower code, and the profiles already differ in
+    // optimization level.
+    settings
+        .set("regalloc_algorithm", "backtracking")
+        .map_err(EmitError::Configuration)?;
     settings
         .set(
             "opt_level",
