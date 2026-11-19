@@ -183,8 +183,11 @@ enum Command {
     },
     Run {
         file: PathBuf,
-        #[arg(long, value_enum, default_value = "jit")]
-        engine: Engine,
+        /// Engine to run on. Default: the verified interpreter, or the legacy
+        /// tiered engine when a program needs something it cannot lower or a
+        /// JIT report is asked for.
+        #[arg(long, value_enum)]
+        engine: Option<Engine>,
     },
     Debug {
         file: PathBuf,
@@ -417,7 +420,7 @@ fn main() -> color_eyre::Result<()> {
     let deferred = matches!(
         cli.command,
         Command::Run {
-            engine: Engine::Jit | Engine::Interpreter,
+            engine: None | Some(Engine::Jit | Engine::Interpreter),
             ..
         } | Command::Bytecode {
             verified: Some(_),
@@ -509,11 +512,47 @@ fn main() -> color_eyre::Result<()> {
                 Dialect::Simplified => "simplified (fixed inferred types)",
             }
         ),
-        Command::Run {
-            engine: Engine::Verified,
-            ..
-        } => run_verified(program.clone(), runtime.gc.stress)?,
         Command::Run { engine, .. } => {
+            // Reports and inspection are produced by the legacy engines.
+            let wants_legacy = runtime.jit_report
+                || runtime.jit_notices
+                || runtime.jit_no_inline
+                || runtime.inspection.is_some();
+            let try_verified = match engine {
+                Some(Engine::Verified) => Some(true),
+                None if !wants_legacy => Some(false),
+                _ => None,
+            };
+            if let Some(explicit) = try_verified {
+                match cyallo::vm::Session::with_context(program.clone(), runtime.context()) {
+                    Ok(session) => {
+                        if !run_verified(session, &source_name, diagnostic_color, options.dialect)?
+                        {
+                            std::process::exit(1);
+                        }
+                        return Ok(());
+                    }
+                    Err(d) if explicit => {
+                        eprintln!(
+                            "{}",
+                            cyallo::diagnostics::render_program(
+                                &source_name,
+                                &program,
+                                &d,
+                                diagnostic_color,
+                                options.dialect,
+                            )
+                        );
+                        std::process::exit(1);
+                    }
+                    // The default falls back for programs it cannot lower yet.
+                    Err(_) => {}
+                }
+            }
+            let engine = match engine {
+                Some(Engine::Verified) | None => Engine::Jit,
+                Some(other) => other,
+            };
             if !run(
                 program,
                 engine,
@@ -552,33 +591,52 @@ fn main() -> color_eyre::Result<()> {
 }
 /// Instructions per slice of a verified run.
 const VERIFIED_SLICE: usize = 1_000_000;
-/// Entry routine of a linked program.
-const ENTRY_ROUTINE: usize = 0;
-/// Fuel and call depth of a verified run.
-const VERIFIED_LIMITS: cyallo::bytecode::verified::ExecutionLimits =
-    cyallo::bytecode::verified::ExecutionLimits {
-        fuel: usize::MAX,
-        frames: 10_000,
-    };
-/// Run the entry routine in the verified interpreter. A program that uses an
-/// operation it cannot execute stops before running, with the reason.
+/// Run the program on the verified interpreter: output is written as it is
+/// produced, input is read from standard input when the program asks, and a
+/// failure is shown as a diagnostic with its source span.
 fn run_verified(
-    program: std::sync::Arc<cyallo::ir::Program>,
-    gc_stress: bool,
-) -> color_eyre::Result<()> {
-    use cyallo::bytecode::verified::ExecutionStatus;
-    let module = cyallo::bytecode::verified::VerifiedModule::lower_shared(program, ENTRY_ROUTINE)?;
-    let mut activation = module
-        .start(&[], VERIFIED_LIMITS)
-        .map_err(|error| color_eyre::eyre::eyre!(error))?;
-    activation.set_gc_stress(gc_stress);
+    mut session: cyallo::vm::Session,
+    source_name: &str,
+    diagnostic_color: bool,
+    dialect: cyallo::Dialect,
+) -> color_eyre::Result<bool> {
+    let mut written = 0;
+    let render = |session: &cyallo::vm::Session, diagnostic: &cyallo::Diagnostic| {
+        cyallo::diagnostics::render_program(
+            source_name,
+            session.program(),
+            diagnostic,
+            diagnostic_color,
+            dialect,
+        )
+    };
     loop {
-        match activation.resume(VERIFIED_SLICE) {
-            ExecutionStatus::Paused(_) => {}
-            ExecutionStatus::Returned(_) => return Ok(()),
-            ExecutionStatus::Failed(error) => {
-                eprintln!("{error}");
-                std::process::exit(1);
+        session.run(VERIFIED_SLICE);
+        if session.context.output.len() > written {
+            print!("{}", &session.context.output[written..]);
+            written = session.context.output.len();
+        }
+        io::stdout().flush()?;
+        match session.status() {
+            Status::Paused | Status::Waiting => {}
+            Status::WaitingForInput => {
+                let mut line = String::new();
+                if io::stdin().read_line(&mut line)? == 0 {
+                    session.end_input();
+                    continue;
+                }
+                if line.ends_with('\n') {
+                    line.pop();
+                    if line.ends_with('\r') {
+                        line.pop();
+                    }
+                }
+                session.context.input.push_back(line);
+            }
+            Status::Finished => return Ok(true),
+            Status::Failed(failure) => {
+                eprintln!("{}", render(&session, &failure.diagnostic()));
+                return Ok(false);
             }
         }
     }

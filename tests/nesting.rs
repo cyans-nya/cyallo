@@ -1,5 +1,8 @@
 //! Syntax nesting is bounded with a diagnostic, and parsing stays linear.
-use cyallo::{compile, vm::{Session, Status}};
+use cyallo::{
+    compile,
+    vm::{Session, Status},
+};
 use std::{sync::Arc, time::Instant};
 
 /// Compiler worker threads use the default 2 MiB stack.

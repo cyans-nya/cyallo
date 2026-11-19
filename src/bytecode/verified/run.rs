@@ -5354,6 +5354,12 @@ impl Activation {
         }
     }
 
+    /// Stop waiting for input: an input instruction that finds no line fails
+    /// with the end of input.
+    pub fn end_input(&mut self) {
+        self.input.waits = false;
+    }
+
     /// Whether the last slice stopped on an input instruction with no line.
     pub fn awaiting_input(&self) -> bool {
         self.awaiting_input

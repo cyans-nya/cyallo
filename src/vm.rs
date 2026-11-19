@@ -141,6 +141,15 @@ impl Session {
         &self.status
     }
 
+    /// No more input will come: a program that waits for a line fails with the
+    /// end of input instead.
+    pub fn end_input(&mut self) {
+        self.activation.end_input();
+        if self.status == Status::WaitingForInput {
+            self.status = Status::Paused;
+        }
+    }
+
     /// Run one instruction. `true` while the program can go on.
     pub fn step(&mut self) -> bool {
         matches!(self.run(1), Status::Paused)

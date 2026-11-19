@@ -785,3 +785,54 @@ fn verified_engine_refuses_unsupported_programs_before_running() {
     assert!(result.stdout.is_empty());
     assert!(String::from_utf8_lossy(&result.stderr).contains("unsupported"));
 }
+
+#[test]
+fn the_default_engine_is_the_verified_interpreter() {
+    // Output and input match the older engines.
+    for example in [
+        "examples/fib.ya",
+        "examples/composites.ya",
+        "examples/rc-ownership.ya",
+    ] {
+        let default = cli(&["run", example]).output().unwrap();
+        let older = cli(&["run", example, "--engine", "interpreter"])
+            .output()
+            .unwrap();
+        assert!(default.status.success(), "{example}");
+        assert_eq!(default.stdout, older.stdout, "{example}");
+    }
+    let mut child = cli(&["run", "examples/secret-number.ya"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"50\nabc\n42\n")
+        .unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(String::from_utf8_lossy(&result.stdout).ends_with("Correct!\n"));
+    // A failure is a diagnostic with a code and the failing source line.
+    let failing = std::env::temp_dir().join(format!("cyallo-default-{}.ya", std::process::id()));
+    std::fs::write(&failing, "let zero = 0\nstd::io::print(1 / zero)\n").unwrap();
+    let result = cli(&["run", failing.to_str().unwrap()]).output().unwrap();
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(error.contains("R100"), "{error}");
+    assert!(error.contains("1 / zero"), "{error}");
+}
+
+#[test]
+fn programs_the_verified_engine_cannot_lower_fall_back_unless_it_is_asked_for() {
+    let path = unsupported_program();
+    let fallback = cli(&["run", path.to_str().unwrap()]).output().unwrap();
+    assert!(fallback.status.success());
+    assert_eq!(fallback.stdout, b"a\n");
+    let asked = cli(&["run", path.to_str().unwrap(), "--engine", "verified"])
+        .output()
+        .unwrap();
+    assert!(!asked.status.success());
+    assert!(asked.stdout.is_empty());
+}
