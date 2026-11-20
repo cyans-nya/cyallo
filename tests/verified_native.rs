@@ -445,12 +445,12 @@ fn loop_fuel_and_recovery_are_stable_at_different_slice_sizes() {
 }
 
 #[test]
-fn native_ineligible_text_executes_via_verified_dispatch() {
+fn native_ineligible_collections_execute_via_verified_dispatch() {
     if NativeTarget::host().is_none() {
         return;
     }
     let module = verified(
-        "fn entry(input: i64) -> i64 { let label = \"ab\"; return input + 1 }\n",
+        "fn entry(input: i64) -> i64 { let items = Vec[input]; return items[0] + 1 }\n",
     );
     let mut store = CodeStore::new(module.clone()).unwrap();
     assert!(matches!(
