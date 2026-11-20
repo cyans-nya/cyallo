@@ -445,17 +445,17 @@ fn loop_fuel_and_recovery_are_stable_at_different_slice_sizes() {
 }
 
 #[test]
-fn native_ineligible_loans_execute_via_verified_dispatch() {
+fn native_ineligible_text_executes_via_verified_dispatch() {
     if NativeTarget::host().is_none() {
         return;
     }
     let module = verified(
-        "fn entry(input: i64) -> i64 { let owner = input + 1; let view = &owner; return view.* }\n",
+        "fn entry(input: i64) -> i64 { let label = \"ab\"; return input + 1 }\n",
     );
     let mut store = CodeStore::new(module.clone()).unwrap();
     assert!(matches!(
         store.prepare(module.entry()),
-        Err(PrepareError::NonScalar(_))
+        Err(PrepareError::NonScalar(_) | PrepareError::UnsupportedOperation { .. })
     ));
     let args = [Scalar::I64(41)];
     let mut run = store

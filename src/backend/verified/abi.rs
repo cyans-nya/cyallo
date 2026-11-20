@@ -120,6 +120,7 @@ pub enum Failure {
     Trap = 3,
     ConversionOutOfRange = 4,
     EnumVariant = 5,
+    ZeroStep = 6,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

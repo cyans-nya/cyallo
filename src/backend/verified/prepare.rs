@@ -5,8 +5,8 @@ use crate::{
     Span,
     bytecode::verified::{
         BooleanOp, CallSiteId, CallTarget, FloatOp, FunctionId, Instruction, InstructionId,
-        IntegerOp, Register, RegisterType, Scalar, ScalarType, Shape, StorageState, ValueType,
-        VerifiedFunction, VerifiedModule,
+        IntegerOp, LoanOrigin, Register, RegisterType, Scalar, ScalarType, Shape, StorageState,
+        ValueType, VerifiedFunction, VerifiedModule,
     },
 };
 use std::{collections::BTreeMap, fmt};
@@ -33,6 +33,9 @@ pub struct LayoutId(pub u32);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Layout {
     Scalar(ScalarType),
+    /// A loan: one word holding the address of the borrowed words, which
+    /// stay in the owner's frame.
+    Loan,
     Tuple(Box<[Layout]>),
     Enum(Box<[Option<Layout>]>),
 }
@@ -40,7 +43,7 @@ pub enum Layout {
 impl Layout {
     pub fn words(&self) -> u32 {
         match self {
-            Self::Scalar(_) => 1,
+            Self::Scalar(_) | Self::Loan => 1,
             Self::Tuple(fields) => fields.iter().map(Layout::words).sum(),
             Self::Enum(variants) => {
                 1 + variants
@@ -60,6 +63,15 @@ impl Layout {
         };
         (index < fields.len()).then(|| fields[..index].iter().map(Layout::words).sum())
     }
+}
+
+/// What a projection borrows from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoanBase {
+    /// The place another loan points at.
+    Loan(NativeHome),
+    /// A register of this frame, at this byte offset.
+    Owner(ByteOffset),
 }
 
 /// One 64-bit move within the frame, by byte offset.
@@ -142,10 +154,37 @@ pub enum Operation {
     },
     /// Composite moves, built from word operations.
     Words(WordRange),
+    /// The loan receives the address of the owner's first word.
+    Borrow {
+        destination: NativeHome,
+        owner: ByteOffset,
+    },
+    /// The destination loan receives the address of a field or payload of
+    /// the borrowed place; a payload first needs the enum to hold the variant.
+    Project {
+        destination: NativeHome,
+        base: LoanBase,
+        offset: u32,
+        variant: Option<u32>,
+    },
+    /// Copy `words` words from the address in the loan.
+    ReadLoan {
+        destination: ByteOffset,
+        loan: NativeHome,
+        words: u32,
+    },
+    /// Copy `words` words to the address in the loan.
+    WriteLoan {
+        loan: NativeHome,
+        source: ByteOffset,
+        words: u32,
+    },
+    /// Fail when the step is zero.
+    NonZero(NativeHome),
     /// Whether the enum with this tag word holds the variant.
     TagIs {
         destination: NativeHome,
-        tag: ByteOffset,
+        base: LoanBase,
         variant: u32,
     },
     /// Fail unless the tag word names the variant, then run the word moves.
@@ -223,6 +262,7 @@ pub struct PreparedFunction {
     frame_bytes: u32,
     layouts: Box<[Layout]>,
     words: Box<[WordOp]>,
+    borrowed: Box<[u32]>,
     sites: Box<[Site]>,
     calls: BTreeMap<InstructionId, Call>,
 }
@@ -353,6 +393,7 @@ impl PreparedFunction {
             frame_bytes,
             layouts: map.layouts.into_boxed_slice(),
             words: map.words.into_boxed_slice(),
+            borrowed: map.borrowed.into_iter().collect(),
             sites: sites.into_boxed_slice(),
             calls,
         })
@@ -402,6 +443,12 @@ impl PreparedFunction {
         self.layouts.get(usize::try_from(id.0).ok()?)
     }
 
+    /// Whether the word at this byte offset is borrowed somewhere in the
+    /// function, so it must live in the frame and not in a register.
+    pub fn is_borrowed(&self, offset: u32) -> bool {
+        self.borrowed.binary_search(&offset).is_ok()
+    }
+
     pub fn words(&self, range: WordRange) -> &[WordOp] {
         let start = range.start as usize;
         &self.words[start..start + range.len as usize]
@@ -437,7 +484,7 @@ fn result_kind(
 }
 
 /// The word layout of a value type, if it is made of scalars, tuples and enums.
-fn layout_of(body: &VerifiedFunction, ty: ValueType) -> Option<Layout> {
+pub(super) fn layout_of(body: &VerifiedFunction, ty: ValueType) -> Option<Layout> {
     match ty {
         ValueType::Scalar(ScalarType::U64) => None,
         ValueType::Scalar(scalar) => Some(Layout::Scalar(scalar)),
@@ -471,6 +518,7 @@ struct FrameMap<'a> {
     frame_bytes: u32,
     layouts: Vec<Layout>,
     words: Vec<WordOp>,
+    borrowed: std::collections::BTreeSet<u32>,
 }
 
 impl<'a> FrameMap<'a> {
@@ -506,6 +554,7 @@ impl<'a> FrameMap<'a> {
             frame_bytes: next.checked_mul(8).ok_or(PrepareError::FrameTooLarge)?,
             layouts,
             words: Vec::new(),
+            borrowed: Default::default(),
         })
     }
 
@@ -529,6 +578,11 @@ impl<'a> FrameMap<'a> {
             }
             Some(RegisterType::Composite(id)) => layout_of(self.body, ValueType::Composite(id))
                 .ok_or(PrepareError::NonScalar(register)),
+            Some(RegisterType::Loan {
+                origin: LoanOrigin::Local(_) | LoanOrigin::Parameter { .. },
+                pointee,
+                ..
+            }) if layout_of(self.body, pointee).is_some() => Ok(Layout::Loan),
             _ => Err(PrepareError::NonScalar(register)),
         }
     }
@@ -555,6 +609,40 @@ impl<'a> FrameMap<'a> {
                 layout: Some(self.intern(composite)),
             },
         })
+    }
+
+    /// The layout and address base for projecting out of `source`, which is
+    /// either a loan or an owning register of this frame.
+    fn projection_base(
+        &mut self,
+        source: Register,
+        unsupported: PrepareError,
+    ) -> Result<(Layout, LoanBase), PrepareError> {
+        let index = source.0 as usize;
+        let home = self.home(source)?;
+        if let Some(RegisterType::Loan { pointee, .. }) = self.body.registers().get(index).copied()
+        {
+            let layout = layout_of(self.body, pointee).ok_or(unsupported)?;
+            return Ok((layout, LoanBase::Loan(home)));
+        }
+        let layout = self.layout_of_register(source)?;
+        for word in 0..layout.words() {
+            self.borrowed.insert(home.offset.0 + word * 8);
+        }
+        Ok((layout, LoanBase::Owner(home.offset)))
+    }
+
+    /// The home of a register that holds an enum itself.
+    fn enum_home(
+        &mut self,
+        register: Register,
+        unsupported: PrepareError,
+    ) -> Result<NativeHome, PrepareError> {
+        let home = self.home(register)?;
+        match self.layout_of_home(home) {
+            Some(Layout::Enum(_)) => Ok(home),
+            _ => Err(unsupported),
+        }
     }
 
     fn layout_of_home(&self, home: NativeHome) -> Option<Layout> {
@@ -714,6 +802,10 @@ fn failures(operation: Operation) -> &'static [Failure] {
             ..
         } => &[Failure::ConversionOutOfRange],
         Operation::Variant { .. } => &[Failure::EnumVariant],
+        Operation::NonZero(_) => &[Failure::ZeroStep],
+        Operation::Project {
+            variant: Some(_), ..
+        } => &[Failure::EnumVariant],
         Operation::Trap => &[Failure::Trap],
         _ => &[],
     }
@@ -761,6 +853,60 @@ fn legalize(
                 }
             }
         }
+        Instruction::Borrow(loan, owner) => {
+            let owner = map.home(owner)?;
+            for word in 0..map.words_of(owner) {
+                map.borrowed.insert(owner.offset.0 + word * 8);
+            }
+            Operation::Borrow {
+                destination: map.home(loan)?,
+                owner: owner.offset,
+            }
+        }
+        Instruction::ReadLoan(dst, loan) => {
+            let destination = map.home(dst)?;
+            Operation::ReadLoan {
+                destination: destination.offset,
+                loan: map.home(loan)?,
+                words: map.words_of(destination),
+            }
+        }
+        Instruction::WriteLoan(loan, src) => {
+            let source = map.home(src)?;
+            Operation::WriteLoan {
+                loan: map.home(loan)?,
+                source: source.offset,
+                words: map.words_of(source),
+            }
+        }
+        Instruction::LoanField(dst, src, field) => {
+            let (layout, base) = map.projection_base(src, unsupported)?;
+            let Some(words) = layout.field_words(field as usize) else {
+                return Err(unsupported);
+            };
+            Operation::Project {
+                destination: map.home(dst)?,
+                base,
+                offset: words * 8,
+                variant: None,
+            }
+        }
+        Instruction::LoanPayload(dst, src, variant) => {
+            let (layout, base) = map.projection_base(src, unsupported)?;
+            let Layout::Enum(variants) = layout else {
+                return Err(unsupported);
+            };
+            if !matches!(variants.get(variant as usize), Some(Some(_))) {
+                return Err(unsupported);
+            }
+            Operation::Project {
+                destination: map.home(dst)?,
+                base,
+                offset: 8,
+                variant: Some(variant),
+            }
+        }
+        Instruction::CheckStep(step) => Operation::NonZero(map.home(step)?),
         Instruction::Tuple(dst, list) => {
             let destination = map.home(dst)?;
             let Some(layout) = map.layout_of_home(destination) else {
@@ -809,6 +955,7 @@ fn legalize(
             }])?)
         }
         Instruction::EnumWrap(dst, variant, src) => {
+            map.enum_home(dst, unsupported)?;
             let (destination, source) = (map.home(dst)?, map.home(src)?);
             if map.overlap(destination, source) {
                 return Err(unsupported);
@@ -824,18 +971,27 @@ fn legalize(
             ));
             Operation::Words(map.push(ops)?)
         }
-        Instruction::EnumIs(dst, src, variant) => Operation::TagIs {
-            destination: map.home(dst)?,
-            tag: map.home(src)?.offset,
-            variant,
-        },
+        Instruction::EnumIs(dst, src, variant) => {
+            let source = map.home(src)?;
+            // The enum is either held here or read through a loan.
+            let base = match map.layout_of_home(source) {
+                Some(Layout::Loan) => LoanBase::Loan(source),
+                Some(Layout::Enum(_)) => LoanBase::Owner(source.offset),
+                _ => return Err(unsupported),
+            };
+            Operation::TagIs {
+                destination: map.home(dst)?,
+                base,
+                variant,
+            }
+        }
         Instruction::EnumExpect(src, variant) => Operation::Variant {
-            tag: map.home(src)?.offset,
+            tag: map.enum_home(src, unsupported)?.offset,
             variant,
             then: map.push([])?,
         },
         Instruction::EnumPayload(dst, src, variant) => {
-            let (destination, source) = (map.home(dst)?, map.home(src)?);
+            let (destination, source) = (map.home(dst)?, map.enum_home(src, unsupported)?);
             if map.overlap(destination, source) {
                 return Err(unsupported);
             }
@@ -918,11 +1074,7 @@ fn legalize(
         }
         Instruction::Trap => Operation::Trap,
         Instruction::Call(_) => Operation::Call(origin.instruction),
-        Instruction::Borrow(..)
-        | Instruction::ReadLoan(..)
-        | Instruction::WriteLoan(..)
-        | Instruction::CheckStep(..)
-        | Instruction::ObjectNew(..)
+        Instruction::ObjectNew(..)
         | Instruction::ObjectGet(..)
         | Instruction::ObjectGetKey(..)
         | Instruction::ObjectSet(..)
@@ -1036,8 +1188,6 @@ fn legalize(
         | Instruction::RcStrongCount(..)
         | Instruction::EnumTake(..)
         | Instruction::GcBorrow(..)
-        | Instruction::LoanField(..)
-        | Instruction::LoanPayload(..)
         | Instruction::LoanElement(..)
         | Instruction::ArrayDeclare(..)
         | Instruction::ArrayNew(..)

@@ -26,7 +26,7 @@ pub use debug::{StatementArrival, StatementBoundary};
 pub use frame::{FrameLayout, FrameSlot};
 pub use lower::LowerError;
 pub(crate) use run::ScalarFrameSnapshot;
-pub use run::RecoveredValue;
+pub use run::{RecoveredStep, RecoveredValue};
 pub use run::ScalarRecoveryError;
 pub use run::{
     Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, GeneratorFault, HeapStats,

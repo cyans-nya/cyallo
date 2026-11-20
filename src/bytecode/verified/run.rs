@@ -1927,10 +1927,24 @@ pub struct Activation {
     state: ExecutionState,
 }
 
+/// One projection step of a recovered loan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveredStep {
+    Field(u32),
+    Payload(u32),
+}
+
 /// A value rebuilt from native words: scalars and the tuples and enums of them.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RecoveredValue {
     Scalar(Scalar),
+    /// A loan of the whole register `register` of the frame at stack index `frame`.
+    Loan {
+        frame: usize,
+        register: Register,
+        /// Projections from the register to the borrowed place.
+        path: Vec<RecoveredStep>,
+    },
     Tuple(Vec<RecoveredValue>),
     Enum {
         variant: u32,
@@ -1956,6 +1970,7 @@ impl VerifiedFunction {
             {
                 Some(FrameValue::Scalar(*scalar))
             }
+            (RecoveredValue::Loan { .. }, _) => None,
             (RecoveredValue::Tuple(values), ValueType::Composite(id)) => {
                 let Shape::Tuple(fields) = self.shape_table().get(usize::try_from(id.0).ok()?)?
                 else {
@@ -2202,12 +2217,48 @@ impl VerifiedModule {
                     register,
                 };
                 let slot = values.get_mut(register.index()).ok_or(error)?;
+                if let RecoveredValue::Loan {
+                    frame,
+                    register: owner,
+                    path,
+                } = value
+                {
+                    let owned = snapshots.get(*frame).and_then(|owner_frame| {
+                        self.function(owner_frame.function)?
+                            .registers()
+                            .get(owner.index())
+                    });
+                    if !matches!(body.register_kind(register), Ok(RegisterType::Loan { .. }))
+                        || owned.is_none()
+                        || state[register.index()] != StorageState::Initialized
+                    {
+                        return Err(error);
+                    }
+                    let place = BorrowedPlace {
+                        root: Root::Frame {
+                            frame: *frame,
+                            register: *owner,
+                        },
+                        path: path
+                            .iter()
+                            .map(|step| match step {
+                                RecoveredStep::Field(field) => Step::Field(*field),
+                                RecoveredStep::Payload(variant) => Step::Payload(*variant),
+                            })
+                            .collect(),
+                        window: None,
+                    };
+                    if slot.replace(FrameValue::Loan(place)).is_some() {
+                        return Err(error);
+                    }
+                    continue;
+                }
                 let ty = match body.register_kind(register) {
                     Ok(RegisterType::Scalar(ty)) => ValueType::Scalar(ty),
                     Ok(RegisterType::Composite(shape)) => ValueType::Composite(shape),
                     _ => return Err(error),
                 };
-                let Some(value) = body.recovered_value(&value, ty) else {
+                let Some(value) = body.recovered_value(value, ty) else {
                     return Err(error);
                 };
                 if state[register.index()] != StorageState::Initialized

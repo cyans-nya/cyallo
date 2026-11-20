@@ -208,7 +208,11 @@ impl Frame {
         decode_layout(layout, self.words(home)?)
     }
 
-    fn snapshot(&self) -> Result<ScalarFrameSnapshot, NativeRunError> {
+    fn snapshot(
+        &self,
+        stack: &[Frame],
+        index: usize,
+    ) -> Result<ScalarFrameSnapshot, NativeRunError> {
         let (pc, next, arrival) = match self.position {
             Position::Ready { next, arrival } => (next, next, arrival),
             Position::Waiting { call, successor } => {
@@ -222,7 +226,11 @@ impl Frame {
         let mut values = Vec::new();
         for &slot in &site.recover {
             if let RecoverySlot::Initialized(home) = slot {
-                values.push((home.register, self.read(home)?));
+                let value = match self.read(home)? {
+                    RecoveredValue::Loan { .. } => recover_loan(stack, index, home)?,
+                    other => other,
+                };
+                values.push((home.register, value));
             }
         }
         Ok(ScalarFrameSnapshot {
@@ -300,9 +308,8 @@ impl NativeActivation {
             return Err(NativeRunError::InvalidActivation);
         };
         let root = stack.first().ok_or(NativeRunError::InvalidActivation)?;
-        let snapshots = stack
-            .iter()
-            .map(Frame::snapshot)
+        let snapshots = (0..stack.len())
+            .map(|index| stack[index].snapshot(&stack, index))
             .collect::<Result<Vec<_>, _>>()?;
         root.entry
             .module()
@@ -486,6 +493,11 @@ fn step(
                     instruction,
                     span,
                 },
+                Failure::ZeroStep => RunError::ZeroStep {
+                    function,
+                    instruction,
+                    span,
+                },
                 Failure::EnumVariant => RunError::EnumVariant {
                     function,
                     instruction,
@@ -563,8 +575,167 @@ fn decode(ty: ScalarType, word: u64) -> Result<Scalar, NativeRunError> {
     }
 }
 
+/// A loan register rebuilt for the interpreter: its owner from the static
+/// origin, and the projection steps from where its address lies in the
+/// owner's words.
+fn recover_loan(
+    stack: &[Frame],
+    index: usize,
+    home: NativeHome,
+) -> Result<RecoveredValue, NativeRunError> {
+    use super::{RecoverySlot, prepare::layout_of};
+    use crate::bytecode::verified::{RecoveredStep, RegisterType};
+    let invalid = NativeRunError::InvalidHome(home.register);
+    let frame = &stack[index];
+    let pointer = frame.slots[frame.slot(home)?];
+    let (owner_frame, owner) = resolve_loan(stack, index, home.register)?;
+    let holder = &stack[owner_frame];
+    let plan = holder.entry.plan();
+    let pc = match holder.position {
+        Position::Ready { next, .. } => next,
+        Position::Waiting { call, .. } => call,
+    };
+    let owner_home = plan
+        .site(pc)
+        .and_then(|site| {
+            site.recover.iter().find_map(|slot| match slot {
+                RecoverySlot::Initialized(candidate) | RecoverySlot::Uninitialized(candidate)
+                    if candidate.register == owner =>
+                {
+                    Some(*candidate)
+                }
+                _ => None,
+            })
+        })
+        .ok_or(invalid)?;
+    let base = holder.slots.as_ptr() as u64 + u64::from(owner_home.offset.0);
+    let delta = pointer.checked_sub(base).ok_or(invalid)?;
+    if delta % 8 != 0 {
+        return Err(invalid);
+    }
+    let owner_layout = match owner_home.layout {
+        Some(id) => plan.layout(id).ok_or(invalid)?.clone(),
+        None => Layout::Scalar(owner_home.ty),
+    };
+    let body = frame
+        .entry
+        .module()
+        .function(frame.entry.plan().function())
+        .ok_or(NativeRunError::InvalidActivation)?;
+    let Some(RegisterType::Loan { pointee, .. }) =
+        body.registers().get(home.register.0 as usize).copied()
+    else {
+        return Err(invalid);
+    };
+    let target = layout_of(body, pointee).ok_or(invalid)?;
+    let start = holder.slot(owner_home)?;
+    let words = holder
+        .slots
+        .get(start..start + owner_layout.words() as usize)
+        .ok_or(invalid)?;
+    fn walk(
+        layout: &Layout,
+        words: &[u64],
+        offset: u64,
+        target: &Layout,
+    ) -> Option<Vec<RecoveredStep>> {
+        if offset == 0 && layout == target {
+            return Some(Vec::new());
+        }
+        match layout {
+            Layout::Tuple(fields) => {
+                let mut start = 0u64;
+                for (index, field) in fields.iter().enumerate() {
+                    let size = u64::from(field.words());
+                    if offset < start + size {
+                        let slice = words.get(start as usize..(start + size) as usize)?;
+                        let mut path = walk(field, slice, offset - start, target)?;
+                        path.insert(0, RecoveredStep::Field(u32::try_from(index).ok()?));
+                        return Some(path);
+                    }
+                    start += size;
+                }
+                None
+            }
+            Layout::Enum(variants) if offset >= 1 => {
+                let variant = u32::try_from(*words.first()?).ok()?;
+                let payload = variants.get(variant as usize)?.as_ref()?;
+                let slice = words.get(1..1 + payload.words() as usize)?;
+                let mut path = walk(payload, slice, offset - 1, target)?;
+                path.insert(0, RecoveredStep::Payload(variant));
+                Some(path)
+            }
+            _ => None,
+        }
+    }
+    let path = walk(&owner_layout, words, delta / 8, &target).ok_or(invalid)?;
+    Ok(RecoveredValue::Loan {
+        frame: owner_frame,
+        register: owner,
+        path,
+    })
+}
+
+/// The frame and register that own the place a loan register borrows, from
+/// the loan's static origin. A loan received as a parameter belongs to what
+/// the caller passed.
+fn resolve_loan(
+    stack: &[Frame],
+    index: usize,
+    register: Register,
+) -> Result<(usize, Register), NativeRunError> {
+    use crate::bytecode::verified::{LoanOrigin, RegisterType};
+    let frame = stack.get(index).ok_or(NativeRunError::InvalidActivation)?;
+    let plan = frame.entry.plan();
+    let body = frame
+        .entry
+        .module()
+        .function(plan.function())
+        .ok_or(NativeRunError::InvalidActivation)?;
+    let Some(RegisterType::Loan { origin, .. }) =
+        body.registers().get(register.0 as usize).copied()
+    else {
+        return Err(NativeRunError::InvalidHome(register));
+    };
+    match origin {
+        LoanOrigin::Local(owner) => Ok((index, owner)),
+        LoanOrigin::Parameter {
+            register: parameter,
+        } => {
+            let position = body
+                .parameters()
+                .iter()
+                .position(|&candidate| candidate == parameter)
+                .ok_or(NativeRunError::InvalidHome(parameter))?;
+            let caller = index
+                .checked_sub(1)
+                .ok_or(NativeRunError::InvalidHome(parameter))?;
+            let Position::Waiting { call, .. } = stack[caller].position else {
+                return Err(NativeRunError::InvalidActivation);
+            };
+            let call = stack[caller]
+                .entry
+                .plan()
+                .call(call)
+                .ok_or(NativeRunError::InvalidCallee(call))?;
+            let argument = call
+                .arguments
+                .get(position)
+                .ok_or(NativeRunError::InvalidHome(parameter))?;
+            resolve_loan(stack, caller, argument.caller.register)
+        }
+        _ => Err(NativeRunError::InvalidHome(register)),
+    }
+}
+
 fn decode_layout(layout: &Layout, words: &[u64]) -> Result<RecoveredValue, NativeRunError> {
     match layout {
+        // The owner is found from the loan's static origin by the caller.
+        Layout::Loan => Ok(RecoveredValue::Loan {
+            frame: usize::MAX,
+            register: Register(0),
+            path: Vec::new(),
+        }),
         Layout::Scalar(ty) => {
             let word = *words.first().ok_or(NativeRunError::InvalidActivation)?;
             decode(*ty, word).map(RecoveredValue::Scalar)

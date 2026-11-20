@@ -1,7 +1,7 @@
 //! Cranelift translation over the shared scalar native plan.
 
 use super::{
-    AbiLayout, Architecture, CraneliftMachineInfo, CraneliftProfile, EmitError, Failure,
+    AbiLayout, Architecture, CraneliftMachineInfo, CraneliftProfile, EmitError, Failure, LoanBase,
     MachineRange, MachineTrap, NativeHome, NativeTarget, NativeTier, Operation, Platform,
     PreparedFunction, RecoverySlot, ScalarOutcome, Site, UnaryOp, UnlinkedImage, WordOp, WordRange,
     abi::Edge, image::checked_source,
@@ -167,6 +167,10 @@ fn build(
         result,
         slots,
         homes,
+        borrowed: (0..plan.frame_bytes() / 8)
+            .map(|word| word * 8)
+            .filter(|&offset| plan.is_borrowed(offset))
+            .collect(),
         budget,
         predecessor,
         edge,
@@ -203,6 +207,8 @@ struct Lower<'builder, 'function> {
     result: Value,
     slots: Value,
     homes: Vec<Variable>,
+    /// Words that loans point at; they live in the frame, not in variables.
+    borrowed: std::collections::BTreeSet<u32>,
     budget: Variable,
     predecessor: Variable,
     edge: Variable,
@@ -327,12 +333,88 @@ impl Lower<'_, '_> {
                 self.store(destination, value)?;
             }
             Words(range) => self.words(plan, range)?,
-            TagIs {
+            Borrow { destination, owner } => {
+                let address = self
+                    .builder
+                    .ins()
+                    .iadd_imm_s(self.slots, i64::from(owner.0));
+                self.store(destination, address)?;
+            }
+            Project {
                 destination,
-                tag,
+                base,
+                offset,
                 variant,
             } => {
-                let held = self.load_at(tag.0)?;
+                let address = match base {
+                    LoanBase::Loan(home) => self.load(home)?,
+                    LoanBase::Owner(owner) => self
+                        .builder
+                        .ins()
+                        .iadd_imm_s(self.slots, i64::from(owner.0)),
+                };
+                if let Some(variant) = variant {
+                    let held = self
+                        .builder
+                        .ins()
+                        .load(types::I64, MemFlagsData::new(), address, 0);
+                    let other =
+                        self.builder
+                            .ins()
+                            .icmp_imm_s(IntCC::NotEqual, held, i64::from(variant));
+                    self.guard(other, pc, Failure::EnumVariant)?;
+                }
+                let projected = self.builder.ins().iadd_imm_s(address, i64::from(offset));
+                self.store(destination, projected)?;
+            }
+            ReadLoan {
+                destination,
+                loan,
+                words,
+            } => {
+                let address = self.load(loan)?;
+                for word in 0..words {
+                    let at = i32::try_from(word * 8).map_err(|_| EmitError::AbiOffsetOutOfRange)?;
+                    let value =
+                        self.builder
+                            .ins()
+                            .load(types::I64, MemFlagsData::new(), address, at);
+                    self.store_at(destination.0 + word * 8, value)?;
+                }
+            }
+            WriteLoan {
+                loan,
+                source,
+                words,
+            } => {
+                let address = self.load(loan)?;
+                for word in 0..words {
+                    let at = i32::try_from(word * 8).map_err(|_| EmitError::AbiOffsetOutOfRange)?;
+                    let value = self.load_at(source.0 + word * 8)?;
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), value, address, at);
+                }
+            }
+            NonZero(step) => {
+                let value = self.load(step)?;
+                let zero = self.builder.ins().icmp_imm_s(IntCC::Equal, value, 0);
+                self.guard(zero, pc, Failure::ZeroStep)?;
+            }
+            TagIs {
+                destination,
+                base,
+                variant,
+            } => {
+                let held = match base {
+                    LoanBase::Owner(tag) => self.load_at(tag.0)?,
+                    LoanBase::Loan(home) => {
+                        let address = self.load(home)?;
+                        self.builder
+                            .ins()
+                            .load(types::I64, MemFlagsData::new(), address, 0)
+                    }
+                };
                 let is = self
                     .builder
                     .ins()
@@ -377,6 +459,9 @@ impl Lower<'_, '_> {
                         .words();
                     for word in 0..words {
                         let at = home.offset.0 + word * 8;
+                        if self.borrowed.contains(&at) {
+                            continue;
+                        }
                         let value = self.load_at(at)?;
                         let offset =
                             i32::try_from(at).map_err(|_| EmitError::AbiOffsetOutOfRange)?;
@@ -590,11 +675,25 @@ impl Lower<'_, '_> {
     }
 
     fn load_at(&mut self, offset: u32) -> Result<Value, EmitError> {
+        if self.borrowed.contains(&offset) {
+            let at = i32::try_from(offset).map_err(|_| EmitError::AbiOffsetOutOfRange)?;
+            return Ok(self
+                .builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), self.slots, at));
+        }
         let variable = self.home_at(offset)?;
         Ok(self.builder.use_var(variable))
     }
 
     fn store_at(&mut self, offset: u32, value: Value) -> Result<(), EmitError> {
+        if self.borrowed.contains(&offset) {
+            let at = i32::try_from(offset).map_err(|_| EmitError::AbiOffsetOutOfRange)?;
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), value, self.slots, at);
+            return Ok(());
+        }
         let variable = self.home_at(offset)?;
         self.builder.def_var(variable, value);
         Ok(())
@@ -642,6 +741,9 @@ impl Lower<'_, '_> {
                 };
                 for word in 0..words {
                     let at = home.offset.0 + word * 8;
+                    if self.borrowed.contains(&at) {
+                        continue;
+                    }
                     let value = self.load_at(at)?;
                     let offset = i32::try_from(at).map_err(|_| EmitError::AbiOffsetOutOfRange)?;
                     self.builder

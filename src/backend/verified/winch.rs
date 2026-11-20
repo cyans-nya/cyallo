@@ -18,7 +18,7 @@ mod host {
         abi::{Edge, scalar_word},
         image::checked_source,
     };
-    use super::super::{UnaryOp, WordOp, WordRange};
+    use super::super::{LoanBase, UnaryOp, WordOp, WordRange};
     use crate::bytecode::verified::{BooleanOp, FloatOp, InstructionId, IntegerOp, Scalar};
     use std::{collections::BTreeMap, sync::Arc};
     use winch_codegen::native::{Arithmetic, Assembler, Condition, FloatArithmetic, Label};
@@ -228,14 +228,87 @@ mod host {
                     self.store_home(VALUE, destination);
                 }
                 Words(range) => self.words(plan, range),
+                Borrow { destination, owner } => {
+                    self.machine.imm(TEMP, u64::from(owner.0));
+                    self.machine.binary(Arithmetic::Add, VALUE, SLOTS, TEMP);
+                    self.store_home(VALUE, destination);
+                }
+                Project {
+                    destination,
+                    base,
+                    offset,
+                    variant,
+                } => {
+                    match base {
+                        LoanBase::Loan(home) => self.load_home(LEFT, home),
+                        LoanBase::Owner(owner) => {
+                            self.machine.imm(TEMP, u64::from(owner.0));
+                            self.machine.binary(Arithmetic::Add, LEFT, SLOTS, TEMP);
+                        }
+                    }
+                    if let Some(variant) = variant {
+                        let held = self.machine.label();
+                        self.machine.load(VALUE, LEFT, 0);
+                        self.machine.imm(TEMP, u64::from(variant));
+                        self.machine.compare(VALUE, TEMP);
+                        self.machine.branch(Condition::Eq, held);
+                        self.fail(pc, Failure::EnumVariant)?;
+                        self.machine.bind(held);
+                    }
+                    self.machine.imm(TEMP, u64::from(offset));
+                    self.machine.binary(Arithmetic::Add, VALUE, LEFT, TEMP);
+                    self.store_home(VALUE, destination);
+                }
+                ReadLoan {
+                    destination,
+                    loan,
+                    words,
+                } => {
+                    self.load_home(LEFT, loan);
+                    for word in 0..words {
+                        let (base, offset) = self.through(LEFT, word * 8);
+                        self.machine.load(VALUE, base, offset);
+                        self.store_at(VALUE, destination.0 + word * 8);
+                    }
+                }
+                WriteLoan {
+                    loan,
+                    source,
+                    words,
+                } => {
+                    self.load_home(LEFT, loan);
+                    for word in 0..words {
+                        self.load_at(VALUE, source.0 + word * 8);
+                        let (base, offset) = self.through(LEFT, word * 8);
+                        self.machine.store(VALUE, base, offset);
+                    }
+                }
+                NonZero(step) => {
+                    let zero = self.machine.label();
+                    let done = self.machine.label();
+                    self.load_home(LEFT, step);
+                    self.machine.imm(TEMP, 0);
+                    self.machine.compare(LEFT, TEMP);
+                    self.machine.branch(Condition::Eq, zero);
+                    self.machine.jump(done);
+                    self.machine.bind(zero);
+                    self.fail(pc, Failure::ZeroStep)?;
+                    self.machine.bind(done);
+                }
                 TagIs {
                     destination,
-                    tag,
+                    base,
                     variant,
                 } => {
                     let is_true = self.machine.label();
                     let done = self.machine.label();
-                    self.load_at(LEFT, tag.0);
+                    match base {
+                        LoanBase::Owner(tag) => self.load_at(LEFT, tag.0),
+                        LoanBase::Loan(home) => {
+                            self.load_home(LEFT, home);
+                            self.machine.load(LEFT, LEFT, 0);
+                        }
+                    }
                     self.machine.imm(RIGHT, u64::from(variant));
                     self.machine.compare(LEFT, RIGHT);
                     self.machine.branch(Condition::Eq, is_true);
@@ -495,6 +568,19 @@ mod host {
             } else {
                 self.machine.imm(ADDRESS, u64::from(offset));
                 self.machine.binary(Arithmetic::Add, ADDRESS, base, ADDRESS);
+                (ADDRESS, 0)
+            }
+        }
+
+        /// A base register and displacement for the word `offset` bytes past
+        /// the address in `pointer`. Large displacements use the scratch register.
+        fn through(&mut self, pointer: u8, offset: u32) -> (u8, u32) {
+            if offset <= UNSCALED_DISPLACEMENT_MAX {
+                (pointer, offset)
+            } else {
+                self.machine.imm(ADDRESS, u64::from(offset));
+                self.machine
+                    .binary(Arithmetic::Add, ADDRESS, pointer, ADDRESS);
                 (ADDRESS, 0)
             }
         }
