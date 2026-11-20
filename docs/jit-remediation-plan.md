@@ -1,5 +1,7 @@
 # JIT remediation plan
 
+> **Legacy engine (2026-11-20).** This describes the tiered engine in `src/runtime` and `src/backend` (everything outside `src/backend/verified`), which the verified pipeline replaces. It stays accurate while that engine exists and is retired with it in the [legacy removal plan](legacy-removal-plan.md). Current native-tier work: [native tiers: next steps](native-tiers-next-steps.md).
+
 Implemented and validated; see [results and the final layout decision](jit-remediation-results.md).
 The original draft below records the intended work and acceptance criteria.
 Measurements selected a shared per-routine all-PC eager path after call

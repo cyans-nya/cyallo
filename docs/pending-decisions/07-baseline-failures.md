@@ -1,5 +1,7 @@
 # 07 — Failing tests carried since the baseline
 
+> **Status (2026-11-20).** Most of the 15 root-suite failures named below belonged to legacy-engine tests (attributes, tiering, OSR, eager and deferred scheduling, native storage) that were deleted or replaced when the verified pipeline became the default; those names no longer exist in `tests/`. `recursion_and_checked_failures_remain_observable` and `returning_procedures_and_private_mutation` (`tests/effects.rs`) and `stateless_procedure_values_do_not_execute_during_initialization` (`tests/constants.rs`) still exist and run on the verified session; whether they pass was not rechecked here. The five `cyallo-ir` `native_contract` failures listed further down are separate and still need a fresh run. The enum-constructor emission decision below is unchanged.
+
 The full root suite fails the same 15 tests as the pre-existing baseline (compared by name).
 They fail in this tree and pass in the original workspace baseline because the standard enum
 constructor functions the std package now emits shift function indices:

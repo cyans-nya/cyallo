@@ -1,12 +1,12 @@
 # Data enum implementation
 
-Current handoff: [pending work](pending-work.md). The unfinished task patch
-currently fails compilation. The behavior documented below was verified before
-that patch; it does not establish completion of the current worktree. The user
-has rejected the StorageKind-based std type model, so its removal is required
-even for the previously exercised Option/Result/Step/channel declarations.
+Status (2026-11-20): the `data-enums` branch is merged into `main`. The old
+handoff ([pending work](pending-work.md)) is superseded by
+[pending decisions](pending-decisions/README.md); open items live there and in
+[overhaul stages](overhaul-stages.md). The StorageKind-based std type model was
+rejected and its removal is tracked in [StorageKind removal](pending-decisions/02-storagekind-removal.md).
 
-The enum/`Option`/`Result` milestone executes on branch `data-enums`. The remaining
+The enum/`Option`/`Result` milestone executes on `main`. The remaining
 standard status/error migrations are listed below; the whole draft is not yet
 complete. The [work log](data-enums-work-log.md) records decisions, failed checks,
 fixes, verification and the resume point. The target is the
@@ -70,7 +70,7 @@ interpreter, Winch, Cranelift and Cranelift speed, normal/stress GC, continuous
 execution and alternating single-instruction handoffs. It compares output, status
 and instruction counts. It also checks invalid patterns, types, moves and borrows.
 
-[`tests/native_declarations.rs`](../tests/native_declarations.rs) covers standard
+`tests/native_declarations.rs` (retired in the verified cutover; see git history before `08f7c48`) covered standard
 variant renaming, malformed native enum contracts, version annotations and foreign
 open enums. Resolver/specializer checks are in
 [`enum_resolution.rs`](../crates/cyallo-ir/tests/enum_resolution.rs); parser and

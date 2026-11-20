@@ -80,7 +80,7 @@ select `ObjectIcMode::Disabled` on a Session to compare the checked fallback wit
 the generated path. These are runtime verification interfaces; source primitives
 still resolve from their annotated declarations.
 
-The reproducible [differential fuzz tests](../tests/object_fuzz.rs) generate 32
+The differential fuzz tests (`tests/object_fuzz.rs`, retired with the legacy engine; see git history before `a68cb4f`) generated 32
 seeded programs and compare output, typed failures and instruction counts across
 eager/deferred checking, interpreter/Winch/Cranelift, enabled/disabled ICs, GC
 stress and single-instruction/137-instruction handoffs. They exercise more than

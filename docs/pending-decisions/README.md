@@ -13,7 +13,7 @@ work assigned to the user unless a file says "Decision needed".
 | [04-source-bodied-methods.md](04-source-bodied-methods.md) | Cyallo bodies for enum/struct methods | Decided, not implemented |
 | [05-sdk-worlds.md](05-sdk-worlds.md) | SDK/world phases not built | Decided, partly implemented |
 | [06-memory-lifetimes.md](06-memory-lifetimes.md) | Scope-based cell reuse without GC | Decided in principle, partly mitigated |
-| [07-baseline-failures.md](07-baseline-failures.md) | 15 failing tests carried since the baseline | Open |
+| [07-baseline-failures.md](07-baseline-failures.md) | 15 failing tests carried since the baseline | Mostly moot (legacy tests retired); recheck the rest |
 | [08-performance-and-checks.md](08-performance-and-checks.md) | Slowdown, benches, Clippy, format | Open |
 | [09-branches-and-repository.md](09-branches-and-repository.md) | `main` vs `overhaul`, pushing, stray files | Decision needed |
 

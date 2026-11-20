@@ -1,5 +1,7 @@
 # Data enums: work log and resume checklist
 
+> **Historical (2026-11-20).** This log was kept while the work lived on the `data-enums` branch and worktree, which are now merged into `main`; its resume checklist no longer applies. Current open items: [pending decisions](pending-decisions/README.md) and [overhaul stages](overhaul-stages.md).
+
 Branch: `data-enums`.
 Worktree: `/Volumes/Dev/x/cyallo/.worktrees/data-enums`.
 Target: [data enums draft](data-enums-draft.md).

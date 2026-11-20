@@ -97,14 +97,14 @@ interface is another source declaration with a private ABI identity.
 
 ## Verification
 
-[native_declarations.rs](../tests/native_declarations.rs) moves the task module and
+`native_declarations.rs` (retired in the verified cutover; see git history before `08f7c48`) moved the task module and
 renames its type, factory, and member using only `.ya` edits. It also checks source
 fallback behavior, forged annotations, opaque storage, incompatible contracts,
 core source diagnostics, import ceilings, scoped denial, and reexport origins.
 [native_callbacks.rs](../tests/native_callbacks.rs) exercises aliases, generic
 callbacks, effect checks, and exactly-once evaluation across eager/deferred
 checking, all execution engines, GC stress, and instruction-budget handoffs.
-[repl.rs](../tests/repl.rs) verifies identity persistence between submissions.
+The legacy `repl.rs` (retired the same way) verified identity persistence between submissions; [vm_repl.rs](../tests/vm_repl.rs) covers the verified REPL.
 
 The [research report](intrinsic-declaration-research.md) records the read-only
 Origine/V8 investigation and the rationale for these boundaries. Its descriptions

@@ -1,5 +1,7 @@
 # Native object inline caches
 
+> **Legacy engine (2026-11-20).** This describes the tiered engine in `src/runtime` and `src/backend` (everything outside `src/backend/verified`), which the verified pipeline replaces. It stays accurate while that engine exists and is retired with it in the [legacy removal plan](legacy-removal-plan.md). Current native-tier work: [native tiers: next steps](native-tiers-next-steps.md).
+
 Winch and both Cranelift modes use Session-owned shape/slot feedback. Generated
 code guards the receiver, shape, computed key identity, slot extent and
 stored/input representation. Four cases are retained per site; other cases use

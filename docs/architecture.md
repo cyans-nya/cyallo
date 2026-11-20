@@ -1,5 +1,7 @@
 # Architecture
 
+> **Status (2026-11-20).** The sections below on tiering, Session-owned feedback, inline caches and the worker pool describe the legacy tiered engine (`src/runtime`, `src/backend` outside `verified`). The default execution path is now the verified interpreter (`cyallo::vm::Session` over `src/bytecode/verified`), with verified native tiers in `src/backend/verified` still under construction. See [overhaul stages](overhaul-stages.md), [backend design](backend-design.md), [native tiers: next steps](native-tiers-next-steps.md) and the [legacy removal plan](legacy-removal-plan.md).
+
 Implementation changes follow the [compiler and runtime rules](compiler-and-runtime-rules.md):
 resolved declaration identities and type-directed specialization, typed enums
 and errors, and explicitly owned runtime state.

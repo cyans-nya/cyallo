@@ -6,12 +6,15 @@ validates and publishes each image before any native entry can execute.
 Switch all shipping execution entry points together after the integrated
 replacement passes the language contracts. [Backend design](backend-design.md) · [Direct cutover](compiler-runtime-overhaul-plan.md#direct-execution-cutover)
 
-The scalar interpreter supports v7 bytecode, local loans and resumable
-direct and borrowed calls.
-Installed-table fixtures exercise a checked Cyallo scalar reference and a
-synchronous host callback through aliases. The host fixture checks effects
-and terminal failure across one-instruction slices. Nontrivial aggregate
-cleanup remains open for interpreter conformance. [Interpreter tests](../tests/verified_bytecode.rs) · [Loan fixtures](../tests/verified_loans.rs) · [Source fixture](../tests/sdk_reference.rs) · [Host fixture](../tests/sdk_host.rs) · [Implementation stages](overhaul-stages.md)
+Status (2026-11-20): the verified interpreter runs every shipping example
+(bytecode format v35) and is the default engine for `run`, `repl` and `debug`.
+Native code covers scalars, binary64, tuples/enums of scalars, loans and
+projections, strings, output and fixed-size scalar arrays on Winch and both
+Cranelift profiles, with recovery into the interpreter at any instruction
+budget. What remains, and how to do it, is in
+[native tiers: next steps](native-tiers-next-steps.md); stage-by-stage history
+is in [overhaul stages](overhaul-stages.md). Installed-table fixtures exercise a
+checked Cyallo scalar reference and a synchronous host callback through aliases. [Interpreter tests](../tests/verified_bytecode.rs) · [Loan fixtures](../tests/verified_loans.rs) · [Source fixture](../tests/sdk_reference.rs) · [Host fixture](../tests/sdk_host.rs) · [Implementation stages](overhaul-stages.md)
 
 ## Review and acceptance
 

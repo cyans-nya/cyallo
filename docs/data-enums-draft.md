@@ -1,7 +1,7 @@
 # Data enums and anonymous records — design draft
 
 Status: design target, updated 2026-11-17. User enums, anonymous records,
-matching and standard `Option`/`Result` execute on the `data-enums` branch; see the
+matching and standard `Option`/`Result` execute on `main` (the `data-enums` branch is merged); see the
 [implementation tracker](data-enums-implementation.md) and
 [work log](data-enums-work-log.md) for verified behavior. Other standard statuses
 and failures, including `TaskOutcome`, `SendError`, `ViewError` and `LoadError`,

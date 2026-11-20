@@ -1,5 +1,7 @@
 # Routine optimization results
 
+> **Legacy engine (2026-11-20).** This describes the tiered engine in `src/runtime` and `src/backend` (everything outside `src/backend/verified`), which the verified pipeline replaces. It stays accurate while that engine exists and is retired with it in the [legacy removal plan](legacy-removal-plan.md). Current native-tier work: [native tiers: next steps](native-tiers-next-steps.md).
+
 Implemented on 2026-11-12, following [the routine optimization plan](function-inlining-plan.md).
 
 The later [inspection and predictive-admission implementation](jit-inspection-and-admission.md)

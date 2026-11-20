@@ -1,5 +1,7 @@
 # Native baseline and compilation scheduling plan
 
+> **Legacy engine (2026-11-20).** This describes the tiered engine in `src/runtime` and `src/backend` (everything outside `src/backend/verified`), which the verified pipeline replaces. It stays accurate while that engine exists and is retired with it in the [legacy removal plan](legacy-removal-plan.md). Current native-tier work: [native tiers: next steps](native-tiers-next-steps.md).
+
 Status: implemented on ARM64 macOS, with native Linux ARM64/x64 runtime CI gates configured but not executed locally. The bytecode-native baseline replaces the Wasm adapter by default; the adapter remains feature-gated for differential benchmarks. See [architecture](architecture.md), [measurements](benchmarks.md), and [vendor maintenance](../vendor/README.md) for the implemented contracts. The sections below retain the design and upgrade acceptance criteria; Windows x64 runtime validation remains outstanding.
 
 ## Target

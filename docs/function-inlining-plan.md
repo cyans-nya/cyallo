@@ -1,5 +1,7 @@
 # Routine inlining and related optimization plan
 
+> **Legacy engine (2026-11-20).** This describes the tiered engine in `src/runtime` and `src/backend` (everything outside `src/backend/verified`), which the verified pipeline replaces. It stays accurate while that engine exists and is retired with it in the [legacy removal plan](legacy-removal-plan.md). Current native-tier work: [native tiers: next steps](native-tiers-next-steps.md).
+
 Status: the bounded initial implementation is complete: strict purity, bounded
 compile-time constants with immutable pools, frameless scalar routine inlining,
 opt-in embedded procedure bodies with retained frames, exact accounting and matched

@@ -1,5 +1,7 @@
 # JIT remediation results
 
+> **Legacy engine (2026-11-20).** This describes the tiered engine in `src/runtime` and `src/backend` (everything outside `src/backend/verified`), which the verified pipeline replaces. It stays accurate while that engine exists and is retired with it in the [legacy removal plan](legacy-removal-plan.md). Current native-tier work: [native tiers: next steps](native-tiers-next-steps.md).
+
 The [remediation plan](jit-remediation-plan.md) is implemented. Measurements
 below compare the release binary preserved before implementation with the final
 release binary on the same ARM64 macOS host. The [original diagnosis](jit-diagnosis-2026-11-11.md)

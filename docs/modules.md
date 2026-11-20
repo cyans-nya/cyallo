@@ -87,7 +87,7 @@ contract preparation still rebuild the extended package context.
 
 Verification lives in [module product tests](../tests/module_units.rs), alongside
 [namespace tests](../tests/namespace.rs), [module tests](../tests/modules.rs),
-[parallel compilation tests](../tests/parallel_compilation.rs) and
+parallel compilation (its engine-level tests were retired with the legacy engine) and
 [runtime loading tests](../tests/dynamic_import.rs). The example is exercised with
 eager/deferred checks, interpreter/Winch/Cranelift, moving GC stress and
 single-instruction handoffs. Cache tests verify changed interfaces, moved routine

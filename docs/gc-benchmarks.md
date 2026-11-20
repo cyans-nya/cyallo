@@ -1,5 +1,7 @@
 # Initial cell GC measurements
 
+> **Legacy engine (2026-11-20).** This describes the tiered engine in `src/runtime` and `src/backend` (everything outside `src/backend/verified`), which the verified pipeline replaces. It stays accurate while that engine exists and is retired with it in the [legacy removal plan](legacy-removal-plan.md). Current native-tier work: [native tiers: next steps](native-tiers-next-steps.md).
+
 Recorded 2026-11-11 on native ARM64 macOS with `cargo bench --bench gc`.
 These are medians of nine fresh single-Session samples, in milliseconds.
 Parsing/code generation are outside timing; Session setup and initial native
