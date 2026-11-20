@@ -1,5 +1,6 @@
 //! Fuel-bounded native execution and transfer to the verified interpreter.
 
+use super::SliceKind;
 use super::{BridgeCall, Layout};
 use super::{
     CodeStore, EntryPin, Failure, NativeHome, NativeTier, Operation, Origin, RecoverySlot,
@@ -12,7 +13,7 @@ use crate::bytecode::verified::{
     Register, RunError, Scalar, ScalarFrameSnapshot, ScalarRecoveryError, ScalarType,
     StatementArrival,
 };
-use crate::bytecode::verified::{OutputSink, TextOp};
+use crate::bytecode::verified::{OutputSink, TextFailure, TextMapOp, TextOp, TextTestOp};
 use std::fmt;
 use std::sync::Arc;
 
@@ -686,6 +687,97 @@ fn perform(
             let length = frame.text(*source, runtime.texts)?.chars().count();
             let length = i64::try_from(length).unwrap_or(i64::MAX);
             frame.put(*destination, scalar_word(Scalar::I64(length)))?;
+        }
+        BridgeCall::TextSlice {
+            kind,
+            destination,
+            source,
+            first,
+            second,
+        } => {
+            let text = frame.text(*source, runtime.texts)?;
+            let int = |home: NativeHome| -> Result<i64, NativeRunError> {
+                match frame.load(home)? {
+                    Scalar::I64(value) => Ok(value),
+                    _ => Err(NativeRunError::InvalidHome(home.register)),
+                }
+            };
+            let sliced: Result<String, TextFailure> = match kind {
+                SliceKind::Left => crate::bytecode::verified::slice_left(&text, int(*first)?),
+                SliceKind::Right => crate::bytecode::verified::slice_right(&text, int(*first)?),
+                SliceKind::Mid => {
+                    let second = second.ok_or(NativeRunError::InvalidActivation)?;
+                    crate::bytecode::verified::slice_mid(&text, int(*first)?, int(second)?)
+                }
+            };
+            match sliced {
+                Ok(value) => {
+                    let word = intern(runtime, value.into());
+                    frame.put(*destination, word)?;
+                }
+                Err(failure) => {
+                    return Ok(Some(RunError::Text {
+                        failure,
+                        function: origin.function,
+                        instruction: origin.instruction,
+                        span: origin.span,
+                    }));
+                }
+            }
+        }
+        BridgeCall::TextMap {
+            operation,
+            destination,
+            source,
+        } => {
+            let text = frame.text(*source, runtime.texts)?;
+            let mapped = match operation {
+                TextMapOp::Trim => text.trim().to_owned(),
+                TextMapOp::Upper => text.to_uppercase(),
+                TextMapOp::Lower => text.to_lowercase(),
+            };
+            let word = intern(runtime, mapped.into());
+            frame.put(*destination, word)?;
+        }
+        BridgeCall::TextTest {
+            operation,
+            destination,
+            text,
+            other,
+        } => {
+            let (text, other) = (
+                frame.text(*text, runtime.texts)?,
+                frame.text(*other, runtime.texts)?,
+            );
+            let result = match operation {
+                TextTestOp::Contains => text.contains(&*other),
+                TextTestOp::StartsWith => text.starts_with(&*other),
+                TextTestOp::EndsWith => text.ends_with(&*other),
+            };
+            frame.put(*destination, u64::from(result))?;
+        }
+        BridgeCall::TextReplace {
+            destination,
+            text,
+            from,
+            to,
+        } => {
+            let replaced = frame.text(*text, runtime.texts)?.replace(
+                &*frame.text(*from, runtime.texts)?,
+                &frame.text(*to, runtime.texts)?,
+            );
+            let word = intern(runtime, replaced.into());
+            frame.put(*destination, word)?;
+        }
+        BridgeCall::ToText {
+            destination,
+            source,
+        } => {
+            let value = frame.read(*source, runtime.texts)?;
+            let spelled = crate::bytecode::verified::spell_recovered(&value)
+                .ok_or(NativeRunError::InvalidHome(source.register))?;
+            let word = intern(runtime, spelled.into());
+            frame.put(*destination, word)?;
         }
         BridgeCall::Print {
             template,

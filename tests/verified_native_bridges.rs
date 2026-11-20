@@ -3,13 +3,14 @@
 //! must agree, also when a paused native frame continues in the interpreter.
 
 use cyallo::{
+    CompileOptions, Dialect,
     backend::verified::{
         CodeStore, CraneliftProfile, EntryPin, NativeTarget, NativeTier, Operation, PrepareError,
     },
     bytecode::verified::{
         ExecutionLimits, ExecutionStatus, FunctionId, OutputSink, Scalar, VerifiedModule,
     },
-    compile,
+    compile, compile_with_options,
 };
 use std::sync::{Arc, Mutex};
 
@@ -31,6 +32,16 @@ fn module(source: &str) -> VerifiedModule {
         .position(|routine| routine.name.as_ref() == "entry")
         .unwrap();
     VerifiedModule::lower(&program, index).unwrap()
+}
+
+fn caie_module(source: &str) -> VerifiedModule {
+    let options = CompileOptions {
+        dialect: Dialect::Compatibility,
+        convenience_builtins: true,
+        ..Default::default()
+    };
+    let program = compile_with_options(source, options).unwrap();
+    VerifiedModule::lower(&program, 0).unwrap()
 }
 
 fn publish_all(module: &VerifiedModule, tier: NativeTier) -> (CodeStore, EntryPin) {
@@ -76,10 +87,13 @@ fn capture() -> (OutputSink, Arc<Mutex<Vec<String>>>) {
 }
 
 fn check(source: &str, cases: &[Vec<Scalar>]) {
+    check_module(module(source), cases);
+}
+
+fn check_module(module: VerifiedModule, cases: &[Vec<Scalar>]) {
     if NativeTarget::host().is_none() {
         return;
     }
-    let module = module(source);
     for tier in TIERS {
         let (_store, pin) = publish_all(&module, tier);
         assert!(
@@ -191,4 +205,42 @@ proc entry(n: i64) -> i64 {
 }
 "#;
     check(source, &ints(&[0, 7]));
+}
+
+#[test]
+fn string_functions_match_the_interpreter() {
+    let source = r#"
+proc entry(n: i64) -> i64 {
+    let padded = "  Straße ñ  "
+    let text = std::string::trim(padded)
+    std::io::print("[", text, "]", std::string::upper(text), std::string::lower("ÀBC"))
+    std::io::print(std::string::contains(text, "ße"), std::string::starts_with(text, "St"), std::string::ends_with(text, "x"))
+    std::io::print(std::string::replace("a-b-c", "-", "+"), std::string::replace("aaa", "a", "bb"))
+    std::io::print(std::string::from(n), "|", std::string::from(2.5), "|", std::string::from(n > 0), "|", std::string::from(text))
+    return std::string::len(text) + n
+}
+"#;
+    check(source, &ints(&[-4, 0, 99]));
+}
+
+#[test]
+fn caie_slicing_prints_and_fails_with_the_same_typed_error() {
+    let ok = concat!(
+        "DECLARE t : STRING\n",
+        "t <- \"Cambridge\"\n",
+        "OUTPUT LEFT(t, 3), \"|\", RIGHT(t, 3), \"|\", MID(t, 4, 3), \"|\", MID(t, 1, 9), \"|\", LEFT(t, 0)\n",
+    );
+    check_module(caie_module(ok), &[vec![]]);
+    for expression in [
+        "MID(t, 0, 1)",
+        "MID(t, 2, -1)",
+        "MID(t, 3, 2)",
+        "LEFT(t, 4)",
+        "RIGHT(t, 4)",
+        "LEFT(t, -1)",
+    ] {
+        let source =
+            format!("DECLARE t : STRING\nt <- \"abc\"\nOUTPUT \"ok\"\nOUTPUT {expression}\n");
+        check_module(caie_module(&source), &[vec![]]);
+    }
 }

@@ -22,7 +22,7 @@ pub use image::{
 };
 pub use prepare::{
     BridgeCall, Call, CallArgument, CodeVersion, FunctionVersion, Layout, LayoutId, LoanBase, NativeHome, Operation, Origin,
-    PrepareError, UnaryOp, WordOp, WordRange,
+    PrepareError, SliceKind, UnaryOp, WordOp, WordRange,
     PreparedFunction, RecoverySlot, Site,
 };
 pub use publish::{CodeStore, EntryPin, PublishError};

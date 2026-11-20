@@ -181,6 +181,8 @@ Native slice 3a (runtime bridges) lets native code print and use strings. A brid
 
 Open native-tier work after slice 3a, in the order it is likely to be taken:
 
-1. More bridged operations through the existing mechanism (`ScalarOutcome::Bridge`, `BridgeCall` in `src/backend/verified/prepare.rs`, `perform` in `src/backend/verified/run.rs`): string slicing and mapping, conversion to text, closures and indirect calls, vectors, ranges, cells, arrays, input, module variables.
+1. More bridged operations through the existing mechanism (`ScalarOutcome::Bridge`, `BridgeCall` in `src/backend/verified/prepare.rs`, `perform` in `src/backend/verified/run.rs`): closures and indirect calls, vectors, ranges, cells, arrays, input, module variables. These hold values that are not words (arrays reach 2^22 elements, vectors grow, closures carry captures and are called through the store), so they need a runtime value table whose entries the collector treats as roots; input also needs a native way to pause while a source waits.
 2. Counted owners and GC handles: native frames need root maps the collector can read before any allocation bridge is enabled.
 3. Dynamic features: objects and erased values with shape descriptors and inline caches, service views and lookup caches, module loads, generators, tasks and channels (native park and resume).
+
+Native slice 3b adds bridges for the rest of the string operations: `LEFT`, `RIGHT` and `MID` (failing with the interpreter's typed text errors and spans), trim, upper and lower, contains, starts-with and ends-with, replace, and conversion of scalars and strings to text. The helper functions are the interpreter's own. `tests/verified_native_bridges.rs` now also compares the string functions and every slicing failure on all three tiers. The remaining items in the list above need the runtime value table described there.

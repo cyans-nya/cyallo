@@ -25,7 +25,10 @@ pub use codec::encode;
 pub use debug::{StatementArrival, StatementBoundary};
 pub use frame::{FrameLayout, FrameSlot};
 pub use lower::LowerError;
-pub(crate) use run::{ScalarFrameSnapshot, render_recovered_output};
+pub(crate) use run::{
+    ScalarFrameSnapshot, render_recovered_output, slice_left, slice_mid, slice_right,
+    spell_recovered,
+};
 pub use run::{RecoveredStep, RecoveredValue};
 pub use run::ScalarRecoveryError;
 pub use run::{

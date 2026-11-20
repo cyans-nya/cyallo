@@ -5566,6 +5566,17 @@ fn spell(value: &FrameValue, style: TextStyle) -> String {
     }
 }
 
+/// The plain spelling of a scalar or string, as `ToText` makes it.
+pub(crate) fn spell_recovered(value: &RecoveredValue) -> Option<String> {
+    match value {
+        RecoveredValue::Scalar(scalar) => {
+            Some(spell(&FrameValue::Scalar(*scalar), TextStyle::Plain))
+        }
+        RecoveredValue::Text(text) => Some(text.to_string()),
+        _ => None,
+    }
+}
+
 /// The line an output call prints for arguments recovered from native words.
 pub(crate) fn render_recovered_output(
     template: &OutputTemplate,
@@ -6210,7 +6221,7 @@ fn text_error(
     }
 }
 
-fn slice_left(text: &str, count: i64) -> Result<String, TextFailure> {
+pub(crate) fn slice_left(text: &str, count: i64) -> Result<String, TextFailure> {
     let count = usize::try_from(count).map_err(|_| TextFailure::NegativeLength)?;
     let chars: Vec<char> = text.chars().collect();
     chars
@@ -6219,7 +6230,7 @@ fn slice_left(text: &str, count: i64) -> Result<String, TextFailure> {
         .ok_or(TextFailure::RangeOutOfBounds)
 }
 
-fn slice_right(text: &str, count: i64) -> Result<String, TextFailure> {
+pub(crate) fn slice_right(text: &str, count: i64) -> Result<String, TextFailure> {
     let count = usize::try_from(count).map_err(|_| TextFailure::NegativeLength)?;
     let chars: Vec<char> = text.chars().collect();
     let start = chars
@@ -6230,7 +6241,7 @@ fn slice_right(text: &str, count: i64) -> Result<String, TextFailure> {
 }
 
 /// `start` is one-based, as in the CAIE `MID`.
-fn slice_mid(text: &str, start: i64, count: i64) -> Result<String, TextFailure> {
+pub(crate) fn slice_mid(text: &str, start: i64, count: i64) -> Result<String, TextFailure> {
     let start = start
         .checked_sub(1)
         .and_then(|start| usize::try_from(start).ok())

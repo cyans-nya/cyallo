@@ -6,7 +6,8 @@ use crate::{
     bytecode::verified::{
         BooleanOp, CallSiteId, CallTarget, FloatOp, FunctionId, Instruction, InstructionId,
         IntegerOp, LoanOrigin, OutputId, Register, RegisterType, Scalar, ScalarType, Shape,
-        StorageState, TextId, TextOp, ValueType, VerifiedFunction, VerifiedModule,
+        StorageState, TextId, TextMapOp, TextOp, TextTestOp, ValueType, VerifiedFunction,
+        VerifiedModule,
     },
 };
 use std::{collections::BTreeMap, fmt};
@@ -94,6 +95,43 @@ pub enum BridgeCall {
         destination: NativeHome,
         source: NativeHome,
     },
+    /// `LEFT`, `RIGHT` or `MID` by character count; `MID` also has `second`.
+    TextSlice {
+        kind: SliceKind,
+        destination: NativeHome,
+        source: NativeHome,
+        first: NativeHome,
+        second: Option<NativeHome>,
+    },
+    TextMap {
+        operation: TextMapOp,
+        destination: NativeHome,
+        source: NativeHome,
+    },
+    TextTest {
+        operation: TextTestOp,
+        destination: NativeHome,
+        text: NativeHome,
+        other: NativeHome,
+    },
+    TextReplace {
+        destination: NativeHome,
+        text: NativeHome,
+        from: NativeHome,
+        to: NativeHome,
+    },
+    /// The plain spelling of a scalar or string.
+    ToText {
+        destination: NativeHome,
+        source: NativeHome,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SliceKind {
+    Left,
+    Right,
+    Mid,
 }
 
 /// What a projection borrows from.
@@ -1161,6 +1199,70 @@ fn legalize(
                 right,
             })?
         }
+        Instruction::TextLeft(dst, src, count) | Instruction::TextRight(dst, src, count) => {
+            let kind = if matches!(instruction, Instruction::TextLeft(..)) {
+                SliceKind::Left
+            } else {
+                SliceKind::Right
+            };
+            let call = BridgeCall::TextSlice {
+                kind,
+                destination: map.home(dst)?,
+                source: map.home(src)?,
+                first: map.home(count)?,
+                second: None,
+            };
+            map.bridge(call)?
+        }
+        Instruction::TextMid(dst, src, list) => {
+            let [start, count] = map.body.lists()[list.0 as usize][..] else {
+                return Err(unsupported);
+            };
+            let call = BridgeCall::TextSlice {
+                kind: SliceKind::Mid,
+                destination: map.home(dst)?,
+                source: map.home(src)?,
+                first: map.home(start)?,
+                second: Some(map.home(count)?),
+            };
+            map.bridge(call)?
+        }
+        Instruction::TextMap(operation, dst, src) => {
+            let call = BridgeCall::TextMap {
+                operation,
+                destination: map.home(dst)?,
+                source: map.home(src)?,
+            };
+            map.bridge(call)?
+        }
+        Instruction::TextTest(operation, dst, text, other) => {
+            let call = BridgeCall::TextTest {
+                operation,
+                destination: map.home(dst)?,
+                text: map.home(text)?,
+                other: map.home(other)?,
+            };
+            map.bridge(call)?
+        }
+        Instruction::TextReplace(dst, text, list) => {
+            let [from, to] = map.body.lists()[list.0 as usize][..] else {
+                return Err(unsupported);
+            };
+            let call = BridgeCall::TextReplace {
+                destination: map.home(dst)?,
+                text: map.home(text)?,
+                from: map.home(from)?,
+                to: map.home(to)?,
+            };
+            map.bridge(call)?
+        }
+        Instruction::ToText(dst, src) => {
+            let call = BridgeCall::ToText {
+                destination: map.home(dst)?,
+                source: map.home(src)?,
+            };
+            map.bridge(call)?
+        }
         Instruction::TextLength(dst, src) => {
             let (destination, source) = (map.home(dst)?, map.home(src)?);
             map.bridge(BridgeCall::TextLength {
@@ -1209,9 +1311,6 @@ fn legalize(
         | Instruction::ClockNew(..)
         | Instruction::ClockClone(..)
         | Instruction::ClockSleep(..)
-        | Instruction::TextLeft(..)
-        | Instruction::TextRight(..)
-        | Instruction::TextMid(..)
         | Instruction::Closure(..)
         | Instruction::BorrowGlobal(..)
         | Instruction::GcNew(..)
@@ -1228,10 +1327,6 @@ fn legalize(
         | Instruction::CellWrite(..)
         | Instruction::CellReplace(..)
         | Instruction::Clone(..)
-        | Instruction::TextMap(..)
-        | Instruction::TextTest(..)
-        | Instruction::TextReplace(..)
-        | Instruction::ToText(..)
         | Instruction::TraitBox(..)
         | Instruction::Abs(..)
         | Instruction::CountToInteger(..)
