@@ -110,6 +110,8 @@ pub enum ScalarOutcome {
     Paused = 1,
     Failed = 2,
     Call = 3,
+    /// The runtime performs the operation, and the frame continues after it.
+    Bridge = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

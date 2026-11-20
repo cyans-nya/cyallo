@@ -5,8 +5,8 @@ use crate::{
     Span,
     bytecode::verified::{
         BooleanOp, CallSiteId, CallTarget, FloatOp, FunctionId, Instruction, InstructionId,
-        IntegerOp, LoanOrigin, Register, RegisterType, Scalar, ScalarType, Shape, StorageState,
-        ValueType, VerifiedFunction, VerifiedModule,
+        IntegerOp, LoanOrigin, OutputId, Register, RegisterType, Scalar, ScalarType, Shape,
+        StorageState, TextId, TextOp, ValueType, VerifiedFunction, VerifiedModule,
     },
 };
 use std::{collections::BTreeMap, fmt};
@@ -36,6 +36,8 @@ pub enum Layout {
     /// A loan: one word holding the address of the borrowed words, which
     /// stay in the owner's frame.
     Loan,
+    /// A string: one word indexing the activation's string table.
+    Text,
     Tuple(Box<[Layout]>),
     Enum(Box<[Option<Layout>]>),
 }
@@ -43,7 +45,7 @@ pub enum Layout {
 impl Layout {
     pub fn words(&self) -> u32 {
         match self {
-            Self::Scalar(_) | Self::Loan => 1,
+            Self::Scalar(_) | Self::Loan | Self::Text => 1,
             Self::Tuple(fields) => fields.iter().map(Layout::words).sum(),
             Self::Enum(variants) => {
                 1 + variants
@@ -63,6 +65,35 @@ impl Layout {
         };
         (index < fields.len()).then(|| fields[..index].iter().map(Layout::words).sum())
     }
+}
+
+/// An operation the runtime performs for native code, which cannot do it in
+/// machine code: it holds strings and writes output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeCall {
+    Print {
+        template: OutputId,
+        arguments: Box<[NativeHome]>,
+    },
+    TextConstant {
+        destination: NativeHome,
+        text: TextId,
+    },
+    TextConcat {
+        destination: NativeHome,
+        left: NativeHome,
+        right: NativeHome,
+    },
+    TextCompare {
+        operation: TextOp,
+        destination: NativeHome,
+        left: NativeHome,
+        right: NativeHome,
+    },
+    TextLength {
+        destination: NativeHome,
+        source: NativeHome,
+    },
 }
 
 /// What a projection borrows from.
@@ -181,6 +212,8 @@ pub enum Operation {
     },
     /// Fail when the step is zero.
     NonZero(NativeHome),
+    /// The runtime performs bridge call `index` of the plan.
+    Bridge(u32),
     /// Whether the enum with this tag word holds the variant.
     TagIs {
         destination: NativeHome,
@@ -263,6 +296,7 @@ pub struct PreparedFunction {
     layouts: Box<[Layout]>,
     words: Box<[WordOp]>,
     borrowed: Box<[u32]>,
+    bridges: Box<[BridgeCall]>,
     sites: Box<[Site]>,
     calls: BTreeMap<InstructionId, Call>,
 }
@@ -363,7 +397,9 @@ impl PreparedFunction {
                         .ok_or(PrepareError::InstructionOverflow)?,
                 )),
             };
-            if let (Instruction::Call(id), Some(next)) = (instruction, successor) {
+            if let (Instruction::Call(id), Some(next)) = (instruction, successor)
+                && !matches!(body.calls()[id.0 as usize].target, CallTarget::Output(_))
+            {
                 let link_offset = frame_offset(calls.len())?;
                 calls.insert(
                     pc,
@@ -394,6 +430,7 @@ impl PreparedFunction {
             layouts: map.layouts.into_boxed_slice(),
             words: map.words.into_boxed_slice(),
             borrowed: map.borrowed.into_iter().collect(),
+            bridges: map.bridges.into_boxed_slice(),
             sites: sites.into_boxed_slice(),
             calls,
         })
@@ -449,6 +486,10 @@ impl PreparedFunction {
         self.borrowed.binary_search(&offset).is_ok()
     }
 
+    pub fn bridge(&self, index: u32) -> Option<&BridgeCall> {
+        self.bridges.get(index as usize)
+    }
+
     pub fn words(&self, range: WordRange) -> &[WordOp] {
         let start = range.start as usize;
         &self.words[start..start + range.len as usize]
@@ -488,6 +529,7 @@ pub(super) fn layout_of(body: &VerifiedFunction, ty: ValueType) -> Option<Layout
     match ty {
         ValueType::Scalar(ScalarType::U64) => None,
         ValueType::Scalar(scalar) => Some(Layout::Scalar(scalar)),
+        ValueType::Text => Some(Layout::Text),
         ValueType::Composite(id) => match body.shape_table().get(usize::try_from(id.0).ok()?)? {
             Shape::Tuple(fields) => fields
                 .iter()
@@ -519,6 +561,7 @@ struct FrameMap<'a> {
     layouts: Vec<Layout>,
     words: Vec<WordOp>,
     borrowed: std::collections::BTreeSet<u32>,
+    bridges: Vec<BridgeCall>,
 }
 
 impl<'a> FrameMap<'a> {
@@ -555,6 +598,7 @@ impl<'a> FrameMap<'a> {
             layouts,
             words: Vec::new(),
             borrowed: Default::default(),
+            bridges: Vec::new(),
         })
     }
 
@@ -576,6 +620,7 @@ impl<'a> FrameMap<'a> {
             Some(RegisterType::Scalar(ty)) => {
                 layout_of(self.body, ValueType::Scalar(ty)).ok_or(PrepareError::NonScalar(register))
             }
+            Some(RegisterType::Text) => Ok(Layout::Text),
             Some(RegisterType::Composite(id)) => layout_of(self.body, ValueType::Composite(id))
                 .ok_or(PrepareError::NonScalar(register)),
             Some(RegisterType::Loan {
@@ -643,6 +688,12 @@ impl<'a> FrameMap<'a> {
             Some(Layout::Enum(_)) => Ok(home),
             _ => Err(unsupported),
         }
+    }
+
+    fn bridge(&mut self, call: BridgeCall) -> Result<Operation, PrepareError> {
+        let index = u32::try_from(self.bridges.len()).map_err(|_| PrepareError::FrameTooLarge)?;
+        self.bridges.push(call);
+        Ok(Operation::Bridge(index))
     }
 
     fn layout_of_home(&self, home: NativeHome) -> Option<Layout> {
@@ -1073,7 +1124,50 @@ fn legalize(
             Operation::Return(value.map(|register| map.home(register)).transpose()?)
         }
         Instruction::Trap => Operation::Trap,
-        Instruction::Call(_) => Operation::Call(origin.instruction),
+        Instruction::Call(id) => {
+            let call = &map.body.calls()[id.0 as usize];
+            if let CallTarget::Output(template) = call.target {
+                let arguments = call
+                    .arguments
+                    .iter()
+                    .map(|&register| map.home(register))
+                    .collect::<Result<_, _>>()?;
+                map.bridge(BridgeCall::Print {
+                    template,
+                    arguments,
+                })?
+            } else {
+                Operation::Call(origin.instruction)
+            }
+        }
+        Instruction::TextConstant(dst, text) => {
+            let destination = map.home(dst)?;
+            map.bridge(BridgeCall::TextConstant { destination, text })?
+        }
+        Instruction::TextConcat(dst, lhs, rhs) => {
+            let (destination, left, right) = (map.home(dst)?, map.home(lhs)?, map.home(rhs)?);
+            map.bridge(BridgeCall::TextConcat {
+                destination,
+                left,
+                right,
+            })?
+        }
+        Instruction::TextCompare(operation, dst, lhs, rhs) => {
+            let (destination, left, right) = (map.home(dst)?, map.home(lhs)?, map.home(rhs)?);
+            map.bridge(BridgeCall::TextCompare {
+                operation,
+                destination,
+                left,
+                right,
+            })?
+        }
+        Instruction::TextLength(dst, src) => {
+            let (destination, source) = (map.home(dst)?, map.home(src)?);
+            map.bridge(BridgeCall::TextLength {
+                destination,
+                source,
+            })?
+        }
         Instruction::ObjectNew(..)
         | Instruction::ObjectGet(..)
         | Instruction::ObjectGetKey(..)
@@ -1115,10 +1209,6 @@ fn legalize(
         | Instruction::ClockNew(..)
         | Instruction::ClockClone(..)
         | Instruction::ClockSleep(..)
-        | Instruction::TextConstant(..)
-        | Instruction::TextConcat(..)
-        | Instruction::TextCompare(..)
-        | Instruction::TextLength(..)
         | Instruction::TextLeft(..)
         | Instruction::TextRight(..)
         | Instruction::TextMid(..)

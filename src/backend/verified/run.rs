@@ -1,6 +1,6 @@
 //! Fuel-bounded native execution and transfer to the verified interpreter.
 
-use super::Layout;
+use super::{BridgeCall, Layout};
 use super::{
     CodeStore, EntryPin, Failure, NativeHome, NativeTier, Operation, Origin, RecoverySlot,
     ScalarOutcome,
@@ -12,7 +12,9 @@ use crate::bytecode::verified::{
     Register, RunError, Scalar, ScalarFrameSnapshot, ScalarRecoveryError, ScalarType,
     StatementArrival,
 };
+use crate::bytecode::verified::{OutputSink, TextOp};
 use std::fmt;
+use std::sync::Arc;
 
 const ENTRY: InstructionId = InstructionId(0);
 
@@ -90,6 +92,8 @@ impl EntryPin {
             frame.store(home, argument)?;
         }
         Ok(NativeActivation {
+            texts: Vec::new(),
+            output: OutputSink::default(),
             state: State::Active(vec![frame]),
             limits,
             spent: 0,
@@ -106,6 +110,9 @@ pub struct EntryEvent {
 
 #[derive(Debug)]
 pub struct NativeActivation {
+    /// Strings held by native frames, which carry indices into this table.
+    texts: Vec<Arc<str>>,
+    output: OutputSink,
     state: State,
     limits: ExecutionLimits,
     spent: usize,
@@ -196,7 +203,22 @@ impl Frame {
             .ok_or(NativeRunError::InvalidHome(home.register))
     }
 
-    fn read(&self, home: NativeHome) -> Result<RecoveredValue, NativeRunError> {
+    fn put(&mut self, home: NativeHome, word: u64) -> Result<(), NativeRunError> {
+        let index = self.slot(home)?;
+        self.slots[index] = word;
+        Ok(())
+    }
+
+    fn text(&self, home: NativeHome, texts: &[Arc<str>]) -> Result<Arc<str>, NativeRunError> {
+        let word = self.slots[self.slot(home)?];
+        usize::try_from(word)
+            .ok()
+            .and_then(|index| texts.get(index))
+            .cloned()
+            .ok_or(NativeRunError::InvalidHome(home.register))
+    }
+
+    fn read(&self, home: NativeHome, texts: &[Arc<str>]) -> Result<RecoveredValue, NativeRunError> {
         let Some(id) = home.layout else {
             return self.load(home).map(RecoveredValue::Scalar);
         };
@@ -205,13 +227,14 @@ impl Frame {
             .plan()
             .layout(id)
             .ok_or(NativeRunError::InvalidHome(home.register))?;
-        decode_layout(layout, self.words(home)?)
+        decode_layout(layout, self.words(home)?, texts)
     }
 
     fn snapshot(
         &self,
         stack: &[Frame],
         index: usize,
+        texts: &[Arc<str>],
     ) -> Result<ScalarFrameSnapshot, NativeRunError> {
         let (pc, next, arrival) = match self.position {
             Position::Ready { next, arrival } => (next, next, arrival),
@@ -226,7 +249,7 @@ impl Frame {
         let mut values = Vec::new();
         for &slot in &site.recover {
             if let RecoverySlot::Initialized(home) = slot {
-                let value = match self.read(home)? {
+                let value = match self.read(home, texts)? {
                     RecoveredValue::Loan { .. } => recover_loan(stack, index, home)?,
                     other => other,
                 };
@@ -244,6 +267,11 @@ impl Frame {
 }
 
 impl NativeActivation {
+    /// Where the program's output goes. Set before the first slice.
+    pub fn set_output(&mut self, sink: OutputSink) {
+        self.output = sink;
+    }
+
     pub fn instructions_executed(&self) -> usize {
         self.spent
     }
@@ -279,6 +307,10 @@ impl NativeActivation {
         while available != 0 {
             match step(
                 stack,
+                &mut Runtime {
+                    texts: &mut self.texts,
+                    output: &mut self.output,
+                },
                 self.limits.frames,
                 &mut available,
                 &mut self.spent,
@@ -309,12 +341,15 @@ impl NativeActivation {
         };
         let root = stack.first().ok_or(NativeRunError::InvalidActivation)?;
         let snapshots = (0..stack.len())
-            .map(|index| stack[index].snapshot(&stack, index))
+            .map(|index| stack[index].snapshot(&stack, index, &self.texts))
             .collect::<Result<Vec<_>, _>>()?;
-        root.entry
+        let mut activation = root
+            .entry
             .module()
             .restore_scalars(snapshots, self.limits, self.spent)
-            .map_err(NativeRunError::Recovery)
+            .map_err(NativeRunError::Recovery)?;
+        activation.set_output(self.output);
+        Ok(activation)
     }
 }
 
@@ -323,8 +358,15 @@ enum Step {
     Terminal(ExecutionStatus),
 }
 
+/// What native code reaches through bridges.
+struct Runtime<'a> {
+    texts: &'a mut Vec<Arc<str>>,
+    output: &'a mut OutputSink,
+}
+
 fn step(
     stack: &mut Vec<Frame>,
+    runtime: &mut Runtime<'_>,
     max_frames: usize,
     available: &mut usize,
     spent: &mut usize,
@@ -390,6 +432,21 @@ fn step(
                 return Err(NativeRunError::InvalidEdge);
             }
             frame.position = Position::Ready { next: pc, arrival };
+        }
+        ScalarOutcome::Bridge => {
+            let Operation::Bridge(index) = site.operation else {
+                return Err(NativeRunError::InvalidPc(context.next));
+            };
+            let bridge = plan
+                .bridge(index)
+                .ok_or(NativeRunError::InvalidPc(context.next))?;
+            if let Some(error) = perform(bridge, frame, runtime, site.origin)? {
+                return Ok(Step::Terminal(ExecutionStatus::Failed(error)));
+            }
+            frame.position = Position::Ready {
+                next: InstructionId(pc.0 + 1),
+                arrival: StatementArrival::Next(pc),
+            };
         }
         ScalarOutcome::Call => {
             let call = plan
@@ -550,6 +607,7 @@ fn outcome(raw: u64) -> Result<ScalarOutcome, NativeRunError> {
         ScalarOutcome::Paused,
         ScalarOutcome::Failed,
         ScalarOutcome::Call,
+        ScalarOutcome::Bridge,
     ]
     .into_iter()
     .find(|outcome| *outcome as u64 == raw)
@@ -562,6 +620,95 @@ fn position(origin: Origin) -> ExecutionPosition {
         instruction: origin.instruction,
         span: origin.span,
     }
+}
+
+/// Run a bridge call for the frame. `Some` is a failure of the program.
+fn perform(
+    bridge: &BridgeCall,
+    frame: &mut Frame,
+    runtime: &mut Runtime<'_>,
+    origin: Origin,
+) -> Result<Option<RunError>, NativeRunError> {
+    let intern = |runtime: &mut Runtime<'_>, text: Arc<str>| -> u64 {
+        runtime.texts.push(text);
+        (runtime.texts.len() - 1) as u64
+    };
+    match bridge {
+        BridgeCall::TextConstant { destination, text } => {
+            let module = frame.entry.module();
+            let body = module
+                .function(origin.function)
+                .ok_or(NativeRunError::InvalidActivation)?;
+            let value = body
+                .texts()
+                .get(text.0 as usize)
+                .cloned()
+                .ok_or(NativeRunError::InvalidActivation)?;
+            let word = intern(runtime, value);
+            frame.put(*destination, word)?;
+        }
+        BridgeCall::TextConcat {
+            destination,
+            left,
+            right,
+        } => {
+            let joined = format!(
+                "{}{}",
+                frame.text(*left, runtime.texts)?,
+                frame.text(*right, runtime.texts)?
+            );
+            let word = intern(runtime, joined.into());
+            frame.put(*destination, word)?;
+        }
+        BridgeCall::TextCompare {
+            operation,
+            destination,
+            left,
+            right,
+        } => {
+            let ordering = frame
+                .text(*left, runtime.texts)?
+                .cmp(&frame.text(*right, runtime.texts)?);
+            let value = match operation {
+                TextOp::Equal => ordering.is_eq(),
+                TextOp::NotEqual => ordering.is_ne(),
+                TextOp::Less => ordering.is_lt(),
+                TextOp::LessEqual => ordering.is_le(),
+                TextOp::Greater => ordering.is_gt(),
+                TextOp::GreaterEqual => ordering.is_ge(),
+            };
+            frame.put(*destination, u64::from(value))?;
+        }
+        BridgeCall::TextLength {
+            destination,
+            source,
+        } => {
+            let length = frame.text(*source, runtime.texts)?.chars().count();
+            let length = i64::try_from(length).unwrap_or(i64::MAX);
+            frame.put(*destination, scalar_word(Scalar::I64(length)))?;
+        }
+        BridgeCall::Print {
+            template,
+            arguments,
+        } => {
+            let module = frame.entry.module();
+            let body = module
+                .function(origin.function)
+                .ok_or(NativeRunError::InvalidActivation)?;
+            let template = body
+                .outputs()
+                .get(template.0 as usize)
+                .ok_or(NativeRunError::InvalidActivation)?;
+            let values = arguments
+                .iter()
+                .map(|&home| frame.read(home, runtime.texts))
+                .collect::<Result<Vec<_>, _>>()?;
+            let line = crate::bytecode::verified::render_recovered_output(template, &values)
+                .ok_or(NativeRunError::InvalidActivation)?;
+            runtime.output.write_line(&line);
+        }
+    }
+    Ok(None)
 }
 
 fn decode(ty: ScalarType, word: u64) -> Result<Scalar, NativeRunError> {
@@ -728,8 +875,20 @@ fn resolve_loan(
     }
 }
 
-fn decode_layout(layout: &Layout, words: &[u64]) -> Result<RecoveredValue, NativeRunError> {
+fn decode_layout(
+    layout: &Layout,
+    words: &[u64],
+    texts: &[Arc<str>],
+) -> Result<RecoveredValue, NativeRunError> {
     match layout {
+        Layout::Text => {
+            let word = *words.first().ok_or(NativeRunError::InvalidActivation)?;
+            usize::try_from(word)
+                .ok()
+                .and_then(|index| texts.get(index))
+                .map(|text| RecoveredValue::Text(text.clone()))
+                .ok_or(NativeRunError::InvalidActivation)
+        }
         // The owner is found from the loan's static origin by the caller.
         Layout::Loan => Ok(RecoveredValue::Loan {
             frame: usize::MAX,
@@ -748,7 +907,7 @@ fn decode_layout(layout: &Layout, words: &[u64]) -> Result<RecoveredValue, Nativ
                 let slice = words
                     .get(at..at + count)
                     .ok_or(NativeRunError::InvalidActivation)?;
-                values.push(decode_layout(field, slice)?);
+                values.push(decode_layout(field, slice, texts)?);
                 at += count;
             }
             Ok(RecoveredValue::Tuple(values))
@@ -764,7 +923,7 @@ fn decode_layout(layout: &Layout, words: &[u64]) -> Result<RecoveredValue, Nativ
                     let slice = words
                         .get(1..1 + layout.words() as usize)
                         .ok_or(NativeRunError::InvalidActivation)?;
-                    Some(Box::new(decode_layout(layout, slice)?))
+                    Some(Box::new(decode_layout(layout, slice, texts)?))
                 }
                 None => None,
             };

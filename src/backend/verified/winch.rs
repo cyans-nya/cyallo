@@ -228,6 +228,7 @@ mod host {
                     self.store_home(VALUE, destination);
                 }
                 Words(range) => self.words(plan, range),
+                Bridge(_) => self.exit_at(ScalarOutcome::Bridge, pc)?,
                 Borrow { destination, owner } => {
                     self.machine.imm(TEMP, u64::from(owner.0));
                     self.machine.binary(Arithmetic::Add, VALUE, SLOTS, TEMP);
@@ -362,7 +363,7 @@ mod host {
                 }
                 Trap => self.fail(pc, Failure::Trap)?,
             }
-            if !matches!(site.operation, Call(_))
+            if !matches!(site.operation, Call(_) | Bridge(_))
                 && let Some(next) = site.successor
             {
                 self.arrive(pc, Edge::Next)?;

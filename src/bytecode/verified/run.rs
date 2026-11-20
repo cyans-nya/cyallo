@@ -1938,6 +1938,7 @@ pub enum RecoveredStep {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RecoveredValue {
     Scalar(Scalar),
+    Text(Arc<str>),
     /// A loan of the whole register `register` of the frame at stack index `frame`.
     Loan {
         frame: usize,
@@ -1971,6 +1972,7 @@ impl VerifiedFunction {
                 Some(FrameValue::Scalar(*scalar))
             }
             (RecoveredValue::Loan { .. }, _) => None,
+            (RecoveredValue::Text(text), ValueType::Text) => Some(FrameValue::Text(text.clone())),
             (RecoveredValue::Tuple(values), ValueType::Composite(id)) => {
                 let Shape::Tuple(fields) = self.shape_table().get(usize::try_from(id.0).ok()?)?
                 else {
@@ -2254,6 +2256,7 @@ impl VerifiedModule {
                     continue;
                 }
                 let ty = match body.register_kind(register) {
+                    Ok(RegisterType::Text) => ValueType::Text,
                     Ok(RegisterType::Scalar(ty)) => ValueType::Scalar(ty),
                     Ok(RegisterType::Composite(shape)) => ValueType::Composite(shape),
                     _ => return Err(error),
@@ -5158,7 +5161,7 @@ impl OutputSink {
         Self::new(|line| println!("{line}"))
     }
 
-    fn write_line(&mut self, line: &str) {
+    pub(crate) fn write_line(&mut self, line: &str) {
         (self.0)(line);
     }
 }
@@ -5561,6 +5564,22 @@ fn spell(value: &FrameValue, style: TextStyle) -> String {
             | FrameValue::Moved,
         ) => unreachable!("verified text operand is a scalar or string"),
     }
+}
+
+/// The line an output call prints for arguments recovered from native words.
+pub(crate) fn render_recovered_output(
+    template: &OutputTemplate,
+    arguments: &[RecoveredValue],
+) -> Option<String> {
+    let values = arguments
+        .iter()
+        .map(|argument| match argument {
+            RecoveredValue::Scalar(scalar) => Some(FrameValue::Scalar(*scalar)),
+            RecoveredValue::Text(text) => Some(FrameValue::Text(text.clone())),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(render_output(template, &values))
 }
 
 fn render_output(template: &OutputTemplate, arguments: &[FrameValue]) -> String {

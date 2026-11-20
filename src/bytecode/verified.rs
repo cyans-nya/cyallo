@@ -25,7 +25,7 @@ pub use codec::encode;
 pub use debug::{StatementArrival, StatementBoundary};
 pub use frame::{FrameLayout, FrameSlot};
 pub use lower::LowerError;
-pub(crate) use run::ScalarFrameSnapshot;
+pub(crate) use run::{ScalarFrameSnapshot, render_recovered_output};
 pub use run::{RecoveredStep, RecoveredValue};
 pub use run::ScalarRecoveryError;
 pub use run::{

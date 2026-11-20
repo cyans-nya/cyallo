@@ -333,6 +333,10 @@ impl Lower<'_, '_> {
                 self.store(destination, value)?;
             }
             Words(range) => self.words(plan, range)?,
+            Bridge(_) => {
+                self.spill(site, plan)?;
+                return self.exit_at(ScalarOutcome::Bridge, pc);
+            }
             Borrow { destination, owner } => {
                 let address = self
                     .builder
