@@ -1,4 +1,5 @@
-//! Tier-up. Native code starts in Winch, the one-to-one baseline. A run is
+//! Tier-up. Native code starts in Winch, the one-to-one baseline. The opt-in
+//! interpreter-first mode enters Winch at a taken loop backedge. A run is
 //! sliced; each pause attributes the slice to the function that was running
 //! (sampling: no counters in generated code). A function whose executed
 //! instructions reach its threshold is compiled with Cranelift on a worker
@@ -17,9 +18,9 @@ use super::{
     CodeStore, CraneliftProfile, Dispatch, NativeRunError, NativeTier, PreparedFunction,
     UnlinkedImage,
 };
-use crate::bytecode::verified::{ExecutionStatus, FunctionId};
+use crate::bytecode::verified::{ExecutionStatus, FunctionId, Instruction, InstructionId};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{
         Arc,
         mpsc::{self, Receiver, Sender},
@@ -38,6 +39,8 @@ pub struct TierPolicy {
     /// runs on another thread, so starting early costs CPU, not latency.
     pub request_percent: u64,
     pub enabled: bool,
+    /// Run in the interpreter until native code can take over a live loop.
+    pub interpreter_first: bool,
 }
 
 impl Default for TierPolicy {
@@ -49,12 +52,13 @@ impl Default for TierPolicy {
             per_site_squared: 10,
             request_percent: 25,
             enabled: true,
+            interpreter_first: false,
         }
     }
 }
 
 impl TierPolicy {
-    /// The default policy, or none when `CYALLO_TIERING=off`.
+    /// Read the tiering overrides for this run.
     pub fn from_env() -> Self {
         let enabled = std::env::var("CYALLO_TIERING").map_or(true, |value| value != "off");
         let request_percent = std::env::var("CYALLO_TIER_REQUEST_PERCENT")
@@ -64,6 +68,8 @@ impl TierPolicy {
         Self {
             enabled,
             request_percent,
+            interpreter_first: std::env::var("CYALLO_JIT_START")
+                .is_ok_and(|value| value == "interpreter"),
             ..Self::default()
         }
     }
@@ -77,6 +83,7 @@ impl TierPolicy {
             per_site_squared: 0,
             request_percent: 100,
             enabled: true,
+            interpreter_first: false,
         }
     }
 
@@ -102,6 +109,7 @@ impl TierPolicy {
 struct Job {
     function: FunctionId,
     plan: Arc<PreparedFunction>,
+    tier: NativeTier,
 }
 
 struct Done {
@@ -109,7 +117,7 @@ struct Done {
     image: Option<UnlinkedImage>,
 }
 
-/// One thread that emits Cranelift images. Emitting reads a plan and produces
+/// One thread that emits native images. Emitting reads a plan and produces
 /// an image; publishing stays on the owning thread because pins are not `Send`.
 struct Worker {
     jobs: Option<Sender<Job>>,
@@ -124,10 +132,13 @@ impl Worker {
         let handle = thread::Builder::new()
             .name("cyallo-tier-up".into())
             .spawn(move || {
-                for Job { function, plan } in queue {
-                    let image = NativeTier::Cranelift(CraneliftProfile::LowLatency)
-                        .emit(plan)
-                        .ok();
+                for Job {
+                    function,
+                    plan,
+                    tier,
+                } in queue
+                {
+                    let image = tier.emit(plan).ok();
                     if finished.send(Done { function, image }).is_err() {
                         break;
                     }
@@ -157,7 +168,7 @@ pub struct Tiered {
     store: Option<CodeStore>,
     policy: TierPolicy,
     executed: HashMap<FunctionId, u64>,
-    requested: HashSet<FunctionId>,
+    requested: HashMap<FunctionId, NativeTier>,
     worker: Option<Worker>,
     /// Compile jobs sent and not yet received back.
     outstanding: usize,
@@ -180,7 +191,7 @@ impl Tiered {
             store,
             policy,
             executed: HashMap::new(),
-            requested: HashSet::new(),
+            requested: HashMap::new(),
             worker: None,
             outstanding: 0,
             promoted: Vec::new(),
@@ -206,7 +217,7 @@ impl Tiered {
     /// first status that is not a plain budget pause (finished, failed, or
     /// waiting for input) or when the budget is spent.
     pub fn resume(&mut self, budget: usize) -> Result<ExecutionStatus, NativeRunError> {
-        if !self.policy.enabled || self.store.is_none() {
+        if budget == 0 || !self.policy.enabled || self.store.is_none() {
             return self.dispatch.resume(budget);
         }
         let mut remaining = budget;
@@ -234,31 +245,43 @@ impl Tiered {
     /// when it crosses the threshold.
     fn sample(&mut self, function: FunctionId, used: u64) {
         let total = self.executed.entry(function).or_insert(0);
-        *total += used;
+        *total = total.saturating_add(used);
         let total = *total;
-        if self.requested.contains(&function) {
-            return;
-        }
+        let waiting_for_osr = self.dispatch.waiting_for_osr();
         let Some(store) = &mut self.store else {
             return;
         };
-        let Some(current) = store.entry(function) else {
-            return;
+        let tier = match store.entry(function) {
+            Some(current) if !waiting_for_osr && current.tier() == NativeTier::Winch => {
+                NativeTier::Cranelift(CraneliftProfile::LowLatency)
+            }
+            None if waiting_for_osr => NativeTier::Winch,
+            _ => return,
         };
-        if !matches!(current.tier(), NativeTier::Winch) {
+        if self.requested.get(&function) == Some(&tier) {
             return;
         }
-        let sites = current.plan().sites().len();
-        if total < self.policy.request_at(sites) {
+        if waiting_for_osr && !has_backedge(store, function) {
             return;
         }
         let Ok(plan) = store.prepare(function) else {
             return;
         };
-        self.requested.insert(function);
+        // The experimental interpreter-first mode reuses the existing
+        // conservative request threshold until Winch's startup cost is tuned.
+        if total < self.policy.request_at(plan.sites().len()) {
+            return;
+        }
+        self.requested.insert(function, tier);
         let worker = self.worker.get_or_insert_with(Worker::spawn);
         if let Some(jobs) = &worker.jobs
-            && jobs.send(Job { function, plan }).is_ok()
+            && jobs
+                .send(Job {
+                    function,
+                    plan,
+                    tier,
+                })
+                .is_ok()
         {
             self.outstanding += 1;
         }
@@ -286,6 +309,9 @@ impl Tiered {
         let Ok(pin) = store.publish(image) else {
             return;
         };
+        if pin.tier() == NativeTier::Winch {
+            self.executed.remove(&function);
+        }
         self.dispatch.install(function, pin);
         self.promoted.push(function);
     }
@@ -302,4 +328,22 @@ impl Tiered {
             }
         }
     }
+}
+
+fn has_backedge(store: &CodeStore, function: FunctionId) -> bool {
+    let Some(body) = store.module().function(function) else {
+        return false;
+    };
+    body.instructions()
+        .iter()
+        .enumerate()
+        .any(|(pc, instruction)| {
+            let back = |to: InstructionId| to.0 as usize <= pc;
+            let is_backedge = match *instruction {
+                Instruction::Jump(to) => back(to),
+                Instruction::Branch(_, yes, no) => back(yes) || back(no),
+                _ => false,
+            };
+            is_backedge && body.is_reachable(InstructionId(pc as u32))
+        })
 }

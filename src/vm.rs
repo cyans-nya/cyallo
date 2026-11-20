@@ -51,8 +51,13 @@ pub fn start_jit_with(
         fuel: TOTAL_FUEL,
         frames: context.max_frames,
     };
-    let mut store = CodeStore::new(module.clone()).ok();
+    let mut store = if policy.interpreter_first {
+        CodeStore::for_osr(module.clone()).ok()
+    } else {
+        CodeStore::new(module.clone()).ok()
+    };
     let started = match &mut store {
+        Some(store) if policy.interpreter_first => store.start_for_osr(limits),
         Some(store) => {
             store.compile_available();
             store.start(&[], limits, ExecutionMode::PreferNative)

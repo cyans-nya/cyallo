@@ -18,6 +18,7 @@ declaration-based primitives, instance-owned runtime state.
 | Shared runtime: closures, calls, managed memory, input, globals, random (4.3-4.5) | done | `08269f5` |
 | `ng` and `ng_jit` in the CLI, contiguous interpreter frame stack | done | `fda2d2d` |
 | Tier-up Winch to Cranelift with sampling and a worker thread | done | `dc82b52` |
+| Interpreter to Winch at a live loop header | implemented, opt-in | |
 | Cells, slices, sums, extrema (4.2) | open | |
 | `Vec<T>` as std code over a buffer primitive (4.0) | open, design agreed | |
 | Objects, services, module loads, generators, tasks, channels in native (4.6) | open | |
@@ -212,10 +213,33 @@ reason for each (`docs/native-tier-samples.md`):
   warm it on the worker when any function reaches a fraction of its threshold.
 - **Shared-runtime bridge cost.** Each bridge copies the live scalar homes in and out;
   measure a loop with a bridged operation inside and batch consecutive bridges if it loses.
-- Inlining of direct native calls, register-resident small arrays, loop OSR from the
-  interpreter into native code (needs an `import` direction; `recover` is the reverse),
-  and rebuilding the JIT reports and trace viewer on this tier (wanted, not urgent).
+- Inlining of direct native calls, register-resident small arrays, broader OSR
+  admission and rebuilding the JIT reports and trace viewer on this tier.
 - Calibrate the tier-up constants on x86_64 and on call-heavy and enum-heavy code.
+
+#### Interpreter to native OSR
+
+```sh
+CYALLO_JIT_START=interpreter cargo run --release -- run examples/osr-loop.ya --engine ng_jit
+```
+
+The example prints `500000500000:1`. The interpreter-first mode uses shared-runtime
+plans. The tier driver queues a Winch compile when sampling finds a hot function
+with a reachable backward branch. Once the image is published, the interpreter
+continues to a taken backedge to a site in the published
+module before handing off. The shared-runtime driver loads the initialized
+scalar homes and enters at that PC with the original statement edge and
+remaining fuel. The verified activation retains the stack, loans, GC roots
+and I/O state. Further execution can tier up from Winch to Cranelift.
+
+The mode is opt-in while the initial Winch threshold is measured. It currently
+reuses the Winch-to-Cranelift request threshold. Native entry requires the
+same verified module and that the entry task is the only live task. The eager
+`ng_jit` path remains the default. [OSR tests](../tests/verified_tiering.rs)
+
+On arm64 macOS, 20 warmed release CLI runs of `osr-loop.ya` averaged 217.9 ms
+and 13.4 MiB with `ng`, and 21.2 ms and 17.4 MiB with interpreter-first
+`ng_jit`. These timings include process startup.
 
 ### 4.9 Native-ineligible leftovers to decide
 `u64` counts have one-word homes and checked conversions. Count arithmetic and

@@ -11,6 +11,10 @@ pub enum StatementArrival {
 }
 
 impl StatementArrival {
+    pub(crate) fn is_backedge_to(self, target: InstructionId) -> bool {
+        matches!(self, Self::Jump(from) | Self::Branch { from, .. } if from >= target)
+    }
+
     pub(crate) fn reaches(self, target: InstructionId, code: &[Instruction]) -> bool {
         match self {
             Self::Entry => target == InstructionId(0),

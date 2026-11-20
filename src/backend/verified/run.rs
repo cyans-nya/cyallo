@@ -11,7 +11,7 @@ use super::{
 use crate::bytecode::verified::{
     Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, FunctionId, HeapStats,
     InputSource, InstructionId, MAX_VEC_ELEMENTS, RecoveredValue, Register, RunError, Scalar,
-    ScalarFrameSnapshot, ScalarRecoveryError, ScalarType, StatementArrival,
+    ScalarFrameSnapshot, ScalarRecoveryError, ScalarType, StatementArrival, VerifiedModule,
 };
 use crate::bytecode::verified::{OutputSink, TextFailure, TextMapOp, TextOp, TextTestOp};
 use std::sync::Arc;
@@ -32,6 +32,26 @@ pub enum Dispatch {
 }
 
 impl CodeStore {
+    pub(crate) fn start_for_osr(
+        &self,
+        limits: ExecutionLimits,
+    ) -> Result<Dispatch, NativeRunError> {
+        let activation = self
+            .module()
+            .start(&[], limits)
+            .map_err(NativeRunError::Guest)?;
+        Ok(Dispatch::Native(NativeActivation::new(
+            State::Shared(Box::new(SharedActivation {
+                activation,
+                module: self.module().clone(),
+                entries: HashMap::new(),
+                slots: Vec::new(),
+                admission: SharedAdmission::TakenBackedge,
+            })),
+            limits,
+        )))
+    }
+
     pub fn start(
         &self,
         arguments: &[Scalar],
@@ -95,6 +115,14 @@ impl Dispatch {
             Self::Interpreter(activation) => activation.awaiting_input(),
         }
     }
+
+    pub(super) fn waiting_for_osr(&self) -> bool {
+        matches!(
+            self,
+            Self::Native(NativeActivation { state: State::Shared(shared), .. })
+                if shared.admission == SharedAdmission::TakenBackedge
+        )
+    }
 }
 
 impl EntryPin {
@@ -111,9 +139,10 @@ impl EntryPin {
             return Ok(NativeActivation::new(
                 State::Shared(Box::new(SharedActivation {
                     activation,
-                    entry: self.clone(),
+                    module: self.module().clone(),
                     entries: self.runtime_snapshot(),
                     slots: Vec::new(),
+                    admission: SharedAdmission::AnySite,
                 })),
                 limits,
             ));
@@ -415,15 +444,19 @@ impl NativeActivation {
 
     /// See [`Dispatch::install`].
     pub fn install(&mut self, function: FunctionId, entry: EntryPin) {
+        if entry.plan().function() != function {
+            return;
+        }
         match &mut self.state {
-            State::Shared(shared) => {
+            State::Shared(shared)
+                if entry.plan().uses_shared_runtime()
+                    && shared.module.shares_functions_with(entry.module()) =>
+            {
                 shared.entries.insert(function, entry);
             }
             State::Active(word) => {
                 for frame in &mut word.stack {
-                    if frame.entry.plan().function() == function
-                        && frame.entry.version() == entry.version()
-                    {
+                    if std::ptr::eq(frame.entry.plan(), entry.plan()) {
                         frame.entry = entry.clone();
                     }
                 }
@@ -551,9 +584,16 @@ enum Step {
 #[derive(Debug)]
 struct SharedActivation {
     activation: Activation,
-    entry: EntryPin,
+    module: VerifiedModule,
     entries: HashMap<FunctionId, EntryPin>,
     slots: Vec<u64>,
+    admission: SharedAdmission,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedAdmission {
+    TakenBackedge,
+    AnySite,
 }
 
 impl SharedActivation {
@@ -562,6 +602,12 @@ impl SharedActivation {
         budget: usize,
         entry_event: &mut Option<EntryEvent>,
     ) -> Result<ExecutionStatus, NativeRunError> {
+        if budget == 0 {
+            return Ok(self.activation.status());
+        }
+        if self.entries.is_empty() {
+            return Ok(self.activation.resume(budget));
+        }
         let start = self.activation.instructions_executed();
         while matches!(self.activation.status(), ExecutionStatus::Paused(_)) {
             let used = self.activation.instructions_executed() - start;
@@ -569,17 +615,24 @@ impl SharedActivation {
             if available == 0 {
                 break;
             }
-            let native = self
-                .activation
-                .native_position(self.entry.module())
-                .and_then(|(position, arrival)| {
-                    Some((
-                        self.entries.get(&position.function)?,
-                        position.instruction,
-                        arrival,
-                    ))
-                });
+            let native =
+                self.activation
+                    .native_position(&self.module)
+                    .and_then(|(position, arrival)| {
+                        if self.admission == SharedAdmission::TakenBackedge
+                            && (!arrival.is_backedge_to(position.instruction)
+                                || self.activation.awaiting_input())
+                        {
+                            return None;
+                        }
+                        Some((
+                            self.entries.get(&position.function)?,
+                            position.instruction,
+                            arrival,
+                        ))
+                    });
             if let Some((entry, next, arrival)) = native {
+                self.admission = SharedAdmission::AnySite;
                 run_section(
                     &mut self.activation,
                     &mut self.slots,
@@ -589,6 +642,11 @@ impl SharedActivation {
                     available,
                     entry_event,
                 )?;
+            } else if self.admission == SharedAdmission::TakenBackedge {
+                self.activation
+                    .resume_to_native_loop(available, &self.module, |function| {
+                        self.entries.contains_key(&function)
+                    });
             } else {
                 self.activation.resume(1);
             }

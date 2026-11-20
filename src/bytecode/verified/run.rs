@@ -5927,10 +5927,7 @@ impl Activation {
         &self,
         module: &VerifiedModule,
     ) -> Option<(ExecutionPosition, StatementArrival)> {
-        if !Arc::ptr_eq(&self.module.functions, &module.functions)
-            || self.memory.current_task != 0
-            || self.memory.live_tasks() != 1
-        {
+        if !Self::can_enter_native(&self.module, module, &self.memory) {
             return None;
         }
         let ExecutionState::Active(stack) = &self.state else {
@@ -5945,6 +5942,16 @@ impl Activation {
             .arrival
             .reaches(position.instruction, body.instructions())
             .then_some((position, frame.arrival))
+    }
+
+    fn can_enter_native(
+        current: &VerifiedModule,
+        published: &VerifiedModule,
+        memory: &Memory,
+    ) -> bool {
+        current.shares_functions_with(published)
+            && memory.current_task == 0
+            && memory.live_tasks() == 1
     }
 
     pub(crate) fn native_fuel(&self) -> usize {
@@ -6421,6 +6428,35 @@ impl Activation {
     /// Advance by at most `budget` instructions. A zero budget only reports the
     /// current status. Terminal outcomes are retained across subsequent calls.
     pub fn resume(&mut self, budget: usize) -> ExecutionStatus {
+        self.resume_until(budget, |_, _, _| false)
+    }
+
+    /// Run until a taken backedge reaches a loop with a published entry.
+    pub(crate) fn resume_to_native_loop(
+        &mut self,
+        budget: usize,
+        published: &VerifiedModule,
+        mut has_entry: impl FnMut(FunctionId) -> bool,
+    ) -> ExecutionStatus {
+        self.resume_until(budget, |module, stack, memory| {
+            stack.last().is_some_and(|frame| {
+                let next = instruction_id(frame.pc);
+                frame.arrival.is_backedge_to(next)
+                    && has_entry(frame.function)
+                    && Self::can_enter_native(module, published, memory)
+                    && frame.arrival.reaches(
+                        next,
+                        module.functions[frame.function.index()].instructions(),
+                    )
+            })
+        })
+    }
+
+    fn resume_until(
+        &mut self,
+        budget: usize,
+        mut stop: impl FnMut(&VerifiedModule, &FrameStack, &Memory) -> bool,
+    ) -> ExecutionStatus {
         let ExecutionState::Active(stack) = &mut self.state else {
             return self.status();
         };
@@ -6478,6 +6514,11 @@ impl Activation {
                     if self.quantum == 0 {
                         self.quantum = QUANTUM;
                         self.module.rotate(stack, &mut self.memory, false);
+                    }
+                    if self.instructions_executed < self.limits.fuel
+                        && stop(&self.module, stack, &self.memory)
+                    {
+                        return self.status();
                     }
                 }
                 Ok(StepOutcome::Blocked) => {

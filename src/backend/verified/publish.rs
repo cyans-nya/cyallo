@@ -27,10 +27,22 @@ pub struct CodeStore {
 
 impl CodeStore {
     pub fn new(module: VerifiedModule) -> Result<Self, PublishError> {
+        let shared_runtime = PreparedFunction::requires_shared_runtime(&module);
+        Self::new_with_runtime(module, shared_runtime)
+    }
+
+    pub(crate) fn for_osr(module: VerifiedModule) -> Result<Self, PublishError> {
+        Self::new_with_runtime(module, true)
+    }
+
+    fn new_with_runtime(
+        module: VerifiedModule,
+        shared_runtime: bool,
+    ) -> Result<Self, PublishError> {
         let target = NativeTarget::host().ok_or(PublishError::UnsupportedHost)?;
         Ok(Self {
             target,
-            shared_runtime: PreparedFunction::requires_shared_runtime(&module),
+            shared_runtime,
             module,
             version: CodeVersion(0),
             plans: HashMap::new(),

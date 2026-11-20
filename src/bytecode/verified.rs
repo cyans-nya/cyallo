@@ -2252,6 +2252,10 @@ pub struct VerifiedModule {
 }
 
 impl VerifiedModule {
+    pub(crate) fn shares_functions_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.functions, &other.functions)
+    }
+
     /// Whether code lowered from an extended program can replace this one under
     /// frames that are already running: every routine this module has is
     /// identical in it, and every table keeps its entries and their numbers.
@@ -2324,6 +2328,25 @@ impl VerifiedModule {
     /// [`Self::lower`] for a program that run-time loads may extend.
     pub fn lower_shared(program: Arc<Program>, routine: usize) -> Result<Self, LowerError> {
         Self::lower_extended(program, routine, &[])
+    }
+
+    /// Lower the entry routine together with every analyzed routine of the
+    /// program, so validation and dumps cover bodies nothing reaches.
+    /// Routines still deferred are left out rather than analyzed here.
+    pub fn lower_analyzed(program: &Program) -> Result<Self, LowerError> {
+        let roots: Vec<usize> = program
+            .functions()
+            .iter()
+            .enumerate()
+            .filter(|&(index, routine)| index != 0 && routine.is_analyzed())
+            .map(|(index, _)| index)
+            .collect();
+        Self::lower_checked_roots(
+            program.functions(),
+            0,
+            Some(program.services.clone()),
+            &roots,
+        )
     }
 
     /// Lower the program with these checked routines as extra roots, after

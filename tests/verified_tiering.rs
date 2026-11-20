@@ -4,11 +4,13 @@
 //! plans (scalar programs) and shared-runtime plans (programs using globals).
 
 use cyallo::{
-    backend::verified::{CraneliftProfile, NativeTarget, NativeTier, TierPolicy},
+    CompileOptions,
+    backend::verified::{CraneliftProfile, Dispatch, NativeTarget, NativeTier, TierPolicy, Tiered},
     bytecode::verified::{
-        ExecutionLimits, ExecutionStatus, FunctionId, OutputSink, VerifiedModule,
+        ExecutionLimits, ExecutionStatus, FunctionId, Instruction, OutputSink, RunError,
+        VerifiedModule,
     },
-    compile,
+    compile, compile_for_execution,
     vm::start_jit_with,
 };
 use std::sync::{Arc, Mutex};
@@ -154,4 +156,231 @@ fn disabled_tiering_never_promotes() {
     };
     let (_, _, promoted, _, _) = tiered(WORD_LOOP, policy, 50_000);
     assert!(promoted.is_empty());
+}
+
+fn start_with_osr(program: Arc<cyallo::ir::Program>) -> Tiered {
+    let mut context = cyallo::vm::Context::default();
+    context.gc.stress = true;
+    start_jit_with(
+        program,
+        &context,
+        TierPolicy {
+            interpreter_first: true,
+            base: 64,
+            ..TierPolicy::eager(64)
+        },
+    )
+    .unwrap()
+}
+
+fn enter_loop(tiered: &mut Tiered, module: &VerifiedModule) -> usize {
+    let ExecutionStatus::Paused(mut position) = tiered.resume(64).unwrap() else {
+        panic!("expected an interpreted pause inside the loop");
+    };
+    let Dispatch::Native(activation) = tiered.dispatch() else {
+        panic!("expected the OSR driver");
+    };
+    assert!(activation.last_entry().is_none());
+    assert_eq!(activation.instructions_executed(), 64);
+    tiered.settle();
+    assert_eq!(tiered.tier_of(position.function), Some(NativeTier::Winch));
+
+    for _ in 0..module
+        .function(position.function)
+        .unwrap()
+        .instructions()
+        .len()
+    {
+        let ExecutionStatus::Paused(next) = tiered.resume(1).unwrap() else {
+            panic!("expected to reach native code before the loop exits");
+        };
+        let Dispatch::Native(activation) = tiered.dispatch() else {
+            panic!("expected the OSR driver");
+        };
+        if let Some(event) = activation.last_entry() {
+            assert_eq!(event.tier, NativeTier::Winch);
+            assert_eq!(event.origin.function, position.function);
+            assert_eq!(event.origin.instruction, position.instruction);
+            let body = module.function(position.function).unwrap();
+            let target = position.instruction;
+            assert!(body.instructions()[target.0 as usize..].iter().any(|instruction| {
+                matches!(instruction, Instruction::Jump(to) if *to == target)
+                    || matches!(instruction, Instruction::Branch(_, yes, no) if *yes == target || *no == target)
+            }));
+            return activation.instructions_executed();
+        }
+        position = next;
+    }
+    panic!("expected machine code to run at a loop header")
+}
+
+#[test]
+fn interpreter_enters_winch_at_a_live_loop_and_recovers_at_each_budget() {
+    if NativeTarget::host().is_none() {
+        return;
+    }
+    let source = r#"
+proc sum_to(by: i64) {
+    let mut total = 0
+    let mut i = 0
+    std::io::print("start")
+    while i < 12 {
+        total += by
+        i += 1
+        if i == 6 { std::io::print(total) }
+    }
+    std::io::print(total)
+}
+sum_to(8)
+"#;
+    let program = Arc::new(compile_for_execution(source, CompileOptions::default()).unwrap());
+    let module = VerifiedModule::lower_shared(program.clone(), 0).unwrap();
+    let (wanted, instructions) = reference(source);
+    assert_eq!(wanted, ["start", "48", "96"]);
+
+    let first = check_osr(program.clone(), &module, None, &wanted, instructions);
+    for budget in 0..instructions - first {
+        check_osr(
+            program.clone(),
+            &module,
+            Some(budget),
+            &wanted,
+            instructions,
+        );
+    }
+}
+
+fn check_osr(
+    program: Arc<cyallo::ir::Program>,
+    module: &VerifiedModule,
+    recovery_budget: Option<usize>,
+    wanted: &[String],
+    instructions: usize,
+) -> usize {
+    let mut tiered = start_with_osr(program);
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let capture = lines.clone();
+    let Dispatch::Native(activation) = tiered.dispatch() else {
+        panic!("expected the OSR driver");
+    };
+    activation.set_output(OutputSink::new(move |line| {
+        capture.lock().unwrap().push(line.to_owned())
+    }));
+    let entered = enter_loop(&mut tiered, module);
+    let Dispatch::Native(activation) = tiered.dispatch() else {
+        panic!("expected the OSR driver");
+    };
+    let (status, executed) = if let Some(budget) = recovery_budget {
+        assert!(matches!(
+            activation.resume(budget).unwrap(),
+            ExecutionStatus::Paused(_)
+        ));
+        let unused = module
+            .start(&[], ExecutionLimits { fuel: 1, frames: 1 })
+            .unwrap();
+        let Dispatch::Native(activation) =
+            std::mem::replace(tiered.dispatch(), Dispatch::Interpreter(Box::new(unused)))
+        else {
+            panic!("expected the OSR driver");
+        };
+        let mut recovered = activation.recover().unwrap();
+        (
+            recovered.resume(usize::MAX),
+            recovered.instructions_executed(),
+        )
+    } else {
+        (
+            activation.resume(usize::MAX).unwrap(),
+            activation.instructions_executed(),
+        )
+    };
+    assert_eq!(status, ExecutionStatus::Returned(None));
+    assert_eq!(executed, instructions);
+    assert_eq!(*lines.lock().unwrap(), wanted);
+    entered
+}
+
+#[test]
+fn osr_preserves_a_live_gc_handle_and_the_failure_position() {
+    if NativeTarget::host().is_none() {
+        return;
+    }
+    let source = r#"
+proc sum_to(by: i64) {
+    let kept = gc by
+    let mut total = 0
+    let mut i = 0
+    while i < 12 {
+        total += by
+        i += 1
+    }
+    let fresh = gc total
+    std::io::print(kept.* + fresh.*)
+}
+"#;
+    for (input, should_fail) in [(7, false), (1_000_000_000_000_000_000i64, true)] {
+        let source = format!("{source}\nsum_to({input})");
+        let program = Arc::new(compile(&source).unwrap());
+        let module = VerifiedModule::lower_shared(program.clone(), 0).unwrap();
+        let mut reference = module
+            .start(
+                &[],
+                ExecutionLimits {
+                    fuel: usize::MAX,
+                    frames: 64,
+                },
+            )
+            .unwrap();
+        reference.set_gc_stress(true);
+        reference.set_output(OutputSink::new(|_| {}));
+        let wanted = reference.resume(usize::MAX);
+        assert_eq!(
+            matches!(
+                wanted,
+                ExecutionStatus::Failed(RunError::IntegerOverflow { .. })
+            ),
+            should_fail
+        );
+        let mut tiered = start_with_osr(program);
+        let Dispatch::Native(activation) = tiered.dispatch() else {
+            panic!("expected the OSR driver");
+        };
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let capture = lines.clone();
+        activation.set_output(OutputSink::new(move |line| {
+            capture.lock().unwrap().push(line.to_owned())
+        }));
+        enter_loop(&mut tiered, &module);
+        assert_eq!(tiered.resume(usize::MAX).unwrap(), wanted);
+        assert_eq!(
+            tiered.dispatch().instructions_executed(),
+            reference.instructions_executed()
+        );
+        if should_fail {
+            assert!(lines.lock().unwrap().is_empty());
+        } else {
+            assert_eq!(*lines.lock().unwrap(), ["91"]);
+        }
+    }
+}
+
+#[test]
+fn a_loop_entered_from_the_interpreter_can_tier_up_again() {
+    if NativeTarget::host().is_none() {
+        return;
+    }
+    let (wanted, instructions) = reference(WORD_LOOP);
+    let (lines, executed, promoted, tiers, last) = tiered(
+        WORD_LOOP,
+        TierPolicy {
+            interpreter_first: true,
+            ..TierPolicy::eager(20_000)
+        },
+        50_000,
+    );
+    assert_eq!(lines, wanted);
+    assert_eq!(executed, instructions);
+    assert_eq!(last, Some(CRANELIFT));
+    assert!(matches!(promoted.as_slice(), [winch, cranelift] if winch == cranelift));
+    assert!(tiers.contains(&CRANELIFT));
 }
