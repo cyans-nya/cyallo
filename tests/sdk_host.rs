@@ -144,6 +144,63 @@ fn bound_call_failure_is_terminal_and_keeps_the_call_site() {
 }
 
 #[test]
+fn native_bound_calls_commit_once_and_keep_the_typed_outcome() {
+    use cyallo::backend::verified::{
+        CodeStore, CraneliftProfile, NativeTarget, NativeTier, Operation,
+    };
+    if NativeTarget::host().is_none() {
+        return;
+    }
+    for tier in [
+        NativeTier::Winch,
+        NativeTier::Cranelift(CraneliftProfile::LowLatency),
+        NativeTier::Cranelift(CraneliftProfile::Optimized),
+    ] {
+        for result in [Ok(Scalar::I64(41)), Err(HostFailure::Rejected)] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let module = install("entry", CONTRACT, move |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                result
+            })
+            .unwrap();
+            let args = [Scalar::I64(21)];
+            let mut reference = module.start(&args, LIMITS).unwrap();
+            let expected = reference.resume(LIMITS.fuel);
+            calls.store(0, Ordering::Relaxed);
+            let function = module.entry();
+            let mut store = CodeStore::new(module).unwrap();
+            let plan = store.prepare(function).unwrap();
+            assert!(
+                plan.sites()
+                    .iter()
+                    .any(|site| site.operation == Operation::Runtime)
+            );
+            let entry = store.publish(tier.emit(plan).unwrap()).unwrap();
+            for budget in 1..reference.instructions_executed() {
+                calls.store(0, Ordering::Relaxed);
+                let mut native = entry.start(&args, LIMITS).unwrap();
+                assert!(matches!(
+                    native.resume(budget).unwrap(),
+                    ExecutionStatus::Paused(_)
+                ));
+                let mut recovered = native.recover().unwrap();
+                assert_eq!(recovered.resume(LIMITS.fuel), expected);
+                assert_eq!(
+                    recovered.instructions_executed(),
+                    reference.instructions_executed()
+                );
+                assert_eq!(calls.load(Ordering::Relaxed), 1);
+            }
+            calls.store(0, Ordering::Relaxed);
+            let mut native = entry.start(&args, LIMITS).unwrap();
+            assert_eq!(native.resume(LIMITS.fuel).unwrap(), expected);
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+        }
+    }
+}
+
+#[test]
 fn discarded_bound_result_still_runs_and_validates_the_callback() {
     for result in [
         Ok(Scalar::I64(41)),

@@ -419,7 +419,7 @@ impl Lower<'_, '_> {
                 };
                 self.store(destination, loan)?;
             }
-            Bridge(_) => {
+            Bridge(_) | Runtime => {
                 self.spill(site, plan)?;
                 return self.exit_at(ScalarOutcome::Bridge, pc);
             }

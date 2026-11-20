@@ -48,12 +48,19 @@ pub enum Layout {
     Vec(ScalarType),
     Tuple(Box<[Layout]>),
     Enum(Box<[Option<Layout>]>),
+    /// A value kept in the verified runtime across native sections.
+    RuntimeValue,
 }
 
 impl Layout {
     pub fn words(&self) -> u32 {
         match self {
-            Self::Scalar(_) | Self::Loan | Self::Text | Self::Array { .. } | Self::Vec(_) => 1,
+            Self::Scalar(_)
+            | Self::Loan
+            | Self::Text
+            | Self::Array { .. }
+            | Self::Vec(_)
+            | Self::RuntimeValue => 1,
             Self::Tuple(fields) => fields.iter().map(Layout::words).sum(),
             Self::Enum(variants) => {
                 1 + variants
@@ -313,6 +320,8 @@ pub enum Operation {
     NonZero(NativeHome),
     /// The runtime performs bridge call `index` of the plan.
     Bridge(u32),
+    /// Spill scalar homes and execute this instruction in the shared runtime.
+    Runtime,
     /// Read a checked element. Reading an unwritten array element fails.
     ArrayLoad {
         destination: NativeHome,
@@ -411,6 +420,7 @@ pub struct PreparedFunction {
     arguments: Box<[NativeHome]>,
     result: Option<ScalarType>,
     result_layout: Option<Layout>,
+    shared_runtime: bool,
     frame_bytes: u32,
     layouts: Box<[Layout]>,
     words: Box<[WordOp]>,
@@ -480,21 +490,53 @@ impl fmt::Display for PrepareError {
 impl std::error::Error for PrepareError {}
 
 impl PreparedFunction {
+    pub(super) fn requires_shared_runtime(module: &VerifiedModule) -> bool {
+        (0..)
+            .map(FunctionId)
+            .map_while(|id| module.function(id))
+            .any(uses_runtime_instruction)
+    }
+
     pub fn prepare(
         module: &VerifiedModule,
         function: FunctionId,
         version: CodeVersion,
         target: NativeTarget,
     ) -> Result<Self, PrepareError> {
+        Self::prepare_in_mode(
+            module,
+            function,
+            version,
+            target,
+            Self::requires_shared_runtime(module),
+        )
+    }
+
+    pub(super) fn prepare_in_mode(
+        module: &VerifiedModule,
+        function: FunctionId,
+        version: CodeVersion,
+        target: NativeTarget,
+        shared_runtime: bool,
+    ) -> Result<Self, PrepareError> {
         let body = module
             .function(function)
             .ok_or(PrepareError::UnknownFunction(function))?;
-        let mut map = FrameMap::new(body)?;
+        let mut map = FrameMap::new(body, shared_runtime)?;
+        if shared_runtime {
+            map.use_shared_runtime()?;
+        }
         let frame_bytes = map.frame_bytes;
         let arguments = body
             .parameters()
             .iter()
-            .map(|&reg| map.home(reg))
+            .map(|&reg| {
+                if shared_runtime {
+                    map.runtime_argument(reg)
+                } else {
+                    map.home(reg)
+                }
+            })
             .collect::<Result<_, _>>()?;
         let mut sites = Vec::new();
         let mut calls = BTreeMap::new();
@@ -517,7 +559,8 @@ impl PreparedFunction {
                         .ok_or(PrepareError::InstructionOverflow)?,
                 )),
             };
-            if let (Instruction::Call(id), Some(next)) = (instruction, successor)
+            if !shared_runtime
+                && let (Instruction::Call(id), Some(next)) = (instruction, successor)
                 && !matches!(body.calls()[id.0 as usize].target, CallTarget::Output(_))
             {
                 let link_offset = frame_offset(calls.len())?;
@@ -526,7 +569,11 @@ impl PreparedFunction {
                     prepare_call(module, &mut map, id, origin, next, link_offset)?,
                 );
             }
-            let operation = legalize(&mut map, instruction, origin, state)?;
+            let operation = if shared_runtime {
+                legalize_scalar_section(&mut map, instruction, origin, state)?
+            } else {
+                legalize(&mut map, instruction, origin, state)?
+            };
             let recover = recovery_map(&mut map, state, origin)?;
             sites.push(Site {
                 origin,
@@ -538,7 +585,16 @@ impl PreparedFunction {
             });
             Ok(())
         })?;
-        let (result, result_layout) = result_kind(body)?;
+        let (result, result_layout) = if shared_runtime {
+            let scalar = body.result().and_then(ValueType::scalar);
+            let layout = body
+                .result()
+                .filter(|ty| ty.scalar().is_none())
+                .map(|_| Layout::RuntimeValue);
+            (scalar, layout)
+        } else {
+            result_kind(body)?
+        };
         Ok(Self {
             target,
             function,
@@ -546,6 +602,7 @@ impl PreparedFunction {
             arguments,
             result,
             result_layout,
+            shared_runtime,
             frame_bytes,
             layouts: map.layouts.into_boxed_slice(),
             words: map.words.into_boxed_slice(),
@@ -595,6 +652,10 @@ impl PreparedFunction {
 
     pub fn result_layout(&self) -> Option<&Layout> {
         self.result_layout.as_ref()
+    }
+
+    pub(super) fn uses_shared_runtime(&self) -> bool {
+        self.shared_runtime
     }
 
     pub fn layout(&self, id: LayoutId) -> Option<&Layout> {
@@ -743,10 +804,12 @@ struct FrameMap<'a> {
     borrowed: std::collections::BTreeSet<u32>,
     bridges: Vec<BridgeCall>,
     accesses: Vec<ElementAccess>,
+    /// Registers whose whole lifetime can use native scalar homes.
+    scalars: Option<Vec<bool>>,
 }
 
 impl<'a> FrameMap<'a> {
-    fn new(body: &'a VerifiedFunction) -> Result<Self, PrepareError> {
+    fn new(body: &'a VerifiedFunction, scalar_sections: bool) -> Result<Self, PrepareError> {
         let frame = body.frame_layout();
         let mut sizes = vec![1u32; frame.slot_count()];
         let mut layouts: Vec<Layout> = Vec::new();
@@ -757,7 +820,8 @@ impl<'a> FrameMap<'a> {
             else {
                 continue;
             };
-            if let RegisterType::Composite(id) = *kind
+            if !scalar_sections
+                && let RegisterType::Composite(id) = *kind
                 && let Some(layout) = layout_of(body, ValueType::Composite(id))
             {
                 sizes[slot.index()] = sizes[slot.index()].max(layout.words());
@@ -781,7 +845,41 @@ impl<'a> FrameMap<'a> {
             borrowed: Default::default(),
             bridges: Vec::new(),
             accesses: Vec::new(),
+            scalars: None,
         })
+    }
+
+    fn use_shared_runtime(&mut self) -> Result<(), PrepareError> {
+        let mut scalars = self
+            .body
+            .registers()
+            .iter()
+            .map(|kind| matches!(kind, RegisterType::Scalar(_)))
+            .collect::<Vec<_>>();
+        self.body.visit_storage(|_, state| {
+            for (scalar, state) in scalars.iter_mut().zip(state) {
+                *scalar &= *state != StorageState::MaybeInitialized;
+            }
+            Ok(())
+        })?;
+        self.scalars = Some(scalars);
+        Ok(())
+    }
+
+    fn runtime_argument(&mut self, register: Register) -> Result<NativeHome, PrepareError> {
+        if let Some(ValueType::Scalar(ty)) = self.body.registers()[register.0 as usize].value() {
+            self.scalar_home(register, ty)
+        } else {
+            let mut home = self.scalar_home(register, ScalarType::I64)?;
+            home.layout = Some(self.intern(Layout::RuntimeValue));
+            Ok(home)
+        }
+    }
+
+    fn keeps_in_runtime(&self, register: Register) -> bool {
+        self.scalars
+            .as_ref()
+            .is_some_and(|scalars| !scalars[register.0 as usize])
     }
 
     fn intern(&mut self, layout: Layout) -> LayoutId {
@@ -815,26 +913,32 @@ impl<'a> FrameMap<'a> {
     }
 
     fn home(&mut self, register: Register) -> Result<NativeHome, PrepareError> {
+        if self.keeps_in_runtime(register) {
+            return Err(PrepareError::NonScalar(register));
+        }
         let layout = self.layout_of_register(register)?;
+        match layout {
+            Layout::Scalar(ty) => self.scalar_home(register, ty),
+            composite => {
+                let mut home = self.scalar_home(register, ScalarType::I64)?;
+                home.layout = Some(self.intern(composite));
+                Ok(home)
+            }
+        }
+    }
+
+    fn scalar_home(&self, register: Register, ty: ScalarType) -> Result<NativeHome, PrepareError> {
         let slot = self
             .body
             .frame_layout()
             .slot(register)
             .ok_or(PrepareError::MissingHome(register))?;
         let offset = ByteOffset(self.slot_offsets[slot.index()]);
-        Ok(match layout {
-            Layout::Scalar(ty) => NativeHome {
-                register,
-                offset,
-                ty,
-                layout: None,
-            },
-            composite => NativeHome {
-                register,
-                offset,
-                ty: ScalarType::I64,
-                layout: Some(self.intern(composite)),
-            },
+        Ok(NativeHome {
+            register,
+            offset,
+            ty,
+            layout: None,
         })
     }
 
@@ -981,6 +1085,9 @@ fn recovery_map(
             continue;
         }
         let register = Register(u32::try_from(index).map_err(|_| PrepareError::FrameTooLarge)?);
+        if map.keeps_in_runtime(register) {
+            continue;
+        }
         let slot = map.home(register)?;
         slots.push(match value {
             StorageState::Initialized => RecoverySlot::Initialized(slot),
@@ -1014,7 +1121,7 @@ fn prepare_call(
     let callee = module
         .function(function)
         .ok_or(PrepareError::UnknownFunction(function))?;
-    let mut callee_map = FrameMap::new(callee)?;
+    let mut callee_map = FrameMap::new(callee, false)?;
     let arguments = call
         .arguments
         .iter()
@@ -1099,6 +1206,71 @@ fn failures(operation: Operation, accesses: &[ElementAccess]) -> &'static [Failu
         } => &[Failure::EnumVariant],
         Operation::Trap => &[Failure::Trap],
         _ => &[],
+    }
+}
+
+fn uses_runtime_instruction(body: &VerifiedFunction) -> bool {
+    body.instructions()
+        .iter()
+        .any(|&instruction| match instruction {
+            Instruction::Call(id) => matches!(
+                body.calls()[id.0 as usize].target,
+                CallTarget::Closure(_) | CallTarget::Bound(_) | CallTarget::Method { .. }
+            ),
+            Instruction::Closure(..)
+            | Instruction::GcNew(..)
+            | Instruction::GcBorrow(..)
+            | Instruction::RcNew(..)
+            | Instruction::RcNewIn(..)
+            | Instruction::RcClone(..)
+            | Instruction::RcDowngrade(..)
+            | Instruction::RcUpgrade(..)
+            | Instruction::RcStrongCount(..)
+            | Instruction::TraitBox(..)
+            | Instruction::Allocate(..)
+            | Instruction::Deallocate(..)
+            | Instruction::BorrowGlobal(..)
+            | Instruction::Input(..)
+            | Instruction::InputLoan(..)
+            | Instruction::Random(..) => true,
+            _ => false,
+        })
+}
+
+/// Only frame-local scalar operations run in machine code with a shared
+/// runtime. Other instructions may access slots through verified loans.
+fn legalize_scalar_section(
+    map: &mut FrameMap<'_>,
+    instruction: Instruction,
+    origin: Origin,
+    state: &[StorageState],
+) -> Result<Operation, PrepareError> {
+    match instruction {
+        Instruction::StorageLive(_)
+        | Instruction::StorageDead(_)
+        | Instruction::Constant(..)
+        | Instruction::Copy(..)
+        | Instruction::Move(..)
+        | Instruction::Integer(..)
+        | Instruction::Float(..)
+        | Instruction::Boolean(..)
+        | Instruction::RealDivide(..)
+        | Instruction::NegateInteger(..)
+        | Instruction::NegateFloat(..)
+        | Instruction::Not(..)
+        | Instruction::CheckStep(..)
+        | Instruction::IntegerToFloat(..)
+        | Instruction::CountToInteger(..)
+        | Instruction::IntegerToCount(..)
+        | Instruction::Jump(..)
+        | Instruction::Branch(..)
+        | Instruction::Trap => match legalize(map, instruction, origin, state) {
+            Err(PrepareError::NonScalar(_) | PrepareError::UnsupportedOperation { .. }) => {
+                Ok(Operation::Runtime)
+            }
+            operation => operation,
+        },
+        _ => Ok(Operation::Runtime),
     }
 }
 

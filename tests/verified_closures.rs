@@ -137,15 +137,20 @@ std::io::print(deep(1))
 }
 
 #[test]
-fn closure_routines_stay_in_the_verified_interpreter() {
-    use cyallo::backend::verified::{CodeVersion, NativeTarget, PreparedFunction};
+fn closures_select_the_shared_runtime_bridge() {
+    use cyallo::backend::verified::{CodeVersion, NativeTarget, Operation, PreparedFunction};
     let Some(target) = NativeTarget::host() else {
         return;
     };
     let source = "fn make(k: i64) -> fn(i64) -> i64 { return fn(n: i64) -> i64 { return n + k } }\nlet f = make(1)\nstd::io::print(f(2))\n";
     let program = compile(source).unwrap();
     let module = VerifiedModule::lower(&program, 0).unwrap();
-    assert!(PreparedFunction::prepare(&module, module.entry(), CodeVersion(1), target).is_err());
+    let plan = PreparedFunction::prepare(&module, module.entry(), CodeVersion(1), target).unwrap();
+    assert!(
+        plan.sites()
+            .iter()
+            .any(|site| site.operation == Operation::Runtime)
+    );
 }
 
 mod images {

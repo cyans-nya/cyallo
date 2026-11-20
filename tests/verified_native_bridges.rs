@@ -8,12 +8,16 @@ use cyallo::{
         CodeStore, CraneliftProfile, EntryPin, NativeTarget, NativeTier, Operation, PrepareError,
     },
     bytecode::verified::{
-        ExecutionLimits, ExecutionStatus, FunctionId, OutputSink, Scalar, VerifiedModule,
+        ExecutionLimits, ExecutionStatus, FunctionId, InputSource, OutputSink, RunError, Scalar,
+        VerifiedModule,
     },
     compile, compile_for_execution, compile_with_options,
     ir::Program,
 };
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 
 const LIMITS: ExecutionLimits = ExecutionLimits {
     fuel: 100_000,
@@ -95,66 +99,89 @@ fn check(source: &str, cases: &[Vec<Scalar>]) {
 }
 
 fn check_module(module: VerifiedModule, cases: &[Vec<Scalar>]) {
+    check_module_with_input(module, cases, &[]);
+}
+
+fn check_module_with_input(module: VerifiedModule, cases: &[Vec<Scalar>], lines: &[&str]) {
     if NativeTarget::host().is_none() {
         return;
     }
+    let input = || {
+        InputSource::lines(
+            lines
+                .iter()
+                .map(|line| (*line).to_owned())
+                .collect::<Vec<_>>(),
+        )
+    };
     for tier in TIERS {
         let (_store, pin) = publish_all(&module, tier);
         assert!(
             pin.plan()
                 .sites()
                 .iter()
-                .any(|site| matches!(site.operation, Operation::Bridge(_))),
+                .any(|site| matches!(site.operation, Operation::Bridge(_) | Operation::Runtime)),
             "{tier:?}: no bridge in the entry"
         );
-        for args in cases {
-            let (sink, wanted_lines) = capture();
-            let mut reference = module.start(args, LIMITS).unwrap();
-            reference.set_output(sink);
-            reference.set_gc_stress(true);
-            let wanted = reference.resume(LIMITS.fuel);
+        for stress in [false, true] {
+            for args in cases {
+                let (sink, wanted_lines) = capture();
+                let mut reference = module.start(args, LIMITS).unwrap();
+                reference.set_output(sink);
+                reference.set_input(input());
+                reference.set_gc_stress(stress);
+                reference.set_random_seed(17);
+                let wanted = reference.resume(LIMITS.fuel);
 
-            let (sink, lines) = capture();
-            let mut native = pin.start(args, LIMITS).unwrap();
-            native.set_output(sink);
-            assert_eq!(
-                native.resume(LIMITS.fuel).unwrap(),
-                wanted,
-                "{tier:?} {args:?}"
-            );
-            assert_eq!(
-                *lines.lock().unwrap(),
-                *wanted_lines.lock().unwrap(),
-                "{tier:?} {args:?}"
-            );
-            assert_eq!(
-                native.instructions_executed(),
-                reference.instructions_executed()
-            );
-            for budget in 1..reference.instructions_executed() {
                 let (sink, lines) = capture();
                 let mut native = pin.start(args, LIMITS).unwrap();
                 native.set_output(sink);
-                assert!(
-                    matches!(native.resume(budget).unwrap(), ExecutionStatus::Paused(_)),
-                    "{tier:?} {args:?} should pause at {budget}"
-                );
-                let mut resumed = native.recover().unwrap();
-                resumed.set_gc_stress(true);
+                native.set_input(input());
+                native.set_gc_stress(stress);
+                native.set_random_seed(17);
                 assert_eq!(
-                    resumed.resume(LIMITS.fuel),
+                    native.resume(LIMITS.fuel).unwrap(),
                     wanted,
-                    "{tier:?} {args:?} @{budget}"
+                    "{tier:?} {args:?}"
                 );
                 assert_eq!(
                     *lines.lock().unwrap(),
                     *wanted_lines.lock().unwrap(),
-                    "{tier:?} {args:?} output after recovery at {budget}"
+                    "{tier:?} {args:?}"
                 );
                 assert_eq!(
-                    resumed.instructions_executed(),
+                    native.instructions_executed(),
                     reference.instructions_executed()
                 );
+                assert_eq!(native.heap_stats(), reference.heap_stats());
+                for budget in 1..reference.instructions_executed() {
+                    let (sink, lines) = capture();
+                    let mut native = pin.start(args, LIMITS).unwrap();
+                    native.set_output(sink);
+                    native.set_input(input());
+                    native.set_gc_stress(stress);
+                    native.set_random_seed(17);
+                    assert!(
+                        matches!(native.resume(budget).unwrap(), ExecutionStatus::Paused(_)),
+                        "{tier:?} {args:?} should pause at {budget}"
+                    );
+                    let mut resumed = native.recover().unwrap();
+                    assert_eq!(
+                        resumed.resume(LIMITS.fuel),
+                        wanted,
+                        "{tier:?} {args:?} @{budget}"
+                    );
+                    assert_eq!(
+                        *lines.lock().unwrap(),
+                        *wanted_lines.lock().unwrap(),
+                        "{tier:?} {args:?} output after recovery at {budget}"
+                    );
+                    assert_eq!(
+                        resumed.instructions_executed(),
+                        reference.instructions_executed()
+                    );
+                    assert_eq!(resumed.heap_stats(), reference.heap_stats());
+                }
             }
         }
     }
@@ -515,4 +542,230 @@ append()
         assert!(matches!(error, LowerError::Verification(error)
                 if matches!(error.kind, InvalidBytecode::ExclusiveOwnerAccess(_))));
     }
+}
+
+#[test]
+fn closures_share_captures_and_enter_the_published_dynamic_target() {
+    let source = r#"
+fn make(offset: i64) -> fn(i64) -> i64 {
+    return fn(n: i64) -> i64 { return n + offset }
+}
+proc entry(n: i64) -> i64 {
+    let f = make(4)
+    return f(n) * 2
+}
+"#;
+    let cases = ints(&[3, i64::MAX]);
+    check(source, &cases);
+    let deferred = compile_for_execution(source, CompileOptions::default()).unwrap();
+    let module = lower_entry(&deferred);
+    check_module(module.clone(), &cases);
+    if NativeTarget::host().is_none() {
+        return;
+    }
+    for tier in TIERS {
+        let (mut store, pin) = publish_all(&module, tier);
+        let mut native = pin.start(&[Scalar::I64(3)], LIMITS).unwrap();
+        // The running activation pins every currently published runtime entry.
+        for id in (1..)
+            .map(FunctionId)
+            .take_while(|&id| module.function(id).is_some())
+        {
+            store.retire(id);
+        }
+        let mut entered_dynamic_target = false;
+        loop {
+            let status = native.resume(1).unwrap();
+            if let Some(event) = native.last_entry()
+                && matches!(
+                    module
+                        .function(event.origin.function)
+                        .unwrap()
+                        .instructions()[event.origin.instruction.0 as usize],
+                    cyallo::bytecode::verified::Instruction::Integer(..)
+                )
+                && event.origin.function != module.entry()
+            {
+                entered_dynamic_target = true;
+            }
+            if !matches!(status, ExecutionStatus::Paused(_)) {
+                assert_eq!(status, ExecutionStatus::Returned(Some(Scalar::I64(14))));
+                break;
+            }
+        }
+        assert!(entered_dynamic_target, "{tier:?}");
+        let mut fallback = pin.start(&[Scalar::I64(3)], LIMITS).unwrap();
+        assert_eq!(
+            fallback.resume(LIMITS.fuel).unwrap(),
+            ExecutionStatus::Returned(Some(Scalar::I64(14)))
+        );
+    }
+}
+
+#[test]
+fn managed_roots_counts_and_allocator_finalizers_survive_every_handoff() {
+    for source in [
+        include_str!("../examples/managed.ya"),
+        include_str!("../examples/rc-ownership.ya"),
+    ] {
+        check_module(
+            VerifiedModule::lower(&compile(source).unwrap(), 0).unwrap(),
+            &[vec![]],
+        );
+    }
+    check(
+        r#"
+proc allocate(n: i64) -> i64 {
+    let temporary = gc n
+    return temporary.* + 1
+}
+proc entry(n: i64) -> i64 {
+    let first = gc 41
+    let root = rc (gc 7)
+    let second = root.clone()
+    let weak = root.downgrade()
+    let result = allocate(n)
+    std::io::print(first.*, ":", second.*.*, ":", root.strong_count())
+    std::mem::drop(root)
+    std::mem::drop(second)
+    std::io::print(weak.upgrade().is_none())
+    std::mem::drop(weak)
+    return result + first.*
+}
+"#,
+        &ints(&[0, 5, i64::MAX]),
+    );
+}
+
+#[test]
+fn trait_dispatched_calls_share_the_heap_with_native_sections() {
+    let program = compile(include_str!("../examples/traits.ya")).unwrap();
+    check_module(VerifiedModule::lower(&program, 0).unwrap(), &[vec![]]);
+}
+
+#[test]
+fn globals_and_random_state_are_activation_owned() {
+    let source = r#"
+let mut counter = 0
+proc bump() -> i64 {
+    counter += 1
+    return counter * 7
+}
+std::io::print(bump(), ":", std::random::uniform(10))
+std::io::print(bump(), ":", std::random::uniform(10))
+"#;
+    let program = compile_for_execution(source, CompileOptions::default()).unwrap();
+    check_module(VerifiedModule::lower(&program, 0).unwrap(), &[vec![]]);
+    check(
+        "let mut counter = 5\nproc entry() -> i64 { return counter }\n",
+        &[vec![]],
+    );
+    check(
+        "proc entry(n: i64) { std::io::print(std::random::uniform(n)) }",
+        &ints(&[0, -1, 1]),
+    );
+}
+
+#[test]
+fn native_input_waits_without_spending_fuel_and_retains_the_source_on_recovery() {
+    if NativeTarget::host().is_none() {
+        return;
+    }
+    let module = module(
+        r#"
+proc entry() -> i64 {
+    let mut n = 0
+    std::io::print("ready")
+    std::runtime::caie::input(&mut n)
+    return n + 1
+}
+"#,
+    );
+    for tier in TIERS {
+        let (_store, pin) = publish_all(&module, tier);
+        for recover in [false, true] {
+            let (sink, lines) = capture();
+            let input = Arc::new(Mutex::new(VecDeque::new()));
+            let queue = input.clone();
+            let mut native = pin.start(&[], LIMITS).unwrap();
+            native.set_input(InputSource::waiting(move || {
+                queue.lock().unwrap().pop_front()
+            }));
+            native.set_output(sink);
+            let paused = native.resume(LIMITS.fuel).unwrap();
+            assert!(native.awaiting_input());
+            let spent = native.instructions_executed();
+            assert_eq!(native.resume(LIMITS.fuel).unwrap(), paused);
+            assert_eq!(native.instructions_executed(), spent);
+            assert_eq!(*lines.lock().unwrap(), ["ready"]);
+
+            input.lock().unwrap().push_back("41".into());
+            let result = if recover {
+                native.recover().unwrap().resume(LIMITS.fuel)
+            } else {
+                let result = native.resume(LIMITS.fuel).unwrap();
+                assert!(!native.awaiting_input());
+                result
+            };
+            assert_eq!(result, ExecutionStatus::Returned(Some(Scalar::I64(42))));
+            assert_eq!(*lines.lock().unwrap(), ["ready"]);
+            assert!(input.lock().unwrap().is_empty());
+        }
+
+        for line in [Some("x"), None] {
+            let mut native = pin.start(&[], LIMITS).unwrap();
+            native.set_input(InputSource::waiting(move || line.map(str::to_owned)));
+            native.set_output(OutputSink::new(|_| {}));
+            if line.is_some() {
+                assert!(matches!(
+                    native.resume(LIMITS.fuel).unwrap(),
+                    ExecutionStatus::Failed(RunError::InputInvalid { .. })
+                ));
+            } else {
+                native.resume(LIMITS.fuel).unwrap();
+                assert!(native.awaiting_input());
+                native.end_input();
+                assert!(matches!(
+                    native.resume(LIMITS.fuel).unwrap(),
+                    ExecutionStatus::Failed(RunError::InputExhausted { .. })
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn input_values_and_loans_recover_at_every_budget() {
+    use cyallo::bytecode::verified::Instruction;
+    let direct = caie_module("DECLARE n : INTEGER\nINPUT n\nOUTPUT n + 1\n");
+    assert!(
+        direct
+            .function(direct.entry())
+            .unwrap()
+            .instructions()
+            .iter()
+            .any(|inst| matches!(inst, Instruction::Input(..)))
+    );
+    check_module_with_input(direct, &[vec![]], &["6"]);
+
+    let loan = module(
+        r#"
+proc read(target: &mut i64) { std::runtime::caie::input(target) }
+proc entry() -> i64 {
+    let mut n = 0
+    read(&mut n)
+    return n * 3
+}
+"#,
+    );
+    assert!(
+        (0..)
+            .map(FunctionId)
+            .map_while(|id| loan.function(id))
+            .any(|body| body
+                .instructions()
+                .iter()
+                .any(|inst| matches!(inst, Instruction::InputLoan(..))))
+    );
+    check_module_with_input(loan, &[vec![]], &["6"]);
 }

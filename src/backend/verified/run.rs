@@ -4,18 +4,18 @@ use super::SliceKind;
 use super::{BridgeCall, Layout, LoanBase};
 use super::{
     CodeStore, EntryPin, Failure, NativeHome, NativeTier, Operation, Origin, RecoverySlot,
-    ScalarOutcome,
+    ScalarOutcome, Site,
     abi::{Edge, ScalarContext, VECTOR_HEADER_BYTES, VECTOR_HEADER_WORDS, scalar_word},
     platform::Invocation,
 };
 use crate::bytecode::verified::{
-    Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, InstructionId,
-    MAX_VEC_ELEMENTS, RecoveredValue, Register, RunError, Scalar, ScalarFrameSnapshot,
-    ScalarRecoveryError, ScalarType, StatementArrival,
+    Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, FunctionId, HeapStats,
+    InputSource, InstructionId, MAX_VEC_ELEMENTS, RecoveredValue, Register, RunError, Scalar,
+    ScalarFrameSnapshot, ScalarRecoveryError, ScalarType, StatementArrival,
 };
 use crate::bytecode::verified::{OutputSink, TextFailure, TextMapOp, TextOp, TextTestOp};
-use std::fmt;
 use std::sync::Arc;
+use std::{collections::HashMap, fmt};
 
 const ENTRY: InstructionId = InstructionId(0);
 
@@ -65,6 +65,21 @@ impl EntryPin {
         arguments: &[Scalar],
         limits: ExecutionLimits,
     ) -> Result<NativeActivation, NativeRunError> {
+        if self.plan().uses_shared_runtime() {
+            let activation = self
+                .module()
+                .start_at(self.plan().function(), arguments, limits)
+                .map_err(NativeRunError::Guest)?;
+            return Ok(NativeActivation::new(
+                State::Shared(Box::new(SharedActivation {
+                    activation,
+                    entry: self.clone(),
+                    entries: self.runtime_snapshot(),
+                    slots: Vec::new(),
+                })),
+                limits,
+            ));
+        }
         if self.plan().result_layout().is_some() {
             return Err(NativeRunError::Guest(RunError::EntryResultNotScalar));
         }
@@ -100,14 +115,17 @@ impl EntryPin {
         for (&home, &argument) in parameters.iter().zip(arguments) {
             frame.store(home, argument)?;
         }
-        Ok(NativeActivation {
-            heap: Heap::default(),
-            output: OutputSink::default(),
-            state: State::Active(vec![frame]),
+        Ok(NativeActivation::new(
+            State::Active(Box::new(WordActivation {
+                stack: vec![frame],
+                heap: Heap::default(),
+                output: OutputSink::default(),
+                input: InputSource::default(),
+                gc_stress: false,
+                random_seed: None,
+            })),
             limits,
-            spent: 0,
-            last_entry: None,
-        })
+        ))
     }
 }
 
@@ -119,9 +137,6 @@ pub struct EntryEvent {
 
 #[derive(Debug)]
 pub struct NativeActivation {
-    /// Strings and collection buffers held by native frames.
-    heap: Heap,
-    output: OutputSink,
     state: State,
     limits: ExecutionLimits,
     spent: usize,
@@ -130,9 +145,21 @@ pub struct NativeActivation {
 
 #[derive(Debug)]
 enum State {
-    Active(Vec<Frame>),
+    Active(Box<WordActivation>),
+    Shared(Box<SharedActivation>),
     Terminal(ExecutionStatus),
     Broken(NativeRunError),
+}
+
+#[derive(Debug)]
+struct WordActivation {
+    stack: Vec<Frame>,
+    /// Strings and collection buffers held by native frames.
+    heap: Heap,
+    output: OutputSink,
+    input: InputSource,
+    gc_stress: bool,
+    random_seed: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -276,13 +303,83 @@ impl Frame {
 }
 
 impl NativeActivation {
+    fn new(state: State, limits: ExecutionLimits) -> Self {
+        Self {
+            state,
+            limits,
+            spent: 0,
+            last_entry: None,
+        }
+    }
+
     /// Where the program's output goes. Set before the first slice.
     pub fn set_output(&mut self, sink: OutputSink) {
-        self.output = sink;
+        match &mut self.state {
+            State::Shared(shared) => shared.activation.set_output(sink),
+            State::Active(word) => word.output = sink,
+            _ => {}
+        }
+    }
+
+    /// Replace the source of input lines.
+    pub fn set_input(&mut self, source: InputSource) {
+        match &mut self.state {
+            State::Shared(shared) => shared.activation.set_input(source),
+            State::Active(word) => word.input = source,
+            _ => {}
+        }
+    }
+
+    /// Let an empty input source report end of input.
+    pub fn end_input(&mut self) {
+        match &mut self.state {
+            State::Shared(shared) => shared.activation.end_input(),
+            State::Active(word) => word.input.end_input(),
+            _ => {}
+        }
+    }
+
+    /// Whether the last slice paused for a line of input.
+    pub fn awaiting_input(&self) -> bool {
+        matches!(&self.state, State::Shared(shared) if shared.activation.awaiting_input())
+    }
+
+    /// Collect before guest allocations to exercise the root set.
+    pub fn set_gc_stress(&mut self, stress: bool) {
+        match &mut self.state {
+            State::Shared(shared) => shared.activation.set_gc_stress(stress),
+            State::Active(word) => word.gc_stress = stress,
+            _ => {}
+        }
+    }
+
+    /// Initialize this invocation's pseudo-random state.
+    pub fn set_random_seed(&mut self, seed: u64) {
+        match &mut self.state {
+            State::Shared(shared) => shared.activation.set_random_seed(seed),
+            State::Active(word) => word.random_seed = Some(seed),
+            _ => {}
+        }
+    }
+
+    /// Occupancy and collection counts for the managed guest heap.
+    pub fn heap_stats(&self) -> HeapStats {
+        match &self.state {
+            State::Shared(shared) => shared.activation.heap_stats(),
+            _ => HeapStats {
+                live: 0,
+                peak: 0,
+                collections: 0,
+                counted: 0,
+            },
+        }
     }
 
     pub fn instructions_executed(&self) -> usize {
-        self.spent
+        match &self.state {
+            State::Shared(shared) => shared.activation.instructions_executed(),
+            _ => self.spent,
+        }
     }
 
     pub fn last_entry(&self) -> Option<EntryEvent> {
@@ -293,8 +390,9 @@ impl NativeActivation {
         match &self.state {
             State::Terminal(status) => Ok(*status),
             State::Broken(error) => Err(*error),
-            State::Active(stack) => {
-                let frame = stack.last().ok_or(NativeRunError::InvalidActivation)?;
+            State::Shared(shared) => Ok(shared.activation.status()),
+            State::Active(word) => {
+                let frame = word.stack.last().ok_or(NativeRunError::InvalidActivation)?;
                 let Position::Ready { next, .. } = frame.position else {
                     return Err(NativeRunError::InvalidActivation);
                 };
@@ -309,16 +407,24 @@ impl NativeActivation {
     }
 
     pub fn resume(&mut self, budget: usize) -> Result<ExecutionStatus, NativeRunError> {
-        let State::Active(stack) = &mut self.state else {
+        if let State::Shared(shared) = &mut self.state {
+            let result = shared.resume(budget, &mut self.last_entry);
+            if let Err(error) = result {
+                self.spent = shared.activation.instructions_executed();
+                self.state = State::Broken(error);
+            }
+            return result;
+        }
+        let State::Active(word) = &mut self.state else {
             return self.status();
         };
         let mut available = budget.min(self.limits.fuel - self.spent);
         while available != 0 {
             match step(
-                stack,
+                &mut word.stack,
                 &mut Runtime {
-                    heap: &mut self.heap,
-                    output: &mut self.output,
+                    heap: &mut word.heap,
+                    output: &mut word.output,
                 },
                 self.limits.frames,
                 &mut available,
@@ -345,19 +451,37 @@ impl NativeActivation {
     /// Consume a paused native activation and resume the same invocation in
     /// verified bytecode. Suspended callers use their pre-call storage maps.
     pub fn recover(self) -> Result<Activation, NativeRunError> {
-        let State::Active(stack) = self.state else {
-            return Err(NativeRunError::InvalidActivation);
+        let WordActivation {
+            stack,
+            heap,
+            output,
+            input,
+            gc_stress,
+            random_seed,
+        } = match self.state {
+            State::Shared(shared)
+                if matches!(shared.activation.status(), ExecutionStatus::Paused(_)) =>
+            {
+                return Ok(shared.activation);
+            }
+            State::Active(word) => *word,
+            _ => return Err(NativeRunError::InvalidActivation),
         };
         let root = stack.first().ok_or(NativeRunError::InvalidActivation)?;
         let snapshots = (0..stack.len())
-            .map(|index| stack[index].snapshot(&stack, index, &self.heap))
+            .map(|index| stack[index].snapshot(&stack, index, &heap))
             .collect::<Result<Vec<_>, _>>()?;
         let mut activation = root
             .entry
             .module()
             .restore_scalars(snapshots, self.limits, self.spent)
             .map_err(NativeRunError::Recovery)?;
-        activation.set_output(self.output);
+        activation.set_output(output);
+        activation.set_input(input);
+        activation.set_gc_stress(gc_stress);
+        if let Some(seed) = random_seed {
+            activation.set_random_seed(seed);
+        }
         Ok(activation)
     }
 }
@@ -365,6 +489,183 @@ impl NativeActivation {
 enum Step {
     Continue,
     Terminal(ExecutionStatus),
+}
+
+#[derive(Debug)]
+struct SharedActivation {
+    activation: Activation,
+    entry: EntryPin,
+    entries: HashMap<FunctionId, EntryPin>,
+    slots: Vec<u64>,
+}
+
+impl SharedActivation {
+    fn resume(
+        &mut self,
+        budget: usize,
+        entry_event: &mut Option<EntryEvent>,
+    ) -> Result<ExecutionStatus, NativeRunError> {
+        let start = self.activation.instructions_executed();
+        while matches!(self.activation.status(), ExecutionStatus::Paused(_)) {
+            let used = self.activation.instructions_executed() - start;
+            let available = (budget - used).min(self.activation.native_fuel());
+            if available == 0 {
+                break;
+            }
+            let native = self
+                .activation
+                .native_position(self.entry.module())
+                .and_then(|(position, arrival)| {
+                    Some((
+                        self.entries.get(&position.function)?,
+                        position.instruction,
+                        arrival,
+                    ))
+                });
+            if let Some((entry, next, arrival)) = native {
+                run_section(
+                    &mut self.activation,
+                    &mut self.slots,
+                    entry,
+                    next,
+                    arrival,
+                    available,
+                    entry_event,
+                )?;
+            } else {
+                self.activation.resume(1);
+            }
+            if self.activation.awaiting_input() {
+                break;
+            }
+        }
+        Ok(self.activation.status())
+    }
+}
+
+fn initialized_scalars(site: &Site) -> impl Iterator<Item = NativeHome> + '_ {
+    site.recover.iter().filter_map(|slot| match slot {
+        RecoverySlot::Initialized(home) => Some(*home),
+        RecoverySlot::Uninitialized(_) => None,
+    })
+}
+
+fn run_section(
+    activation: &mut Activation,
+    slots: &mut Vec<u64>,
+    entry: &EntryPin,
+    next: InstructionId,
+    arrival: StatementArrival,
+    budget: usize,
+    entry_event: &mut Option<EntryEvent>,
+) -> Result<(), NativeRunError> {
+    let plan = entry.plan();
+    let invalid_home = |home: NativeHome| NativeRunError::InvalidHome(home.register);
+    let slot = |home: NativeHome| home.offset.0 as usize / size_of::<u64>();
+    slots.resize(plan.frame_bytes() as usize / size_of::<u64>(), 0);
+    let start = plan
+        .site(next)
+        .ok_or(NativeRunError::InvalidPc(u64::from(next.0)))?;
+    for home in initialized_scalars(start) {
+        let value = activation
+            .native_scalar(home.register)
+            .filter(|value| value.ty() == home.ty)
+            .ok_or_else(|| invalid_home(home))?;
+        *slots
+            .get_mut(slot(home))
+            .ok_or_else(|| invalid_home(home))? = scalar_word(value);
+    }
+
+    let exit = invoke(entry, slots, next, arrival, budget)?;
+    *entry_event = Some(EntryEvent {
+        origin: start.origin,
+        tier: entry.tier(),
+    });
+    let site = plan
+        .site(exit.pc)
+        .ok_or(NativeRunError::InvalidPc(u64::from(exit.pc.0)))?;
+    let bridge = match exit.outcome {
+        ScalarOutcome::Failed => {
+            activation.fail_from_native(decode_failure(site, exit.context.failure)?, exit.used);
+            return Ok(());
+        }
+        ScalarOutcome::Paused if exit.used == budget => false,
+        ScalarOutcome::Bridge if site.operation == Operation::Runtime => true,
+        _ => return Err(NativeRunError::InvalidOutcome(exit.outcome as u64)),
+    };
+    let values = initialized_scalars(site)
+        .map(|home| {
+            let value = *slots.get(slot(home)).ok_or_else(|| invalid_home(home))?;
+            Ok((home.register, decode(home.ty, value)?))
+        })
+        .collect::<Result<Vec<_>, NativeRunError>>()?;
+    let arrival = decode_edge(exit.context.predecessor, exit.context.edge)?;
+    // The emitter reserved the bridge's unit of fuel. The reference step
+    // charges it only if the operation runs, including a failing instruction.
+    activation
+        .resume_from_native(
+            exit.pc,
+            arrival,
+            initialized_scalars(start).map(|home| home.register),
+            &values,
+            exit.used - usize::from(bridge),
+        )
+        .ok_or(NativeRunError::InvalidEdge)?;
+    if bridge {
+        activation.resume(1);
+    }
+    Ok(())
+}
+
+struct NativeExit {
+    context: ScalarContext,
+    outcome: ScalarOutcome,
+    pc: InstructionId,
+    used: usize,
+    result: u64,
+}
+
+fn invoke(
+    pin: &EntryPin,
+    slots: &mut [u64],
+    next: InstructionId,
+    arrival: StatementArrival,
+    budget: usize,
+) -> Result<NativeExit, NativeRunError> {
+    let input_budget = u64::try_from(budget).map_err(|_| NativeRunError::WordWidth)?;
+    let (predecessor, edge) = encode_edge(arrival);
+    let mut context = ScalarContext {
+        slots: std::ptr::null_mut(),
+        budget: input_budget,
+        next: u64::from(next.0),
+        failure: 0,
+        links: std::ptr::null(),
+        callee: 0,
+        predecessor,
+        edge,
+    };
+    let mut result = 0;
+    let raw = pin.executable().invoke(Invocation {
+        context: &mut context,
+        slots,
+        links: pin.links(),
+        result: &mut result,
+    });
+    let used = input_budget
+        .checked_sub(context.budget)
+        .filter(|used| *used != 0)
+        .ok_or(NativeRunError::InvalidBudget)?;
+    let used = usize::try_from(used).map_err(|_| NativeRunError::WordWidth)?;
+    let pc = InstructionId(
+        u32::try_from(context.next).map_err(|_| NativeRunError::InvalidPc(context.next))?,
+    );
+    Ok(NativeExit {
+        context,
+        result,
+        outcome: outcome(raw)?,
+        pc,
+        used,
+    })
 }
 
 /// What native frames refer to by index or address: strings, and the
@@ -477,43 +778,23 @@ fn step(
     let entry_site = plan
         .site(next)
         .ok_or(NativeRunError::InvalidPc(u64::from(next.0)))?;
-    let input_budget = u64::try_from(*available).map_err(|_| NativeRunError::WordWidth)?;
-    let (predecessor, edge) = encode_edge(arrival);
-    let mut context = ScalarContext {
-        slots: std::ptr::null_mut(),
-        budget: input_budget,
-        next: u64::from(next.0),
-        failure: 0,
-        links: std::ptr::null(),
-        callee: 0,
-        predecessor,
-        edge,
-    };
-    let mut result = 0;
-    let raw = pin.executable().invoke(Invocation {
-        context: &mut context,
-        slots: &mut frame.slots,
-        links: pin.links(),
-        result: &mut result,
-    });
+    let NativeExit {
+        context,
+        outcome,
+        pc,
+        used,
+        result,
+    } = invoke(&pin, &mut frame.slots, next, arrival, *available)?;
     *entry_event = Some(EntryEvent {
         origin: entry_site.origin,
         tier: pin.tier(),
     });
-    let used = input_budget
-        .checked_sub(context.budget)
-        .filter(|used| *used != 0)
-        .ok_or(NativeRunError::InvalidBudget)?;
-    let used = usize::try_from(used).map_err(|_| NativeRunError::WordWidth)?;
     *available -= used;
     *spent += used;
-    let pc = InstructionId(
-        u32::try_from(context.next).map_err(|_| NativeRunError::InvalidPc(context.next))?,
-    );
     let site = plan
         .site(pc)
         .ok_or(NativeRunError::InvalidPc(context.next))?;
-    match outcome(raw)? {
+    match outcome {
         ScalarOutcome::Paused => {
             if *available != 0 {
                 return Err(NativeRunError::InvalidBudget);
@@ -624,64 +905,71 @@ fn step(
             };
         }
         ScalarOutcome::Failed => {
-            let failure = site
-                .failures
-                .iter()
-                .copied()
-                .find(|failure| *failure as u64 == context.failure)
-                .ok_or(NativeRunError::InvalidFailure(context.failure))?;
-            let Origin {
-                function,
-                instruction,
-                span,
-                ..
-            } = site.origin;
-            let error = match failure {
-                Failure::Overflow => RunError::IntegerOverflow {
-                    function,
-                    instruction,
-                    span,
-                },
-                Failure::DivisionByZero => RunError::DivisionByZero {
-                    function,
-                    instruction,
-                    span,
-                },
-                Failure::ConversionOutOfRange => RunError::ConversionOutOfRange {
-                    function,
-                    instruction,
-                    span,
-                },
-                Failure::IndexOutOfBounds => RunError::IndexOutOfBounds {
-                    function,
-                    instruction,
-                    span,
-                },
-                Failure::UninitializedElement => RunError::UninitializedElement {
-                    function,
-                    instruction,
-                    span,
-                },
-                Failure::ZeroStep => RunError::ZeroStep {
-                    function,
-                    instruction,
-                    span,
-                },
-                Failure::EnumVariant => RunError::EnumVariant {
-                    function,
-                    instruction,
-                    span,
-                },
-                Failure::Trap => RunError::ReachedTrap {
-                    function,
-                    instruction,
-                    span,
-                },
-            };
-            return Ok(Step::Terminal(ExecutionStatus::Failed(error)));
+            return Ok(Step::Terminal(ExecutionStatus::Failed(decode_failure(
+                site,
+                context.failure,
+            )?)));
         }
     }
     Ok(Step::Continue)
+}
+
+fn decode_failure(site: &Site, raw: u64) -> Result<RunError, NativeRunError> {
+    let failure = site
+        .failures
+        .iter()
+        .copied()
+        .find(|failure| *failure as u64 == raw)
+        .ok_or(NativeRunError::InvalidFailure(raw))?;
+    let Origin {
+        function,
+        instruction,
+        span,
+        ..
+    } = site.origin;
+    let error = match failure {
+        Failure::Overflow => RunError::IntegerOverflow {
+            function,
+            instruction,
+            span,
+        },
+        Failure::DivisionByZero => RunError::DivisionByZero {
+            function,
+            instruction,
+            span,
+        },
+        Failure::ConversionOutOfRange => RunError::ConversionOutOfRange {
+            function,
+            instruction,
+            span,
+        },
+        Failure::IndexOutOfBounds => RunError::IndexOutOfBounds {
+            function,
+            instruction,
+            span,
+        },
+        Failure::UninitializedElement => RunError::UninitializedElement {
+            function,
+            instruction,
+            span,
+        },
+        Failure::ZeroStep => RunError::ZeroStep {
+            function,
+            instruction,
+            span,
+        },
+        Failure::EnumVariant => RunError::EnumVariant {
+            function,
+            instruction,
+            span,
+        },
+        Failure::Trap => RunError::ReachedTrap {
+            function,
+            instruction,
+            span,
+        },
+    };
+    Ok(error)
 }
 
 fn encode_edge(arrival: StatementArrival) -> (u64, u64) {
@@ -1269,6 +1557,7 @@ fn decode_layout(
     heap: &Heap,
 ) -> Result<RecoveredValue, NativeRunError> {
     match layout {
+        Layout::RuntimeValue => Err(NativeRunError::InvalidActivation),
         Layout::Array { element, count } => {
             let address = *words.first().ok_or(NativeRunError::InvalidActivation)?;
             let buffer = heap

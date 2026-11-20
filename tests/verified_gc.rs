@@ -133,13 +133,18 @@ fn collection_survives_one_instruction_slices() {
 }
 
 #[test]
-fn heap_routines_stay_in_the_verified_interpreter() {
-    use cyallo::backend::verified::{CodeVersion, NativeTarget, PreparedFunction};
+fn heap_allocation_selects_the_shared_runtime_bridge() {
+    use cyallo::backend::verified::{CodeVersion, NativeTarget, Operation, PreparedFunction};
     let Some(target) = NativeTarget::host() else {
         return;
     };
     let module = module("let h = gc 1\nstd::io::print(h.*)\n");
-    assert!(PreparedFunction::prepare(&module, module.entry(), CodeVersion(1), target).is_err());
+    let plan = PreparedFunction::prepare(&module, module.entry(), CodeVersion(1), target).unwrap();
+    assert!(
+        plan.sites()
+            .iter()
+            .any(|site| site.operation == Operation::Runtime)
+    );
 }
 
 mod images {

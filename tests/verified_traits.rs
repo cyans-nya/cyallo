@@ -102,8 +102,8 @@ fn an_object_is_kept_alive_by_a_routine_that_holds_it() {
 }
 
 #[test]
-fn trait_routines_stay_in_the_verified_interpreter() {
-    use cyallo::backend::verified::{CodeVersion, NativeTarget, PreparedFunction};
+fn trait_dispatch_selects_the_shared_runtime_bridge() {
+    use cyallo::backend::verified::{CodeVersion, NativeTarget, Operation, PreparedFunction};
     let Some(target) = NativeTarget::host() else {
         return;
     };
@@ -111,7 +111,12 @@ fn trait_routines_stay_in_the_verified_interpreter() {
         format!("{SHAPES}let s = Square {{ side: 2 }} as dyn Shape\nstd::io::print(s.area())\n");
     let program = compile(&source).unwrap();
     let module = VerifiedModule::lower(&program, 0).unwrap();
-    assert!(PreparedFunction::prepare(&module, module.entry(), CodeVersion(1), target).is_err());
+    let plan = PreparedFunction::prepare(&module, module.entry(), CodeVersion(1), target).unwrap();
+    assert!(
+        plan.sites()
+            .iter()
+            .any(|site| site.operation == Operation::Runtime)
+    );
 }
 
 mod images {

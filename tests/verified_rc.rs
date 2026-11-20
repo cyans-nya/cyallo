@@ -147,8 +147,8 @@ std::mem::drop(kept)
 }
 
 #[test]
-fn counted_routines_stay_in_the_verified_interpreter() {
-    use cyallo::backend::verified::{CodeVersion, NativeTarget, PreparedFunction};
+fn counted_owners_select_the_shared_runtime_bridge() {
+    use cyallo::backend::verified::{CodeVersion, NativeTarget, Operation, PreparedFunction};
     let Some(target) = NativeTarget::host() else {
         return;
     };
@@ -156,7 +156,12 @@ fn counted_routines_stay_in_the_verified_interpreter() {
         compile("let a = rc 1\nstd::io::print(std::rc::strong_count(&a))\nstd::mem::drop(a)\n")
             .unwrap();
     let module = VerifiedModule::lower(&program, 0).unwrap();
-    assert!(PreparedFunction::prepare(&module, module.entry(), CodeVersion(1), target).is_err());
+    let plan = PreparedFunction::prepare(&module, module.entry(), CodeVersion(1), target).unwrap();
+    assert!(
+        plan.sites()
+            .iter()
+            .any(|site| site.operation == Operation::Runtime)
+    );
 }
 
 mod images {

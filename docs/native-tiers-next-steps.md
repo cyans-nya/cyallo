@@ -1,6 +1,8 @@
 # Finishing the native tiers: instructions for the next sessions
 
-Native slices 1, 2a, 2b, 3a, 3b, 3c and 4.1 are implemented. Goal from the
+Native slices 1, 2a, 2b, 3a, 3b, 3c and 4.1 are implemented. The shared runtime
+also covers closures and calls, managed memory, input, module variables and randomness
+from 4.3–4.5. Goal from the
 project owner: **any code must be able to run in the native tiers**; the interpreter
 stays the reference and the fallback. Native work does not block the legacy removal
 ([legacy-removal-plan.md](legacy-removal-plan.md)). Read
@@ -16,6 +18,7 @@ Code map (all under `src/backend/verified/` unless noted):
 | `prepare.rs` | Legalizes verified bytecode into a `PreparedFunction`: `Operation`s per instruction (`Site`), the frame map (`FrameMap`), layout table (`Layout`), word table (`WordOp`), bridge table (`BridgeCall`), element accesses (`ElementAccess`), call table. **Anything not legalized returns `UnsupportedOperation`/`NonScalar` and the routine stays in the interpreter.** |
 | `cranelift.rs`, `winch.rs` | Two adapters that emit machine code from the same plan. Every `Operation` needs both. Cranelift keeps frame words in SSA variables except *borrowed* words (see 3); Winch keeps every word in frame memory. |
 | `run.rs` | The driver: runs one native function per invocation, handles calls (copying words between frames), returns, failures, bridges, and recovery into the interpreter (`NativeActivation::recover`). Owns the `Heap` (strings, array and vector buffers) and the output sink. |
+| `run.rs::SharedActivation` | Keeps verified runtime frames and memory for a module that uses the shared runtime. Copies only initialized scalar homes across each native section and executes the requested runtime instruction at a bridge. |
 | `abi.rs` | `ScalarOutcome` (Returned, Paused, Failed, Call, Bridge), `Failure` codes. |
 | `publish.rs`, `validate.rs`, `image.rs` | Code store, linking, image checks. |
 | `src/bytecode/verified/run.rs` | The interpreter (reference). Native recovery enters through `restore_scalars`, `RecoveredValue`, `RecoveredStep`. |
@@ -37,7 +40,7 @@ per instruction (`Site::recover`).
 2. **Representation.** Does the value fit in words? If yes add a `Layout` variant (or reuse
    one) and give `layout_of`/`layout_of_top` and `FrameMap::layout_of_register` the case.
    If not, it needs a heap (see section 4).
-3. **Legalize** in `legalize()` (`prepare.rs`): produce an existing `Operation`, a
+3. **Legalize** in `legalize()` (`prepare.rs`) for word-based plans: produce an existing `Operation`, a
    word-move (`Operation::Words`), or a new `Operation`/`BridgeCall`. Remove the
    instruction from the rejection list at the bottom. Reject (`return Err(unsupported)`)
    every shape you do not handle, e.g. a destination that overlaps a source.
@@ -47,7 +50,7 @@ per instruction (`Site::recover`).
    (`winch.rs::operation`). Winch has few scratch registers (`LEFT RIGHT VALUE TEMP
    ADDRESS SAVED_DIVIDEND`); `address()`/`through()` use `ADDRESS` for large offsets, so
    do not hold values there across `load_home`/`store_home`.
-6. **Recovery.** If the instruction produces a new kind of register value, extend
+6. **Recovery.** If a word-based plan produces a new kind of register value, extend
    `RecoveredValue` (interpreter side `recovered_value`, backend side `decode_layout`)
    and make sure the interpreter's expected storage state matches.
 7. **Tests** in `tests/verified_native_*.rs`: run the same program on the interpreter and
@@ -112,53 +115,43 @@ through loans still use the interpreter. Elements with drop semantics wait for 4
 - `TextTest`/`TextMap` already bridged; add the not-yet-covered text instructions and
   arrays of text only after 4.4 (they need element drop semantics).
 
-### 4.3 Closures, indirect calls, bound calls (host functions), method calls
-A closure value is a pair `(function id, captures)`. Captures are words when scalar;
-store the capture words in an activation heap block and let the closure register be
-that block's address. `Closure` builds it (bridge). `CallTarget::Closure` needs the
-**callee's native entry from the code store**: give `NativeActivation` a reference to the
-store (or a resolver) so the driver can pick the entry (or fall back to interpreting that
-frame, see 4.6). Captures are the callee's leading parameters. `CallTarget::Bound` (host
-bindings) and `CallTarget::Method` (trait objects, service views) go through the existing
-interpreter implementations via the bridge mechanism of 4.6.
+### 4.3 Closures, indirect calls, host bindings, and methods (implemented)
 
-### 4.4 Counted owners and GC handles (root maps)
-`Rc`, `Weak`, `Gc` need the collector to see native frames.
-- Represent `Gc` as the interpreter's heap index (a word) and keep the interpreter's `Heap`
-  inside `NativeActivation` (move `Memory` ownership into the native activation;
-  `ActivationMemory`/`into_memory` already show the pattern).
-- Add `Site::roots` (per instruction: which homes hold handles) and make allocation
-  bridges (`GcNew`, `RcNew`, `TraitBox`, `Allocate`) the only points that collect;
-  they run in the driver where all native frames are known, so the root set is the union
-  of `recover` homes holding handles across the whole stack plus the heap.
-- `--gc-stress` (collect before every allocation) must pass for every native test; add a
-  `gc_stress` flag to the test helpers.
-- `Drop`/`Clone`/`RcClone`/`RcDowngrade`/`RcUpgrade`/`RcStrongCount` become bridges that
-  call the interpreter's `memory.drop_value`/`clone_value` on the handle.
-- Finalizers (allocator-backed blocks) push frames in the interpreter (`memory.finalizers`);
-  a bridge that frees such a block must hand control to the interpreter (recover) or run
-  the finalizer natively; start with recover.
+Shared-runtime plans execute frame-local scalar instructions in Winch or Cranelift.
+At a runtime bridge the driver spills initialized scalar homes, restores the
+instruction and statement edge, and executes one verified instruction. The runtime
+keeps closure captures and resolves dynamic calls. The native driver selects the
+callee from the activation's snapshot of published entries. A callee without a
+published entry runs in the interpreter, and the driver can re-enter native code at
+the caller. Host callbacks and trait dispatch use the same verified call implementation.
 
-### 4.5 Input, module variables, random, clocks
-- `Input`/`InputLoan`: give `NativeActivation` an `InputSource`. When no line is waiting the
-  interpreter reports `AwaitInput`; native must exit with a paused status the same way
-  (the CLI/`vm::Session` already handle `ExecutionStatus` for the interpreter; mirror it).
-- Module variables (`BorrowGlobal`, loads/stores of globals): a per-activation words block
-  addressed through the context; initialization state per variable (see
-  `UninitializedGlobal`).
-- `Random`: seeded LCG state lives in the activation; bridge it.
+### 4.4 Counted owners and GC handles (implemented)
 
-### 4.6 The general fallback: execute one interpreter instruction from native code
-For everything else (objects, erased values, services, module loads, generators, tasks,
-channels) do **not** reimplement semantics. Add a bridge that recovers the current stack
-to an interpreter `Activation`, runs exactly one instruction there, and re-imports the
-frames. This needs: (a) a way to step the interpreter one instruction with `fuel = 1`,
-(b) a `NativeActivation::import(activation)` that rebuilds native frames from interpreter
-frames for the instruction's kinds, (c) keeping non-word registers in a side table with
-words as indices. Do this only after 4.1-4.5 so the common kinds do not pay for it.
-Native park/resume for generators, tasks and channels (stage 8 in `overhaul-stages.md`)
-builds on this: a parked generator is a suspended frame stack, which the interpreter
-already represents.
+The shared runtime retains the entire verified stack and heap. Managed values and
+loans stay in their verified slots, so the collector traces suspended callers and
+the current frame through its existing root scan. Allocation, clone, count, weak
+upgrade and drop use the verified operations. Allocator-backed drops push finalizer
+frames on the shared stack. Recovery returns that activation with the same heap,
+counts and stack. Tests exercise every budget under normal collection and GC stress.
+
+### 4.5 Input, module variables and randomness (implemented)
+
+The shared runtime owns input, globals and random state. Waiting input preserves
+the instruction and incoming statement edge without spending fuel. Closing the
+source delivers the typed end-of-input failure. Globals retain their initialization
+state, and recovery preserves the input source and random seed. Clock operations
+belong with broader suspension support in 4.6.
+
+### 4.6 Extend the shared runtime bridge
+
+Extend native admission and coverage to objects, erased values, services, module loads,
+generators, tasks, and channels. Use the same single-instruction bridge and preserve
+the runtime's effect ordering, instruction counts and suspension across handoffs.
+The shared runtime can already retain these values while it runs a bridge. Modules
+that only use those features still need native admission and coverage. Verify
+re-entry after module publication and scheduler changes, then add native park and
+resume tests for the suspended frames described in stage 8 of
+[overhaul-stages.md](overhaul-stages.md).
 
 ### 4.7 Caches (deferred until here, per the project owner)
 Service slot and call-site caches, lookup-plan caches, object shape descriptors and inline
@@ -181,8 +174,9 @@ verified kinds first (legacy-removal decisions 1-2). The simplified dialect need
 sparse arrays in the verified engine first.
 
 ## 5. Interpreter-side prerequisites to remember
-- `Activation::restore_scalars` is the only way native frames re-enter the interpreter;
-  it validates storage state and shapes. Each new native value kind needs a case there.
+- `Activation::restore_scalars` rebuilds native word frames in the interpreter and
+  validates storage state and shapes. Shared-runtime plans retain the existing
+  activation, so they only synchronize the scalar homes at section boundaries.
 - Interpreter output goes through `OutputSink`; native shares the sink on recovery.
 - The perf session owns `src/dynamic_modules.rs`, `crates/cyallo-ir/src/analysis/modules.rs`,
   `src/bytecode.rs`, `crates/cyallo-ir/src/{ir,analysis,osr}.rs`: message that session

@@ -5,14 +5,24 @@ use super::{
     PreparedFunction, UnlinkedImage, ValidatedImage, platform::Executable,
 };
 use crate::bytecode::verified::{FunctionId, InstructionId, VerifiedModule};
-use std::{collections::HashMap, fmt, rc::Rc, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    fmt,
+    rc::{Rc, Weak},
+    sync::Arc,
+};
+
+type RuntimeEntries = Rc<RefCell<HashMap<FunctionId, Weak<Published>>>>;
 
 pub struct CodeStore {
     target: NativeTarget,
     module: VerifiedModule,
     version: CodeVersion,
+    shared_runtime: bool,
     plans: HashMap<FunctionId, Arc<PreparedFunction>>,
     entries: HashMap<FunctionId, EntryPin>,
+    runtime_entries: RuntimeEntries,
 }
 
 impl CodeStore {
@@ -20,10 +30,12 @@ impl CodeStore {
         let target = NativeTarget::host().ok_or(PublishError::UnsupportedHost)?;
         Ok(Self {
             target,
+            shared_runtime: PreparedFunction::requires_shared_runtime(&module),
             module,
             version: CodeVersion(0),
             plans: HashMap::new(),
             entries: HashMap::new(),
+            runtime_entries: RuntimeEntries::default(),
         })
     }
 
@@ -36,8 +48,10 @@ impl CodeStore {
             .checked_add(1)
             .ok_or(PublishError::VersionExhausted)?;
         self.version = CodeVersion(version);
+        self.shared_runtime = PreparedFunction::requires_shared_runtime(&module);
         self.module = module;
         self.entries.clear();
+        self.runtime_entries = RuntimeEntries::default();
         self.plans.clear();
         Ok(())
     }
@@ -46,11 +60,12 @@ impl CodeStore {
         if let Some(plan) = self.plans.get(&function) {
             return Ok(plan.clone());
         }
-        let plan = Arc::new(PreparedFunction::prepare(
+        let plan = Arc::new(PreparedFunction::prepare_in_mode(
             &self.module,
             function,
             self.version,
             self.target,
+            self.shared_runtime,
         )?);
         self.plans.insert(function, plan.clone());
         Ok(plan)
@@ -81,7 +96,13 @@ impl CodeStore {
             executable,
             linkage,
             module: self.module.clone(),
+            runtime_entries: self.runtime_entries.clone(),
         }));
+        if pin.plan().uses_shared_runtime() {
+            self.runtime_entries
+                .borrow_mut()
+                .insert(function, Rc::downgrade(&pin.0));
+        }
         self.entries.insert(function, pin.clone());
         Ok(pin)
     }
@@ -130,6 +151,7 @@ impl CodeStore {
 
     pub fn retire(&mut self, function: FunctionId) {
         self.entries.remove(&function);
+        self.runtime_entries.borrow_mut().remove(&function);
     }
 
     pub fn module(&self) -> &VerifiedModule {
@@ -142,6 +164,7 @@ struct Published {
     executable: Executable,
     linkage: Linkage,
     module: VerifiedModule,
+    runtime_entries: RuntimeEntries,
 }
 
 struct Linkage {
@@ -163,6 +186,20 @@ impl fmt::Debug for EntryPin {
 }
 
 impl EntryPin {
+    /// Capture a version's available entries once for a new activation.
+    /// Weak references in the registry avoid cycles between executable pins.
+    pub(super) fn runtime_snapshot(&self) -> HashMap<FunctionId, EntryPin> {
+        let mut entries = self
+            .0
+            .runtime_entries
+            .borrow()
+            .iter()
+            .filter_map(|(&function, pin)| pin.upgrade().map(|pin| (function, EntryPin(pin))))
+            .collect::<HashMap<_, _>>();
+        entries.insert(self.plan().function(), self.clone());
+        entries
+    }
+
     pub fn tier(&self) -> NativeTier {
         self.0.image.image().tier()
     }

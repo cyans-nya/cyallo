@@ -2360,7 +2360,16 @@ impl VerifiedModule {
         arguments: &[Scalar],
         limits: ExecutionLimits,
     ) -> Result<Activation, RunError> {
-        let entry = &self.functions[self.entry.index()];
+        self.start_at(self.entry, arguments, limits)
+    }
+
+    pub(crate) fn start_at(
+        &self,
+        function: FunctionId,
+        arguments: &[Scalar],
+        limits: ExecutionLimits,
+    ) -> Result<Activation, RunError> {
+        let entry = &self.functions[function.index()];
         // An activation hands back at most a scalar, and takes only scalars.
         if matches!(entry.result, Some(result) if result.scalar().is_none()) {
             return Err(RunError::EntryResultNotScalar);
@@ -2396,7 +2405,7 @@ impl VerifiedModule {
             return Err(RunError::FuelExhausted);
         }
         let entry = Frame::new(
-            self.entry,
+            function,
             entry,
             arguments.iter().copied().map(FrameValue::Scalar),
             None,
@@ -2482,6 +2491,7 @@ impl VerifiedModule {
         let body = &self.functions[function.index()];
         let layout = body.frame_layout();
         let pc = frame.pc;
+        let arrival = frame.arrival;
         let from = instruction_id(pc);
         frame.pc += 1;
         frame.arrival = StatementArrival::Next(from);
@@ -2584,8 +2594,11 @@ impl VerifiedModule {
             }
             Instruction::RcNew(dst, value) => {
                 let value = frame.value(layout, value);
+                if memory.heap.should_collect() {
+                    memory.collect(stack);
+                }
                 let block = memory.new_counted(value);
-                frame.set_value(layout, dst, FrameValue::Rc(block));
+                stack[depth - 1].set_value(layout, dst, FrameValue::Rc(block));
             }
             Instruction::RcClone(dst, src)
             | Instruction::RcDowngrade(dst, src)
@@ -2763,12 +2776,15 @@ impl VerifiedModule {
             }
             Instruction::Allocate(dst, _) => {
                 let (ok, _) = body.allocation_result_runtime(dst);
+                if memory.heap.should_collect() {
+                    memory.collect(stack);
+                }
                 memory.allocations += 1;
                 let allocated = Composite::Enum {
                     variant: ok,
                     payload: Some(Box::new(FrameValue::Allocation(memory.allocations))),
                 };
-                frame.set_value(layout, dst, FrameValue::Composite(allocated));
+                stack[depth - 1].set_value(layout, dst, FrameValue::Composite(allocated));
             }
             Instruction::Deallocate(_) => {}
             Instruction::RcNewIn(dst, list, deallocate) => {
@@ -2797,6 +2813,9 @@ impl VerifiedModule {
                 else {
                     unreachable!("verified allocation payload");
                 };
+                if memory.heap.should_collect() {
+                    memory.collect(stack);
+                }
                 let block = memory.new_counted_in(
                     value,
                     Some(AllocatorState {
@@ -2805,7 +2824,7 @@ impl VerifiedModule {
                         allocation,
                     }),
                 );
-                frame.set_value(layout, dst, FrameValue::Rc(block));
+                stack[depth - 1].set_value(layout, dst, FrameValue::Rc(block));
             }
             Instruction::LocationField(dst, owner, field) => {
                 let held = self
@@ -2921,7 +2940,8 @@ impl VerifiedModule {
                 let line = match input.next_line() {
                     Some(line) => line,
                     None if input.waits => {
-                        stack[depth - 1].pc -= 1;
+                        frame.pc = pc;
+                        frame.arrival = arrival;
                         return Ok(StepOutcome::AwaitInput);
                     }
                     None => return Err(read_error(true)),
@@ -5270,6 +5290,10 @@ impl InputSource {
     fn next_line(&mut self) -> Option<String> {
         (self.next)()
     }
+
+    pub(crate) fn end_input(&mut self) {
+        self.waits = false;
+    }
 }
 
 impl Default for InputSource {
@@ -5650,6 +5674,100 @@ fn render_output(template: &OutputTemplate, arguments: &[FrameValue]) -> String 
 }
 
 impl Activation {
+    /// Scalar sections can run on the current frame while the reference
+    /// activation retains its heap and full stack. Task scheduling stays in
+    /// the reference engine while another task can run.
+    pub(crate) fn native_position(
+        &self,
+        module: &VerifiedModule,
+    ) -> Option<(ExecutionPosition, StatementArrival)> {
+        if !Arc::ptr_eq(&self.module.functions, &module.functions)
+            || self.memory.current_task != 0
+            || self.memory.live_tasks() != 1
+        {
+            return None;
+        }
+        let ExecutionState::Active(stack) = &self.state else {
+            return None;
+        };
+        let ExecutionStatus::Paused(position) = self.status() else {
+            return None;
+        };
+        let frame = stack.last()?;
+        let body = self.module.function(frame.function)?;
+        frame
+            .arrival
+            .reaches(position.instruction, body.instructions())
+            .then_some((position, frame.arrival))
+    }
+
+    pub(crate) fn native_fuel(&self) -> usize {
+        self.limits.fuel - self.instructions_executed
+    }
+
+    pub(crate) fn native_scalar(&self, register: Register) -> Option<Scalar> {
+        let ExecutionState::Active(stack) = &self.state else {
+            return None;
+        };
+        let frame = stack.last()?;
+        let slots = self.module.function(frame.function)?.frame_layout();
+        match frame.slots.get(slots.slot(register)?.index())? {
+            Some(FrameValue::Scalar(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Apply only initialized scalar homes, then deliver the verified PC and
+    /// statement edge. Clear old slots first because the verifier reuses slots.
+    pub(crate) fn resume_from_native(
+        &mut self,
+        next: InstructionId,
+        arrival: StatementArrival,
+        old: impl Iterator<Item = Register>,
+        values: &[(Register, Scalar)],
+        executed: usize,
+    ) -> Option<()> {
+        if executed > self.native_fuel() {
+            return None;
+        }
+        let ExecutionState::Active(stack) = &mut self.state else {
+            return None;
+        };
+        let frame = stack.last_mut()?;
+        let body = self.module.function(frame.function)?;
+        if !arrival.reaches(next, body.instructions()) {
+            return None;
+        }
+        let layout = body.frame_layout();
+        for register in old {
+            frame.clear(layout, register);
+        }
+        for &(register, value) in values {
+            frame.set(layout, register, value);
+        }
+        frame.pc = next.index();
+        frame.arrival = arrival;
+        if executed != 0 {
+            self.awaiting_input = false;
+            self.stalled = 0;
+            self.quantum = if executed < self.quantum {
+                self.quantum - executed
+            } else {
+                QUANTUM - (executed - self.quantum) % QUANTUM
+            };
+            self.instructions_executed += executed;
+            if self.native_fuel() == 0 {
+                self.state = ExecutionState::Failed(RunError::FuelExhausted);
+            }
+        }
+        Some(())
+    }
+
+    pub(crate) fn fail_from_native(&mut self, error: RunError, executed: usize) {
+        self.instructions_executed += executed;
+        self.state = ExecutionState::Failed(error);
+    }
+
     /// Collect before every allocation, to expose a handle that is not
     /// reachable from a root. Set before the first slice.
     pub fn set_gc_stress(&mut self, stress: bool) {
@@ -5680,7 +5798,7 @@ impl Activation {
     /// Stop waiting for input: an input instruction that finds no line fails
     /// with the end of input.
     pub fn end_input(&mut self) {
-        self.input.waits = false;
+        self.input.end_input();
     }
 
     /// Whether the last slice stopped on an input instruction with no line.
