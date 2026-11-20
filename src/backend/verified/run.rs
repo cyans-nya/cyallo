@@ -58,6 +58,23 @@ impl Dispatch {
         }
     }
 
+    /// Instructions executed so far.
+    pub fn instructions_executed(&self) -> usize {
+        match self {
+            Self::Native(activation) => activation.instructions_executed(),
+            Self::Interpreter(activation) => activation.instructions_executed(),
+        }
+    }
+
+    /// Run `function` from now on with `entry`, which must be another image of
+    /// the same plan. Frames and recovery maps are identical, so a paused run
+    /// re-enters the new image at the same instruction.
+    pub fn install(&mut self, function: FunctionId, entry: EntryPin) {
+        if let Self::Native(activation) = self {
+            activation.install(function, entry);
+        }
+    }
+
     pub fn set_input(&mut self, source: InputSource) {
         match self {
             Self::Native(activation) => activation.set_input(source),
@@ -393,6 +410,25 @@ impl NativeActivation {
                 collections: 0,
                 counted: 0,
             },
+        }
+    }
+
+    /// See [`Dispatch::install`].
+    pub fn install(&mut self, function: FunctionId, entry: EntryPin) {
+        match &mut self.state {
+            State::Shared(shared) => {
+                shared.entries.insert(function, entry);
+            }
+            State::Active(word) => {
+                for frame in &mut word.stack {
+                    if frame.entry.plan().function() == function
+                        && frame.entry.version() == entry.version()
+                    {
+                        frame.entry = entry.clone();
+                    }
+                }
+            }
+            _ => {}
         }
     }
 

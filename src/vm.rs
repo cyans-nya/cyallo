@@ -7,7 +7,7 @@ pub mod repl;
 pub use crate::runtime::{Context, Status};
 use crate::{
     Diagnostic, Span,
-    backend::verified::{CodeStore, Dispatch, ExecutionMode, NativeRunError},
+    backend::verified::{CodeStore, Dispatch, ExecutionMode, NativeRunError, TierPolicy, Tiered},
     bytecode::verified::{
         Activation, ExecutionLimits, ExecutionStatus, GeneratorFault, InputSource, OutputSink,
         RunError, VerifiedModule,
@@ -34,18 +34,30 @@ fn lower(program: Arc<Program>) -> Result<VerifiedModule, Diagnostic> {
 /// Start a verified batch run, preferring published native code when available.
 /// The context supplies the frame limit, GC stress setting and random seed.
 /// The caller can configure input on the dispatch before the first slice.
-pub fn start_jit(program: Arc<Program>, context: &Context) -> Result<Dispatch, Diagnostic> {
+/// Hot functions are promoted from Winch to Cranelift while the run goes on
+/// (`CYALLO_TIERING=off` disables it; see `backend::verified::tiering`).
+pub fn start_jit(program: Arc<Program>, context: &Context) -> Result<Tiered, Diagnostic> {
+    start_jit_with(program, context, TierPolicy::from_env())
+}
+
+/// [`start_jit`] with an explicit tier-up policy.
+pub fn start_jit_with(
+    program: Arc<Program>,
+    context: &Context,
+    policy: TierPolicy,
+) -> Result<Tiered, Diagnostic> {
     let module = lower(program)?;
     let limits = ExecutionLimits {
         fuel: TOTAL_FUEL,
         frames: context.max_frames,
     };
-    let started = match CodeStore::new(module.clone()) {
-        Ok(mut store) => {
+    let mut store = CodeStore::new(module.clone()).ok();
+    let started = match &mut store {
+        Some(store) => {
             store.compile_available();
             store.start(&[], limits, ExecutionMode::PreferNative)
         }
-        Err(_) => module
+        None => module
             .start(&[], limits)
             .map(|activation| Dispatch::Interpreter(Box::new(activation)))
             .map_err(NativeRunError::Guest),
@@ -62,7 +74,10 @@ pub fn start_jit(program: Arc<Program>, context: &Context) -> Result<Dispatch, D
             activation.set_random_seed(context.random_seed);
         }
     }
-    Ok(dispatch)
+    Ok(match store {
+        Some(store) if policy.enabled => Tiered::new(store, dispatch, policy),
+        _ => Tiered::without_store(dispatch),
+    })
 }
 
 pub struct Session {

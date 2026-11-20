@@ -182,6 +182,77 @@ sparse arrays in the verified engine first.
   `src/bytecode.rs`, `crates/cyallo-ir/src/{ir,analysis,osr}.rs`: message that session
   before touching them. `src/bytecode/verified*` and `src/backend/verified*` are free.
 
+### Interpreter frame storage
+
+Ignition and JavaScriptCore's native LLInt both put call headers and local slots
+on a contiguous stack. On 64-bit targets each operand identifies a slot relative
+to the frame pointer. In the inspected ARM64 Ignition layout, local zero is
+56 bytes below the frame pointer and the receiver is 16 bytes above it.
+In 64-bit LLInt, local zero is eight bytes below the frame pointer and `this` is
+40 bytes above it. Ignition encodes the displacement in words. LLInt encodes
+local `i` as `-1 - i` and uses a separate operand range for constants.
+[Ignition frame constants](https://github.com/v8/v8/blob/main/src/execution/frame-constants.h)
+· [Ignition register encoding](https://github.com/v8/v8/blob/main/src/interpreter/bytecode-register.h)
+· [LLInt call frame](https://github.com/WebKit/WebKit/blob/main/Source/JavaScriptCore/interpreter/CallFrame.h#L100-L172)
+· [LLInt virtual register encoding](https://github.com/WebKit/WebKit/blob/main/Source/JavaScriptCore/bytecode/VirtualRegister.h#L101-L119)
+
+Cyallo uses an owned VM value stack. `FrameStack` stores frame headers and one
+contiguous vector of optional values per running or parked task. Each header
+has a slot range. The ranges partition the live vector in call order. Guest
+calls reserve a tail range and fill parameters in place, including a closure's
+leading captures or a method's receiver. Native recovery, module initializers,
+and finalizers also initialize the active stack directly. Detached generators
+own their slot buffers while suspended.
+
+After verification assigns physical slots, `FrameLayout` prepares a
+PC-indexed table for storage markers, copies and moves, scalar arithmetic and
+conversions, branches, and returns. Those instructions index the active
+frame's slot range with the prepared operand. Other instructions resolve
+operands through `FrameLayout::slot`. Loans retain their logical frame and
+register, so growing the vector can move its backing allocation. Recovery
+and debugging use the same logical register IDs.
+[Stack implementation](../src/bytecode/verified/run.rs)
+· [Verified slot layout](../src/bytecode/verified/frame.rs)
+
+Return truncates the live range after saving the result and its destination.
+Truncation removes dead values from the active root scan and preserves capacity
+for sibling calls. Existing bytecode drop operations control managed cleanup.
+An instruction-budget pause or an input wait keeps the whole live range.
+A yielding generator moves its frame values into detached storage and restores
+them on resume. A parked task keeps its whole stack. The task's backing storage
+is freed when the stack is dropped.
+
+Start with a contiguous vector and measure execution after lowering as well as
+whole-command latency. Consider segmentation if growth copies become material
+or a native interface requires stable addresses. A segmented design should keep
+each frame within one segment so the interpreter can resolve the segment once
+per frame entry. Trim retained capacity at an idle boundary only if a
+long-lived continuation exhibits sustained excess retention. Measure the cost
+of the prepared operand table before extending its coverage. Measure generator
+yield and resume before changing ownership of detached slots.
+
+The first slice was measured on ARM64 macOS with warmed `hyperfine` runs of the
+verified CLI. These wall times include process startup and bytecode lowering.
+
+| Workload | Runs per binary | Per-frame buffers | Contiguous stack |
+| --- | ---: | ---: | ---: |
+| `fib(22)` | 90 | 23.9 ms | 22.6 ms |
+| `fib(26)` | 40 | 124.7 ms | 116.3 ms |
+
+The next slice was measured against the first slice in a separate session.
+The measurements include both prepared slots and direct initialization for
+the remaining active call paths.
+
+| Workload | Runs per binary | First slice | Prepared slots and calls |
+| --- | ---: | ---: | ---: |
+| `fib(22)` | 90 | 22.6 ms | 20.4 ms |
+| `fib(26)` | 40 | 121.4 ms | 103.6 ms |
+
+The regression test grows the stack recursively while an exclusive loan
+points into an ancestor frame. It collects on every allocation, resumes one
+instruction at a time, and exercises both eager and deferred checking.
+[Regression test](../tests/verified_borrowing.rs)
+
 ## 6. Verification gates for every slice
 ```bash
 args=$(ls tests/verified_*.rs tests/vm_*.rs tests/cli.rs tests/native_emitters.rs tests/bytecode.rs | sed 's#tests/\(.*\)\.rs#--test \1#')
@@ -195,3 +266,109 @@ cargo clippy --release --offline --locked --lib
   (`git commit -- <paths>`), because other sessions leave staged changes in the index.
 - Record benchmark numbers (storage, startup, throughput) in the stage doc once the
   tiers cover the examples, before the legacy engine is deleted.
+
+## 7. Review risks to check (from the review of `be6cc7f`, `08269f5`, `df22415`)
+
+Committed HEAD passes the verified, vm, CLI, SDK-host and native suites in a clean export.
+These points are not covered by a failing test; check them before building on this code.
+
+1. **Native `Vec` is a hardcoded backend type.** `be6cc7f` gives the native tiers a dense
+   vector layout and vector bridges. The project owner's direction is `Vec<T>` as ordinary
+   std code over memory primitives (like Rust's `Vec::push`), not intrinsics or bytecode.
+   Treat the native `Vec` as a stopgap: when `Buffer<T>` lands, the vector layout,
+   bridges and loan relocation come out. Do not extend it (no `pop`, `VecDeque`, slices of
+   vectors) in the meantime.
+2. **Cost of the shared runtime.** At every bridge `08269f5` copies all initialized scalar
+   homes into the interpreter's frame and back (`run_section`). It is correct but costs
+   O(live scalars) per bridged instruction, so code that bridges often can be slower than
+   the interpreter. Measure a loop with a bridged operation inside; if it loses, keep
+   scalar state in the interpreter frame between consecutive bridges, or bridge in runs.
+3. **Vector growth with live loans.** `relocate_vector_loans` rewrites spilled loan words
+   that point into a buffer that grew. Add tests for: an element reborrow live across a
+   push through the vector loan in an *inlined* Cranelift loop (not only a callee), several
+   frames holding loans into the same buffer, and a loan that also lives in a Cranelift
+   borrowed word. Anything holding an element address outside `Site::recover` is missed.
+4. **Two driver modes.** Word-based plans (`WordActivation`) and shared-runtime plans
+   (`SharedActivation`) have separate drivers, recovery paths and failure decoding, and a
+   function picks its mode (`uses_shared_runtime`). Keep one conformance suite that runs
+   every program in both modes, and decide whether the word mode stays once the shared
+   runtime covers it, to avoid maintaining both.
+5. **Uncommitted work in flight.** At the time of the review the working tree had about
+   800 uncommitted lines in `src/bytecode/verified/run.rs`, `src/main.rs`, `src/vm.rs`,
+   `src/backend/verified/{publish,run}.rs`, `src/bytecode/verified/frame.rs` and
+   `src/report/model.rs`, and one `verified_composites` test failing only with them.
+   Commit or discard that work before starting new slices on the same files.
+
+Benchmark note (hyperfine, `examples/hot-loop.ya`, 100k-iteration scalar loop, 400 runs
+each): `legacy_jit` 7.0 ms and 16.6 MiB, `ng_jit` 7.7 ms (+9.9%) and 14.0 MiB (-15.4%).
+At this size wall time is dominated by startup (compile, lowering, tier publication), not
+the loop, so the +0.7 ms is startup cost; use a longer loop (millions of iterations) and a
+startup-only run to separate them before drawing conclusions.
+
+## 8. Tier-up policy: data and proposal
+
+Raw data: [native-tier-samples.md](native-tier-samples.md) (aarch64 macOS, release build,
+collected by a sampling agent; all 24 native runs matched the interpreter).
+
+Findings:
+- Run cost per executed verified instruction: interpreter 7.9-9.8 ns; Winch 0.58-0.71 ns
+  on scalar, float and array loops, 1.45 ns with calls, 2.0 ns on tuple/enum loops;
+  Cranelift 0.22-0.23 ns scalar, 0.85 with calls, 1.36 on tuple/enum. The gap Winch minus
+  Cranelift is 0.48 ns (scalar) to 0.65 ns (calls, enums).
+- Cranelift `LowLatency` and `Optimized` run within 3% of each other on every program, and
+  `Optimized` compiles 1.1-1.7x slower: promote to `LowLatency` only.
+- Compile cost over plan sites `s` (instructions): Winch about 12 us + 0.37 us * s
+  (linear: 1.7 ms at 4618 sites). Cranelift `LowLatency` is superlinear and fits
+  `250 + 16 s + 0.005 s^2` microseconds within 5% (0.70 ms at 28 sites, 25 ms at 1162,
+  178 ms at 4618).
+- Cold start: the first emit in a process costs 0.5 ms (Winch) and 2.1 ms (Cranelift),
+  against medians of 22 us and 0.70 ms: about 1.4 ms of one-off Cranelift setup.
+- Startup of the examples is dominated by the frontend (`compile` about 3.1 ms); lowering
+  35 us, preparing 4 us, Winch emit of the entry 11 us.
+- Sampling is feasible: a paused `resume(100_000)` always reports function and instruction,
+  and `status()` costs about 4 ns. Resume overhead is within noise (about 2 us).
+- Threads: `PreparedFunction` and `UnlinkedImage` are `Send`; `CodeStore` is not (its
+  `EntryPin` holds an `Rc`). A worker can therefore emit, and the main thread publishes.
+
+Implemented in `src/backend/verified/tiering.rs` (`Tiered`, `TierPolicy`), used by
+`ng_jit` through `vm::start_jit`; `CYALLO_TIERING=off` disables it and
+`CYALLO_TIER_REQUEST_PERCENT=n` sets how early the compile is requested. Tests:
+`tests/verified_tiering.rs`. Measured with `hyperfine -N` (no `env` wrapper: it adds
+about 3 ms to every run) on `examples/osr-loop.ya` (27M instructions) and
+`examples/hot-loop.ya`:
+
+| | osr-loop | hot-loop |
+| --- | --- | --- |
+| `ng_jit`, tier-up off | 25.1 ms | 7.6 ms |
+| request at 100% of the threshold | 15.0 ms | 8.0 ms |
+| request at 50% | 14.4 ms | 7.6 ms |
+| request at 25% (default) | 14.0 ms | 7.7 ms |
+| request at 10% | 13.5 ms | 7.7 ms |
+| `legacy_jit` | 11.4 ms | 6.8 ms |
+
+The compile runs on a worker thread, so requesting early costs CPU on another core, not
+latency, and the worker is not joined at exit. The default is 25% of the threshold; 10%
+is a little faster but compiles almost any function that runs for 0.2 ms, which would
+waste CPU on a busy or single-core machine. The remaining gap to `legacy_jit` is the
+Winch time before the swap, the Cranelift cold start (1.4 ms) and +3 MiB for the worker.
+Policy as built (the threshold is when the compile is worth it; with `request_percent`
+the request goes out earlier):
+1. Run everything in Winch first (cheap, one-to-one with the bytecode).
+2. Slice the run at 100k instructions. At each pause attribute the slice to the function
+   at the reported position (`executed[f] += slice`). No counters in generated code.
+3. Promote function `f` with `s` plan sites when its executed instructions reach
+   `N(s) = 500_000 + 32_000 * s + 10 * s^2`, which is the point where the saving of
+   0.5 ns per instruction repays the estimated Cranelift compile cost
+   (`1.4M` at 28 sites, `11M` at 298, `51M` at 1162). Use the executed count so far as the
+   estimate of what remains. Add 1.4 ms to the cost for the first Cranelift emit of the
+   process, or warm Cranelift on the worker once any function reaches half of its threshold.
+4. Emit `LowLatency` on a worker thread from a clone of the `PreparedFunction`; publish the
+   image on the main thread at the next pause. Both tiers share the plan, frame layout and
+   recovery maps, so the swap is re-entering the new image at the paused instruction
+   (this is also the loop OSR for a single long invocation).
+5. Programs shorter than about 10 ms never reach a threshold and pay nothing.
+
+Open points: calibrate the constants on a second host (x86_64) and on call-heavy and
+enum-heavy code; decide whether large functions (`s` over about 1000) should be split or
+skipped because their threshold exceeds typical run lengths; revisit after fuel batching
+and lowering cleanups change the per-instruction costs.

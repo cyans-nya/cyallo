@@ -6,7 +6,7 @@ use cyallo::{
     CompileOptions, Dialect,
     backend::verified::{
         CodeStore, CraneliftProfile, Dispatch, EntryPin, NativeTarget, NativeTier, Operation,
-        PrepareError,
+        PrepareError, TierPolicy,
     },
     bytecode::verified::{
         ExecutionLimits, ExecutionStatus, FunctionId, InputSource, OutputSink, RunError, Scalar,
@@ -42,9 +42,16 @@ fn ng_jit_enters_the_hot_loop_in_winch() {
         .position(|routine| routine.name.as_ref() == "sum_to")
         .unwrap();
     let module = VerifiedModule::lower_shared(program.clone(), 0).unwrap();
-    let Dispatch::Native(mut activation) =
-        cyallo::vm::start_jit(program, &Default::default()).unwrap()
-    else {
+    let mut tiered = cyallo::vm::start_jit_with(
+        program,
+        &Default::default(),
+        TierPolicy {
+            enabled: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let Dispatch::Native(activation) = tiered.dispatch() else {
         panic!("expected a native entry");
     };
     let budget = 5_000;
@@ -61,8 +68,8 @@ fn ng_jit_enters_the_hot_loop_in_winch() {
 #[test]
 fn ng_jit_falls_back_for_unlinked_recursive_word_code() {
     let program = Arc::new(compile(include_str!("../examples/fib.ya")).unwrap());
-    let dispatch = cyallo::vm::start_jit(program, &Default::default()).unwrap();
-    assert!(matches!(dispatch, Dispatch::Interpreter(_)));
+    let mut tiered = cyallo::vm::start_jit(program, &Default::default()).unwrap();
+    assert!(matches!(tiered.dispatch(), Dispatch::Interpreter(_)));
 }
 
 fn module(source: &str) -> VerifiedModule {

@@ -13,7 +13,7 @@ use cyallo::{
     Diagnostic, Session, Status,
     backend::{
         CraneliftConfig, Executable, NativeBackend, TierPolicy, TieredArtifact, TieredBackend,
-        verified::{Dispatch, NativeRunError},
+        verified::NativeRunError,
     },
     bytecode::verified::{ExecutionStatus, InputSource},
     debugger::{Debugger, Mode},
@@ -562,7 +562,7 @@ fn main() -> color_eyre::Result<()> {
                 let context = runtime.context();
                 let run = if matches!(engine, Some(Engine::NgJit)) {
                     cyallo::vm::start_jit(program.clone(), &context)
-                        .map(|dispatch| run_ng_jit(dispatch, &render))
+                        .map(|tiered| run_ng_jit(tiered, &render))
                 } else {
                     cyallo::vm::Session::with_context(program.clone(), context)
                         .map(|session| run_verified(session, &render))
@@ -662,20 +662,22 @@ fn run_verified(
 }
 
 fn run_ng_jit(
-    mut dispatch: Dispatch,
+    mut tiered: cyallo::backend::verified::Tiered,
     render: &impl Fn(&Diagnostic) -> String,
 ) -> color_eyre::Result<bool> {
     let line = Arc::new(Mutex::new(None));
     let source = line.clone();
-    dispatch.set_input(InputSource::waiting(move || source.lock().unwrap().take()));
+    tiered
+        .dispatch()
+        .set_input(InputSource::waiting(move || source.lock().unwrap().take()));
     loop {
-        let status = dispatch.resume(VERIFIED_SLICE);
+        let status = tiered.resume(VERIFIED_SLICE);
         io::stdout().flush()?;
         match status {
-            Ok(ExecutionStatus::Paused(_)) if dispatch.awaiting_input() => {
+            Ok(ExecutionStatus::Paused(_)) if tiered.dispatch().awaiting_input() => {
                 match read_input_line()? {
                     Some(input) => *line.lock().unwrap() = Some(input),
-                    None => dispatch.end_input(),
+                    None => tiered.dispatch().end_input(),
                 }
             }
             Ok(ExecutionStatus::Paused(_)) => {}

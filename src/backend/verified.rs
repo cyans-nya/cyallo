@@ -9,6 +9,7 @@ mod platform;
 mod prepare;
 mod publish;
 mod run;
+mod tiering;
 mod validate;
 mod winch;
 
@@ -28,4 +29,5 @@ pub use prepare::{
 };
 pub use publish::{CodeStore, EntryPin, PublishError};
 pub use run::{Dispatch, EntryEvent, ExecutionMode, NativeActivation, NativeRunError};
+pub use tiering::{TierPolicy, Tiered};
 pub use validate::{ImageError, ValidatedImage};
