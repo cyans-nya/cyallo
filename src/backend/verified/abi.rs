@@ -118,6 +118,8 @@ pub enum Failure {
     Overflow = 1,
     DivisionByZero = 2,
     Trap = 3,
+    ConversionOutOfRange = 4,
+    EnumVariant = 5,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

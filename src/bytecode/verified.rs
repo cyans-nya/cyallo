@@ -26,6 +26,7 @@ pub use debug::{StatementArrival, StatementBoundary};
 pub use frame::{FrameLayout, FrameSlot};
 pub use lower::LowerError;
 pub(crate) use run::ScalarFrameSnapshot;
+pub use run::RecoveredValue;
 pub use run::ScalarRecoveryError;
 pub use run::{
     Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, GeneratorFault, HeapStats,
@@ -1453,6 +1454,11 @@ impl VerifiedFunction {
 
     pub fn result(&self) -> Option<ValueType> {
         self.result
+    }
+
+    /// The module's shape table, indexed by `ShapeId`.
+    pub fn shape_table(&self) -> &[Shape] {
+        &self.shapes
     }
 
     pub fn lists(&self) -> &[Box<[Register]>] {

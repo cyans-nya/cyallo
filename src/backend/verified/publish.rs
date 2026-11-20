@@ -105,6 +105,7 @@ impl CodeStore {
             if callee.target() != self.target
                 || callee.abi() != raw.plan().abi()
                 || call.result != callee.result()
+                || call.result_layout.as_ref() != callee.result_layout()
                 || !call
                     .arguments
                     .iter()

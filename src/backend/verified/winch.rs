@@ -18,9 +18,10 @@ mod host {
         abi::{Edge, scalar_word},
         image::checked_source,
     };
-    use crate::bytecode::verified::{InstructionId, IntegerOp, Scalar};
+    use super::super::{UnaryOp, WordOp, WordRange};
+    use crate::bytecode::verified::{BooleanOp, FloatOp, InstructionId, IntegerOp, Scalar};
     use std::{collections::BTreeMap, sync::Arc};
-    use winch_codegen::native::{Arithmetic, Assembler, Condition, Label};
+    use winch_codegen::native::{Arithmetic, Assembler, Condition, FloatArithmetic, Label};
 
     // Logical Winch native-assembler registers. Its prologue saves context,
     // environment, and result-place operands as registers 0 through 2.
@@ -169,6 +170,92 @@ mod host {
                     self.integer(operation, pc)?;
                     self.store_home(VALUE, destination);
                 }
+                Float {
+                    operation,
+                    destination,
+                    left,
+                    right,
+                } => {
+                    self.load_home(LEFT, left);
+                    self.load_home(RIGHT, right);
+                    self.float(operation, pc)?;
+                    self.store_home(VALUE, destination);
+                }
+                Boolean {
+                    operation,
+                    destination,
+                    left,
+                    right,
+                } => {
+                    self.load_home(LEFT, left);
+                    self.load_home(RIGHT, right);
+                    let condition = match operation {
+                        BooleanOp::Equal => Condition::Eq,
+                        BooleanOp::NotEqual => Condition::Ne,
+                    };
+                    self.boolean_from(condition);
+                    self.store_home(VALUE, destination);
+                }
+                RealDivide {
+                    destination,
+                    left,
+                    right,
+                } => {
+                    self.load_home(LEFT, left);
+                    self.load_home(RIGHT, right);
+                    let zero = self.machine.label();
+                    let done = self.machine.label();
+                    self.machine.imm(TEMP, 0);
+                    self.machine.compare(RIGHT, TEMP);
+                    self.machine.branch(Condition::Eq, zero);
+                    self.machine.int_to_float(0, LEFT);
+                    self.machine.int_to_float(1, RIGHT);
+                    self.machine.float_binary(FloatArithmetic::Div, 2, 0, 1);
+                    self.machine.float_to_bits(VALUE, 2);
+                    self.machine.jump(done);
+                    self.machine.bind(zero);
+                    self.fail(pc, Failure::DivisionByZero)?;
+                    self.machine.bind(done);
+                    self.store_home(VALUE, destination);
+                }
+                Unary {
+                    operation,
+                    destination,
+                    source,
+                } => {
+                    self.load_home(LEFT, source);
+                    self.unary(operation, pc)?;
+                    self.store_home(VALUE, destination);
+                }
+                Words(range) => self.words(plan, range),
+                TagIs {
+                    destination,
+                    tag,
+                    variant,
+                } => {
+                    let is_true = self.machine.label();
+                    let done = self.machine.label();
+                    self.load_at(LEFT, tag.0);
+                    self.machine.imm(RIGHT, u64::from(variant));
+                    self.machine.compare(LEFT, RIGHT);
+                    self.machine.branch(Condition::Eq, is_true);
+                    self.machine.imm(VALUE, 0);
+                    self.machine.jump(done);
+                    self.machine.bind(is_true);
+                    self.machine.imm(VALUE, 1);
+                    self.machine.bind(done);
+                    self.store_home(VALUE, destination);
+                }
+                Variant { tag, variant, then } => {
+                    let held = self.machine.label();
+                    self.load_at(LEFT, tag.0);
+                    self.machine.imm(RIGHT, u64::from(variant));
+                    self.machine.compare(LEFT, RIGHT);
+                    self.machine.branch(Condition::Eq, held);
+                    self.fail(pc, Failure::EnumVariant)?;
+                    self.machine.bind(held);
+                    self.words(plan, then);
+                }
                 Jump(to) => {
                     self.arrive(pc, Edge::Jump)?;
                     self.machine.jump(self.label(to)?);
@@ -207,6 +294,102 @@ mod host {
             {
                 self.arrive(pc, Edge::Next)?;
                 self.machine.jump(self.label(next)?);
+            }
+            Ok(())
+        }
+
+        /// VALUE = 1 when LEFT and RIGHT satisfy the integer condition, else 0.
+        fn boolean_from(&mut self, condition: Condition) {
+            let is_true = self.machine.label();
+            let done = self.machine.label();
+            self.machine.compare(LEFT, RIGHT);
+            self.machine.branch(condition, is_true);
+            self.machine.imm(VALUE, 0);
+            self.machine.jump(done);
+            self.machine.bind(is_true);
+            self.machine.imm(VALUE, 1);
+            self.machine.bind(done);
+        }
+
+        fn float(&mut self, operation: FloatOp, pc: InstructionId) -> Result<(), EmitError> {
+            use FloatOp::*;
+            self.machine.bits_to_float(0, LEFT);
+            self.machine.bits_to_float(1, RIGHT);
+            let arithmetic = match operation {
+                Add => Some(FloatArithmetic::Add),
+                Subtract => Some(FloatArithmetic::Sub),
+                Multiply => Some(FloatArithmetic::Mul),
+                Divide | CheckedDivide => Some(FloatArithmetic::Div),
+                Remainder => return Err(EmitError::UnsupportedOperation(pc)),
+                _ => None,
+            };
+            if let Some(arithmetic) = arithmetic {
+                let done = self.machine.label();
+                if operation == CheckedDivide {
+                    let zero = self.machine.label();
+                    self.machine.imm(TEMP, 0);
+                    self.machine.bits_to_float(3, TEMP);
+                    self.machine.float_branch(1, 3, Condition::Eq, zero);
+                    self.machine.float_binary(arithmetic, 2, 0, 1);
+                    self.machine.float_to_bits(VALUE, 2);
+                    self.machine.jump(done);
+                    self.machine.bind(zero);
+                    self.fail(pc, Failure::DivisionByZero)?;
+                } else {
+                    self.machine.float_binary(arithmetic, 2, 0, 1);
+                    self.machine.float_to_bits(VALUE, 2);
+                }
+                self.machine.bind(done);
+                return Ok(());
+            }
+            let condition = match operation {
+                Less => Condition::Lt,
+                LessEqual => Condition::Le,
+                Greater => Condition::Gt,
+                GreaterEqual => Condition::Ge,
+                Equal => Condition::Eq,
+                NotEqual => Condition::Ne,
+                _ => unreachable!("arithmetic handled above"),
+            };
+            let is_true = self.machine.label();
+            let done = self.machine.label();
+            self.machine.float_branch(0, 1, condition, is_true);
+            self.machine.imm(VALUE, 0);
+            self.machine.jump(done);
+            self.machine.bind(is_true);
+            self.machine.imm(VALUE, 1);
+            self.machine.bind(done);
+            Ok(())
+        }
+
+        fn unary(&mut self, operation: UnaryOp, pc: InstructionId) -> Result<(), EmitError> {
+            match operation {
+                UnaryOp::NegateInteger => {
+                    let minimum = self.machine.label();
+                    let done = self.machine.label();
+                    self.machine.imm(TEMP, scalar_word(Scalar::I64(i64::MIN)));
+                    self.machine.compare(LEFT, TEMP);
+                    self.machine.branch(Condition::Eq, minimum);
+                    self.machine.imm(TEMP, 0);
+                    self.machine.binary(Arithmetic::Sub, VALUE, TEMP, LEFT);
+                    self.machine.jump(done);
+                    self.machine.bind(minimum);
+                    self.fail(pc, Failure::Overflow)?;
+                    self.machine.bind(done);
+                }
+                UnaryOp::NegateFloat => {
+                    self.machine.imm(TEMP, scalar_word(Scalar::I64(i64::MIN)));
+                    self.machine.binary(Arithmetic::Xor, VALUE, LEFT, TEMP);
+                }
+                UnaryOp::Not => {
+                    self.machine.imm(TEMP, 1);
+                    self.machine.binary(Arithmetic::Xor, VALUE, LEFT, TEMP);
+                }
+                UnaryOp::IntegerToFloat => {
+                    self.machine.int_to_float(0, LEFT);
+                    self.machine.float_to_bits(VALUE, 0);
+                }
+                UnaryOp::FloatToInteger => return Err(EmitError::UnsupportedOperation(pc)),
             }
             Ok(())
         }
@@ -317,8 +500,35 @@ mod host {
         }
 
         fn load_home(&mut self, dst: u8, home: NativeHome) {
-            let (base, offset) = self.address(SLOTS, home.offset.0);
+            self.load_at(dst, home.offset.0);
+        }
+
+        fn load_at(&mut self, dst: u8, offset: u32) {
+            let (base, offset) = self.address(SLOTS, offset);
             self.machine.load(dst, base, offset);
+        }
+
+        fn store_at(&mut self, src: u8, offset: u32) {
+            let (base, offset) = self.address(SLOTS, offset);
+            self.machine.store(src, base, offset);
+        }
+
+        fn words(&mut self, plan: &PreparedFunction, range: WordRange) {
+            for &op in plan.words(range) {
+                match op {
+                    WordOp::Copy {
+                        destination,
+                        source,
+                    } => {
+                        self.load_at(VALUE, source.0);
+                        self.store_at(VALUE, destination.0);
+                    }
+                    WordOp::Constant { destination, value } => {
+                        self.machine.imm(VALUE, value);
+                        self.store_at(VALUE, destination.0);
+                    }
+                }
+            }
         }
 
         fn store_home(&mut self, src: u8, home: NativeHome) {

@@ -3,10 +3,10 @@
 use super::{
     AbiLayout, Architecture, CraneliftMachineInfo, CraneliftProfile, EmitError, Failure,
     MachineRange, MachineTrap, NativeHome, NativeTarget, NativeTier, Operation, Platform,
-    PreparedFunction, RecoverySlot, ScalarOutcome, Site, UnlinkedImage, abi::Edge,
-    image::checked_source,
+    PreparedFunction, RecoverySlot, ScalarOutcome, Site, UnaryOp, UnlinkedImage, WordOp, WordRange,
+    abi::Edge, image::checked_source,
 };
-use crate::bytecode::verified::{InstructionId, IntegerOp, Scalar};
+use crate::bytecode::verified::{BooleanOp, FloatOp, InstructionId, IntegerOp, Scalar};
 use cranelift::{
     codegen::{
         Context,
@@ -233,7 +233,7 @@ impl Lower<'_, '_> {
         );
         self.builder.ins().brif(can_run, running, &[], paused, &[]);
         self.builder.switch_to_block(paused);
-        self.spill(site)?;
+        self.spill(site, plan)?;
         self.exit_at(ScalarOutcome::Paused, pc)?;
         self.builder.switch_to_block(running);
         let cost = self.builder.ins().iconst(types::I64, word(site.fuel));
@@ -275,6 +275,80 @@ impl Lower<'_, '_> {
                 let value = self.integer(operation, pc, left, right)?;
                 self.store(destination, value)?;
             }
+            Float {
+                operation,
+                destination,
+                left,
+                right,
+            } => {
+                let left = self.load(left)?;
+                let right = self.load(right)?;
+                let value = self.float(operation, pc, left, right)?;
+                self.store(destination, value)?;
+            }
+            Boolean {
+                operation,
+                destination,
+                left,
+                right,
+            } => {
+                let left = self.load(left)?;
+                let right = self.load(right)?;
+                let condition = match operation {
+                    BooleanOp::Equal => IntCC::Equal,
+                    BooleanOp::NotEqual => IntCC::NotEqual,
+                };
+                let result = self.builder.ins().icmp(condition, left, right);
+                let value = self.builder.ins().uextend(types::I64, result);
+                self.store(destination, value)?;
+            }
+            RealDivide {
+                destination,
+                left,
+                right,
+            } => {
+                let left = self.load(left)?;
+                let right = self.load(right)?;
+                let zero = self.builder.ins().icmp_imm_s(IntCC::Equal, right, 0);
+                self.guard(zero, pc, Failure::DivisionByZero)?;
+                let left = self.builder.ins().fcvt_from_sint(types::F64, left);
+                let right = self.builder.ins().fcvt_from_sint(types::F64, right);
+                let quotient = self.builder.ins().fdiv(left, right);
+                let value = self.float_as_bits(quotient);
+                self.store(destination, value)?;
+            }
+            Unary {
+                operation,
+                destination,
+                source,
+            } => {
+                let source = self.load(source)?;
+                let value = self.unary(operation, pc, source)?;
+                self.store(destination, value)?;
+            }
+            Words(range) => self.words(plan, range)?,
+            TagIs {
+                destination,
+                tag,
+                variant,
+            } => {
+                let held = self.load_at(tag.0)?;
+                let is = self
+                    .builder
+                    .ins()
+                    .icmp_imm_s(IntCC::Equal, held, i64::from(variant));
+                let value = self.builder.ins().uextend(types::I64, is);
+                self.store(destination, value)?;
+            }
+            Variant { tag, variant, then } => {
+                let held = self.load_at(tag.0)?;
+                let other =
+                    self.builder
+                        .ins()
+                        .icmp_imm_s(IntCC::NotEqual, held, i64::from(variant));
+                self.guard(other, pc, Failure::EnumVariant)?;
+                self.words(plan, then)?;
+            }
             Jump(to) => {
                 self.arrive(pc, Edge::Jump);
                 let block = self.label(to)?;
@@ -293,7 +367,24 @@ impl Lower<'_, '_> {
                 }
             }
             Return(value) => {
-                if let Some(home) = value {
+                if let Some(home) = value
+                    && let Some(id) = home.layout
+                {
+                    // A composite result is read from the frame by the caller.
+                    let words = plan
+                        .layout(id)
+                        .ok_or(EmitError::AbiOffsetOutOfRange)?
+                        .words();
+                    for word in 0..words {
+                        let at = home.offset.0 + word * 8;
+                        let value = self.load_at(at)?;
+                        let offset =
+                            i32::try_from(at).map_err(|_| EmitError::AbiOffsetOutOfRange)?;
+                        self.builder
+                            .ins()
+                            .store(MemFlagsData::new(), value, self.slots, offset);
+                    }
+                } else if let Some(home) = value {
                     let value = self.load(home)?;
                     self.builder
                         .ins()
@@ -303,7 +394,7 @@ impl Lower<'_, '_> {
             }
             Call(call_pc) => {
                 let call = plan.call(call_pc).ok_or(EmitError::MissingCall(call_pc))?;
-                self.spill(site)?;
+                self.spill(site, plan)?;
                 let links = self.builder.ins().load(
                     types::I64,
                     MemFlagsData::new(),
@@ -356,6 +447,100 @@ impl Lower<'_, '_> {
         Ok(value)
     }
 
+    fn bits_as_float(&mut self, word: Value) -> Value {
+        self.builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), word)
+    }
+
+    fn float_as_bits(&mut self, float: Value) -> Value {
+        self.builder
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), float)
+    }
+
+    fn float(
+        &mut self,
+        operation: FloatOp,
+        pc: InstructionId,
+        left: Value,
+        right: Value,
+    ) -> Result<Value, EmitError> {
+        use FloatOp::*;
+        let left = self.bits_as_float(left);
+        let right = self.bits_as_float(right);
+        let arithmetic = match operation {
+            Add => self.builder.ins().fadd(left, right),
+            Subtract => self.builder.ins().fsub(left, right),
+            Multiply => self.builder.ins().fmul(left, right),
+            Divide => self.builder.ins().fdiv(left, right),
+            CheckedDivide => {
+                let zero = self.builder.ins().f64const(0.0);
+                let is_zero = self.builder.ins().fcmp(FloatCC::Equal, right, zero);
+                self.guard(is_zero, pc, Failure::DivisionByZero)?;
+                self.builder.ins().fdiv(left, right)
+            }
+            Remainder => return Err(EmitError::UnsupportedOperation(pc)),
+            comparison => {
+                // NaN compares unequal to everything, itself included.
+                let condition = match comparison {
+                    Less => FloatCC::LessThan,
+                    LessEqual => FloatCC::LessThanOrEqual,
+                    Greater => FloatCC::GreaterThan,
+                    GreaterEqual => FloatCC::GreaterThanOrEqual,
+                    Equal => FloatCC::Equal,
+                    NotEqual => FloatCC::NotEqual,
+                    _ => unreachable!("arithmetic handled above"),
+                };
+                let result = self.builder.ins().fcmp(condition, left, right);
+                return Ok(self.builder.ins().uextend(types::I64, result));
+            }
+        };
+        Ok(self.float_as_bits(arithmetic))
+    }
+
+    fn unary(
+        &mut self,
+        operation: UnaryOp,
+        pc: InstructionId,
+        source: Value,
+    ) -> Result<Value, EmitError> {
+        Ok(match operation {
+            UnaryOp::NegateInteger => {
+                let minimum = self
+                    .builder
+                    .ins()
+                    .icmp_imm_s(IntCC::Equal, source, i64::MIN);
+                self.guard(minimum, pc, Failure::Overflow)?;
+                self.builder.ins().ineg(source)
+            }
+            // Flipping the sign bit negates every binary64 value, NaN included.
+            UnaryOp::NegateFloat => self.builder.ins().bxor_imm_s(source, i64::MIN),
+            UnaryOp::Not => self.builder.ins().bxor_imm_s(source, 1),
+            UnaryOp::IntegerToFloat => {
+                let float = self.builder.ins().fcvt_from_sint(types::F64, source);
+                self.float_as_bits(float)
+            }
+            UnaryOp::FloatToInteger => {
+                let float = self.bits_as_float(source);
+                let truncated = self.builder.ins().trunc(float);
+                // 2^63 is not an i64, so the upper bound is exclusive; NaN
+                // fails both comparisons.
+                let low = self.builder.ins().f64const(-9_223_372_036_854_775_808.0);
+                let high = self.builder.ins().f64const(9_223_372_036_854_775_808.0);
+                let above = self
+                    .builder
+                    .ins()
+                    .fcmp(FloatCC::GreaterThanOrEqual, truncated, low);
+                let below = self.builder.ins().fcmp(FloatCC::LessThan, truncated, high);
+                let in_range = self.builder.ins().band(above, below);
+                let out_of_range = self.builder.ins().bxor_imm_s(in_range, 1);
+                self.guard(out_of_range, pc, Failure::ConversionOutOfRange)?;
+                self.builder.ins().fcvt_to_sint_sat(types::I64, truncated)
+            }
+        })
+    }
+
     fn division(
         &mut self,
         operation: IntegerOp,
@@ -397,18 +582,45 @@ impl Lower<'_, '_> {
     }
 
     fn load(&mut self, home: NativeHome) -> Result<Value, EmitError> {
-        let variable = self.home(home)?;
-        Ok(self.builder.use_var(variable))
+        self.load_at(home.offset.0)
     }
 
     fn store(&mut self, home: NativeHome, value: Value) -> Result<(), EmitError> {
-        let variable = self.home(home)?;
+        self.store_at(home.offset.0, value)
+    }
+
+    fn load_at(&mut self, offset: u32) -> Result<Value, EmitError> {
+        let variable = self.home_at(offset)?;
+        Ok(self.builder.use_var(variable))
+    }
+
+    fn store_at(&mut self, offset: u32, value: Value) -> Result<(), EmitError> {
+        let variable = self.home_at(offset)?;
         self.builder.def_var(variable, value);
         Ok(())
     }
 
-    fn home(&self, home: NativeHome) -> Result<Variable, EmitError> {
-        let offset = usize::try_from(home.offset.0).map_err(|_| EmitError::AbiOffsetOutOfRange)?;
+    fn words(&mut self, plan: &PreparedFunction, range: WordRange) -> Result<(), EmitError> {
+        for &op in plan.words(range) {
+            match op {
+                WordOp::Copy {
+                    destination,
+                    source,
+                } => {
+                    let value = self.load_at(source.0)?;
+                    self.store_at(destination.0, value)?;
+                }
+                WordOp::Constant { destination, value } => {
+                    let value = self.builder.ins().iconst(types::I64, word(value));
+                    self.store_at(destination.0, value)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn home_at(&self, offset: u32) -> Result<Variable, EmitError> {
+        let offset = usize::try_from(offset).map_err(|_| EmitError::AbiOffsetOutOfRange)?;
         if offset % self.abi.slot_bytes != 0 {
             return Err(EmitError::AbiOffsetOutOfRange);
         }
@@ -418,15 +630,24 @@ impl Lower<'_, '_> {
             .ok_or(EmitError::AbiOffsetOutOfRange)
     }
 
-    fn spill(&mut self, site: &Site) -> Result<(), EmitError> {
+    fn spill(&mut self, site: &Site, plan: &PreparedFunction) -> Result<(), EmitError> {
         for &slot in &site.recover {
             if let RecoverySlot::Initialized(home) = slot {
-                let value = self.load(home)?;
-                let offset =
-                    i32::try_from(home.offset.0).map_err(|_| EmitError::AbiOffsetOutOfRange)?;
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), value, self.slots, offset);
+                let words = match home.layout {
+                    Some(id) => plan
+                        .layout(id)
+                        .ok_or(EmitError::AbiOffsetOutOfRange)?
+                        .words(),
+                    None => 1,
+                };
+                for word in 0..words {
+                    let at = home.offset.0 + word * 8;
+                    let value = self.load_at(at)?;
+                    let offset = i32::try_from(at).map_err(|_| EmitError::AbiOffsetOutOfRange)?;
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), value, self.slots, offset);
+                }
             }
         }
         Ok(())

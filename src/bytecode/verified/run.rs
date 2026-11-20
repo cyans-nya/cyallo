@@ -2,8 +2,8 @@ use super::{
     BooleanOp, CallSite, CallTarget, Contract, DebugPlace, DynamicOp, Extremum, FloatOp,
     FrameLayout, Frozen, FunctionId, GlobalId, HostBindingId, HostFailure, InputKind, Instruction,
     InstructionId, IntegerOp, OutputPiece, OutputTemplate, Register, RegisterType, Scalar,
-    ScalarType, StatementArrival, StatementBoundary, TextFailure, TextMapOp, TextOp, TextStyle,
-    TextTestOp, ValueType, VerifiedFunction, VerifiedModule, array_len,
+    ScalarType, Shape, StatementArrival, StatementBoundary, TextFailure, TextMapOp, TextOp,
+    TextStyle, TextTestOp, ValueType, VerifiedFunction, VerifiedModule, array_len,
 };
 use crate::{
     Span,
@@ -1927,12 +1927,69 @@ pub struct Activation {
     state: ExecutionState,
 }
 
+/// A value rebuilt from native words: scalars and the tuples and enums of them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecoveredValue {
+    Scalar(Scalar),
+    Tuple(Vec<RecoveredValue>),
+    Enum {
+        variant: u32,
+        payload: Option<Box<RecoveredValue>>,
+    },
+}
+
 pub(crate) struct ScalarFrameSnapshot {
     pub function: FunctionId,
     pub next: InstructionId,
     pub arrival: StatementArrival,
     pub destination: Option<Register>,
-    pub values: Vec<(Register, Scalar)>,
+    pub values: Vec<(Register, RecoveredValue)>,
+}
+
+impl VerifiedFunction {
+    /// The interpreter value for a recovered native value of this type, if
+    /// the shape agrees with it.
+    fn recovered_value(&self, value: &RecoveredValue, ty: ValueType) -> Option<FrameValue> {
+        match (value, ty) {
+            (RecoveredValue::Scalar(scalar), ValueType::Scalar(expected))
+                if scalar.ty() == expected =>
+            {
+                Some(FrameValue::Scalar(*scalar))
+            }
+            (RecoveredValue::Tuple(values), ValueType::Composite(id)) => {
+                let Shape::Tuple(fields) = self.shape_table().get(usize::try_from(id.0).ok()?)?
+                else {
+                    return None;
+                };
+                if fields.len() != values.len() {
+                    return None;
+                }
+                let items = values
+                    .iter()
+                    .zip(fields.iter())
+                    .map(|(value, &field)| self.recovered_value(value, field))
+                    .collect::<Option<Box<[_]>>>()?;
+                Some(FrameValue::Composite(Composite::Tuple(items)))
+            }
+            (RecoveredValue::Enum { variant, payload }, ValueType::Composite(id)) => {
+                let Shape::Enum(variants) = self.shape_table().get(usize::try_from(id.0).ok()?)?
+                else {
+                    return None;
+                };
+                let declared = variants.get(usize::try_from(*variant).ok()?)?;
+                let payload = match (payload, declared) {
+                    (None, None) => None,
+                    (Some(value), Some(ty)) => Some(Box::new(self.recovered_value(value, *ty)?)),
+                    _ => return None,
+                };
+                Some(FrameValue::Composite(Composite::Enum {
+                    variant: *variant,
+                    payload,
+                }))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2137,15 +2194,23 @@ impl VerifiedModule {
             }
             .ok_or(position)?;
 
-            let mut values = vec![None; state.len()];
-            for &(register, value) in &snapshot.values {
+            let mut values: Vec<Option<FrameValue>> = vec![None; state.len()];
+            for (register, value) in &snapshot.values {
+                let register = *register;
                 let error = ScalarRecoveryError::InvalidValue {
                     function: snapshot.function,
                     register,
                 };
                 let slot = values.get_mut(register.index()).ok_or(error)?;
+                let ty = match body.register_kind(register) {
+                    Ok(RegisterType::Scalar(ty)) => ValueType::Scalar(ty),
+                    Ok(RegisterType::Composite(shape)) => ValueType::Composite(shape),
+                    _ => return Err(error),
+                };
+                let Some(value) = body.recovered_value(&value, ty) else {
+                    return Err(error);
+                };
                 if state[register.index()] != StorageState::Initialized
-                    || body.register_type(register) != Ok(value.ty())
                     || slot.replace(value).is_some()
                 {
                     return Err(error);
@@ -2162,7 +2227,7 @@ impl VerifiedModule {
             for (index, (&state, value)) in state.iter().zip(values).enumerate() {
                 let register = Register(u32::try_from(index).map_err(|_| position)?);
                 if let Some(value) = value {
-                    frame.set(body.frame_layout(), register, value);
+                    frame.set_value(body.frame_layout(), register, value);
                 } else if matches!(
                     state,
                     StorageState::Initialized | StorageState::MaybeInitialized

@@ -21,7 +21,8 @@ pub use image::{
     Relocation, RelocationKind, UnlinkedImage,
 };
 pub use prepare::{
-    Call, CallArgument, CodeVersion, FunctionVersion, NativeHome, Operation, Origin, PrepareError,
+    Call, CallArgument, CodeVersion, FunctionVersion, Layout, LayoutId, NativeHome, Operation, Origin,
+    PrepareError, UnaryOp, WordOp, WordRange,
     PreparedFunction, RecoverySlot, Site,
 };
 pub use publish::{CodeStore, EntryPin, PublishError};

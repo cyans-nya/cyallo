@@ -107,6 +107,8 @@ pub enum EmitError {
     Configuration(cranelift::codegen::settings::SetError),
     Codegen(cranelift::codegen::CodegenError),
     UnexpectedRelocation,
+    /// The adapter has no encoding for this operation; the routine stays in the interpreter.
+    UnsupportedOperation(InstructionId),
 }
 
 impl fmt::Display for EmitError {
@@ -122,6 +124,9 @@ impl fmt::Display for EmitError {
                 "source ID {} cannot be represented in native metadata",
                 pc.0
             ),
+            Self::UnsupportedOperation(pc) => {
+                write!(f, "instruction {} has no encoding in this adapter", pc.0)
+            }
             Self::AbiOffsetOutOfRange => f.write_str("native ABI offset exceeds emitter capacity"),
             Self::Configuration(error) => write!(f, "Cranelift configuration failed: {error}"),
             Self::Codegen(error) => write!(f, "Cranelift emission failed: {error}"),

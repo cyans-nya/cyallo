@@ -119,7 +119,7 @@ fn a_routine_returning_a_composite_can_be_inspected_but_not_started() {
 }
 
 #[test]
-fn composite_routines_stay_in_the_verified_interpreter() {
+fn routines_that_print_stay_in_the_verified_interpreter() {
     use cyallo::backend::verified::{CodeVersion, NativeTarget, PrepareError, PreparedFunction};
     let program = compile(&format!("{SHAPES}std::io::print(area(Shape::Circle(1)))\n")).unwrap();
     let module = VerifiedModule::lower(&program, 0).unwrap();

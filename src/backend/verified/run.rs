@@ -1,5 +1,6 @@
 //! Fuel-bounded native execution and transfer to the verified interpreter.
 
+use super::Layout;
 use super::{
     CodeStore, EntryPin, Failure, NativeHome, NativeTier, Operation, Origin, RecoverySlot,
     ScalarOutcome,
@@ -7,8 +8,9 @@ use super::{
     platform::Invocation,
 };
 use crate::bytecode::verified::{
-    Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, InstructionId, Register,
-    RunError, Scalar, ScalarFrameSnapshot, ScalarRecoveryError, ScalarType, StatementArrival,
+    Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, InstructionId, RecoveredValue,
+    Register, RunError, Scalar, ScalarFrameSnapshot, ScalarRecoveryError, ScalarType,
+    StatementArrival,
 };
 use std::fmt;
 
@@ -162,7 +164,7 @@ impl Frame {
     }
 
     fn store(&mut self, home: NativeHome, value: Scalar) -> Result<(), NativeRunError> {
-        if home.ty != value.ty() {
+        if home.layout.is_some() || home.ty != value.ty() {
             return Err(NativeRunError::InvalidHome(home.register));
         }
         let index = self.slot(home)?;
@@ -171,7 +173,39 @@ impl Frame {
     }
 
     fn load(&self, home: NativeHome) -> Result<Scalar, NativeRunError> {
+        if home.layout.is_some() {
+            return Err(NativeRunError::InvalidHome(home.register));
+        }
         decode(home.ty, self.slots[self.slot(home)?])
+    }
+
+    /// The words of a composite home, or of a scalar one.
+    fn words(&self, home: NativeHome) -> Result<&[u64], NativeRunError> {
+        let start = self.slot(home)?;
+        let count = match home.layout {
+            Some(id) => self
+                .entry
+                .plan()
+                .layout(id)
+                .ok_or(NativeRunError::InvalidHome(home.register))?
+                .words() as usize,
+            None => 1,
+        };
+        self.slots
+            .get(start..start + count)
+            .ok_or(NativeRunError::InvalidHome(home.register))
+    }
+
+    fn read(&self, home: NativeHome) -> Result<RecoveredValue, NativeRunError> {
+        let Some(id) = home.layout else {
+            return self.load(home).map(RecoveredValue::Scalar);
+        };
+        let layout = self
+            .entry
+            .plan()
+            .layout(id)
+            .ok_or(NativeRunError::InvalidHome(home.register))?;
+        decode_layout(layout, self.words(home)?)
     }
 
     fn snapshot(&self) -> Result<ScalarFrameSnapshot, NativeRunError> {
@@ -188,7 +222,7 @@ impl Frame {
         let mut values = Vec::new();
         for &slot in &site.recover {
             if let RecoverySlot::Initialized(home) = slot {
-                values.push((home.register, self.load(home)?));
+                values.push((home.register, self.read(home)?));
             }
         }
         Ok(ScalarFrameSnapshot {
@@ -364,7 +398,17 @@ fn step(
             }
             let mut callee = Frame::new(entry.clone(), call.destination)?;
             for argument in &call.arguments {
-                callee.store(argument.callee, frame.load(argument.caller)?)?;
+                if argument.caller.layout.is_some() {
+                    let words = frame.words(argument.caller)?.to_vec();
+                    let start = callee.slot(argument.callee)?;
+                    callee
+                        .slots
+                        .get_mut(start..start + words.len())
+                        .ok_or(NativeRunError::InvalidHome(argument.callee.register))?
+                        .copy_from_slice(&words);
+                } else {
+                    callee.store(argument.callee, frame.load(argument.caller)?)?;
+                }
             }
             frame.position = Position::Waiting {
                 call: pc,
@@ -377,19 +421,36 @@ fn step(
                 return Err(NativeRunError::InvalidPc(context.next));
             }
             let value = plan.result().map(|ty| decode(ty, result)).transpose()?;
+            // A composite result stays in the callee's frame, at the returned home.
+            let composite = match (&site.operation, plan.result_layout()) {
+                (Operation::Return(Some(home)), Some(_)) => Some(frame.words(*home)?.to_vec()),
+                _ => None,
+            };
             let destination = frame.destination;
             stack.pop();
             let Some(caller) = stack.last_mut() else {
+                if composite.is_some() {
+                    return Err(NativeRunError::InvalidActivation);
+                }
                 return Ok(Step::Terminal(ExecutionStatus::Returned(value)));
             };
             let Position::Waiting { call, successor } = caller.position else {
                 return Err(NativeRunError::InvalidActivation);
             };
             if let Some(home) = destination {
-                caller.store(
-                    home,
-                    value.ok_or(NativeRunError::InvalidHome(home.register))?,
-                )?;
+                if let Some(words) = composite {
+                    let start = caller.slot(home)?;
+                    caller
+                        .slots
+                        .get_mut(start..start + words.len())
+                        .ok_or(NativeRunError::InvalidHome(home.register))?
+                        .copy_from_slice(&words);
+                } else {
+                    caller.store(
+                        home,
+                        value.ok_or(NativeRunError::InvalidHome(home.register))?,
+                    )?;
+                }
             }
             caller.position = Position::Ready {
                 next: successor,
@@ -416,6 +477,16 @@ fn step(
                     span,
                 },
                 Failure::DivisionByZero => RunError::DivisionByZero {
+                    function,
+                    instruction,
+                    span,
+                },
+                Failure::ConversionOutOfRange => RunError::ConversionOutOfRange {
+                    function,
+                    instruction,
+                    span,
+                },
+                Failure::EnumVariant => RunError::EnumVariant {
                     function,
                     instruction,
                     span,
@@ -492,8 +563,48 @@ fn decode(ty: ScalarType, word: u64) -> Result<Scalar, NativeRunError> {
     }
 }
 
+fn decode_layout(layout: &Layout, words: &[u64]) -> Result<RecoveredValue, NativeRunError> {
+    match layout {
+        Layout::Scalar(ty) => {
+            let word = *words.first().ok_or(NativeRunError::InvalidActivation)?;
+            decode(*ty, word).map(RecoveredValue::Scalar)
+        }
+        Layout::Tuple(fields) => {
+            let mut at = 0usize;
+            let mut values = Vec::with_capacity(fields.len());
+            for field in fields.iter() {
+                let count = field.words() as usize;
+                let slice = words
+                    .get(at..at + count)
+                    .ok_or(NativeRunError::InvalidActivation)?;
+                values.push(decode_layout(field, slice)?);
+                at += count;
+            }
+            Ok(RecoveredValue::Tuple(values))
+        }
+        Layout::Enum(variants) => {
+            let tag = *words.first().ok_or(NativeRunError::InvalidActivation)?;
+            let variant = u32::try_from(tag).map_err(|_| NativeRunError::InvalidVariant(tag))?;
+            let declared = variants
+                .get(variant as usize)
+                .ok_or(NativeRunError::InvalidVariant(tag))?;
+            let payload = match declared {
+                Some(layout) => {
+                    let slice = words
+                        .get(1..1 + layout.words() as usize)
+                        .ok_or(NativeRunError::InvalidActivation)?;
+                    Some(Box::new(decode_layout(layout, slice)?))
+                }
+                None => None,
+            };
+            Ok(RecoveredValue::Enum { variant, payload })
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeRunError {
+    InvalidVariant(u64),
     Guest(RunError),
     WordWidth,
     InvalidHome(Register),
