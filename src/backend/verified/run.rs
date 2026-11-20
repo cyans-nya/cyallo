@@ -57,6 +57,27 @@ impl Dispatch {
             Self::Interpreter(activation) => Ok(activation.resume(budget)),
         }
     }
+
+    pub fn set_input(&mut self, source: InputSource) {
+        match self {
+            Self::Native(activation) => activation.set_input(source),
+            Self::Interpreter(activation) => activation.set_input(source),
+        }
+    }
+
+    pub fn end_input(&mut self) {
+        match self {
+            Self::Native(activation) => activation.end_input(),
+            Self::Interpreter(activation) => activation.end_input(),
+        }
+    }
+
+    pub fn awaiting_input(&self) -> bool {
+        match self {
+            Self::Native(activation) => activation.awaiting_input(),
+            Self::Interpreter(activation) => activation.awaiting_input(),
+        }
+    }
 }
 
 impl EntryPin {

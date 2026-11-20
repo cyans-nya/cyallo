@@ -1,8 +1,8 @@
 //! Instance-owned publication and transitive executable entry pins.
 
 use super::{
-    CodeVersion, FunctionVersion, ImageError, NativeTarget, NativeTier, Origin, PrepareError,
-    PreparedFunction, UnlinkedImage, ValidatedImage, platform::Executable,
+    CodeVersion, CraneliftProfile, FunctionVersion, ImageError, NativeTarget, NativeTier, Origin,
+    PrepareError, PreparedFunction, UnlinkedImage, ValidatedImage, platform::Executable,
 };
 use crate::bytecode::verified::{FunctionId, InstructionId, VerifiedModule};
 use std::{
@@ -69,6 +69,41 @@ impl CodeStore {
         )?);
         self.plans.insert(function, plan.clone());
         Ok(plan)
+    }
+
+    /// Eagerly compile routines that can be published on this host. Word
+    /// plans need their linked callees first. Shared-runtime plans can call
+    /// unpublished routines through the interpreter.
+    pub(crate) fn compile_available(&mut self) {
+        let mut pending = (0..)
+            .map(FunctionId)
+            .take_while(|&id| self.module.function(id).is_some())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|id| self.prepare(id).ok())
+            .collect::<Vec<_>>();
+        pending.reverse();
+        loop {
+            let before = pending.len();
+            pending.retain(|plan| {
+                if plan
+                    .relocations()
+                    .any(|link| !self.entries.contains_key(&link.target.function))
+                {
+                    return true;
+                }
+                let image = NativeTier::Winch.emit(plan.clone()).or_else(|_| {
+                    NativeTier::Cranelift(CraneliftProfile::LowLatency).emit(plan.clone())
+                });
+                if let Ok(image) = image {
+                    let _ = self.publish(image);
+                }
+                false
+            });
+            if pending.is_empty() || pending.len() == before {
+                break;
+            }
+        }
     }
 
     /// Resolve the exact plan and active dependency pins before mapping. A

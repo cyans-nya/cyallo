@@ -111,11 +111,12 @@ pub(crate) struct Document {
 
 fn engine_name(engine: Engine) -> &'static str {
     match engine {
-        Engine::Jit => "jit",
-        Engine::Interpreter => "interpreter",
-        Engine::Verified => "verified",
-        Engine::Cranelift => "cranelift",
-        Engine::CraneliftSpeed => "cranelift_speed",
+        Engine::LegacyJit => "jit",
+        Engine::LegacyInterpreter => "interpreter",
+        Engine::Ng => "verified",
+        Engine::NgJit => "ng_jit",
+        Engine::LegacyCranelift => "cranelift",
+        Engine::LegacyCraneliftSpeed => "cranelift_speed",
     }
 }
 
@@ -643,8 +644,8 @@ pub(crate) fn build(
         compile_events = events;
     } else {
         let direct = match engine {
-            Engine::Cranelift => Some(CraneliftConfig::fast()),
-            Engine::CraneliftSpeed => Some(CraneliftConfig::speed()),
+            Engine::LegacyCranelift => Some(CraneliftConfig::fast()),
+            Engine::LegacyCraneliftSpeed => Some(CraneliftConfig::speed()),
             _ => None,
         };
         if let Some(config) = direct {

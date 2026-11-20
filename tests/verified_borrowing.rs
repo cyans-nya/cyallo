@@ -2,8 +2,9 @@
 //! verified interpreter. Expected text is written by hand.
 
 use cyallo::{
+    CompileOptions,
     bytecode::verified::{ExecutionLimits, ExecutionStatus, OutputSink, RunError, VerifiedModule},
-    compile,
+    compile, compile_for_execution,
 };
 use std::sync::{Arc, Mutex};
 
@@ -96,6 +97,38 @@ std::io::print(count_twice())
     activation.set_output(writer);
     while matches!(activation.resume(1), ExecutionStatus::Paused(_)) {}
     assert_eq!(*lines.lock().unwrap(), ["2"]);
+}
+
+#[test]
+fn recursive_stack_growth_preserves_caller_loans_and_gc_roots() {
+    let source = r#"
+proc walk(n: i64, total: &mut i64) {
+    let current = gc n
+    if n > 0 { walk(n - 1, total) }
+    total.* += current.*
+}
+proc work() -> i64 {
+    let marker = gc 1
+    let mut total = 0
+    walk(24, &mut total)
+    walk(24, &mut total)
+    return total + marker.*
+}
+std::io::print(work())
+"#;
+    for program in [
+        compile(source).unwrap(),
+        compile_for_execution(source, CompileOptions::default()).unwrap(),
+    ] {
+        let module = VerifiedModule::lower(&program, 0).unwrap();
+        let (writer, lines) = sink();
+        let mut activation = module.start(&[], LIMITS).unwrap();
+        activation.set_output(writer);
+        activation.set_gc_stress(true);
+        while let ExecutionStatus::Paused(_) = activation.resume(1) {}
+        assert_eq!(activation.status(), ExecutionStatus::Returned(None));
+        assert_eq!(*lines.lock().unwrap(), ["601"]);
+    }
 }
 
 mod images {

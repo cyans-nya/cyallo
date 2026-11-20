@@ -2724,8 +2724,9 @@ impl ModuleImage {
         }
         for index in 0..functions.len() {
             let id = function_id(index).map_err(image_error)?;
-            let (frame, storage_entries) =
+            let (mut frame, storage_entries) =
                 functions[index].verify(id, &functions, &host_bindings)?;
+            frame.prepare_operands(&functions[index].instructions);
             functions[index].frame = frame;
             functions[index].storage_entries = storage_entries;
         }

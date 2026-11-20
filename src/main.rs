@@ -13,8 +13,11 @@ use cyallo::{
     Diagnostic, Session, Status,
     backend::{
         CraneliftConfig, Executable, NativeBackend, TierPolicy, TieredArtifact, TieredBackend,
+        verified::{Dispatch, NativeRunError},
     },
+    bytecode::verified::{ExecutionStatus, InputSource},
     debugger::{Debugger, Mode},
+    runtime::RuntimeFailure,
 };
 use ratatui::{
     prelude::*,
@@ -23,7 +26,7 @@ use ratatui::{
 use std::{
     io::{self, BufRead, IsTerminal, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 #[derive(Parser)]
@@ -169,8 +172,7 @@ enum Command {
     },
     /// Start a persistent interactive session (modern syntax by default).
     Repl {
-        /// Engine to run on. Default: the verified interpreter. The other
-        /// engines are the legacy tiered engines, kept until they are removed.
+        /// Engine to run on. Defaults to ng, the next-generation interpreter.
         #[arg(long, value_enum)]
         engine: Option<Engine>,
         #[arg(long, default_value_t = 1_000_000, value_parser = clap::value_parser!(u64).range(1..))]
@@ -185,9 +187,7 @@ enum Command {
     },
     Run {
         file: PathBuf,
-        /// Engine to run on. Default: the verified interpreter, which refuses
-        /// a program it cannot lower. The other engines are the legacy tiered
-        /// engines, kept until they are removed.
+        /// Engine to run on. Defaults to ng, the next-generation interpreter.
         #[arg(long, value_enum)]
         engine: Option<Engine>,
     },
@@ -214,16 +214,24 @@ impl Command {
 }
 #[derive(Clone, Copy, ValueEnum)]
 enum Engine {
-    #[value(alias = "tiered")]
-    Jit,
-    Interpreter,
-    /// The verified bytecode interpreter. Programs it cannot lower are refused.
-    Verified,
+    /// The next-generation verified bytecode interpreter.
+    #[value(alias = "verified")]
+    Ng,
+    /// The next-generation engine with eager native compilation (run only).
+    #[value(name = "ng_jit", alias = "ng-jit")]
+    NgJit,
+    /// The legacy tiered JIT.
+    #[value(name = "legacy_jit", aliases = ["jit", "tiered"])]
+    LegacyJit,
+    /// The legacy bytecode interpreter.
+    #[value(name = "legacy_interpreter", alias = "interpreter")]
+    LegacyInterpreter,
     /// Eager per-routine Cranelift compilation with low-latency settings.
-    Cranelift,
+    #[value(name = "legacy_cranelift", alias = "cranelift")]
+    LegacyCranelift,
     /// Eager per-routine Cranelift compilation optimized for execution speed.
-    #[value(name = "cranelift_speed", alias = "cranelift-speed")]
-    CraneliftSpeed,
+    #[value(name = "legacy_cranelift_speed", aliases = ["cranelift_speed", "cranelift-speed"])]
+    LegacyCraneliftSpeed,
 }
 #[derive(Clone, Copy, ValueEnum)]
 enum ColorMode {
@@ -271,8 +279,8 @@ fn compile_engine(
     inlining: bool,
 ) -> color_eyre::Result<Option<Compiled>> {
     Ok(match engine {
-        Engine::Interpreter | Engine::Verified => None,
-        Engine::Cranelift => Some(Compiled::Direct(
+        Engine::LegacyInterpreter | Engine::Ng | Engine::NgJit => None,
+        Engine::LegacyCranelift => Some(Compiled::Direct(
             CraneliftConfig {
                 inlining,
                 ..CraneliftConfig::fast()
@@ -281,7 +289,7 @@ fn compile_engine(
             .map(Box::new)
             .map_err(|e| color_eyre::eyre::eyre!(e))?,
         )),
-        Engine::CraneliftSpeed => Some(Compiled::Direct(
+        Engine::LegacyCraneliftSpeed => Some(Compiled::Direct(
             CraneliftConfig {
                 inlining,
                 ..CraneliftConfig::speed()
@@ -290,7 +298,7 @@ fn compile_engine(
             .map(Box::new)
             .map_err(|e| color_eyre::eyre::eyre!(e))?,
         )),
-        Engine::Jit => {
+        Engine::LegacyJit => {
             let backend = TieredBackend::new(TierPolicy {
                 inlining,
                 ..TierPolicy::default()
@@ -385,11 +393,15 @@ fn main() -> color_eyre::Result<()> {
             engine,
             max_instructions,
         } => {
+            if matches!(engine, Some(Engine::NgJit)) {
+                eprintln!("error: --engine ng_jit is available only with run");
+                std::process::exit(2);
+            }
             let reports = runtime.jit_report
                 || runtime.jit_notices
                 || runtime.jit_no_inline
                 || runtime.inspection.is_some();
-            if matches!(engine, None | Some(Engine::Verified)) {
+            if matches!(engine, None | Some(Engine::Ng)) {
                 if reports {
                     legacy_option_error();
                 }
@@ -436,7 +448,7 @@ fn main() -> color_eyre::Result<()> {
     let deferred = matches!(
         cli.command,
         Command::Run {
-            engine: None | Some(Engine::Jit | Engine::Interpreter),
+            engine: None | Some(Engine::LegacyJit | Engine::LegacyInterpreter),
             ..
         } | Command::Bytecode {
             verified: Some(_),
@@ -529,7 +541,7 @@ fn main() -> color_eyre::Result<()> {
             }
         ),
         Command::Run { engine, .. } => {
-            if matches!(engine, None | Some(Engine::Verified)) {
+            if matches!(engine, None | Some(Engine::Ng | Engine::NgJit)) {
                 // JIT reports and inspection are produced by the legacy engines.
                 if runtime.jit_report
                     || runtime.jit_notices
@@ -538,25 +550,32 @@ fn main() -> color_eyre::Result<()> {
                 {
                     legacy_option_error();
                 }
-                match cyallo::vm::Session::with_context(program.clone(), runtime.context()) {
-                    Ok(session) => {
-                        if !run_verified(session, &source_name, diagnostic_color, options.dialect)?
-                        {
+                let render = |diagnostic: &Diagnostic| {
+                    cyallo::diagnostics::render_program(
+                        &source_name,
+                        &program,
+                        diagnostic,
+                        diagnostic_color,
+                        options.dialect,
+                    )
+                };
+                let context = runtime.context();
+                let run = if matches!(engine, Some(Engine::NgJit)) {
+                    cyallo::vm::start_jit(program.clone(), &context)
+                        .map(|dispatch| run_ng_jit(dispatch, &render))
+                } else {
+                    cyallo::vm::Session::with_context(program.clone(), context)
+                        .map(|session| run_verified(session, &render))
+                };
+                match run {
+                    Ok(result) => {
+                        if !result? {
                             std::process::exit(1);
                         }
                         return Ok(());
                     }
-                    Err(d) => {
-                        eprintln!(
-                            "{}",
-                            cyallo::diagnostics::render_program(
-                                &source_name,
-                                &program,
-                                &d,
-                                diagnostic_color,
-                                options.dialect,
-                            )
-                        );
+                    Err(diagnostic) => {
+                        eprintln!("{}", render(&diagnostic));
                         std::process::exit(1);
                     }
                 }
@@ -605,7 +624,7 @@ fn main() -> color_eyre::Result<()> {
 /// JIT reports, notices and inspection come from the legacy engines only.
 fn legacy_option_error() -> ! {
     eprintln!(
-        "error: --jit-* reports and inspection need a legacy engine; pass --engine jit, interpreter, cranelift or cranelift_speed"
+        "error: --jit-* reports and inspection need a legacy engine; pass --engine with legacy_jit, legacy_interpreter, legacy_cranelift, or legacy_cranelift_speed"
     );
     std::process::exit(2);
 }
@@ -617,20 +636,9 @@ const VERIFIED_SLICE: usize = 1_000_000;
 /// failure is shown as a diagnostic with its source span.
 fn run_verified(
     mut session: cyallo::vm::Session,
-    source_name: &str,
-    diagnostic_color: bool,
-    dialect: cyallo::Dialect,
+    render: &impl Fn(&Diagnostic) -> String,
 ) -> color_eyre::Result<bool> {
     let mut written = 0;
-    let render = |session: &cyallo::vm::Session, diagnostic: &cyallo::Diagnostic| {
-        cyallo::diagnostics::render_program(
-            source_name,
-            session.program(),
-            diagnostic,
-            diagnostic_color,
-            dialect,
-        )
-    };
     loop {
         session.run(VERIFIED_SLICE);
         if session.context.output.len() > written {
@@ -640,27 +648,59 @@ fn run_verified(
         io::stdout().flush()?;
         match session.status() {
             Status::Paused | Status::Waiting => {}
-            Status::WaitingForInput => {
-                let mut line = String::new();
-                if io::stdin().read_line(&mut line)? == 0 {
-                    session.end_input();
-                    continue;
-                }
-                if line.ends_with('\n') {
-                    line.pop();
-                    if line.ends_with('\r') {
-                        line.pop();
-                    }
-                }
-                session.context.input.push_back(line);
-            }
+            Status::WaitingForInput => match read_input_line()? {
+                Some(line) => session.context.input.push_back(line),
+                None => session.end_input(),
+            },
             Status::Finished => return Ok(true),
             Status::Failed(failure) => {
-                eprintln!("{}", render(&session, &failure.diagnostic()));
+                eprintln!("{}", render(&failure.diagnostic()));
                 return Ok(false);
             }
         }
     }
+}
+
+fn run_ng_jit(
+    mut dispatch: Dispatch,
+    render: &impl Fn(&Diagnostic) -> String,
+) -> color_eyre::Result<bool> {
+    let line = Arc::new(Mutex::new(None));
+    let source = line.clone();
+    dispatch.set_input(InputSource::waiting(move || source.lock().unwrap().take()));
+    loop {
+        let status = dispatch.resume(VERIFIED_SLICE);
+        io::stdout().flush()?;
+        match status {
+            Ok(ExecutionStatus::Paused(_)) if dispatch.awaiting_input() => {
+                match read_input_line()? {
+                    Some(input) => *line.lock().unwrap() = Some(input),
+                    None => dispatch.end_input(),
+                }
+            }
+            Ok(ExecutionStatus::Paused(_)) => {}
+            Ok(ExecutionStatus::Returned(_)) => return Ok(true),
+            Ok(ExecutionStatus::Failed(error)) | Err(NativeRunError::Guest(error)) => {
+                eprintln!("{}", render(&RuntimeFailure::from(error).diagnostic()));
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn read_input_line() -> io::Result<Option<String>> {
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line)? == 0 {
+        return Ok(None);
+    }
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+    Ok(Some(line))
 }
 /// Instruction budget per run slice while the live view is on.
 const LIVE_SLICE: usize = 50_000;

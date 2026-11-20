@@ -1,8 +1,8 @@
 use super::{
     BooleanOp, CallSite, CallTarget, Contract, DebugPlace, DynamicOp, Extremum, FloatOp,
-    FrameLayout, Frozen, FunctionId, GlobalId, HostBindingId, HostFailure, InputKind, Instruction,
-    InstructionId, IntegerOp, OutputPiece, OutputTemplate, Register, RegisterType, Scalar,
-    ScalarType, Shape, StatementArrival, StatementBoundary, TextFailure, TextMapOp, TextOp,
+    FrameLayout, FrameSlot, Frozen, FunctionId, GlobalId, HostBindingId, HostFailure, InputKind,
+    Instruction, InstructionId, IntegerOp, OutputPiece, OutputTemplate, Register, RegisterType,
+    Scalar, ScalarType, Shape, StatementArrival, StatementBoundary, TextFailure, TextMapOp, TextOp,
     TextStyle, TextTestOp, ValueType, VerifiedFunction, VerifiedModule, array_len,
 };
 use crate::{
@@ -10,8 +10,10 @@ use crate::{
     integer::{IntegerDivision, IntegerError},
 };
 use std::{
+    borrow::{Borrow, BorrowMut},
     collections::{HashMap, HashSet, VecDeque},
     fmt,
+    ops::{Deref, DerefMut, Range},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
     time::{Duration, Instant},
@@ -484,11 +486,10 @@ impl std::error::Error for RunError {
 }
 
 #[derive(Debug)]
-struct Frame {
+struct FrameHeader {
     function: FunctionId,
     pc: usize,
     arrival: StatementArrival,
-    slots: Box<[Option<FrameValue>]>,
     destination: Option<Register>,
     /// The value a returned storage path is applied to, for a mapped call.
     mapped: Option<Box<FrameValue>>,
@@ -506,6 +507,155 @@ struct Frame {
     scope: Option<usize>,
     /// The provider binding whose method this frame runs.
     lease: Option<usize>,
+}
+
+type Slot = Option<FrameValue>;
+type FrameRef<'a> = Frame<&'a [Slot], &'a FrameHeader>;
+type FrameMut<'a> = Frame<&'a mut [Slot], &'a mut FrameHeader>;
+
+/// A detached frame owns its slots. Active frames keep their range in the
+/// continuation's value stack and expose that range through temporary views.
+#[derive(Debug)]
+struct Frame<S = Box<[Slot]>, H = FrameHeader> {
+    header: H,
+    slots: S,
+}
+
+impl<S, H: Borrow<FrameHeader>> Deref for Frame<S, H> {
+    type Target = FrameHeader;
+
+    fn deref(&self) -> &Self::Target {
+        self.header.borrow()
+    }
+}
+
+impl<S, H: BorrowMut<FrameHeader>> DerefMut for Frame<S, H> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.header.borrow_mut()
+    }
+}
+
+/// The headers and contiguous values of one running or parked task.
+/// Frame ranges partition `values` in call order. Only the top frame can
+/// leave, and growing the vector leaves every frame's indices valid.
+#[derive(Debug, Default)]
+struct FrameStack {
+    frames: Vec<Frame<Range<usize>>>,
+    values: Vec<Slot>,
+}
+
+impl FrameStack {
+    fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    fn frame(&self, index: usize) -> FrameRef<'_> {
+        let frame = &self.frames[index];
+        Frame {
+            header: &frame.header,
+            slots: &self.values[frame.slots.clone()],
+        }
+    }
+
+    fn frame_mut(&mut self, index: usize) -> FrameMut<'_> {
+        let frame = &mut self.frames[index];
+        Frame {
+            header: &mut frame.header,
+            slots: &mut self.values[frame.slots.clone()],
+        }
+    }
+
+    fn last(&self) -> Option<FrameRef<'_>> {
+        Some(self.frame(self.len().checked_sub(1)?))
+    }
+
+    fn last_mut(&mut self) -> Option<FrameMut<'_>> {
+        Some(self.frame_mut(self.len().checked_sub(1)?))
+    }
+
+    fn first(&self) -> Option<FrameRef<'_>> {
+        (!self.frames.is_empty()).then(|| self.frame(0))
+    }
+
+    fn push_empty(&mut self, header: FrameHeader, slots: usize) -> usize {
+        let base = self.values.len();
+        self.values.resize_with(base + slots, || None);
+        self.frames.push(Frame {
+            header,
+            slots: base..self.values.len(),
+        });
+        base
+    }
+
+    fn enter_call(
+        &mut self,
+        header: FrameHeader,
+        callee: &VerifiedFunction,
+        caller_layout: &FrameLayout,
+        arguments: &[Register],
+        leading: impl Iterator<Item = FrameValue>,
+    ) {
+        let caller_base = self
+            .frames
+            .last()
+            .expect("a guest call has a caller")
+            .slots
+            .start;
+        let callee_layout = callee.frame_layout();
+        // Reserve before reading arguments. Growth can move the buffer, so
+        // both the caller and callee are accessed by their indices.
+        let base = self.push_empty(header, callee_layout.slot_count());
+        // Captures or a receiver occupy the leading parameters.
+        let mut parameters = callee.parameters.iter().copied();
+        for value in leading {
+            let parameter = parameters.next().expect("verified leading parameter");
+            self.values[base + slot(callee_layout, parameter)] = Some(value);
+        }
+        for (parameter, &argument) in parameters.zip(arguments) {
+            let value = self.values[caller_base + slot(caller_layout, argument)]
+                .clone()
+                .expect("a verified call reads initialized arguments");
+            self.values[base + slot(callee_layout, parameter)] = Some(value);
+        }
+    }
+
+    fn push_detached(&mut self, frame: Frame) {
+        let base = self.values.len();
+        self.values.extend(frame.slots.into_vec());
+        self.frames.push(Frame {
+            header: frame.header,
+            slots: base..self.values.len(),
+        });
+    }
+
+    fn enter(
+        &mut self,
+        header: FrameHeader,
+        body: &VerifiedFunction,
+        arguments: impl Iterator<Item = FrameValue>,
+    ) {
+        let layout = body.frame_layout();
+        let base = self.push_empty(header, layout.slot_count());
+        for (&parameter, value) in body.parameters.iter().zip(arguments) {
+            self.values[base + slot(layout, parameter)] = Some(value);
+        }
+    }
+
+    fn pop(&mut self) {
+        if let Some(frame) = self.frames.pop() {
+            self.values.truncate(frame.slots.start);
+        }
+    }
+
+    /// Move only the yielding frame's values out of the caller's stack.
+    fn suspend(&mut self) -> Option<Frame> {
+        let frame = self.frames.pop()?;
+        let slots = self.values.drain(frame.slots).collect();
+        Some(Frame {
+            header: frame.header,
+            slots,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -778,15 +928,16 @@ impl Services {
 }
 
 /// The contexts frames are running setup or cleanup of, in every task.
-fn service_scopes(stack: &[Frame], memory: &Memory) -> HashSet<usize> {
+fn service_scopes(stack: &FrameStack, memory: &Memory) -> HashSet<usize> {
     stack
+        .frames
         .iter()
         .chain(
             memory
                 .tasks
                 .iter()
                 .flatten()
-                .flat_map(|task| task.stack.iter()),
+                .flat_map(|task| task.stack.frames.iter()),
         )
         .filter_map(|frame| frame.scope)
         .collect()
@@ -1047,7 +1198,7 @@ const QUANTUM: usize = 1000;
 /// A task other than the one running, or one that has ended.
 #[derive(Debug)]
 struct TaskRecord {
-    stack: Vec<Frame>,
+    stack: FrameStack,
     end: Option<TaskEnd>,
     cancelled: bool,
     waiting: Option<usize>,
@@ -1145,7 +1296,7 @@ impl Memory {
             channels: Vec::new(),
             free_channels: Vec::new(),
             tasks: vec![Some(TaskRecord {
-                stack: Vec::new(),
+                stack: FrameStack::default(),
                 end: None,
                 cancelled: false,
                 waiting: None,
@@ -1458,12 +1609,13 @@ impl Memory {
     }
 
     /// Free every object that no frame, variable or live object reaches.
-    fn collect(&mut self, stack: &[Frame]) {
+    fn collect(&mut self, stack: &FrameStack) {
         let mut marks = vec![false; self.heap.slots.len()];
         let mut pending = Vec::new();
         for value in stack
+            .values
             .iter()
-            .flat_map(|frame| frame.slots.iter().flatten())
+            .flatten()
             .chain(self.globals.iter().flatten())
             .chain(
                 self.counted
@@ -1748,19 +1900,12 @@ fn write_place(value: &mut FrameValue, path: &[Step], new: FrameValue) -> Result
     }
 }
 
-impl Frame {
-    fn new(
-        function: FunctionId,
-        body: &VerifiedFunction,
-        values: impl Iterator<Item = FrameValue>,
-        destination: Option<Register>,
-    ) -> Self {
-        let layout = body.frame_layout();
-        let mut frame = Self {
+impl FrameHeader {
+    fn new(function: FunctionId, destination: Option<Register>) -> Self {
+        Self {
             function,
             pc: 0,
             arrival: StatementArrival::Entry,
-            slots: vec![None; layout.slot_count()].into_boxed_slice(),
             destination,
             mapped: None,
             finalizing: None,
@@ -1769,45 +1914,38 @@ impl Frame {
             namespace: None,
             scope: None,
             lease: None,
+        }
+    }
+}
+
+impl Frame {
+    fn detached(
+        function: FunctionId,
+        body: &VerifiedFunction,
+        values: impl Iterator<Item = FrameValue>,
+        destination: Option<Register>,
+    ) -> Self {
+        let layout = body.frame_layout();
+        let mut frame = Self {
+            header: FrameHeader::new(function, destination),
+            slots: vec![None; layout.slot_count()].into_boxed_slice(),
         };
         for (&register, value) in body.parameters.iter().zip(values) {
             frame.set_value(layout, register, value);
         }
         frame
     }
+}
 
+impl<S: AsRef<[Slot]>, H> Frame<S, H> {
     fn get(&self, layout: &FrameLayout, register: Register) -> Scalar {
-        match self.value(layout, register) {
-            FrameValue::Scalar(value) => value,
-            FrameValue::Loan(_)
-            | FrameValue::Text(_)
-            | FrameValue::Composite(_)
-            | FrameValue::Closure(_)
-            | FrameValue::Handle(_)
-            | FrameValue::Rc(_)
-            | FrameValue::Weak(_)
-            | FrameValue::Object { .. }
-            | FrameValue::Path(_)
-            | FrameValue::Location(_)
-            | FrameValue::Allocation(_)
-            | FrameValue::Generator(_)
-            | FrameValue::Sender(_)
-            | FrameValue::Receiver(_)
-            | FrameValue::Task(_)
-            | FrameValue::Clock
-            | FrameValue::OpenObject(_)
-            | FrameValue::Properties(_)
-            | FrameValue::Dynamic(_)
-            | FrameValue::Failure(_)
-            | FrameValue::Any(_)
-            | FrameValue::Context(_)
-            | FrameValue::Registration(_)
-            | FrameValue::ServiceKey(_)
-            | FrameValue::ServiceRef(..)
-            | FrameValue::NativeCallable(_)
-            | FrameValue::Moved => {
-                unreachable!("verified scalar operand")
-            }
+        self.get_at(verified_slot(layout, register))
+    }
+
+    fn get_at(&self, slot: FrameSlot) -> Scalar {
+        match &self.slots.as_ref()[slot.index()] {
+            Some(FrameValue::Scalar(value)) => *value,
+            _ => unreachable!("verified scalar operand"),
         }
     }
 
@@ -1847,33 +1985,47 @@ impl Frame {
     }
 
     fn value(&self, layout: &FrameLayout, register: Register) -> FrameValue {
-        let Some(value) = self.slots[slot(layout, register)].clone() else {
+        self.value_at(verified_slot(layout, register))
+    }
+
+    fn value_at(&self, slot: FrameSlot) -> FrameValue {
+        let Some(value) = self.slots.as_ref()[slot.index()].clone() else {
             // Verification requires initialization along every reachable path to a read.
             unreachable!("read of uninitialized verified storage");
         };
         value
     }
 
-    fn slot_mut(&mut self, layout: &FrameLayout, register: Register) -> &mut Option<FrameValue> {
-        &mut self.slots[slot(layout, register)]
-    }
-
     fn composite(&self, layout: &FrameLayout, register: Register) -> &Composite {
-        match &self.slots[slot(layout, register)] {
+        match &self.slots.as_ref()[slot(layout, register)] {
             Some(FrameValue::Composite(value)) => value,
             _ => unreachable!("verified composite operand"),
         }
     }
 
     fn text(&self, layout: &FrameLayout, register: Register) -> &Arc<str> {
-        match &self.slots[slot(layout, register)] {
+        match &self.slots.as_ref()[slot(layout, register)] {
             Some(FrameValue::Text(text)) => text,
             _ => unreachable!("verified text operand"),
         }
     }
+}
+
+impl<S: AsMut<[Slot]>, H> Frame<S, H> {
+    fn slot_mut(&mut self, layout: &FrameLayout, register: Register) -> &mut Option<FrameValue> {
+        self.slot_mut_at(verified_slot(layout, register))
+    }
+
+    fn slot_mut_at(&mut self, slot: FrameSlot) -> &mut Slot {
+        &mut self.slots.as_mut()[slot.index()]
+    }
+
+    fn set_at(&mut self, slot: FrameSlot, value: Scalar) {
+        *self.slot_mut_at(slot) = Some(FrameValue::Scalar(value));
+    }
 
     fn composite_mut(&mut self, layout: &FrameLayout, register: Register) -> &mut Composite {
-        match &mut self.slots[slot(layout, register)] {
+        match &mut self.slots.as_mut()[slot(layout, register)] {
             Some(FrameValue::Composite(value)) => value,
             _ => unreachable!("verified composite operand"),
         }
@@ -1884,20 +2036,24 @@ impl Frame {
     }
 
     fn set_value(&mut self, layout: &FrameLayout, register: Register, value: FrameValue) {
-        self.slots[slot(layout, register)] = Some(value);
+        self.slots.as_mut()[slot(layout, register)] = Some(value);
     }
 
     fn clear(&mut self, layout: &FrameLayout, register: Register) {
-        self.slots[slot(layout, register)] = None;
+        self.slots.as_mut()[slot(layout, register)] = None;
     }
 }
 
 fn slot(layout: &FrameLayout, register: Register) -> usize {
+    verified_slot(layout, register).index()
+}
+
+fn verified_slot(layout: &FrameLayout, register: Register) -> FrameSlot {
     let Some(slot) = layout.slot(register) else {
         // The layout assigns a slot to every register with a reachable lifetime.
         unreachable!("reachable register has no frame slot");
     };
-    slot.index()
+    slot
 }
 
 fn instruction_id(pc: usize) -> InstructionId {
@@ -2090,7 +2246,7 @@ impl std::error::Error for ScalarRecoveryError {}
 
 #[derive(Debug)]
 enum ExecutionState {
-    Active(Vec<Frame>),
+    Active(FrameStack),
     Returned(Option<Scalar>),
     Failed(RunError),
 }
@@ -2121,7 +2277,7 @@ enum StepOutcome {
 impl VerifiedModule {
     /// Give the running task's frames to the table and run another live task
     /// instead. `false` when no other task can run, and nothing changed.
-    fn rotate(&self, stack: &mut Vec<Frame>, memory: &mut Memory, finished: bool) -> bool {
+    fn rotate(&self, stack: &mut FrameStack, memory: &mut Memory, finished: bool) -> bool {
         let current = memory.current_task;
         let count = memory.tasks.len();
         for offset in 1..=count {
@@ -2162,7 +2318,7 @@ impl VerifiedModule {
 
     /// The running task has returned or failed: record how, release what its
     /// frames own, and run another task.
-    fn end_task(&self, stack: &mut Vec<Frame>, memory: &mut Memory, end: TaskEnd) {
+    fn end_task(&self, stack: &mut FrameStack, memory: &mut Memory, end: TaskEnd) {
         memory.stop_waiting();
         memory.sleeping_until = None;
         self.release_frames(memory, std::mem::take(stack));
@@ -2194,8 +2350,9 @@ impl VerifiedModule {
 
     /// Release the parameters of frames that will not run again. Parameters
     /// are the values a frame owns outright; temporaries may alias them.
-    fn release_frames(&self, memory: &mut Memory, frames: Vec<Frame>) {
-        for mut frame in frames {
+    fn release_frames(&self, memory: &mut Memory, mut stack: FrameStack) {
+        for index in 0..stack.len() {
+            let mut frame = stack.frame_mut(index);
             let body = &self.functions[frame.function.index()];
             let layout = body.frame_layout();
             for &parameter in body.parameters.iter() {
@@ -2219,7 +2376,8 @@ impl VerifiedModule {
         {
             return Err(ScalarRecoveryError::InvalidLimits);
         }
-        let mut frames = Vec::with_capacity(snapshots.len());
+        let mut frames = FrameStack::default();
+        frames.frames.reserve(snapshots.len());
         for (index, snapshot) in snapshots.iter().enumerate() {
             let position = ScalarRecoveryError::InvalidPosition {
                 function: snapshot.function,
@@ -2313,14 +2471,11 @@ impl VerifiedModule {
                     return Err(error);
                 }
             }
-            let mut frame = Frame::new(
-                snapshot.function,
-                body,
-                std::iter::empty(),
-                snapshot.destination,
-            );
-            frame.pc = snapshot.next.index();
-            frame.arrival = snapshot.arrival;
+            let mut header = FrameHeader::new(snapshot.function, snapshot.destination);
+            header.pc = snapshot.next.index();
+            header.arrival = snapshot.arrival;
+            frames.push_empty(header, body.frame_layout().slot_count());
+            let mut frame = frames.last_mut().expect("recovery has reserved a frame");
             for (index, (&state, value)) in state.iter().zip(values).enumerate() {
                 let register = Register(u32::try_from(index).map_err(|_| position)?);
                 if let Some(value) = value {
@@ -2335,7 +2490,6 @@ impl VerifiedModule {
                     });
                 }
             }
-            frames.push(frame);
         }
         Ok(Activation {
             module: self.clone(),
@@ -2404,11 +2558,11 @@ impl VerifiedModule {
         if limits.fuel == 0 {
             return Err(RunError::FuelExhausted);
         }
-        let entry = Frame::new(
-            function,
+        let mut stack = FrameStack::default();
+        stack.enter(
+            FrameHeader::new(function, None),
             entry,
             arguments.iter().copied().map(FrameValue::Scalar),
-            None,
         );
         Ok(Activation {
             module: self.clone(),
@@ -2420,7 +2574,7 @@ impl VerifiedModule {
             memory: Memory::new(self.globals.len()),
             limits,
             instructions_executed: 0,
-            state: ExecutionState::Active(vec![entry]),
+            state: ExecutionState::Active(stack),
         })
     }
 
@@ -2440,10 +2594,8 @@ impl VerifiedModule {
         memory.globals.resize(self.globals.len(), None);
         activation.memory = memory;
         activation.instructions_executed = instructions_executed;
-        if let ExecutionState::Active(stack) = &mut activation.state
-            && let Some(frame) = stack.first_mut()
-        {
-            frame.pc = at.index();
+        if let ExecutionState::Active(stack) = &mut activation.state {
+            stack.frame_mut(0).pc = at.index();
         }
         Ok(activation)
     }
@@ -2476,14 +2628,14 @@ impl VerifiedModule {
 
     fn step(
         &self,
-        stack: &mut Vec<Frame>,
+        stack: &mut FrameStack,
         memory: &mut Memory,
         max_frames: usize,
         output: &mut OutputSink,
         input: &mut InputSource,
     ) -> Result<StepOutcome, RunError> {
         let depth = stack.len();
-        let Some(frame) = stack.last_mut() else {
+        let Some(mut frame) = stack.last_mut() else {
             // An entry return transitions out of Active in the same step.
             unreachable!("active execution has no frame");
         };
@@ -2496,11 +2648,14 @@ impl VerifiedModule {
         frame.pc += 1;
         frame.arrival = StatementArrival::Next(from);
         match body.instructions[pc] {
-            Instruction::StorageLive(reg) | Instruction::StorageDead(reg) => {
-                frame.clear(layout, reg);
+            Instruction::StorageLive(_) | Instruction::StorageDead(_) => {
+                *frame.slot_mut_at(layout.operands(pc).one()) = None;
             }
-            Instruction::Constant(dst, value) => frame.set(layout, dst, value),
-            Instruction::Copy(dst, src) => frame.set_value(layout, dst, frame.value(layout, src)),
+            Instruction::Constant(_, value) => frame.set_at(layout.operands(pc).one(), value),
+            Instruction::Copy(..) => {
+                let [dst, src] = layout.operands(pc).two();
+                *frame.slot_mut_at(dst) = Some(frame.value_at(src));
+            }
             Instruction::Borrow(loan, owner) => {
                 let place = BorrowedPlace {
                     root: Root::Frame {
@@ -2522,7 +2677,7 @@ impl VerifiedModule {
                     instruction: from,
                     span: body.spans[pc],
                 })?;
-                stack[depth - 1].set_value(
+                stack.frame_mut(depth - 1).set_value(
                     layout,
                     dst,
                     FrameValue::Object {
@@ -2541,7 +2696,9 @@ impl VerifiedModule {
                     instruction: from,
                     span: body.spans[pc],
                 })?;
-                stack[depth - 1].set_value(layout, dst, FrameValue::Handle(handle));
+                stack
+                    .frame_mut(depth - 1)
+                    .set_value(layout, dst, FrameValue::Handle(handle));
             }
             Instruction::GcBorrow(dst, handle) => {
                 let root = match frame.value(layout, handle) {
@@ -2556,12 +2713,13 @@ impl VerifiedModule {
                 };
                 frame.set_value(layout, dst, FrameValue::Loan(place));
             }
-            Instruction::Move(dst, src) => {
-                let value = frame.slot_mut(layout, src).take();
+            Instruction::Move(..) => {
+                let [dst, src] = layout.operands(pc).two();
+                let value = frame.slot_mut_at(src).take();
                 let Some(value) = value else {
                     unreachable!("verified move source is initialized");
                 };
-                frame.set_value(layout, dst, value);
+                *frame.slot_mut_at(dst) = Some(value);
             }
             Instruction::Drop(reg) => {
                 // A value that was already moved out leaves nothing to release.
@@ -2590,7 +2748,7 @@ impl VerifiedModule {
                     }
                     (None, false) => unreachable!("a place was read from this root"),
                 }
-                stack[depth - 1].set_value(layout, dst, value);
+                stack.frame_mut(depth - 1).set_value(layout, dst, value);
             }
             Instruction::RcNew(dst, value) => {
                 let value = frame.value(layout, value);
@@ -2598,7 +2756,9 @@ impl VerifiedModule {
                     memory.collect(stack);
                 }
                 let block = memory.new_counted(value);
-                stack[depth - 1].set_value(layout, dst, FrameValue::Rc(block));
+                stack
+                    .frame_mut(depth - 1)
+                    .set_value(layout, dst, FrameValue::Rc(block));
             }
             Instruction::RcClone(dst, src)
             | Instruction::RcDowngrade(dst, src)
@@ -2623,7 +2783,7 @@ impl VerifiedModule {
                         u64::try_from(counts.strong).unwrap_or(u64::MAX),
                     )),
                 };
-                stack[depth - 1].set_value(layout, dst, result);
+                stack.frame_mut(depth - 1).set_value(layout, dst, result);
             }
             Instruction::RcUpgrade(dst, src) => {
                 let held = self
@@ -2646,7 +2806,9 @@ impl VerifiedModule {
                         payload: None,
                     }
                 };
-                stack[depth - 1].set_value(layout, dst, FrameValue::Composite(value));
+                stack
+                    .frame_mut(depth - 1)
+                    .set_value(layout, dst, FrameValue::Composite(value));
             }
             Instruction::EnumTake(dst, src, variant) => {
                 let Composite::Enum { variant: held, .. } = frame.composite(layout, src) else {
@@ -2688,7 +2850,7 @@ impl VerifiedModule {
                     .ok_or(uninitialized)?;
                 let value = read_place(&root, &place.path)
                     .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
-                stack[depth - 1].set_value(layout, dst, value);
+                stack.frame_mut(depth - 1).set_value(layout, dst, value);
             }
             Instruction::WriteLoan(loan, value) => {
                 let place = frame.loan(layout, loan);
@@ -2708,11 +2870,11 @@ impl VerifiedModule {
                 }
             }
             Instruction::LoanField(dst, src, field) => {
-                let place = project_base(body, frame, layout, depth, src, Step::Field(field));
+                let place = project_base(body, &frame, layout, depth, src, Step::Field(field));
                 frame.set_value(layout, dst, FrameValue::Loan(place));
             }
             Instruction::LoanPayload(dst, src, variant) => {
-                let place = project_base(body, frame, layout, depth, src, Step::Payload(variant));
+                let place = project_base(body, &frame, layout, depth, src, Step::Payload(variant));
                 // The variant must be held when the borrow is taken.
                 let root = self.root_value(stack, memory, &place.root).ok_or(
                     RunError::UninitializedGlobal {
@@ -2723,7 +2885,9 @@ impl VerifiedModule {
                 )?;
                 read_place(&root, &place.path)
                     .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
-                stack[depth - 1].set_value(layout, dst, FrameValue::Loan(place));
+                stack
+                    .frame_mut(depth - 1)
+                    .set_value(layout, dst, FrameValue::Loan(place));
             }
             Instruction::Clone(dst, src) => {
                 let held = self
@@ -2735,7 +2899,7 @@ impl VerifiedModule {
                         span: body.spans[pc],
                     })?;
                 let copy = memory.clone_value(&held);
-                stack[depth - 1].set_value(layout, dst, copy);
+                stack.frame_mut(depth - 1).set_value(layout, dst, copy);
             }
             Instruction::TextMap(op, dst, src) => {
                 let text = frame.text(layout, src);
@@ -2784,7 +2948,9 @@ impl VerifiedModule {
                     variant: ok,
                     payload: Some(Box::new(FrameValue::Allocation(memory.allocations))),
                 };
-                stack[depth - 1].set_value(layout, dst, FrameValue::Composite(allocated));
+                stack
+                    .frame_mut(depth - 1)
+                    .set_value(layout, dst, FrameValue::Composite(allocated));
             }
             Instruction::Deallocate(_) => {}
             Instruction::RcNewIn(dst, list, deallocate) => {
@@ -2824,7 +2990,9 @@ impl VerifiedModule {
                         allocation,
                     }),
                 );
-                stack[depth - 1].set_value(layout, dst, FrameValue::Rc(block));
+                stack
+                    .frame_mut(depth - 1)
+                    .set_value(layout, dst, FrameValue::Rc(block));
             }
             Instruction::LocationField(dst, owner, field) => {
                 let held = self
@@ -2838,7 +3006,9 @@ impl VerifiedModule {
                     path: Box::new([Step::Field(field)]),
                     window: None,
                 };
-                stack[depth - 1].set_value(layout, dst, FrameValue::Location(place));
+                stack
+                    .frame_mut(depth - 1)
+                    .set_value(layout, dst, FrameValue::Location(place));
             }
             Instruction::LocationLoad(dst, location) => {
                 let held = self
@@ -2857,7 +3027,7 @@ impl VerifiedModule {
                 let value = read_place(&root, &place.path)
                     .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
                 let value = memory.clone_value(&value);
-                stack[depth - 1].set_value(layout, dst, value);
+                stack.frame_mut(depth - 1).set_value(layout, dst, value);
             }
             Instruction::LocationStore(location, value) => {
                 let held = self
@@ -2866,7 +3036,7 @@ impl VerifiedModule {
                 let Some(FrameValue::Location(place)) = held else {
                     unreachable!("verified location operand");
                 };
-                let value = stack[depth - 1].value(layout, value);
+                let value = stack.frame(depth - 1).value(layout, value);
                 let Root::Heap(object) = place.root else {
                     unreachable!("a location is rooted in the heap");
                 };
@@ -2988,8 +3158,9 @@ impl VerifiedModule {
                 };
                 frame.set_value(layout, dst, FrameValue::Composite(value));
             }
-            Instruction::CountToInteger(dst, src) => {
-                let Scalar::U64(value) = frame.get(layout, src) else {
+            Instruction::CountToInteger(..) => {
+                let [dst, src] = layout.operands(pc).two();
+                let Scalar::U64(value) = frame.get_at(src) else {
                     unreachable!("verified count operand");
                 };
                 let value = i64::try_from(value).map_err(|_| RunError::ConversionOutOfRange {
@@ -2997,10 +3168,11 @@ impl VerifiedModule {
                     instruction: from,
                     span: body.spans[pc],
                 })?;
-                frame.set(layout, dst, Scalar::I64(value));
+                frame.set_at(dst, Scalar::I64(value));
             }
-            Instruction::IntegerToCount(dst, src) => {
-                let Scalar::I64(value) = frame.get(layout, src) else {
+            Instruction::IntegerToCount(..) => {
+                let [dst, src] = layout.operands(pc).two();
+                let Scalar::I64(value) = frame.get_at(src) else {
                     unreachable!("verified integer operand");
                 };
                 let value = u64::try_from(value).map_err(|_| RunError::ConversionOutOfRange {
@@ -3008,10 +3180,11 @@ impl VerifiedModule {
                     instruction: from,
                     span: body.spans[pc],
                 })?;
-                frame.set(layout, dst, Scalar::U64(value));
+                frame.set_at(dst, Scalar::U64(value));
             }
-            Instruction::Abs(dst, src) => {
-                let result = match frame.get(layout, src) {
+            Instruction::Abs(..) => {
+                let [dst, src] = layout.operands(pc).two();
+                let result = match frame.get_at(src) {
                     Scalar::I64(value) => {
                         Scalar::I64(value.checked_abs().ok_or(RunError::IntegerOverflow {
                             function,
@@ -3022,11 +3195,11 @@ impl VerifiedModule {
                     Scalar::F64(bits) => Scalar::F64(f64::from_bits(bits).abs().to_bits()),
                     _ => unreachable!("verified number operand"),
                 };
-                frame.set(layout, dst, result);
+                frame.set_at(dst, result);
             }
-            Instruction::Extremum(op, dst, lhs, rhs) => {
-                let (Scalar::I64(lhs), Scalar::I64(rhs)) =
-                    (frame.get(layout, lhs), frame.get(layout, rhs))
+            Instruction::Extremum(op, ..) => {
+                let [dst, lhs, rhs] = layout.operands(pc).three();
+                let (Scalar::I64(lhs), Scalar::I64(rhs)) = (frame.get_at(lhs), frame.get_at(rhs))
                 else {
                     unreachable!("verified integer operands");
                 };
@@ -3034,7 +3207,7 @@ impl VerifiedModule {
                     Extremum::Min => lhs.min(rhs),
                     Extremum::Max => lhs.max(rhs),
                 };
-                frame.set(layout, dst, Scalar::I64(value));
+                frame.set_at(dst, Scalar::I64(value));
             }
             Instruction::RangeNew(dst, start, end)
             | Instruction::RangeInclusive(dst, start, end) => {
@@ -3120,7 +3293,9 @@ impl VerifiedModule {
                     unreachable!("verified vector operand");
                 };
                 let length = u64::try_from(items.len()).unwrap_or(u64::MAX);
-                stack[depth - 1].set(layout, dst, Scalar::U64(length));
+                stack
+                    .frame_mut(depth - 1)
+                    .set(layout, dst, Scalar::U64(length));
             }
             Instruction::CellNew(dst, value) => {
                 let value = frame.value(layout, value);
@@ -3143,7 +3318,7 @@ impl VerifiedModule {
                     unreachable!("verified cell operand");
                 };
                 let value = (**inner).clone();
-                stack[depth - 1].set_value(layout, dst, value);
+                stack.frame_mut(depth - 1).set_value(layout, dst, value);
             }
             Instruction::CellWrite(cell, value) => {
                 let value = frame.value(layout, value);
@@ -3164,15 +3339,17 @@ impl VerifiedModule {
                     unreachable!("verified cell operand");
                 };
                 let old = std::mem::replace(&mut **inner, value);
-                stack[depth - 1].set_value(layout, dst, old);
+                stack.frame_mut(depth - 1).set_value(layout, dst, old);
             }
             Instruction::SliceOf(dst, src) => {
-                let mut place = place_of(body, frame, layout, depth, src);
+                let mut place = place_of(body, &frame, layout, depth, src);
                 let window = self
                     .sequence_window(stack, memory, body, src)
                     .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
                 place.window = window;
-                stack[depth - 1].set_value(layout, dst, FrameValue::Loan(place));
+                stack
+                    .frame_mut(depth - 1)
+                    .set_value(layout, dst, FrameValue::Loan(place));
             }
             Instruction::SliceLength(dst, src) => {
                 let window = self
@@ -3180,7 +3357,9 @@ impl VerifiedModule {
                     .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
                 let length = window.map_or(0, |window| window.len);
                 let length = i64::try_from(length).unwrap_or(i64::MAX);
-                stack[depth - 1].set(layout, dst, Scalar::I64(length));
+                stack
+                    .frame_mut(depth - 1)
+                    .set(layout, dst, Scalar::I64(length));
             }
             Instruction::Sum(dst, src) => {
                 let elements = self
@@ -3201,12 +3380,18 @@ impl VerifiedModule {
                         span: body.spans[pc],
                     })?;
                 }
-                stack[depth - 1].set(layout, dst, Scalar::I64(total));
+                stack
+                    .frame_mut(depth - 1)
+                    .set(layout, dst, Scalar::I64(total));
             }
             Instruction::LoanElement(dst, src, list)
                 if body.projects_from_slice(src) || body.projects_from_vec(src) =>
             {
-                let index = scalar_index(stack[depth - 1].get(layout, body.lists[list.index()][0]));
+                let index = scalar_index(
+                    stack
+                        .frame_mut(depth - 1)
+                        .get(layout, body.lists[list.index()][0]),
+                );
                 let window = self
                     .sequence_window(stack, memory, body, src)
                     .map_err(|fault| place_error(fault, function, from, body.spans[pc]))?;
@@ -3223,28 +3408,30 @@ impl VerifiedModule {
                 })?;
                 let place = project_base(
                     body,
-                    &stack[depth - 1],
+                    &stack.frame(depth - 1),
                     layout,
                     depth,
                     src,
                     Step::Offset(offset),
                 );
-                stack[depth - 1].set_value(layout, dst, FrameValue::Loan(place));
+                stack
+                    .frame_mut(depth - 1)
+                    .set_value(layout, dst, FrameValue::Loan(place));
             }
             Instruction::LoanElement(dst, src, list) => {
                 let offset =
-                    element_offset(frame, layout, body.projected_array_bounds(src), list, body)
+                    element_offset(&frame, layout, body.projected_array_bounds(src), list, body)
                         .ok_or(RunError::IndexOutOfBounds {
                             function,
                             instruction: from,
                             span: body.spans[pc],
                         })?;
-                let place = project_base(body, frame, layout, depth, src, Step::Offset(offset));
+                let place = project_base(body, &frame, layout, depth, src, Step::Offset(offset));
                 frame.set_value(layout, dst, FrameValue::Loan(place));
             }
-            Instruction::Integer(op, dst, lhs, rhs) => {
-                let (Scalar::I64(lhs), Scalar::I64(rhs)) =
-                    (frame.get(layout, lhs), frame.get(layout, rhs))
+            Instruction::Integer(op, ..) => {
+                let [dst, lhs, rhs] = layout.operands(pc).three();
+                let (Scalar::I64(lhs), Scalar::I64(rhs)) = (frame.get_at(lhs), frame.get_at(rhs))
                 else {
                     unreachable!("verified integer operands");
                 };
@@ -3263,14 +3450,15 @@ impl VerifiedModule {
                         },
                     }
                 })?;
-                frame.set(layout, dst, value);
+                frame.set_at(dst, value);
             }
             Instruction::Jump(to) => {
                 frame.pc = to.index();
                 frame.arrival = StatementArrival::Jump(from);
             }
-            Instruction::Branch(condition, yes, no) => {
-                let Scalar::Bool(condition) = frame.get(layout, condition) else {
+            Instruction::Branch(_, yes, no) => {
+                let condition = layout.operands(pc).one();
+                let Scalar::Bool(condition) = frame.get_at(condition) else {
                     unreachable!("verified boolean condition");
                 };
                 frame.pc = if condition { yes.index() } else { no.index() };
@@ -3287,13 +3475,13 @@ impl VerifiedModule {
                             return Err(RunError::FrameLimit);
                         }
                         let callee = &self.functions[target.index()];
-                        let next = Frame::new(
-                            target,
+                        stack.enter_call(
+                            FrameHeader::new(target, call.destination),
                             callee,
-                            call.arguments.iter().map(|&reg| frame.value(layout, reg)),
-                            call.destination,
+                            layout,
+                            &call.arguments,
+                            std::iter::empty(),
                         );
-                        stack.push(next);
                     }
                     CallTarget::Output(id) => {
                         let template = &body.outputs[id.index()];
@@ -3325,7 +3513,7 @@ impl VerifiedModule {
                             let values = captures
                                 .into_iter()
                                 .chain(call.arguments.iter().map(|&reg| frame.value(layout, reg)));
-                            let suspended = Frame::new(closure.function, target, values, None);
+                            let suspended = Frame::detached(closure.function, target, values, None);
                             let Some(id) = memory.new_generator(suspended) else {
                                 return Err(RunError::Generator {
                                     function,
@@ -3339,17 +3527,17 @@ impl VerifiedModule {
                             }
                             return Ok(StepOutcome::Continue);
                         }
-                        let values = closure
-                            .captures
-                            .iter()
-                            .cloned()
-                            .chain(call.arguments.iter().map(|&reg| frame.value(layout, reg)));
-                        let mut next =
-                            Frame::new(closure.function, target, values, call.destination);
+                        let mut next = FrameHeader::new(closure.function, call.destination);
                         if matches!(call.target, CallTarget::Mapped(_)) {
                             next.mapped = Some(Box::new(frame.value(layout, call.arguments[0])));
                         }
-                        stack.push(next);
+                        stack.enter_call(
+                            next,
+                            target,
+                            layout,
+                            &call.arguments,
+                            closure.captures.iter().cloned(),
+                        );
                     }
                     CallTarget::Method { object, method } => {
                         if depth == max_frames {
@@ -3379,7 +3567,6 @@ impl VerifiedModule {
                             }
                             other => other,
                         };
-                        let frame = &mut stack[depth - 1];
                         let FrameValue::Object {
                             heap,
                             implementation,
@@ -3410,16 +3597,20 @@ impl VerifiedModule {
                                 window: None,
                             })
                         };
-                        let values = std::iter::once(receiver)
-                            .chain(call.arguments.iter().map(|&reg| frame.value(layout, reg)));
-                        let mut next = Frame::new(target, callee, values, call.destination);
+                        let mut next = FrameHeader::new(target, call.destination);
                         next.lease = lease;
-                        stack.push(next);
+                        stack.enter_call(
+                            next,
+                            callee,
+                            layout,
+                            &call.arguments,
+                            std::iter::once(receiver),
+                        );
                     }
                     CallTarget::Bound(binding) => self.call_bound(
                         binding,
                         call,
-                        frame,
+                        &mut frame,
                         layout,
                         ExecutionPosition {
                             function,
@@ -3433,12 +3624,13 @@ impl VerifiedModule {
                 let Some((id, resumer)) = frame.generator else {
                     unreachable!("checked above");
                 };
-                let Some(returned) = value.map(|reg| frame.value(layout, reg)) else {
+                let Some(returned) = value.map(|_| frame.value_at(layout.operands(pc).one()))
+                else {
                     unreachable!("a generator returns a value");
                 };
                 stack.pop();
                 memory.generator(id).state = GeneratorState::Done;
-                let caller = stack
+                let mut caller = stack
                     .last_mut()
                     .expect("a generator runs above its resumer");
                 let caller_body = &self.functions[caller.function.index()];
@@ -3474,7 +3666,7 @@ impl VerifiedModule {
                     unreachable!("verified channel end");
                 };
                 let copy = memory.clone_value(&end);
-                stack[depth - 1].set_value(layout, dst, copy);
+                stack.frame_mut(depth - 1).set_value(layout, dst, copy);
             }
             Instruction::ChannelClose(end) | Instruction::ChannelIsClosed(_, end) => {
                 let held = self
@@ -3487,7 +3679,7 @@ impl VerifiedModule {
                 };
                 if let Instruction::ChannelIsClosed(dst, _) = body.instructions[pc] {
                     let closed = memory.channel(id).closed;
-                    stack[depth - 1].set_value(
+                    stack.frame_mut(depth - 1).set_value(
                         layout,
                         dst,
                         FrameValue::Scalar(Scalar::Bool(closed)),
@@ -3514,7 +3706,7 @@ impl VerifiedModule {
                 let Some(FrameValue::Sender(id)) = held else {
                     unreachable!("verified sender");
                 };
-                let value = stack[depth - 1].value(layout, value);
+                let value = stack.frame(depth - 1).value(layout, value);
                 let blocking = matches!(body.instructions[pc], Instruction::ChannelSend(..));
                 let channel = memory.channel(id);
                 let outcome = if channel.closed {
@@ -3522,7 +3714,7 @@ impl VerifiedModule {
                 } else if channel.has_room() {
                     None
                 } else if blocking {
-                    stack[depth - 1].pc -= 1;
+                    stack.frame_mut(depth - 1).pc -= 1;
                     return Ok(StepOutcome::Blocked);
                 } else {
                     Some(variants.failure(1))
@@ -3543,7 +3735,9 @@ impl VerifiedModule {
                         }))),
                     },
                 };
-                stack[depth - 1].set_value(layout, dst, FrameValue::Composite(result));
+                stack
+                    .frame_mut(depth - 1)
+                    .set_value(layout, dst, FrameValue::Composite(result));
             }
             Instruction::ChannelReceive(dst, end, variants)
             | Instruction::ChannelTryReceive(dst, end, variants) => {
@@ -3563,7 +3757,7 @@ impl VerifiedModule {
                         memory.channel(id).waiting += 1;
                         memory.waiting = Some(id);
                     }
-                    stack[depth - 1].pc -= 1;
+                    stack.frame_mut(depth - 1).pc -= 1;
                     return Ok(StepOutcome::Blocked);
                 }
                 memory.stop_waiting();
@@ -3580,7 +3774,9 @@ impl VerifiedModule {
                         }))),
                     },
                 };
-                stack[depth - 1].set_value(layout, dst, FrameValue::Composite(result));
+                stack
+                    .frame_mut(depth - 1)
+                    .set_value(layout, dst, FrameValue::Composite(result));
             }
             Instruction::ObjectNew(dst, list, contract) => {
                 let contract = &body.contracts[contract.index()];
@@ -3613,7 +3809,7 @@ impl VerifiedModule {
                 } else {
                     object
                 };
-                stack[depth - 1].set_value(layout, dst, value);
+                stack.frame_mut(depth - 1).set_value(layout, dst, value);
             }
             Instruction::ObjectGet(..)
             | Instruction::ObjectGetKey(..)
@@ -3638,12 +3834,16 @@ impl VerifiedModule {
                         (object, Some(body.texts[name.index()].clone()))
                     }
                     Instruction::ObjectGetKey(_, object, key)
-                    | Instruction::ObjectDeleteKey(_, object, key) => {
-                        (object, Some(stack[depth - 1].text(layout, key).clone()))
-                    }
+                    | Instruction::ObjectDeleteKey(_, object, key) => (
+                        object,
+                        Some(stack.frame(depth - 1).text(layout, key).clone()),
+                    ),
                     Instruction::ObjectSetKey(object, list) => {
                         let key = body.lists[list.index()][0];
-                        (object, Some(stack[depth - 1].text(layout, key).clone()))
+                        (
+                            object,
+                            Some(stack.frame(depth - 1).text(layout, key).clone()),
+                        )
                     }
                     Instruction::ObjectView(_, object, _)
                     | Instruction::ObjectTryView(_, object, _)
@@ -3670,7 +3870,7 @@ impl VerifiedModule {
                     let ty = body.registers()[register.index()]
                         .value()
                         .unwrap_or(ValueType::Dynamic);
-                    erased_parts(stack[depth - 1].value(layout, register), ty)
+                    erased_parts(stack.frame(depth - 1).value(layout, register), ty)
                 });
                 let Some(FrameValue::Properties(data)) = memory.heap.slots[id].as_mut() else {
                     unreachable!("an object handle names its properties");
@@ -3688,7 +3888,7 @@ impl VerifiedModule {
                         } else {
                             return Err(fault(ObjectFault::Type));
                         };
-                        stack[depth - 1].set_value(layout, dst, result);
+                        stack.frame_mut(depth - 1).set_value(layout, dst, result);
                     }
                     Instruction::ObjectSet(..) | Instruction::ObjectSetKey(..) => {
                         let name = name.expect("a property name");
@@ -3731,11 +3931,17 @@ impl VerifiedModule {
                             }
                             None => false,
                         };
-                        stack[depth - 1].set(layout, dst, Scalar::Bool(existed));
+                        stack
+                            .frame_mut(depth - 1)
+                            .set(layout, dst, Scalar::Bool(existed));
                     }
                     Instruction::ObjectView(dst, _, contract) => {
                         view_object(data, &body.contracts[contract.index()]).map_err(fault)?;
-                        stack[depth - 1].set_value(layout, dst, FrameValue::OpenObject(id));
+                        stack.frame_mut(depth - 1).set_value(
+                            layout,
+                            dst,
+                            FrameValue::OpenObject(id),
+                        );
                     }
                     Instruction::ObjectTryView(dst, _, contract) => {
                         let outcome = view_object(data, &body.contracts[contract.index()]);
@@ -3777,7 +3983,11 @@ impl VerifiedModule {
                                 )))),
                             },
                         };
-                        stack[depth - 1].set_value(layout, dst, FrameValue::Composite(result));
+                        stack.frame_mut(depth - 1).set_value(
+                            layout,
+                            dst,
+                            FrameValue::Composite(result),
+                        );
                     }
                     _ => data.readonly = true,
                 }
@@ -3975,13 +4185,13 @@ impl VerifiedModule {
                 }
                 let target = &self.functions[closure.function.index()];
                 let all = closure.captures.iter().cloned().chain(values);
-                let mut next = Frame::new(closure.function, target, all, Some(dst));
+                let mut next = FrameHeader::new(closure.function, Some(dst));
                 next.wrap = Some(description.result);
-                stack.push(next);
+                stack.enter(next, target, all);
             }
-            Instruction::Count(op, dst, lhs, rhs) => {
-                let (Scalar::U64(a), Scalar::U64(b)) =
-                    (frame.get(layout, lhs), frame.get(layout, rhs))
+            Instruction::Count(op, ..) => {
+                let [dst, lhs, rhs] = layout.operands(pc).three();
+                let (Scalar::U64(a), Scalar::U64(b)) = (frame.get_at(lhs), frame.get_at(rhs))
                 else {
                     unreachable!("verified count operands");
                 };
@@ -4015,7 +4225,7 @@ impl VerifiedModule {
                     IntegerOp::Equal => Scalar::Bool(a == b),
                     IntegerOp::NotEqual => Scalar::Bool(a != b),
                 };
-                frame.set(layout, dst, result);
+                frame.set_at(dst, result);
             }
             Instruction::Random(dst, bound) => {
                 let bound = match frame.get(layout, bound) {
@@ -4064,7 +4274,7 @@ impl VerifiedModule {
                 let instruction = body.instructions[pc];
                 // Contexts, keys and registrations may be held directly or
                 // through a loan of the place that holds them.
-                let held = |memory: &Memory, register: Register, stack: &[Frame]| {
+                let held = |memory: &Memory, register: Register, stack: &FrameStack| {
                     self.held_value(stack, memory, body, register)
                         .map_err(|fault| place_error(fault, function, from, body.spans[pc]))
                 };
@@ -4082,7 +4292,11 @@ impl VerifiedModule {
                         let Some(view) = memory.services.new_view(None) else {
                             return Err(fault(ServiceFault::Limit));
                         };
-                        stack[depth - 1].set_value(layout, dst, FrameValue::Context(view));
+                        stack.frame_mut(depth - 1).set_value(
+                            layout,
+                            dst,
+                            FrameValue::Context(view),
+                        );
                     }
                     Instruction::ServiceKeyConst(dst, key) => {
                         frame.set_value(layout, dst, FrameValue::ServiceKey(key as usize));
@@ -4090,7 +4304,11 @@ impl VerifiedModule {
                     Instruction::ServiceReference(dst, ctx, key) => {
                         let view = context_of(held(memory, ctx, stack)?);
                         let key = key_of(held(memory, key, stack)?);
-                        stack[depth - 1].set_value(layout, dst, FrameValue::ServiceRef(view, key));
+                        stack.frame_mut(depth - 1).set_value(
+                            layout,
+                            dst,
+                            FrameValue::ServiceRef(view, key),
+                        );
                     }
                     Instruction::ServiceAvailable(dst, ctx, key) => {
                         let view = context_of(held(memory, ctx, stack)?);
@@ -4100,7 +4318,9 @@ impl VerifiedModule {
                             .services
                             .selected(view, key, scopes.contains(&view))
                             .is_ok();
-                        stack[depth - 1].set(layout, dst, Scalar::Bool(available));
+                        stack
+                            .frame_mut(depth - 1)
+                            .set(layout, dst, Scalar::Bool(available));
                     }
                     Instruction::ServiceExtend(dst, ctx)
                     | Instruction::ServiceIsolate(dst, ctx, _) => {
@@ -4119,7 +4339,11 @@ impl VerifiedModule {
                             child_view.realms.insert(key, realm);
                             child_view.admitted.remove(&key);
                         }
-                        stack[depth - 1].set_value(layout, dst, FrameValue::Context(child));
+                        stack.frame_mut(depth - 1).set_value(
+                            layout,
+                            dst,
+                            FrameValue::Context(child),
+                        );
                     }
                     Instruction::ServiceProvide(dst, list) => {
                         let &[ctx, key, value] = &*body.lists[list.index()] else {
@@ -4127,7 +4351,7 @@ impl VerifiedModule {
                         };
                         let view = context_of(held(memory, ctx, stack)?);
                         let key = key_of(held(memory, key, stack)?);
-                        let value = stack[depth - 1].value(layout, value);
+                        let value = stack.frame(depth - 1).value(layout, value);
                         if memory.services.views[view].state != ServiceState::Active {
                             return Err(fault(ServiceFault::InactiveContext));
                         }
@@ -4149,14 +4373,18 @@ impl VerifiedModule {
                         });
                         memory.services.views[view].provided.insert(key, binding);
                         memory.services.active.insert((key, realm), binding);
-                        stack[depth - 1].set_value(layout, dst, FrameValue::Registration(binding));
+                        stack.frame_mut(depth - 1).set_value(
+                            layout,
+                            dst,
+                            FrameValue::Registration(binding),
+                        );
                     }
                     Instruction::ServiceOnDispose(ctx, callback) => {
                         let view = context_of(held(memory, ctx, stack)?);
                         if memory.services.views[view].state != ServiceState::Active {
                             return Err(fault(ServiceFault::InactiveContext));
                         }
-                        let callback = stack[depth - 1].value(layout, callback);
+                        let callback = stack.frame(depth - 1).value(layout, callback);
                         memory.services.views[view].cleanups.push(callback);
                     }
                     Instruction::ServiceInject(list) => {
@@ -4166,7 +4394,7 @@ impl VerifiedModule {
                         let view = context_of(held(memory, ctx, stack)?);
                         let key = key_of(held(memory, key, stack)?);
                         let FrameValue::Closure(callback) =
-                            stack[depth - 1].value(layout, callback)
+                            stack.frame(depth - 1).value(layout, callback)
                         else {
                             unreachable!("verified callback");
                         };
@@ -4193,9 +4421,9 @@ impl VerifiedModule {
                             .iter()
                             .cloned()
                             .chain(std::iter::once(FrameValue::Context(child)));
-                        let mut next = Frame::new(callback.function, target, values, None);
+                        let mut next = FrameHeader::new(callback.function, None);
                         next.scope = Some(child);
-                        stack.push(next);
+                        stack.enter(next, target, values);
                     }
                     Instruction::ServiceDispose(target) => {
                         match held(memory, target, stack)? {
@@ -4219,9 +4447,9 @@ impl VerifiedModule {
                             };
                             let target = &self.functions[callback.function.index()];
                             let values = callback.captures.iter().cloned();
-                            let mut next = Frame::new(callback.function, target, values, None);
+                            let mut next = FrameHeader::new(callback.function, None);
                             next.scope = Some(view);
-                            stack.push(next);
+                            stack.enter(next, target, values);
                         }
                         let scopes = service_scopes(stack, memory);
                         memory.services.release_retired(&scopes);
@@ -4274,7 +4502,7 @@ impl VerifiedModule {
                     now + Duration::from_millis(milliseconds.min(u64::from(u32::MAX) * 1000))
                 });
                 if now < deadline {
-                    stack[depth - 1].pc -= 1;
+                    stack.frame_mut(depth - 1).pc -= 1;
                     return Ok(StepOutcome::Blocked);
                 }
                 memory.sleeping_until = None;
@@ -4292,9 +4520,14 @@ impl VerifiedModule {
                         span: body.spans[pc],
                     });
                 }
-                let task = Frame::new(closure.function, target, captured.into_iter(), None);
+                let mut task = FrameStack::default();
+                task.enter(
+                    FrameHeader::new(closure.function, None),
+                    target,
+                    captured.into_iter(),
+                );
                 let record = TaskRecord {
-                    stack: vec![task],
+                    stack: task,
                     end: None,
                     cancelled: false,
                     waiting: None,
@@ -4313,7 +4546,9 @@ impl VerifiedModule {
                         span: body.spans[pc],
                     });
                 };
-                stack[depth - 1].set_value(layout, dst, FrameValue::Task(id));
+                stack
+                    .frame_mut(depth - 1)
+                    .set_value(layout, dst, FrameValue::Task(id));
             }
             Instruction::TaskJoin(dst, task)
             | Instruction::TaskIsFinished(dst, task)
@@ -4329,7 +4564,7 @@ impl VerifiedModule {
                     .is_some_and(|task| task.end.is_some());
                 match body.instructions[pc] {
                     Instruction::TaskIsFinished(..) => {
-                        stack[depth - 1].set_value(
+                        stack.frame_mut(depth - 1).set_value(
                             layout,
                             dst,
                             FrameValue::Scalar(Scalar::Bool(finished)),
@@ -4342,7 +4577,7 @@ impl VerifiedModule {
                     }
                     _ => {
                         if !finished {
-                            stack[depth - 1].pc -= 1;
+                            stack.frame_mut(depth - 1).pc -= 1;
                             return Ok(StepOutcome::Blocked);
                         }
                         let Some(record) = memory.tasks[id].take() else {
@@ -4363,7 +4598,11 @@ impl VerifiedModule {
                                 payload: None,
                             },
                         };
-                        stack[depth - 1].set_value(layout, dst, FrameValue::Composite(outcome));
+                        stack.frame_mut(depth - 1).set_value(
+                            layout,
+                            dst,
+                            FrameValue::Composite(outcome),
+                        );
                     }
                 }
             }
@@ -4378,14 +4617,14 @@ impl VerifiedModule {
                 else {
                     unreachable!("verified send error");
                 };
-                stack[depth - 1].set_value(layout, dst, *payload);
+                stack.frame_mut(depth - 1).set_value(layout, dst, *payload);
             }
             Instruction::Yield(dst, value) => {
                 let Some((id, resumer)) = frame.generator.take() else {
                     unreachable!("verified yield inside a generator");
                 };
                 let yielded = frame.value(layout, value);
-                let Some(suspended) = stack.pop() else {
+                let Some(suspended) = stack.suspend() else {
                     unreachable!("the yielding frame is on the stack");
                 };
                 let slot = memory.generator(id);
@@ -4394,7 +4633,7 @@ impl VerifiedModule {
                     depth: stack.len(),
                 };
                 slot.frame = Some(suspended);
-                let caller = stack
+                let mut caller = stack
                     .last_mut()
                     .expect("a generator runs above its resumer");
                 let caller_body = &self.functions[caller.function.index()];
@@ -4407,7 +4646,7 @@ impl VerifiedModule {
             | Instruction::GeneratorResume(dst, generator, _) => {
                 let supplied = match body.instructions[pc] {
                     Instruction::GeneratorResume(_, _, value) => {
-                        Some(stack[depth - 1].value(layout, value))
+                        Some(stack.frame(depth - 1).value(layout, value))
                     }
                     _ => None,
                 };
@@ -4477,7 +4716,7 @@ impl VerifiedModule {
                     }
                 }
                 resumed.generator = Some((id, dst));
-                stack.push(resumed);
+                stack.push_detached(resumed);
             }
             Instruction::GeneratorClose(generator) => {
                 let held = self
@@ -4497,7 +4736,7 @@ impl VerifiedModule {
                 memory.close_generator(id);
             }
             Instruction::Return(value) => {
-                let mut value = value.map(|reg| frame.value(layout, reg));
+                let mut value = value.map(|_| frame.value_at(layout.operands(pc).one()));
                 if let Some(wrapped) = frame.wrap.take() {
                     value = Some(match (wrapped, value) {
                         (Some(ty), Some(value)) => FrameValue::Dynamic(Box::new((ty, value))),
@@ -4529,7 +4768,7 @@ impl VerifiedModule {
                 if let Some(block) = finalizing {
                     memory.finish_finalizer(block);
                 }
-                let Some(caller) = stack.last_mut() else {
+                let Some(mut caller) = stack.last_mut() else {
                     return Ok(StepOutcome::Returned(value));
                 };
                 let caller_body = &self.functions[caller.function.index()];
@@ -4629,7 +4868,9 @@ impl VerifiedModule {
                     };
                     *held == variant
                 };
-                stack[depth - 1].set(layout, dst, Scalar::Bool(is));
+                stack
+                    .frame_mut(depth - 1)
+                    .set(layout, dst, Scalar::Bool(is));
             }
             Instruction::EnumExpect(src, variant) => {
                 let Composite::Enum { variant: held, .. } = frame.composite(layout, src) else {
@@ -4661,9 +4902,9 @@ impl VerifiedModule {
                 let payload = payload.clone();
                 frame.set_value(layout, dst, payload);
             }
-            Instruction::Float(op, dst, lhs, rhs) => {
-                let (Scalar::F64(lhs), Scalar::F64(rhs)) =
-                    (frame.get(layout, lhs), frame.get(layout, rhs))
+            Instruction::Float(op, ..) => {
+                let [dst, lhs, rhs] = layout.operands(pc).three();
+                let (Scalar::F64(lhs), Scalar::F64(rhs)) = (frame.get_at(lhs), frame.get_at(rhs))
                 else {
                     unreachable!("verified f64 operands");
                 };
@@ -4674,11 +4915,11 @@ impl VerifiedModule {
                         span: body.spans[pc],
                     },
                 )?;
-                frame.set(layout, dst, value);
+                frame.set_at(dst, value);
             }
-            Instruction::RealDivide(dst, lhs, rhs) => {
-                let (Scalar::I64(lhs), Scalar::I64(rhs)) =
-                    (frame.get(layout, lhs), frame.get(layout, rhs))
+            Instruction::RealDivide(..) => {
+                let [dst, lhs, rhs] = layout.operands(pc).three();
+                let (Scalar::I64(lhs), Scalar::I64(rhs)) = (frame.get_at(lhs), frame.get_at(rhs))
                 else {
                     unreachable!("verified integer operands");
                 };
@@ -4689,11 +4930,11 @@ impl VerifiedModule {
                         span: body.spans[pc],
                     });
                 }
-                frame.set(layout, dst, Scalar::from_f64(lhs as f64 / rhs as f64));
+                frame.set_at(dst, Scalar::from_f64(lhs as f64 / rhs as f64));
             }
-            Instruction::Boolean(op, dst, lhs, rhs) => {
-                let (Scalar::Bool(lhs), Scalar::Bool(rhs)) =
-                    (frame.get(layout, lhs), frame.get(layout, rhs))
+            Instruction::Boolean(op, ..) => {
+                let [dst, lhs, rhs] = layout.operands(pc).three();
+                let (Scalar::Bool(lhs), Scalar::Bool(rhs)) = (frame.get_at(lhs), frame.get_at(rhs))
                 else {
                     unreachable!("verified boolean operands");
                 };
@@ -4703,10 +4944,11 @@ impl VerifiedModule {
                 } else {
                     !equal
                 };
-                frame.set(layout, dst, Scalar::Bool(value));
+                frame.set_at(dst, Scalar::Bool(value));
             }
-            Instruction::NegateInteger(dst, src) => {
-                let Scalar::I64(value) = frame.get(layout, src) else {
+            Instruction::NegateInteger(..) => {
+                let [dst, src] = layout.operands(pc).two();
+                let Scalar::I64(value) = frame.get_at(src) else {
                     unreachable!("verified integer operand");
                 };
                 let value = value.checked_neg().ok_or(RunError::IntegerOverflow {
@@ -4714,28 +4956,32 @@ impl VerifiedModule {
                     instruction: from,
                     span: body.spans[pc],
                 })?;
-                frame.set(layout, dst, Scalar::I64(value));
+                frame.set_at(dst, Scalar::I64(value));
             }
-            Instruction::NegateFloat(dst, src) => {
-                let Scalar::F64(bits) = frame.get(layout, src) else {
+            Instruction::NegateFloat(..) => {
+                let [dst, src] = layout.operands(pc).two();
+                let Scalar::F64(bits) = frame.get_at(src) else {
                     unreachable!("verified f64 operand");
                 };
-                frame.set(layout, dst, Scalar::from_f64(-f64::from_bits(bits)));
+                frame.set_at(dst, Scalar::from_f64(-f64::from_bits(bits)));
             }
-            Instruction::Not(dst, src) => {
-                let Scalar::Bool(value) = frame.get(layout, src) else {
+            Instruction::Not(..) => {
+                let [dst, src] = layout.operands(pc).two();
+                let Scalar::Bool(value) = frame.get_at(src) else {
                     unreachable!("verified boolean operand");
                 };
-                frame.set(layout, dst, Scalar::Bool(!value));
+                frame.set_at(dst, Scalar::Bool(!value));
             }
-            Instruction::IntegerToFloat(dst, src) => {
-                let Scalar::I64(value) = frame.get(layout, src) else {
+            Instruction::IntegerToFloat(..) => {
+                let [dst, src] = layout.operands(pc).two();
+                let Scalar::I64(value) = frame.get_at(src) else {
                     unreachable!("verified integer operand");
                 };
-                frame.set(layout, dst, Scalar::from_f64(value as f64));
+                frame.set_at(dst, Scalar::from_f64(value as f64));
             }
-            Instruction::FloatToInteger(dst, src) => {
-                let Scalar::F64(bits) = frame.get(layout, src) else {
+            Instruction::FloatToInteger(..) => {
+                let [dst, src] = layout.operands(pc).two();
+                let Scalar::F64(bits) = frame.get_at(src) else {
                     unreachable!("verified f64 operand");
                 };
                 let value = float_to_integer(f64::from_bits(bits)).ok_or(
@@ -4745,7 +4991,7 @@ impl VerifiedModule {
                         span: body.spans[pc],
                     },
                 )?;
-                frame.set(layout, dst, Scalar::I64(value));
+                frame.set_at(dst, Scalar::I64(value));
             }
             Instruction::Closure(dst, target, list) => {
                 let captures = body.lists[list.index()]
@@ -4877,7 +5123,7 @@ impl VerifiedModule {
                 frame.set(layout, dst, Scalar::I64(length));
             }
             Instruction::ArrayLoad(dst, array, list) => {
-                let offset = element_offset(frame, layout, body.array_bounds(array).1, list, body)
+                let offset = element_offset(&frame, layout, body.array_bounds(array).1, list, body)
                     .ok_or(RunError::IndexOutOfBounds {
                         function,
                         instruction: from,
@@ -4896,7 +5142,7 @@ impl VerifiedModule {
                 frame.set_value(layout, dst, value);
             }
             Instruction::ArrayStore(array, list, value) => {
-                let offset = element_offset(frame, layout, body.array_bounds(array).1, list, body)
+                let offset = element_offset(&frame, layout, body.array_bounds(array).1, list, body)
                     .ok_or(RunError::IndexOutOfBounds {
                         function,
                         instruction: from,
@@ -4915,8 +5161,9 @@ impl VerifiedModule {
                 let length = i64::try_from(elements.len()).unwrap_or(i64::MAX);
                 frame.set(layout, dst, Scalar::I64(length));
             }
-            Instruction::CheckStep(step) => {
-                if frame.get(layout, step) == Scalar::I64(0) {
+            Instruction::CheckStep(_) => {
+                let step = layout.operands(pc).one();
+                if frame.get_at(step) == Scalar::I64(0) {
                     return Err(RunError::ZeroStep {
                         function,
                         instruction: from,
@@ -4951,19 +5198,18 @@ impl VerifiedModule {
                     window: None,
                 });
                 let values = [receiver, FrameValue::Allocation(allocation)];
-                let mut next = Frame::new(routine, target, values.into_iter(), None);
+                let mut next = FrameHeader::new(routine, None);
                 next.finalizing = Some(block);
-                stack.push(next);
+                stack.enter(next, target, values.into_iter());
             }
         }
         Ok(StepOutcome::Continue)
     }
-
     /// The value an operand's place holds, borrowed in place. `None` when a
     /// module variable is not assigned yet.
     fn container_ref<'a>(
         &self,
-        stack: &'a [Frame],
+        stack: &'a FrameStack,
         memory: &'a Memory,
         body: &VerifiedFunction,
         source: Register,
@@ -4972,10 +5218,10 @@ impl VerifiedModule {
             unreachable!("active execution has a frame");
         };
         let layout = body.frame_layout();
-        let place = place_of(body, frame, layout, stack.len(), source);
+        let place = place_of(body, &frame, layout, stack.len(), source);
         let root = match place.root {
             Root::Frame { frame, register } => {
-                let owner = &stack[frame];
+                let owner = stack.frame(frame);
                 let owner_layout = self.functions[owner.function.index()].frame_layout();
                 owner.slots[slot(owner_layout, register)].as_ref()
             }
@@ -4997,7 +5243,7 @@ impl VerifiedModule {
     /// Like [`Self::container_ref`], for mutation.
     fn container_mut<'a>(
         &self,
-        stack: &'a mut [Frame],
+        stack: &'a mut FrameStack,
         memory: &'a mut Memory,
         body: &VerifiedFunction,
         source: Register,
@@ -5007,7 +5253,7 @@ impl VerifiedModule {
             let Some(frame) = stack.last() else {
                 unreachable!("active execution has a frame");
             };
-            place_of(body, frame, body.frame_layout(), depth, source)
+            place_of(body, &frame, body.frame_layout(), depth, source)
         };
         let root = self.root_slot(stack, memory, &place.root);
         match root {
@@ -5020,7 +5266,7 @@ impl VerifiedModule {
     /// array or vector it is.
     fn sequence_window(
         &self,
-        stack: &[Frame],
+        stack: &FrameStack,
         memory: &Memory,
         body: &VerifiedFunction,
         source: Register,
@@ -5049,7 +5295,7 @@ impl VerifiedModule {
     /// The elements of the array or slice an operand stands for.
     fn sequence_elements(
         &self,
-        stack: &[Frame],
+        stack: &FrameStack,
         memory: &Memory,
         body: &VerifiedFunction,
         source: Register,
@@ -5082,7 +5328,7 @@ impl VerifiedModule {
     /// behind its loan. `None` when a module variable is not assigned yet.
     fn held_value(
         &self,
-        stack: &[Frame],
+        stack: &FrameStack,
         memory: &Memory,
         body: &VerifiedFunction,
         source: Register,
@@ -5104,10 +5350,10 @@ impl VerifiedModule {
 
     /// A copy of the value at a place's root, or `None` when a global has
     /// not been assigned yet.
-    fn root_value(&self, stack: &[Frame], memory: &Memory, root: &Root) -> Option<FrameValue> {
+    fn root_value(&self, stack: &FrameStack, memory: &Memory, root: &Root) -> Option<FrameValue> {
         match *root {
             Root::Frame { frame, register } => {
-                let owner = &stack[frame];
+                let owner = stack.frame(frame);
                 let layout = self.functions[owner.function.index()].frame_layout();
                 Some(owner.value(layout, register))
             }
@@ -5124,15 +5370,15 @@ impl VerifiedModule {
 
     fn root_slot<'a>(
         &self,
-        stack: &'a mut [Frame],
+        stack: &'a mut FrameStack,
         memory: &'a mut Memory,
         root: &Root,
     ) -> &'a mut Option<FrameValue> {
         match *root {
             Root::Frame { frame, register } => {
-                let owner = &mut stack[frame];
+                let owner = stack.frame_mut(frame);
                 let layout = self.functions[owner.function.index()].frame_layout();
-                owner.slot_mut(layout, register)
+                &mut owner.slots[slot(layout, register)]
             }
             Root::Global(global) => &mut memory.globals[global.index()],
             Root::Heap(object) => &mut memory.heap.slots[object],
@@ -5156,7 +5402,7 @@ impl VerifiedModule {
         &self,
         id: HostBindingId,
         call: &CallSite,
-        frame: &mut Frame,
+        frame: &mut FrameMut<'_>,
         layout: &FrameLayout,
         position: ExecutionPosition,
     ) -> Result<(), RunError> {
@@ -5733,7 +5979,7 @@ impl Activation {
         let ExecutionState::Active(stack) = &mut self.state else {
             return None;
         };
-        let frame = stack.last_mut()?;
+        let mut frame = stack.last_mut()?;
         let body = self.module.function(frame.function)?;
         if !arrival.reaches(next, body.instructions()) {
             return None;
@@ -5820,7 +6066,9 @@ impl Activation {
     /// The routines of the running task's frames, outermost first.
     pub fn call_stack(&self) -> Vec<FunctionId> {
         match &self.state {
-            ExecutionState::Active(stack) => stack.iter().map(|frame| frame.function).collect(),
+            ExecutionState::Active(stack) => {
+                stack.frames.iter().map(|frame| frame.function).collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -5877,7 +6125,9 @@ impl Activation {
             }
             _ => None,
         };
-        let live = frame.map(|frame| entry.initialized_at(instruction_id(frame.pc)));
+        let live = frame
+            .as_ref()
+            .map(|frame| entry.initialized_at(instruction_id(frame.pc)));
         entry
             .debug_locals()
             .iter()
@@ -5887,7 +6137,7 @@ impl Activation {
                         self.memory.globals.get(global.index())?.as_ref()?
                     }
                     DebugPlace::Register(register) => {
-                        let (frame, live) = (frame?, live.as_ref()?);
+                        let (frame, live) = (frame.as_ref()?, live.as_ref()?);
                         if !live.contains(&register) {
                             return None;
                         }
@@ -5951,7 +6201,7 @@ impl Activation {
     fn perform_native_call(
         module: &mut VerifiedModule,
         memory: &mut Memory,
-        stack: &mut Vec<Frame>,
+        stack: &mut FrameStack,
         frames: usize,
         destination: Register,
         declaration: u32,
@@ -6020,9 +6270,9 @@ impl Activation {
         let target = &module.functions[id.index()];
         let result = target.result;
         let values = arguments.into_iter().map(|(_, value)| value);
-        let mut next = Frame::new(id, target, values, Some(destination));
+        let mut next = FrameHeader::new(id, Some(destination));
         next.wrap = Some(result);
-        stack.push(next);
+        stack.enter(next, target, values);
         Ok(())
     }
 
@@ -6031,16 +6281,16 @@ impl Activation {
     fn perform_load(
         module: &mut VerifiedModule,
         memory: &mut Memory,
-        stack: &mut Vec<Frame>,
+        stack: &mut FrameStack,
         frames: usize,
         destination: Register,
         path: &str,
         span: Span,
     ) -> Result<(), RunError> {
         let top = stack.len() - 1;
-        let function = stack[top].function.index();
+        let function = stack.frame(top).function.index();
         let deliver = |module: &VerifiedModule,
-                       stack: &mut Vec<Frame>,
+                       stack: &mut FrameStack,
                        result: Result<FrameValue, Arc<FailureData>>| {
             let body = &module.functions[function];
             let (ok, err) = body.failure_result_runtime(destination);
@@ -6054,7 +6304,7 @@ impl Activation {
                     payload: Some(Box::new(FrameValue::Failure(failure))),
                 },
             };
-            stack[top].set_value(
+            stack.frame_mut(top).set_value(
                 body.frame_layout(),
                 destination,
                 FrameValue::Composite(composite),
@@ -6147,8 +6397,7 @@ impl Activation {
             return Ok(());
         };
         let mut pushed = vec![];
-        let target = &module.functions[builder.index()];
-        let mut factory = Frame::new(builder, target, std::iter::empty(), Some(destination));
+        let mut factory = FrameHeader::new(builder, Some(destination));
         factory.namespace = Some(imported.key);
         pushed.push(factory);
         for initializer in imported.initializers.into_iter().rev() {
@@ -6156,14 +6405,16 @@ impl Activation {
                 let Some(id) = module.lowered(initializer) else {
                     continue;
                 };
-                let target = &module.functions[id.index()];
-                pushed.push(Frame::new(id, target, std::iter::empty(), None));
+                pushed.push(FrameHeader::new(id, None));
             }
         }
         if stack.len() + pushed.len() > frames {
             return Err(RunError::FrameLimit);
         }
-        stack.extend(pushed);
+        for frame in pushed {
+            let target = &module.functions[frame.function.index()];
+            stack.enter(frame, target, std::iter::empty());
+        }
         Ok(())
     }
 
@@ -6320,7 +6571,7 @@ fn place_error(
 /// The place a register stands for: its loan's place, or the register itself.
 fn place_of(
     body: &VerifiedFunction,
-    frame: &Frame,
+    frame: &Frame<impl AsRef<[Slot]>, impl Borrow<FrameHeader>>,
     layout: &FrameLayout,
     depth: usize,
     source: Register,
@@ -6343,7 +6594,7 @@ fn place_of(
 /// register itself, extended by one step.
 fn project_base(
     body: &VerifiedFunction,
-    frame: &Frame,
+    frame: &Frame<impl AsRef<[Slot]>, impl Borrow<FrameHeader>>,
     layout: &FrameLayout,
     depth: usize,
     source: Register,
@@ -6420,7 +6671,7 @@ pub(crate) fn slice_mid(text: &str, start: i64, count: i64) -> Result<String, Te
 
 /// Row-major element offset, or `None` when an index leaves its bounds.
 fn element_offset(
-    frame: &Frame,
+    frame: &Frame<impl AsRef<[Slot]>, impl Borrow<FrameHeader>>,
     layout: &FrameLayout,
     bounds: &[(i64, i64)],
     list: super::OperandListId,

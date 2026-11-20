@@ -50,7 +50,12 @@ fn bytecode_can_verify_and_show_a_selected_routine() {
 
 #[test]
 fn moving_gc_cli_and_repl_reset_report_collections() {
-    for engine in ["interpreter", "jit", "cranelift", "cranelift_speed"] {
+    for engine in [
+        "legacy_interpreter",
+        "legacy_jit",
+        "legacy_cranelift",
+        "legacy_cranelift_speed",
+    ] {
         let result = cli(&[
             "run",
             "examples/simplified.psc",
@@ -72,7 +77,7 @@ fn moving_gc_cli_and_repl_reset_report_collections() {
         assert!(String::from_utf8_lossy(&result.stderr).contains("collections"));
     }
     let result = piped_repl(
-        "interpreter",
+        "legacy_interpreter",
         "let a = [1,2]\n:reset\nlet b = [3,4]\nstd::io::print(b[1])\n",
         &["--gc-stress", "--jit-trace=summary"],
     );
@@ -126,7 +131,11 @@ fn extensions_select_dialects_and_simplified_is_explicit() {
 }
 #[test]
 fn engines_run_simplified_source() {
-    for engine in ["interpreter", "cranelift", "cranelift_speed"] {
+    for engine in [
+        "legacy_interpreter",
+        "legacy_cranelift",
+        "legacy_cranelift_speed",
+    ] {
         let result = cli(&[
             "run",
             "examples/simplified.psc",
@@ -147,7 +156,11 @@ fn engines_run_simplified_source() {
 }
 #[test]
 fn input_and_eof_are_reported() {
-    for engine in ["interpreter", "cranelift", "cranelift_speed"] {
+    for engine in [
+        "legacy_interpreter",
+        "legacy_cranelift",
+        "legacy_cranelift_speed",
+    ] {
         let mut child = cli(&["run", "examples/input.psc", "--engine", engine])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -170,7 +183,7 @@ fn input_and_eof_are_reported() {
     }
 }
 #[test]
-fn verified_engine_reads_standard_input() {
+fn verified_engines_read_standard_input() {
     for (example, input, expected) in [
         ("examples/input.psc", "42\n", "Number?\n42\n"),
         (
@@ -179,32 +192,36 @@ fn verified_engine_reads_standard_input() {
             "Guess a whole number from 1 to 100.\nTry lower.\nPlease enter a whole number.\nTry higher.\nCorrect!\n",
         ),
     ] {
-        let mut child = cli(&["run", example, "--engine", "verified"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
-        let result = child.wait_with_output().unwrap();
-        assert!(result.status.success(), "{example}");
-        assert_eq!(
-            String::from_utf8_lossy(&result.stdout),
-            expected,
-            "{example}"
-        );
+        for engine in ["ng", "ng_jit"] {
+            let mut child = cli(&["run", example, "--engine", engine])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert!(result.status.success(), "{engine}: {example}");
+            assert_eq!(
+                String::from_utf8_lossy(&result.stdout),
+                expected,
+                "{engine}: {example}"
+            );
+        }
     }
-    let eof = cli(&["run", "examples/input.psc", "--engine", "verified"])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert!(!eof.status.success());
-    assert!(String::from_utf8_lossy(&eof.stderr).contains("INPUT reached end of input"));
+    for engine in ["ng", "ng_jit"] {
+        let eof = cli(&["run", "examples/input.psc", "--engine", engine])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!eof.status.success(), "{engine}");
+        assert!(String::from_utf8_lossy(&eof.stderr).contains("INPUT reached end of input"));
+    }
 }
 fn piped_repl(engine: &str, source: &str, extra: &[&str]) -> std::process::Output {
     let mut command = cli(&["repl", "--engine", engine]);
@@ -225,7 +242,11 @@ fn piped_repl(engine: &str, source: &str, extra: &[&str]) -> std::process::Outpu
 }
 #[test]
 fn repl_keeps_state_and_accepts_multiline_input() {
-    for engine in ["interpreter", "cranelift", "cranelift_speed"] {
+    for engine in [
+        "legacy_interpreter",
+        "legacy_cranelift",
+        "legacy_cranelift_speed",
+    ] {
         let result = piped_repl(
             engine,
             "let mut Count = 0\nCount = Count + 1\nCount\nlet Arr = std::collections::Vec[123]\nArr[0]\nif true {\nstd::io::print(7)\n}\n:quit\n",
@@ -246,7 +267,11 @@ fn repl_keeps_state_and_accepts_multiline_input() {
 }
 #[test]
 fn repl_recovers_from_errors_and_computation_limits() {
-    for engine in ["interpreter", "cranelift", "cranelift_speed"] {
+    for engine in [
+        "legacy_interpreter",
+        "legacy_cranelift",
+        "legacy_cranelift_speed",
+    ] {
         let result = piped_repl(
             engine,
             "let mut x = 1\nx = \"wrong\"\nx\nwhile true {\n}\nx + 1\n:reset\nx\n:quit\n",
@@ -263,7 +288,7 @@ fn repl_recovers_from_errors_and_computation_limits() {
 #[test]
 fn repl_input_consumes_the_next_line() {
     let result = piped_repl(
-        "interpreter",
+        "legacy_interpreter",
         "let mut n = 0\nstd::runtime::caie::input(&mut n)\n42\nn\n:quit\n",
         &[],
     );
@@ -349,7 +374,12 @@ fn modern_syntax_and_bytecode_are_inspectable() {
 }
 #[test]
 fn reports_show_metrics_without_changing_program_output() {
-    for engine in ["jit", "interpreter", "cranelift", "cranelift_speed"] {
+    for engine in [
+        "legacy_jit",
+        "legacy_interpreter",
+        "legacy_cranelift",
+        "legacy_cranelift_speed",
+    ] {
         let result = cli(&[
             "run",
             "examples/loops.psc",
@@ -376,12 +406,12 @@ fn reports_show_metrics_without_changing_program_output() {
         ] {
             assert!(report.contains(label), "missing {label}: {report}");
         }
-        if engine == "jit" {
+        if engine == "legacy_jit" {
             assert!(report.contains("interp -> winch"));
         }
     }
     let result = piped_repl(
-        "cranelift_speed",
+        "legacy_cranelift_speed",
         "let n = 42\nn\n:quit\n",
         &["--jit-trace=summary"],
     );
@@ -400,7 +430,7 @@ fn jit_report_preserves_inlining_and_has_compact_output() {
         "run",
         "examples/modern.ya",
         "--engine",
-        "cranelift_speed",
+        "legacy_cranelift_speed",
         "--jit-trace=summary",
     ])
     .output()
@@ -422,7 +452,7 @@ fn jit_report_preserves_inlining_and_has_compact_output() {
 #[test]
 fn summary_repl_counts_only_the_current_entry() {
     let result = piped_repl(
-        "cranelift_speed",
+        "legacy_cranelift_speed",
         "fn inc(n: i64) -> i64 { return n + 1 }\ninc(1)\ninc(2)\n:quit\n",
         &["--jit-trace=summary"],
     );
@@ -447,7 +477,12 @@ fn summary_repl_counts_only_the_current_entry() {
 
 #[test]
 fn concurrency_language_examples_execute_through_the_cli() {
-    for engine in ["interpreter", "jit", "cranelift", "cranelift_speed"] {
+    for engine in [
+        "legacy_interpreter",
+        "legacy_jit",
+        "legacy_cranelift",
+        "legacy_cranelift_speed",
+    ] {
         for (path, expected) in [
             (
                 "examples/concurrency/ownership/local-managed.ya",
@@ -483,7 +518,12 @@ fn concurrency_language_examples_execute_through_the_cli() {
 
 #[test]
 fn runtime_import_examples_execute_and_report_published_functions() {
-    for engine in ["interpreter", "jit", "cranelift", "cranelift_speed"] {
+    for engine in [
+        "legacy_interpreter",
+        "legacy_jit",
+        "legacy_cranelift",
+        "legacy_cranelift_speed",
+    ] {
         for (path, expected) in [
             (
                 "examples/modules/dynamic/main.ya",
@@ -543,7 +583,7 @@ fn trace_keeps_inlining_and_no_inline_turns_it_off() {
         "run",
         "examples/modern.ya",
         "--engine",
-        "cranelift_speed",
+        "legacy_cranelift_speed",
         "--jit-trace",
     ])
     .output()
@@ -557,7 +597,7 @@ fn trace_keeps_inlining_and_no_inline_turns_it_off() {
         "run",
         "examples/modern.ya",
         "--engine",
-        "cranelift_speed",
+        "legacy_cranelift_speed",
         "--jit-trace",
         "--jit-no-inline",
     ])
@@ -576,7 +616,7 @@ fn report_styles_follow_the_style_flag_and_color_policy() {
             "run",
             "examples/loops.psc",
             "--engine",
-            "jit",
+            "legacy_jit",
             "--jit-trace=summary",
         ];
         args.extend_from_slice(extra);
@@ -599,7 +639,7 @@ fn json_report_is_one_object_and_stdout_is_unchanged() {
         "run",
         "examples/loops.psc",
         "--engine",
-        "jit",
+        "legacy_jit",
         "--jit-trace=summary",
         "--jit-trace-format=json",
     ])
@@ -621,7 +661,7 @@ fn live_block_is_not_drawn_when_stderr_is_not_a_terminal() {
         "run",
         "examples/loops.psc",
         "--engine",
-        "jit",
+        "legacy_jit",
         "--jit-trace",
     ])
     .output()
@@ -639,7 +679,7 @@ fn json_trace_carries_the_timeline_for_the_viewer() {
         "run",
         "examples/mergesort.ya",
         "--engine",
-        "jit",
+        "legacy_jit",
         "--jit-trace",
         "--jit-trace-format=json",
     ])
@@ -680,7 +720,7 @@ fn jit_trace_out_writes_the_report_to_a_file_and_keeps_stderr_quiet() {
         "run",
         "examples/mergesort.ya",
         "--engine",
-        "jit",
+        "legacy_jit",
         "--jit-trace",
         "--jit-trace-format=json",
         "--jit-trace-out",
@@ -708,7 +748,12 @@ fn jit_trace_out_writes_the_report_to_a_file_and_keeps_stderr_quiet() {
 
 #[test]
 fn enum_examples_execute_through_the_cli() {
-    for engine in ["interpreter", "jit", "cranelift", "cranelift_speed"] {
+    for engine in [
+        "legacy_interpreter",
+        "legacy_jit",
+        "legacy_cranelift",
+        "legacy_cranelift_speed",
+    ] {
         for (path, expected) in [
             ("examples/enums/result.ya", "4\ncannot divide by 0\n"),
             ("examples/enums/patterns.ya", "positive: 7\nchanged\n2\n"),
@@ -729,7 +774,7 @@ fn enum_examples_execute_through_the_cli() {
 }
 
 #[test]
-fn verified_engine_matches_the_interpreter_on_supported_programs() {
+fn verified_engines_match_the_interpreter_on_supported_programs() {
     for example in [
         "examples/functions.psc",
         "examples/loops.psc",
@@ -779,9 +824,20 @@ fn verified_engine_matches_the_interpreter_on_supported_programs() {
         "examples/concurrency/modules/main.ya",
     ] {
         let run = |engine| cli(&["run", example, "--engine", engine]).output().unwrap();
-        let verified = run("verified");
+        let verified = run("ng");
         assert!(verified.status.success(), "{example}");
-        assert_eq!(verified.stdout, run("interpreter").stdout, "{example}");
+        let jit = run("ng_jit");
+        assert!(
+            jit.status.success(),
+            "{example}: {}",
+            String::from_utf8_lossy(&jit.stderr)
+        );
+        assert_eq!(jit.stdout, verified.stdout, "{example}");
+        assert_eq!(
+            verified.stdout,
+            run("legacy_interpreter").stdout,
+            "{example}"
+        );
     }
 }
 
@@ -796,7 +852,7 @@ fn unsupported_program() -> std::path::PathBuf {
 #[test]
 fn verified_engine_refuses_unsupported_programs_before_running() {
     let unsupported = unsupported_program();
-    let result = cli(&["run", unsupported.to_str().unwrap(), "--engine", "verified"])
+    let result = cli(&["run", unsupported.to_str().unwrap(), "--engine", "ng"])
         .output()
         .unwrap();
     assert!(!result.status.success());
@@ -813,7 +869,7 @@ fn the_default_engine_is_the_verified_interpreter() {
         "examples/rc-ownership.ya",
     ] {
         let default = cli(&["run", example]).output().unwrap();
-        let older = cli(&["run", example, "--engine", "interpreter"])
+        let older = cli(&["run", example, "--engine", "legacy_interpreter"])
             .output()
             .unwrap();
         assert!(default.status.success(), "{example}");
@@ -845,7 +901,11 @@ fn the_default_engine_is_the_verified_interpreter() {
 #[test]
 fn programs_the_verified_engine_cannot_lower_are_refused_without_fallback() {
     let path = unsupported_program();
-    for extra in [&[][..], &["--engine", "verified"][..]] {
+    for extra in [
+        &[][..],
+        &["--engine", "ng"][..],
+        &["--engine", "ng_jit"][..],
+    ] {
         let result = cli(&["run", path.to_str().unwrap()])
             .args(extra)
             .output()
@@ -854,11 +914,29 @@ fn programs_the_verified_engine_cannot_lower_are_refused_without_fallback() {
         assert!(result.stdout.is_empty(), "{extra:?}");
     }
     // The legacy engine runs it only when asked for by name.
-    let legacy = cli(&["run", path.to_str().unwrap(), "--engine", "jit"])
+    let legacy = cli(&["run", path.to_str().unwrap(), "--engine", "legacy_jit"])
         .output()
         .unwrap();
     assert!(legacy.status.success());
     assert_eq!(legacy.stdout, b"a\n");
+}
+
+#[test]
+fn ng_jit_runs_a_native_loop_and_an_interpreted_recursive_program() {
+    for (example, expected) in [
+        ("examples/hot-loop.ya", "5000050000:1\n"),
+        ("examples/fib.ya", "17711\n"),
+    ] {
+        let result = cli(&["run", example, "--engine", "ng_jit"])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{example}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(result.stdout, expected.as_bytes(), "{example}");
+    }
 }
 
 #[test]

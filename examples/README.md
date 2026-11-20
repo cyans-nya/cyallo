@@ -5,13 +5,16 @@ Run commands from the repository root. Modern examples use `.ya`; CAIE compatibi
 ```sh
 cargo run -- run examples/tour.ya
 cargo run -- check examples/generics.ya --jobs 4
-cargo run -- run examples/lookups.ya --engine cranelift_speed --gc-stress
+cargo run -- run examples/lookups.ya --engine legacy_cranelift_speed --gc-stress
 ```
 
-`--engine interpreter` runs without native compilation. `--engine jit` is the
-default; `cranelift` and `cranelift_speed` compile eagerly. `--jobs` controls
-front-end compilation workers. `--gc-stress` is useful on the short examples;
-`--gc` runs the longer allocation workload with normal collection intervals.
+`--engine ng` selects the default verified interpreter. For native execution,
+try `run examples/hot-loop.ya --engine ng_jit`.
+`--engine legacy_interpreter` selects the legacy interpreter, and
+`--engine legacy_jit` selects the legacy tiered JIT. `legacy_cranelift` and
+`legacy_cranelift_speed` compile eagerly. `--jobs` controls front-end
+compilation workers. `--gc-stress` is useful on the short examples, and `--gc`
+runs the longer allocation workload with normal collection intervals.
 
 ## Concurrency runtime sets
 

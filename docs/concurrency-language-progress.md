@@ -45,6 +45,10 @@ This tracker records verified language behavior. The runtime contract lives in
 - Instance-owned runtime state and synchronized root registries. Sessions remain
   exclusively accessed and are movable between threads; there is no scheduler
   TLS, global runtime service, or process-wide identity counter.
+- The verified interpreter keeps each task's frame slots in a contiguous value
+  stack. Task switches move that stack with its frame headers. A yielding generator
+  saves its own frame slots and resumes with its logical loans intact. The
+  verified task and generator tests exercise both paths.
 - Runtime `.ya` loads through `std::module::load(path)` suspend through the
   bounded host pool, inherit scoped standard-module permissions, and publish
   append-only code at a VM safe point. Checked module products retain their own

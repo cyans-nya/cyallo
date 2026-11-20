@@ -171,13 +171,15 @@ Source → AST → declarations → per-body checking/inference → typed contro
 
 Scalar/control instructions are 16-byte words with explicit register IDs, branch PCs, and type tags. Source spans and variable-sized operations live separately. `bytecode <file>` disassembles them; `bytecode <file> --wasm <function-id>` displays the optional legacy Wasm adapter. The native baseline consumes bytecode directly. The adapter requires matching runtime metadata and imports; it is not a standalone WASI application or a stable persisted package format.
 
-**Current engines (2026-11-20).** `run`, `repl` and `debug` default to the **verified pipeline**: typed IR is lowered to verified register bytecode (`src/bytecode/verified`) and run by a resumable interpreter (`cyallo::vm::Session`). There is no automatic fallback: a program it cannot lower (characters, 32-bit numbers, the simplified dialect's sparse arrays) is refused with a diagnostic, and `--jit-*` reports and inspection need a legacy engine named with `--engine`. The verified native tiers (`src/backend/verified`: Winch and two Cranelift profiles) already run scalars, floats, tuples and enums of scalars, loans, strings, output and fixed-size arrays with exact handoff to the interpreter, but the CLI does not select them yet; they are driven by tests. See [overhaul stages](docs/overhaul-stages.md), [native tiers: next steps](docs/native-tiers-next-steps.md) and the [legacy removal plan](docs/legacy-removal-plan.md).
+**Current engines (2026-11-20).** The **next-generation verified pipeline** lowers typed IR to verified register bytecode (`src/bytecode/verified`). `run`, `repl` and `debug` default to its resumable interpreter (`--engine ng` for `run` and `repl`). Both `ng` and `ng_jit` report a diagnostic for programs they cannot lower, including programs that use characters, 32-bit numbers, or the simplified dialect's sparse arrays. See [overhaul stages](docs/overhaul-stages.md), [native tiers: next steps](docs/native-tiers-next-steps.md) and the [legacy removal plan](docs/legacy-removal-plan.md).
 
-The rest of this section describes the **legacy tiered engine** (`--engine jit|interpreter|cranelift|cranelift_speed`, `--jit-*` reports and `cyallo trace`), which the legacy removal retires. Its default is `--engine jit`. A dedicated **`cyallo-codegen-N` worker pool** performs native compilation. The default worker count is `min(3, logical CPUs - 1)`, with one worker on single-core/unknown hosts. A Kanal-backed priority scheduler coalesces requests and retains the highest desired tier even while another job is queued or running. Hot upgrades take priority; aging gives older requests a turn. Code is installed on the execution thread at safepoints.
+`cyallo run examples/hot-loop.ya --engine ng_jit` compiles eligible verified routines before execution. It tries Winch first and low-latency Cranelift when Winch cannot emit a routine. Shared-runtime native code can hand off work to the verified interpreter. If the entry point cannot be published, the whole invocation runs on the verified interpreter. Reports and inspection using `--jit-*` require a legacy engine.
+
+The rest of this section describes the **legacy engines** (`--engine legacy_jit|legacy_interpreter|legacy_cranelift|legacy_cranelift_speed`, `--jit-*` reports and `cyallo trace`). A dedicated **`cyallo-codegen-N` worker pool** performs native compilation. The default worker count is `min(3, logical CPUs - 1)`, with one worker on single-core/unknown hosts. A Kanal-backed priority scheduler coalesces requests and retains the highest desired tier even while another job is queued or running. Hot upgrades take priority; aging gives older requests a turn. Code is installed on the execution thread at safepoints.
 
 The automatic JIT can proactively compile likely repeated work in the **[16, 128) bytecode-word window**. It uses syntax-only estimates, direct-call lookahead and recent compilation costs, then checks actual lowered size on a worker. It permits four outstanding eager jobs, 256 estimated speculative words and 2 ms of predicted compilation work. First entries share **one 1 ms wait budget per artifact**; a timeout continues interpretation. `TierPolicy::eager`, `first_call_wait`, and `TieredArtifact::hint_call_soon(function_id)` expose the policy. Set `TierPolicy::eager.enabled = false` to disable prediction for comparison.
 
-`run` with `jit` or `interpreter` checks declarations and the entry body up front. Other bodies are checked/lowered once on use or selection by the proactive JIT; unrelated cold bodies retain syntax without detailed analysis. A deferred semantic error is raised at its original span before that body executes. `check`, the `bytecode` command, debugging, explicit eager Cranelift engines, and the REPL fully validate bodies. Library `compile()` remains eager; use `compile_for_execution(source, options)` for deferred analysis. Dump flags do not force cold bodies to be analyzed.
+`run` with `legacy_jit` or `legacy_interpreter` checks declarations and the entry body up front. Other bodies are checked/lowered once on use or selection by the proactive JIT; unrelated cold bodies retain syntax without detailed analysis. A deferred semantic error is raised at its original span before that body executes. `check`, the `bytecode` command, debugging, explicit eager Cranelift engines, and the REPL fully validate bodies. Library `compile()` remains eager; use `compile_for_execution(source, options)` for deferred analysis. Dump flags do not force cold bodies to be analyzed.
 
 Modern functions and procedures accept independent routine attributes:
 
@@ -230,15 +232,15 @@ JIT reports are selected with `--jit-trace`:
 
 ```sh
 cargo build --release
-./target/release/cyallo run examples/osr-loop.ya --engine jit --jit-trace=summary
-./target/release/cyallo run examples/hot-loop.ya --engine cranelift_speed --jit-trace=summary
-./target/release/cyallo run examples/osr-loop.ya --engine jit --jit-trace
+./target/release/cyallo run examples/osr-loop.ya --engine legacy_jit --jit-trace=summary
+./target/release/cyallo run examples/hot-loop.ya --engine legacy_cranelift_speed --jit-trace=summary
+./target/release/cyallo run examples/osr-loop.ya --engine legacy_jit --jit-trace
 ```
 
 Trace files drive an interactive timeline viewer:
 
 ```sh
-./target/release/cyallo run examples/mergesort.ya --jit-trace --jit-trace-format=json --jit-trace-out trace.json
+./target/release/cyallo run examples/mergesort.ya --engine legacy_jit --jit-trace --jit-trace-format=json --jit-trace-out trace.json
 ./target/release/cyallo trace trace.json
 ```
 
@@ -252,11 +254,11 @@ Tiny programs can finish before compilation completes; the report shows pending 
 
 Cranelift inlines bounded direct scalar calls by default: small integer/boolean functions and procedures can run without VM frames. Small effectful procedures can share embedded code while retaining real frames and helper/GC boundaries; this path is opt-in through `CraneliftConfig.procedure_inlining`. Logical instructions and calls still count toward fuel and promotion thresholds. Full execution reporting disables both paths. Dynamic calls remain out of line, and native artifacts reject a replacement Program. Set `CraneliftConfig.inlining = false` to disable all inlining; see [routine optimization results](docs/routine-optimization-results.md).
 
-`--engine interpreter` disables native compilation. Both explicit Cranelift engines synchronously compile every routine with all-PC resume entries and link their native entry slots: `--engine cranelift` defaults to `opt_level=none` with backtracking (`Ion`) allocation; `--engine cranelift_speed` uses `opt_level=speed` with the same allocator. They share dispatch and resume structure, and neither builds selective-entry continuations or a large combined compiler graph. Speed optimization can increase compilation latency; it does not promise lower total latency on every short run. Effective configurations appear in `--jit-trace=summary`. Library embedders can use `CraneliftConfig` to vary optimization, combined/per-routine scope, resume strategy, and allocator independently. The default `--engine jit` retains automatic tiering with replaceable per-routine units. The public `TierPolicy` controls warm/hot thresholds, the speed body-size cap, and baseline admission.
+`--engine legacy_interpreter` disables native compilation. Both explicit Cranelift engines synchronously compile every routine with all-PC resume entries and link their native entry slots: `--engine legacy_cranelift` defaults to `opt_level=none` with backtracking (`Ion`) allocation; `--engine legacy_cranelift_speed` uses `opt_level=speed` with the same allocator. They share dispatch and resume structure, and neither builds selective-entry continuations or a large combined compiler graph. Speed optimization can increase compilation latency; it does not promise lower total latency on every short run. Effective configurations appear in `--jit-trace=summary`. Library embedders can use `CraneliftConfig` to vary optimization, combined/per-routine scope, resume strategy, and allocator independently. `--engine legacy_jit` uses automatic tiering with replaceable per-routine units. The public `TierPolicy` controls warm/hot thresholds, the speed body-size cap, and baseline admission.
 
 ```sh
-cyallo run program.ya --engine cranelift
-cyallo run program.ya --engine cranelift_speed
+cyallo run program.ya --engine legacy_cranelift
+cyallo run program.ya --engine legacy_cranelift_speed
 ```
 
 Native Winch and Cranelift read and write scalar registers and cells directly through a `repr(C)` VM view. Checked arithmetic, initialization checks, comparisons, and branches are native; PC and counters are batched at safepoints. Available native callees use stable entry slots across tiers. Scalar state is materialized before runtime calls, budget exits, and engine handoffs, preserving BYREF aliases and VM-frame OSR. Allocation, call setup/return, complex values, and I/O retain helpers; Winch uses native branch edges and a small write-through scalar register cache, with no Wasm/Wasmtime transitions in scalar loops. The old runtime adapter is available only with `--features wasm-adapter` for comparison. The CLI and benchmarks use [mimalloc](https://github.com/purpleprotocol/mimalloc_rust); library embedders choose their own allocator. See [architecture](docs/architecture.md) and [measurements](docs/benchmarks.md).

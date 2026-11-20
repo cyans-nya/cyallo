@@ -7,6 +7,7 @@ pub mod repl;
 pub use crate::runtime::{Context, Status};
 use crate::{
     Diagnostic, Span,
+    backend::verified::{CodeStore, Dispatch, ExecutionMode, NativeRunError},
     bytecode::verified::{
         Activation, ExecutionLimits, ExecutionStatus, GeneratorFault, InputSource, OutputSink,
         RunError, VerifiedModule,
@@ -24,6 +25,45 @@ use std::{
 
 /// Instructions one session may run in total.
 const TOTAL_FUEL: usize = usize::MAX;
+
+fn lower(program: Arc<Program>) -> Result<VerifiedModule, Diagnostic> {
+    VerifiedModule::lower_shared(program, 0)
+        .map_err(|error| Diagnostic::new("R900", error.to_string(), Span::default()))
+}
+
+/// Start a verified batch run, preferring published native code when available.
+/// The context supplies the frame limit, GC stress setting and random seed.
+/// The caller can configure input on the dispatch before the first slice.
+pub fn start_jit(program: Arc<Program>, context: &Context) -> Result<Dispatch, Diagnostic> {
+    let module = lower(program)?;
+    let limits = ExecutionLimits {
+        fuel: TOTAL_FUEL,
+        frames: context.max_frames,
+    };
+    let started = match CodeStore::new(module.clone()) {
+        Ok(mut store) => {
+            store.compile_available();
+            store.start(&[], limits, ExecutionMode::PreferNative)
+        }
+        Err(_) => module
+            .start(&[], limits)
+            .map(|activation| Dispatch::Interpreter(Box::new(activation)))
+            .map_err(NativeRunError::Guest),
+    };
+    let mut dispatch =
+        started.map_err(|error| Diagnostic::new("R900", error.to_string(), Span::default()))?;
+    match &mut dispatch {
+        Dispatch::Native(activation) => {
+            activation.set_gc_stress(context.gc.stress);
+            activation.set_random_seed(context.random_seed);
+        }
+        Dispatch::Interpreter(activation) => {
+            activation.set_gc_stress(context.gc.stress);
+            activation.set_random_seed(context.random_seed);
+        }
+    }
+    Ok(dispatch)
+}
 
 pub struct Session {
     /// Input queued for the program, and the output it has written so far.
@@ -46,8 +86,7 @@ impl Session {
     }
 
     pub fn with_context(program: Arc<Program>, context: Context) -> Result<Self, Diagnostic> {
-        let module = VerifiedModule::lower_shared(program.clone(), 0)
-            .map_err(|error| Diagnostic::new("R900", error.to_string(), Span::default()))?;
+        let module = lower(program.clone())?;
         Self::from_module(program, module, context)
     }
 
@@ -224,10 +263,7 @@ impl Session {
             }
             ExecutionStatus::Paused(_) => Status::Paused,
             ExecutionStatus::Returned(_) => Status::Finished,
-            ExecutionStatus::Failed(error) => Status::Failed(RuntimeFailure::new(
-                translate(error),
-                error.span().unwrap_or_default(),
-            )),
+            ExecutionStatus::Failed(error) => Status::Failed(error.into()),
         };
         &self.status
     }
@@ -295,6 +331,12 @@ impl Session {
         self.status = Status::Paused;
         self.cursor = 0;
         Ok(())
+    }
+}
+
+impl From<RunError> for RuntimeFailure {
+    fn from(error: RunError) -> Self {
+        Self::new(translate(error), error.span().unwrap_or_default())
     }
 }
 

@@ -5,7 +5,8 @@
 use cyallo::{
     CompileOptions, Dialect,
     backend::verified::{
-        CodeStore, CraneliftProfile, EntryPin, NativeTarget, NativeTier, Operation, PrepareError,
+        CodeStore, CraneliftProfile, Dispatch, EntryPin, NativeTarget, NativeTier, Operation,
+        PrepareError,
     },
     bytecode::verified::{
         ExecutionLimits, ExecutionStatus, FunctionId, InputSource, OutputSink, RunError, Scalar,
@@ -28,6 +29,41 @@ const TIERS: [NativeTier; 3] = [
     NativeTier::Cranelift(CraneliftProfile::LowLatency),
     NativeTier::Cranelift(CraneliftProfile::Optimized),
 ];
+
+#[test]
+fn ng_jit_enters_the_hot_loop_in_winch() {
+    if NativeTarget::host().is_none() {
+        return;
+    }
+    let program = Arc::new(compile(include_str!("../examples/hot-loop.ya")).unwrap());
+    let sum_to = program
+        .functions()
+        .iter()
+        .position(|routine| routine.name.as_ref() == "sum_to")
+        .unwrap();
+    let module = VerifiedModule::lower_shared(program.clone(), 0).unwrap();
+    let Dispatch::Native(mut activation) =
+        cyallo::vm::start_jit(program, &Default::default()).unwrap()
+    else {
+        panic!("expected a native entry");
+    };
+    let budget = 5_000;
+    let ExecutionStatus::Paused(position) = activation.resume(budget).unwrap() else {
+        panic!("expected to pause in the loop");
+    };
+    let event = activation.last_entry().unwrap();
+    assert_eq!(module.routine_of(position.function), Some(sum_to));
+    assert_eq!(event.origin.function, position.function);
+    assert_eq!(event.tier, NativeTier::Winch);
+    assert_eq!(activation.instructions_executed(), budget);
+}
+
+#[test]
+fn ng_jit_falls_back_for_unlinked_recursive_word_code() {
+    let program = Arc::new(compile(include_str!("../examples/fib.ya")).unwrap());
+    let dispatch = cyallo::vm::start_jit(program, &Default::default()).unwrap();
+    assert!(matches!(dispatch, Dispatch::Interpreter(_)));
+}
 
 fn module(source: &str) -> VerifiedModule {
     lower_entry(&compile(source).unwrap())

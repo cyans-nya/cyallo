@@ -16,6 +16,70 @@ impl FrameSlot {
 pub struct FrameLayout {
     slots: Box<[Option<FrameSlot>]>,
     slot_count: usize,
+    operands: Box<[FrameOperands]>,
+}
+
+/// Physical slots for frequently executed instructions, in operand order.
+/// The verified bytecode keeps the corresponding logical registers.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum FrameOperands {
+    Unprepared,
+    One(FrameSlot),
+    Two([FrameSlot; 2]),
+    Three([FrameSlot; 3]),
+}
+
+impl FrameOperands {
+    fn prepare(layout: &FrameLayout, instruction: Instruction) -> Option<Self> {
+        use Instruction::*;
+        let slot = |register| layout.slot(register);
+        Some(match instruction {
+            StorageLive(register)
+            | StorageDead(register)
+            | Constant(register, _)
+            | CheckStep(register)
+            | Branch(register, ..)
+            | Return(Some(register)) => Self::One(slot(register)?),
+            Copy(dst, src)
+            | Move(dst, src)
+            | NegateInteger(dst, src)
+            | NegateFloat(dst, src)
+            | Not(dst, src)
+            | IntegerToFloat(dst, src)
+            | FloatToInteger(dst, src)
+            | CountToInteger(dst, src)
+            | IntegerToCount(dst, src)
+            | Abs(dst, src) => Self::Two([slot(dst)?, slot(src)?]),
+            Integer(_, dst, lhs, rhs)
+            | Count(_, dst, lhs, rhs)
+            | Float(_, dst, lhs, rhs)
+            | Boolean(_, dst, lhs, rhs)
+            | RealDivide(dst, lhs, rhs)
+            | Extremum(_, dst, lhs, rhs) => Self::Three([slot(dst)?, slot(lhs)?, slot(rhs)?]),
+            _ => Self::Unprepared,
+        })
+    }
+
+    pub(super) fn one(self) -> FrameSlot {
+        match self {
+            Self::One(slot) => slot,
+            _ => unreachable!("verified instruction has one prepared slot"),
+        }
+    }
+
+    pub(super) fn two(self) -> [FrameSlot; 2] {
+        match self {
+            Self::Two(slots) => slots,
+            _ => unreachable!("verified instruction has two prepared slots"),
+        }
+    }
+
+    pub(super) fn three(self) -> [FrameSlot; 3] {
+        match self {
+            Self::Three(slots) => slots,
+            _ => unreachable!("verified instruction has three prepared slots"),
+        }
+    }
 }
 
 impl FrameLayout {
@@ -26,6 +90,20 @@ impl FrameLayout {
     /// Registers with no reachable storage lifetime have no frame slot.
     pub fn slot(&self, register: Register) -> Option<FrameSlot> {
         self.slots.get(register.index()).copied().flatten()
+    }
+
+    pub(super) fn prepare_operands(&mut self, instructions: &[Instruction]) {
+        self.operands = instructions
+            .iter()
+            .map(|&instruction| {
+                // Unreachable code can mention registers without a slot.
+                FrameOperands::prepare(self, instruction).unwrap_or(FrameOperands::Unprepared)
+            })
+            .collect();
+    }
+
+    pub(super) fn operands(&self, pc: usize) -> FrameOperands {
+        self.operands[pc]
     }
 }
 
@@ -103,6 +181,7 @@ impl LiveRanges {
         FrameLayout {
             slots: slots.into_boxed_slice(),
             slot_count,
+            operands: Box::new([]),
         }
     }
 }
