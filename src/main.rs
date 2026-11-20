@@ -169,9 +169,8 @@ enum Command {
     },
     /// Start a persistent interactive session (modern syntax by default).
     Repl {
-        /// Engine to run on. Default: the verified interpreter, or the legacy
-        /// tiered engine for the simplified dialect and when a JIT report is
-        /// asked for.
+        /// Engine to run on. Default: the verified interpreter. The other
+        /// engines are the legacy tiered engines, kept until they are removed.
         #[arg(long, value_enum)]
         engine: Option<Engine>,
         #[arg(long, default_value_t = 1_000_000, value_parser = clap::value_parser!(u64).range(1..))]
@@ -186,9 +185,9 @@ enum Command {
     },
     Run {
         file: PathBuf,
-        /// Engine to run on. Default: the verified interpreter, or the legacy
-        /// tiered engine when a program needs something it cannot lower or a
-        /// JIT report is asked for.
+        /// Engine to run on. Default: the verified interpreter, which refuses
+        /// a program it cannot lower. The other engines are the legacy tiered
+        /// engines, kept until they are removed.
         #[arg(long, value_enum)]
         engine: Option<Engine>,
     },
@@ -386,17 +385,19 @@ fn main() -> color_eyre::Result<()> {
             engine,
             max_instructions,
         } => {
-            let wants_legacy = runtime.jit_report
+            let reports = runtime.jit_report
                 || runtime.jit_notices
                 || runtime.jit_no_inline
-                || runtime.inspection.is_some()
-                || (engine.is_none() && options.dialect == cyallo::Dialect::Simplified);
-            if matches!(engine, Some(Engine::Verified)) || (engine.is_none() && !wants_legacy) {
+                || runtime.inspection.is_some();
+            if matches!(engine, None | Some(Engine::Verified)) {
+                if reports {
+                    legacy_option_error();
+                }
                 return repl_verified_cli(options, *max_instructions, cli.color, runtime);
             }
             let engine = match engine {
-                Some(Engine::Verified) | None => Engine::Jit,
                 Some(other) => *other,
+                None => unreachable!("handled above"),
             };
             return repl_cli(options, engine, *max_instructions, cli.color, runtime);
         }
@@ -528,17 +529,15 @@ fn main() -> color_eyre::Result<()> {
             }
         ),
         Command::Run { engine, .. } => {
-            // Reports and inspection are produced by the legacy engines.
-            let wants_legacy = runtime.jit_report
-                || runtime.jit_notices
-                || runtime.jit_no_inline
-                || runtime.inspection.is_some();
-            let try_verified = match engine {
-                Some(Engine::Verified) => Some(true),
-                None if !wants_legacy => Some(false),
-                _ => None,
-            };
-            if let Some(explicit) = try_verified {
+            if matches!(engine, None | Some(Engine::Verified)) {
+                // JIT reports and inspection are produced by the legacy engines.
+                if runtime.jit_report
+                    || runtime.jit_notices
+                    || runtime.jit_no_inline
+                    || runtime.inspection.is_some()
+                {
+                    legacy_option_error();
+                }
                 match cyallo::vm::Session::with_context(program.clone(), runtime.context()) {
                     Ok(session) => {
                         if !run_verified(session, &source_name, diagnostic_color, options.dialect)?
@@ -547,7 +546,7 @@ fn main() -> color_eyre::Result<()> {
                         }
                         return Ok(());
                     }
-                    Err(d) if explicit => {
+                    Err(d) => {
                         eprintln!(
                             "{}",
                             cyallo::diagnostics::render_program(
@@ -560,13 +559,11 @@ fn main() -> color_eyre::Result<()> {
                         );
                         std::process::exit(1);
                     }
-                    // The default falls back for programs it cannot lower yet.
-                    Err(_) => {}
                 }
             }
             let engine = match engine {
-                Some(Engine::Verified) | None => Engine::Jit,
                 Some(other) => other,
+                None => unreachable!("handled above"),
             };
             if !run(
                 program,
@@ -605,6 +602,14 @@ fn main() -> color_eyre::Result<()> {
 
     Ok(())
 }
+/// JIT reports, notices and inspection come from the legacy engines only.
+fn legacy_option_error() -> ! {
+    eprintln!(
+        "error: --jit-* reports and inspection need a legacy engine; pass --engine jit, interpreter, cranelift or cranelift_speed"
+    );
+    std::process::exit(2);
+}
+
 /// Instructions per slice of a verified run.
 const VERIFIED_SLICE: usize = 1_000_000;
 /// Run the program on the verified interpreter: output is written as it is

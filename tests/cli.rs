@@ -572,7 +572,13 @@ fn trace_keeps_inlining_and_no_inline_turns_it_off() {
 #[test]
 fn report_styles_follow_the_style_flag_and_color_policy() {
     let run = |extra: &[&str]| {
-        let mut args = vec!["run", "examples/loops.psc", "--jit-trace=summary"];
+        let mut args = vec![
+            "run",
+            "examples/loops.psc",
+            "--engine",
+            "jit",
+            "--jit-trace=summary",
+        ];
         args.extend_from_slice(extra);
         cli(&args).output().unwrap()
     };
@@ -592,6 +598,8 @@ fn json_report_is_one_object_and_stdout_is_unchanged() {
     let result = cli(&[
         "run",
         "examples/loops.psc",
+        "--engine",
+        "jit",
         "--jit-trace=summary",
         "--jit-trace-format=json",
     ])
@@ -609,9 +617,15 @@ fn json_report_is_one_object_and_stdout_is_unchanged() {
 
 #[test]
 fn live_block_is_not_drawn_when_stderr_is_not_a_terminal() {
-    let result = cli(&["run", "examples/loops.psc", "--jit-trace"])
-        .output()
-        .unwrap();
+    let result = cli(&[
+        "run",
+        "examples/loops.psc",
+        "--engine",
+        "jit",
+        "--jit-trace",
+    ])
+    .output()
+    .unwrap();
     assert!(result.status.success());
     let text = String::from_utf8_lossy(&result.stderr);
     assert!(text.contains("Execution report:"), "{text}");
@@ -624,6 +638,8 @@ fn json_trace_carries_the_timeline_for_the_viewer() {
     let result = cli(&[
         "run",
         "examples/mergesort.ya",
+        "--engine",
+        "jit",
         "--jit-trace",
         "--jit-trace-format=json",
     ])
@@ -663,6 +679,8 @@ fn jit_trace_out_writes_the_report_to_a_file_and_keeps_stderr_quiet() {
     let result = cli(&[
         "run",
         "examples/mergesort.ya",
+        "--engine",
+        "jit",
         "--jit-trace",
         "--jit-trace-format=json",
         "--jit-trace-out",
@@ -825,16 +843,31 @@ fn the_default_engine_is_the_verified_interpreter() {
 }
 
 #[test]
-fn programs_the_verified_engine_cannot_lower_fall_back_unless_it_is_asked_for() {
+fn programs_the_verified_engine_cannot_lower_are_refused_without_fallback() {
     let path = unsupported_program();
-    let fallback = cli(&["run", path.to_str().unwrap()]).output().unwrap();
-    assert!(fallback.status.success());
-    assert_eq!(fallback.stdout, b"a\n");
-    let asked = cli(&["run", path.to_str().unwrap(), "--engine", "verified"])
+    for extra in [&[][..], &["--engine", "verified"][..]] {
+        let result = cli(&["run", path.to_str().unwrap()])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(!result.status.success(), "{extra:?}");
+        assert!(result.stdout.is_empty(), "{extra:?}");
+    }
+    // The legacy engine runs it only when asked for by name.
+    let legacy = cli(&["run", path.to_str().unwrap(), "--engine", "jit"])
         .output()
         .unwrap();
-    assert!(!asked.status.success());
-    assert!(asked.stdout.is_empty());
+    assert!(legacy.status.success());
+    assert_eq!(legacy.stdout, b"a\n");
+}
+
+#[test]
+fn jit_reports_need_an_explicit_legacy_engine() {
+    let result = cli(&["run", "examples/loops.psc", "--jit-trace=summary"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("need a legacy engine"));
 }
 
 fn default_repl(source: &str, extra: &[&str]) -> std::process::Output {
