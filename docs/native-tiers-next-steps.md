@@ -1,13 +1,33 @@
 # Finishing the native tiers: instructions for the next sessions
 
-Native slices 1, 2a, 2b, 3a, 3b, 3c and 4.1 are implemented. The shared runtime
-also covers closures and calls, managed memory, input, module variables and randomness
-from 4.3–4.5. Goal from the
-project owner: **any code must be able to run in the native tiers**; the interpreter
-stays the reference and the fallback. Native work does not block the legacy removal
-([legacy-removal-plan.md](legacy-removal-plan.md)). Read
+Goal from the project owner: **any code must be able to run in the native tiers**; the
+interpreter stays the reference and the fallback. Native work does not block the legacy
+removal ([legacy-removal-plan.md](legacy-removal-plan.md)). Read
 [compiler-and-runtime-rules.md](compiler-and-runtime-rules.md) first: typed errors,
 declaration-based primitives, instance-owned runtime state.
+
+## 0. Status
+
+| Item | State | Commit |
+| --- | --- | --- |
+| Scalars, floats, booleans, conversions (slice 1) | done | `f40c048` |
+| Scalar composites, calls, recovery (2a); loans and projections (2b) | done | `f40c048`, `dfe503e` |
+| Output and strings through bridges (3a); string functions and slicing (3b) | done | `2347a19`, `599e3b8` |
+| Fixed-size scalar arrays with holes, element loans (3c) | done | `bd149a6` |
+| Dense scalar vectors and integer ranges (4.1) | done, **stopgap** (see 4.0) | `be6cc7f` |
+| Shared runtime: closures, calls, managed memory, input, globals, random (4.3-4.5) | done | `08269f5` |
+| `ng` and `ng_jit` in the CLI, contiguous interpreter frame stack | done | `fda2d2d` |
+| Tier-up Winch to Cranelift with sampling and a worker thread | done | `dc82b52` |
+| Cells, slices, sums, extrema (4.2) | open | |
+| `Vec<T>` as std code over a buffer primitive (4.0) | open, design agreed | |
+| Objects, services, module loads, generators, tasks, channels in native (4.6) | open | |
+| Fuel batching, lowering cleanups, Cranelift warm-up (4.8) | open | |
+| Caches (4.7), `u64` count arithmetic, chars, 32-bit, simplified dialect (4.9) | open | |
+
+Two modes exist and share one plan format: **word plans** keep every value in native
+frame words (fast, limited kinds); **shared-runtime plans** run scalar stretches natively
+and hand one instruction at a time to the verified interpreter (any kind, slower at each
+bridge). A function picks its mode (`uses_shared_runtime`).
 
 ## 1. How the native tier works today
 
@@ -91,7 +111,27 @@ per instruction (`Site::recover`).
 
 ## 4. Remaining work, in order
 
-### 4.1 Scalar vectors and ranges (implemented)
+### 4.0 Direction: collections are std code, not instructions
+Project owner's decision: avoid hardcoding collection behavior as instructions or
+bytecode; `Vec::push` should be an ordinary standard function, as in Rust. This follows
+`compiler-and-runtime-rules.md` (builtin behavior comes from `.ya` declarations) and the
+stage 9 migration in `overhaul-stages.md`. Plan:
+1. Memory primitives, trusted std-only declarations with stable identities: a typed raw
+   `Buffer<T>` with allocate, reallocate, free, element address and uninitialized load and
+   store. Bounds checks, growth policy and the 2^22 cap live in std source.
+2. `Vec<T>` (and later `VecDeque`, maps) written in `.ya` over `Buffer<T>`, with a generic
+   drop loop for elements; arrays with holes stay a language type or become std over the
+   same primitive.
+3. Native tiers then support only the primitives plus ordinary loads, stores and calls;
+   `push` is compiled and inlinable, and a `Vec` of plain values is as compact as in Rust.
+4. Costs to plan for: interpreter `push` becomes bytecode (add a fast path selected by
+   declaration identity, per the rules), drop glue needs the counted-owner work (4.4),
+   generic std bodies must monomorphize, and the primitives must be callable only from
+   trusted std declarations.
+The native `Vec` of 4.1 (`be6cc7f`) is a stopgap: do not extend it; when `Buffer<T>` lands,
+its layout, bridges and loan relocation come out.
+
+### 4.1 Scalar vectors and ranges (implemented; stopgap, see 4.0)
 
 Fixed arrays keep a written flag per element. Vectors store one word per initialized
 scalar in a buffer headed by length and capacity. Native instructions handle length,
@@ -160,12 +200,22 @@ first (`overhaul-stages.md` stage 7 describes guards and snapshots), then add na
 guards. Not needed for correctness.
 
 ### 4.8 Performance work after coverage
-Inlining of direct native calls, loop OSR from interpreter to native
-(`recover` is the reverse direction; OSR needs `import`), register-resident arrays
-(promote small fixed arrays to frame words), removing per-bridge spills, tiering policy
-(`Winch` first, `Cranelift` for hot code), and benchmarks recorded before/after
-(storage, startup, throughput). Rebuild JIT reports and the trace viewer on this tier
-(project owner: wanted, not urgent).
+Done: tier-up with sampling and a worker thread (section 8). Open, with the measured
+reason for each (`docs/native-tier-samples.md`):
+- **Fuel batching.** Cranelift still checks and decrements fuel on every instruction
+  (about 0.22 ns per instruction on scalar loops). Check once per basic block and step
+  instruction by instruction only near the budget; pause positions must stay exact.
+- **Lowering cleanups.** The loop in `osr-loop.ya` runs 27 verified instructions per
+  iteration because storage start and end and register copies each cost a unit of fuel.
+  Copy propagation and dead-storage removal in the lowering speed up the interpreter too.
+- **Cranelift warm-up.** The first Cranelift emit costs 1.4 ms more than later ones;
+  warm it on the worker when any function reaches a fraction of its threshold.
+- **Shared-runtime bridge cost.** Each bridge copies the live scalar homes in and out;
+  measure a loop with a bridged operation inside and batch consecutive bridges if it loses.
+- Inlining of direct native calls, register-resident small arrays, loop OSR from the
+  interpreter into native code (needs an `import` direction; `recover` is the reverse),
+  and rebuilding the JIT reports and trace viewer on this tier (wanted, not urgent).
+- Calibrate the tier-up constants on x86_64 and on call-heavy and enum-heavy code.
 
 ### 4.9 Native-ineligible leftovers to decide
 `u64` counts have one-word homes and checked conversions. Count arithmetic and
@@ -293,7 +343,7 @@ These points are not covered by a failing test; check them before building on th
    function picks its mode (`uses_shared_runtime`). Keep one conformance suite that runs
    every program in both modes, and decide whether the word mode stays once the shared
    runtime covers it, to avoid maintaining both.
-5. **Uncommitted work in flight.** At the time of the review the working tree had about
+5. **Uncommitted work in flight (resolved: committed as `fda2d2d`).** At the time of the review the working tree had about
    800 uncommitted lines in `src/bytecode/verified/run.rs`, `src/main.rs`, `src/vm.rs`,
    `src/backend/verified/{publish,run}.rs`, `src/bytecode/verified/frame.rs` and
    `src/report/model.rs`, and one `verified_composites` test failing only with them.
@@ -305,7 +355,7 @@ At this size wall time is dominated by startup (compile, lowering, tier publicat
 the loop, so the +0.7 ms is startup cost; use a longer loop (millions of iterations) and a
 startup-only run to separate them before drawing conclusions.
 
-## 8. Tier-up policy: data and proposal
+## 8. Tier-up policy: data and implementation
 
 Raw data: [native-tier-samples.md](native-tier-samples.md) (aarch64 macOS, release build,
 collected by a sampling agent; all 24 native runs matched the interpreter).
