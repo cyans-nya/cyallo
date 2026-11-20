@@ -183,12 +183,12 @@ fn arrays_hold_strings_and_cross_calls() {
 }
 
 #[test]
-fn vector_routines_stay_in_the_verified_interpreter() {
+fn arrays_of_text_stay_in_the_verified_interpreter() {
     use cyallo::backend::verified::{CodeVersion, NativeTarget, PreparedFunction};
     let Some(target) = NativeTarget::host() else {
         return;
     };
-    let program = compile("let v = Vec[1]\nstd::io::print(v[0])\n").unwrap();
+    let program = compile("let words = [\"a\", \"b\"]\nstd::io::print(words[0])\n").unwrap();
     let module = VerifiedModule::lower(&program, 0).unwrap();
     assert!(PreparedFunction::prepare(&module, module.entry(), CodeVersion(1), target).is_err());
 }

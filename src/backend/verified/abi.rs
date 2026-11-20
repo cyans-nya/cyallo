@@ -79,6 +79,10 @@ pub enum GuestRegister {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteOffset(pub u32);
 
+// A vector buffer starts with its length and capacity, followed by scalar words.
+pub(super) const VECTOR_HEADER_WORDS: usize = 2;
+pub(super) const VECTOR_HEADER_BYTES: u32 = (VECTOR_HEADER_WORDS * size_of::<u64>()) as u32;
+
 // The admitted targets use the host's 64-bit C pointer representation and
 // canonical scalar slot words. Pointers stay pointers at the Rust boundary.
 #[repr(C)]

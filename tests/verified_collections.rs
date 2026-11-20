@@ -166,12 +166,13 @@ fn ranges_and_growth_are_checked() {
 }
 
 #[test]
-fn collection_routines_stay_in_the_verified_interpreter() {
+fn vectors_of_strings_stay_in_the_verified_interpreter() {
     use cyallo::backend::verified::{CodeVersion, NativeTarget, PreparedFunction};
     let Some(target) = NativeTarget::host() else {
         return;
     };
-    let program = compile("let v = std::collections::Vec[1]\nstd::io::print(v.len())\n").unwrap();
+    let program =
+        compile("let v = std::collections::Vec[\"a\"]\nstd::io::print(v.len())\n").unwrap();
     let module = VerifiedModule::lower(&program, 0).unwrap();
     assert!(PreparedFunction::prepare(&module, module.entry(), CodeVersion(1), target).is_err());
 }

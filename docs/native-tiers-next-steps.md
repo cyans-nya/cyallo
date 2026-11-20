@@ -1,6 +1,6 @@
 # Finishing the native tiers: instructions for the next sessions
 
-State at commit `bd149a6` (native slices 1, 2a, 2b, 3a, 3b, 3c done). Goal from the
+Native slices 1, 2a, 2b, 3a, 3b, 3c and 4.1 are implemented. Goal from the
 project owner: **any code must be able to run in the native tiers**; the interpreter
 stays the reference and the fallback. Native work does not block the legacy removal
 ([legacy-removal-plan.md](legacy-removal-plan.md)). Read
@@ -13,17 +13,18 @@ Code map (all under `src/backend/verified/` unless noted):
 
 | File | Role |
 | --- | --- |
-| `prepare.rs` | Legalizes verified bytecode into a `PreparedFunction`: `Operation`s per instruction (`Site`), the frame map (`FrameMap`), layout table (`Layout`), word table (`WordOp`), bridge table (`BridgeCall`), array accesses (`ArrayAccess`), call table. **Anything not legalized returns `UnsupportedOperation`/`NonScalar` and the routine stays in the interpreter.** |
+| `prepare.rs` | Legalizes verified bytecode into a `PreparedFunction`: `Operation`s per instruction (`Site`), the frame map (`FrameMap`), layout table (`Layout`), word table (`WordOp`), bridge table (`BridgeCall`), element accesses (`ElementAccess`), call table. **Anything not legalized returns `UnsupportedOperation`/`NonScalar` and the routine stays in the interpreter.** |
 | `cranelift.rs`, `winch.rs` | Two adapters that emit machine code from the same plan. Every `Operation` needs both. Cranelift keeps frame words in SSA variables except *borrowed* words (see 3); Winch keeps every word in frame memory. |
-| `run.rs` | The driver: runs one native function per invocation, handles calls (copying words between frames), returns, failures, bridges, and recovery into the interpreter (`NativeActivation::recover`). Owns the `Heap` (strings, array buffers) and the output sink. |
+| `run.rs` | The driver: runs one native function per invocation, handles calls (copying words between frames), returns, failures, bridges, and recovery into the interpreter (`NativeActivation::recover`). Owns the `Heap` (strings, array and vector buffers) and the output sink. |
 | `abi.rs` | `ScalarOutcome` (Returned, Paused, Failed, Call, Bridge), `Failure` codes. |
 | `publish.rs`, `validate.rs`, `image.rs` | Code store, linking, image checks. |
 | `src/bytecode/verified/run.rs` | The interpreter (reference). Native recovery enters through `restore_scalars`, `RecoveredValue`, `RecoveredStep`. |
 
 Execution model: a frame is an array of 64-bit words. Scalars take one word; tuples/
 enums of scalars take consecutive words (`Layout`); a string is an index into the
-activation's string table; an array is the address of a buffer the activation owns; a
-loan is an address (element loans have the low bit set). A native function exits with
+activation's string table; arrays and vectors hold addresses of buffers owned by the
+activation. A loan is an address with the low bit set for fixed-array elements.
+A native function exits with
 `Paused` (out of budget), `Call`, `Bridge`, `Failed` or `Returned`; the driver acts and
 re-enters. Every exit leaves the frame in a state the interpreter can continue from:
 Cranelift **spills** initialized homes before `Call`/`Bridge`/`Paused`; recovery maps are
@@ -87,36 +88,21 @@ per instruction (`Site::recover`).
 
 ## 4. Remaining work, in order
 
-### 4.1 Vectors and ranges (next)
-Two collections, two representations (project owner's decision):
+### 4.1 Scalar vectors and ranges (implemented)
 
-- **Array (like a JS array, may have holes).** Fixed size, per-element *written* flag,
-  as implemented in slice 3c: two words per element, `UninitializedElement` on reading a
-  hole. Element loans are tagged addresses so a write through one fills the hole.
-- **Vec (like a Rust `Vec`).** Dense and compact: no holes, no flags, elements stored
-  back to back exactly like Rust. A native Vec register is one word, the address of a
-  heap block `[length, capacity, element 0, element 1, ...]` owned by the activation.
-  Elements take **one word each** at first; once the layouts exist, pack by element type
-  (`bool` as one byte, `i32` as four, composites of scalars inline at their layout size)
-  so that a Vec of plain values is as compact as in Rust. Element loans are plain
-  addresses (tag bit clear), since an element can never be a hole. Growth reallocates
-  (`VecPush` is a bridge or an inline fast path when `length < capacity`); the borrow
-  checker already forbids a live element loan across a push, so no loan fix-up is needed.
+Fixed arrays keep a written flag per element. Vectors store one word per initialized
+scalar in a buffer headed by length and capacity. Native instructions handle length,
+indexed access and element loans. Bridges handle creation, growth and deep copies.
+Ranges reuse the inline pair of signed bounds from verified bytecode. Inclusive
+range construction checks the end before incrementing it. Recovery restores vectors
+and their loans, including reborrows that the bytecode verifier accepts across growth.
+See the tests in [verified_native_bridges.rs](../tests/verified_native_bridges.rs).
 
-Instructions: `VecNew`, `VecFrom` (range to vector), `VecPush`, `VecLength`, and
-`ArrayLoad`/`ArrayStore`/`LoanElement` on vectors (`body.is_vec`/`projects_from_vec`
-select those paths; the bound is the length word, not a static range). `Clone` of a vector
-is a bridge deep copy. Ranges of integers are two words, so make them an inline
-`Layout::Range`: `RangeNew`, `RangeInclusive` (copy the interpreter's overflow check on
-the closed end).
+Pack vector elements by type once sub-word layouts exist. Support composite elements
+once their layout and copying rules are available. Whole-vector reads and writes
+through loans still use the interpreter. Elements with drop semantics wait for 4.4.
 
-Ownership as for arrays: copy is a bridge deep copy, by-value call arguments are
-deep-copied in the driver, `Move` transfers the address, `StorageDead` of an initialized
-Vec releases the block. Recovery: `RecoveredValue::Vec(Vec<Scalar>)` (the interpreter's
-`Composite::Vec` holds initialized elements only). Do `for x in range` loops first: they
-dominate `.ya` programs. Vec elements that need drop (text, `rc`, `gc`) wait for 4.4.
-
-### 4.2 Cells, slices, sums, extrema, remaining text
+### 4.2 Cells, slices, sums, extrema, remaining text (next)
 - `CellNew/Read/Write/Replace` of scalar contents: a cell is its content inline
   (`Layout::Cell` = element layout); reads and writes are word moves; shared-loan writes
   work because loans are addresses.
@@ -189,9 +175,10 @@ Inlining of direct native calls, loop OSR from interpreter to native
 (project owner: wanted, not urgent).
 
 ### 4.9 Native-ineligible leftovers to decide
-`u64` counts (`ScalarType::U64`) are rejected in `FrameMap::home`; add them (one word,
-unsigned compares). Chars and 32-bit numbers need verified kinds first (legacy-removal
-decisions 1-2). The simplified dialect needs sparse arrays in the verified engine first.
+`u64` counts have one-word homes and checked conversions. Count arithmetic and
+unsigned comparison instructions remain open. Chars and 32-bit numbers need
+verified kinds first (legacy-removal decisions 1-2). The simplified dialect needs
+sparse arrays in the verified engine first.
 
 ## 5. Interpreter-side prerequisites to remember
 - `Activation::restore_scalars` is the only way native frames re-enter the interpreter;

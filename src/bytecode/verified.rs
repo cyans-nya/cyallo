@@ -25,16 +25,16 @@ pub use codec::encode;
 pub use debug::{StatementArrival, StatementBoundary};
 pub use frame::{FrameLayout, FrameSlot};
 pub use lower::LowerError;
-pub(crate) use run::{
-    ScalarFrameSnapshot, render_recovered_output, slice_left, slice_mid, slice_right,
-    spell_recovered,
-};
-pub use run::{RecoveredStep, RecoveredValue};
 pub use run::ScalarRecoveryError;
 pub use run::{
     Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, GeneratorFault, HeapStats,
     InputSource, ObjectFault, OutputSink, PathFault, RunError, ServiceFault,
 };
+pub(crate) use run::{
+    MAX_VEC_ELEMENTS, ScalarFrameSnapshot, render_recovered_output, slice_left, slice_mid,
+    slice_right, spell_recovered,
+};
+pub use run::{RecoveredStep, RecoveredValue};
 pub use sdk::SdkCompileError;
 
 /// Version 35 adds debug locals and pseudo-random numbers. Version 34 adds native callables in erased values. Version 33 adds service contexts. Version 32 adds owned erased values, constant aggregates and count arithmetic. Version 31 adds run-time module loading. Version 30 adds by-value trait receivers. Version 29 adds open objects and erased values. Version 28 adds tasks and clocks. Version 27 adds channels. Version 26 adds generators. Version 25 adds retained field locations. Version 24 adds storage paths and mapped lookups. Version 23 adds interactive input. Version 22 adds trait objects and dynamic dispatch. Version 21 adds cloning, string transformations and integer helpers. Version 20 adds vectors, ranges and cells. Version 19 adds slices of arrays. Version 18 adds counted owners, moves and drops. Version 17 adds GC handles and the managed-type table. Version 16 adds module-level variables. Version 15 adds closures that borrow. Version 14 generalizes loans to any pointee and adds projected loans.
@@ -2029,7 +2029,7 @@ impl VerifiedFunction {
     }
 
     /// Whether a verified register holds a vector.
-    fn is_vec(&self, register: Register) -> bool {
+    pub(crate) fn is_vec(&self, register: Register) -> bool {
         matches!(
             self.register_kind(register),
             Ok(RegisterType::Composite(shape))
@@ -2038,7 +2038,7 @@ impl VerifiedFunction {
     }
 
     /// Whether a verified projection starts from a vector.
-    fn projects_from_vec(&self, source: Register) -> bool {
+    pub(crate) fn projects_from_vec(&self, source: Register) -> bool {
         matches!(
             self.projection_base(source),
             Ok((ValueType::Composite(shape), ..))

@@ -1,10 +1,12 @@
 //! Cranelift translation over the shared scalar native plan.
 
 use super::{
-    AbiLayout, Architecture, CraneliftMachineInfo, CraneliftProfile, EmitError, Failure, LoanBase,
-    MachineRange, MachineTrap, NativeHome, NativeTarget, NativeTier, Operation, Platform,
-    PreparedFunction, RecoverySlot, ScalarOutcome, Site, UnaryOp, UnlinkedImage, WordOp, WordRange,
-    abi::Edge, image::checked_source,
+    AbiLayout, Architecture, CraneliftMachineInfo, CraneliftProfile, ElementAccess, EmitError,
+    Failure, LoanBase, MachineRange, MachineTrap, NativeHome, NativeTarget, NativeTier, Operation,
+    Platform, PreparedFunction, RecoverySlot, ScalarOutcome, Site, UnaryOp, UnlinkedImage, WordOp,
+    WordRange,
+    abi::{Edge, VECTOR_HEADER_BYTES},
+    image::checked_source,
 };
 use crate::bytecode::verified::{BooleanOp, FloatOp, InstructionId, IntegerOp, Scalar};
 use cranelift::{
@@ -333,23 +335,52 @@ impl Lower<'_, '_> {
                 self.store(destination, value)?;
             }
             Words(range) => self.words(plan, range)?,
+            Range {
+                destination,
+                start,
+                end,
+                inclusive,
+            } => {
+                let start = self.load(start)?;
+                let end = self.load(end)?;
+                let end = if inclusive {
+                    let one = self.builder.ins().iconst(types::I64, 1);
+                    self.integer(IntegerOp::Add, pc, end, one)?
+                } else {
+                    end
+                };
+                self.store_at(destination.offset.0, start)?;
+                self.store_at(destination.offset.0 + 8, end)?;
+            }
+            VecLength { destination, base } => {
+                let buffer = self.buffer(base)?;
+                let length = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), buffer, 0);
+                self.store(destination, length)?;
+            }
             ArrayLoad {
                 destination,
                 array,
                 access,
             } => {
                 let buffer = self.load(array)?;
-                let element = self.element(plan, access, buffer, pc)?;
-                let written = self
-                    .builder
-                    .ins()
-                    .load(types::I64, MemFlagsData::new(), element, 0);
-                let unwritten = self.builder.ins().icmp_imm_s(IntCC::Equal, written, 0);
-                self.guard(unwritten, pc, Failure::UninitializedElement)?;
-                let value = self
-                    .builder
-                    .ins()
-                    .load(types::I64, MemFlagsData::new(), element, 8);
+                let (element, written_flag) = self.element(plan, access, buffer, pc)?;
+                if written_flag {
+                    let written =
+                        self.builder
+                            .ins()
+                            .load(types::I64, MemFlagsData::new(), element, 0);
+                    let unwritten = self.builder.ins().icmp_imm_s(IntCC::Equal, written, 0);
+                    self.guard(unwritten, pc, Failure::UninitializedElement)?;
+                }
+                let value = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    element,
+                    i32::from(written_flag) * 8,
+                );
                 self.store(destination, value)?;
             }
             ArrayStore {
@@ -358,34 +389,34 @@ impl Lower<'_, '_> {
                 access,
             } => {
                 let buffer = self.load(array)?;
-                let element = self.element(plan, access, buffer, pc)?;
+                let (element, written_flag) = self.element(plan, access, buffer, pc)?;
                 let value = self.load(value)?;
-                let one = self.builder.ins().iconst(types::I64, 1);
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), one, element, 0);
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), value, element, 8);
+                if written_flag {
+                    let one = self.builder.ins().iconst(types::I64, 1);
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), one, element, 0);
+                }
+                self.builder.ins().store(
+                    MemFlagsData::new(),
+                    value,
+                    element,
+                    i32::from(written_flag) * 8,
+                );
             }
             ElementLoan {
                 destination,
                 base,
                 access,
             } => {
-                let buffer = match base {
-                    LoanBase::Owner(owner) => self.load_at(owner.0)?,
-                    LoanBase::Loan(home) => {
-                        let place = self.load(home)?;
-                        let place = self.builder.ins().band_imm_s(place, -2);
-                        self.builder
-                            .ins()
-                            .load(types::I64, MemFlagsData::new(), place, 0)
-                    }
+                let buffer = self.buffer(base)?;
+                let (element, written_flag) = self.element(plan, access, buffer, pc)?;
+                // Arrays tag the value address so writes also set the flag.
+                let loan = if written_flag {
+                    self.builder.ins().iadd_imm_s(element, 9)
+                } else {
+                    element
                 };
-                let element = self.element(plan, access, buffer, pc)?;
-                // The value word, tagged so that writes also mark it written.
-                let loan = self.builder.ins().iadd_imm_s(element, 9);
                 self.store(destination, loan)?;
             }
             Bridge(_) => {
@@ -605,22 +636,56 @@ impl Lower<'_, '_> {
         Ok(value)
     }
 
-    /// The address of the element selected by the access's indices, after
-    /// checking each against its bounds.
+    fn buffer(&mut self, base: LoanBase) -> Result<Value, EmitError> {
+        match base {
+            LoanBase::Owner(owner) => self.load_at(owner.0),
+            LoanBase::Loan(home) => {
+                let place = self.load(home)?;
+                let place = self.builder.ins().band_imm_s(place, -2);
+                Ok(self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), place, 0))
+            }
+        }
+    }
+
+    /// Checks bounds and returns the element address and whether it has a written flag.
     fn element(
         &mut self,
         plan: &PreparedFunction,
         access: u32,
         buffer: Value,
         pc: InstructionId,
-    ) -> Result<Value, EmitError> {
+    ) -> Result<(Value, bool), EmitError> {
         let access = plan
-            .access(access)
-            .ok_or(EmitError::AbiOffsetOutOfRange)?
-            .clone();
+            .element_access(access)
+            .ok_or(EmitError::AbiOffsetOutOfRange)?;
+        let (bounds, indices) = match access {
+            ElementAccess::Vec { index } => {
+                let index = self.load(*index)?;
+                let length = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), buffer, 0);
+                // Unsigned comparison also rejects negative signed indices.
+                let bad = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, index, length);
+                self.guard(bad, pc, Failure::IndexOutOfBounds)?;
+                let bytes = self.builder.ins().ishl_imm_s(index, 3);
+                let data = self
+                    .builder
+                    .ins()
+                    .iadd_imm_s(buffer, i64::from(VECTOR_HEADER_BYTES));
+                return Ok((self.builder.ins().iadd(data, bytes), false));
+            }
+            ElementAccess::Array(array) => (&array.bounds, &array.indices),
+        };
         let mut offset = self.builder.ins().iconst(types::I64, 0);
         let mut bad: Option<Value> = None;
-        for (&(lower, upper), &home) in access.bounds.iter().zip(access.indices.iter()) {
+        for (&(lower, upper), &home) in bounds.iter().zip(indices.iter()) {
             let index = self.load(home)?;
             let below = self
                 .builder
@@ -644,7 +709,7 @@ impl Lower<'_, '_> {
             self.guard(bad, pc, Failure::IndexOutOfBounds)?;
         }
         let bytes = self.builder.ins().ishl_imm_s(offset, 4);
-        Ok(self.builder.ins().iadd(buffer, bytes))
+        Ok((self.builder.ins().iadd(buffer, bytes), true))
     }
 
     fn bits_as_float(&mut self, word: Value) -> Value {
@@ -717,6 +782,14 @@ impl Lower<'_, '_> {
             // Flipping the sign bit negates every binary64 value, NaN included.
             UnaryOp::NegateFloat => self.builder.ins().bxor_imm_s(source, i64::MIN),
             UnaryOp::Not => self.builder.ins().bxor_imm_s(source, 1),
+            UnaryOp::CountConversion => {
+                let high_bit = self
+                    .builder
+                    .ins()
+                    .icmp_imm_s(IntCC::SignedLessThan, source, 0);
+                self.guard(high_bit, pc, Failure::ConversionOutOfRange)?;
+                source
+            }
             UnaryOp::IntegerToFloat => {
                 let float = self.builder.ins().fcvt_from_sint(types::F64, source);
                 self.float_as_bits(float)

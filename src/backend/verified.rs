@@ -20,10 +20,11 @@ pub use image::{
     CraneliftMachineInfo, CraneliftProfile, EmitError, MachineRange, MachineTrap, NativeTier,
     Relocation, RelocationKind, UnlinkedImage,
 };
+use prepare::ElementAccess;
 pub use prepare::{
-    ArrayAccess, BridgeCall, Call, CallArgument, CodeVersion, FunctionVersion, Layout, LayoutId, LoanBase, NativeHome, Operation, Origin,
-    PrepareError, SliceKind, UnaryOp, WordOp, WordRange,
-    PreparedFunction, RecoverySlot, Site,
+    ArrayAccess, BridgeCall, Call, CallArgument, CodeVersion, FunctionVersion, Layout, LayoutId,
+    LoanBase, NativeHome, Operation, Origin, PrepareError, PreparedFunction, RecoverySlot, Site,
+    SliceKind, UnaryOp, WordOp, WordRange,
 };
 pub use publish::{CodeStore, EntryPin, PublishError};
 pub use run::{Dispatch, EntryEvent, ExecutionMode, NativeActivation, NativeRunError};

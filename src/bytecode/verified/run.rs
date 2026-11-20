@@ -929,7 +929,7 @@ struct Window {
 }
 
 /// Most elements a vector may hold.
-const MAX_VEC_ELEMENTS: usize = 1 << 22;
+pub(crate) const MAX_VEC_ELEMENTS: usize = 1 << 22;
 /// Most objects the heap may hold after a collection.
 const MAX_HEAP_OBJECTS: usize = 1 << 22;
 /// Live objects at which the first collection runs.
@@ -1943,6 +1943,7 @@ pub enum RecoveredValue {
     Text(Arc<str>),
     /// A fixed-size array of scalars; `None` is an element never written.
     Array(Vec<Option<Scalar>>),
+    Vec(Vec<Scalar>),
     /// A loan of the whole register `register` of the frame at stack index `frame`.
     Loan {
         frame: usize,
@@ -1978,7 +1979,9 @@ impl VerifiedFunction {
             (RecoveredValue::Loan { .. }, _) => None,
             (RecoveredValue::Text(text), ValueType::Text) => Some(FrameValue::Text(text.clone())),
             (RecoveredValue::Array(items), ValueType::Composite(id)) => {
-                let Shape::Array { element, bounds } = self.shape_table().get(usize::try_from(id.0).ok()?)? else {
+                let Shape::Array { element, bounds } =
+                    self.shape_table().get(usize::try_from(id.0).ok()?)?
+                else {
                     return None;
                 };
                 let ValueType::Scalar(expected) = element else {
@@ -1998,6 +2001,19 @@ impl VerifiedFunction {
                     })
                     .collect::<Option<Box<[_]>>>()?;
                 Some(FrameValue::Composite(Composite::Array(items)))
+            }
+            (RecoveredValue::Vec(items), ValueType::Composite(id)) => {
+                let Shape::Vec {
+                    element: ValueType::Scalar(expected),
+                } = self.shape_table().get(id.0 as usize)?
+                else {
+                    return None;
+                };
+                let items = items
+                    .iter()
+                    .map(|&scalar| (scalar.ty() == *expected).then_some(FrameValue::Scalar(scalar)))
+                    .collect::<Option<_>>()?;
+                Some(FrameValue::Composite(Composite::Vec(items)))
             }
             (RecoveredValue::Tuple(values), ValueType::Composite(id)) => {
                 let Shape::Tuple(fields) = self.shape_table().get(usize::try_from(id.0).ok()?)?

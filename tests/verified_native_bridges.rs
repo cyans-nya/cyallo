@@ -1,4 +1,4 @@
-//! Output and strings in native code, through runtime bridges. The verified
+//! Output, strings and collections in native code. The verified
 //! interpreter is the reference: results, printed lines and instruction counts
 //! must agree, also when a paused native frame continues in the interpreter.
 
@@ -10,7 +10,8 @@ use cyallo::{
     bytecode::verified::{
         ExecutionLimits, ExecutionStatus, FunctionId, OutputSink, Scalar, VerifiedModule,
     },
-    compile, compile_with_options,
+    compile, compile_for_execution, compile_with_options,
+    ir::Program,
 };
 use std::sync::{Arc, Mutex};
 
@@ -25,13 +26,16 @@ const TIERS: [NativeTier; 3] = [
 ];
 
 fn module(source: &str) -> VerifiedModule {
-    let program = compile(source).unwrap();
+    lower_entry(&compile(source).unwrap())
+}
+
+fn lower_entry(program: &Program) -> VerifiedModule {
     let index = program
         .functions()
         .iter()
         .position(|routine| routine.name.as_ref() == "entry")
         .unwrap();
-    VerifiedModule::lower(&program, index).unwrap()
+    VerifiedModule::lower(program, index).unwrap()
 }
 
 fn caie_module(source: &str) -> VerifiedModule {
@@ -107,6 +111,7 @@ fn check_module(module: VerifiedModule, cases: &[Vec<Scalar>]) {
             let (sink, wanted_lines) = capture();
             let mut reference = module.start(args, LIMITS).unwrap();
             reference.set_output(sink);
+            reference.set_gc_stress(true);
             let wanted = reference.resume(LIMITS.fuel);
 
             let (sink, lines) = capture();
@@ -130,10 +135,12 @@ fn check_module(module: VerifiedModule, cases: &[Vec<Scalar>]) {
                 let (sink, lines) = capture();
                 let mut native = pin.start(args, LIMITS).unwrap();
                 native.set_output(sink);
-                if !matches!(native.resume(budget).unwrap(), ExecutionStatus::Paused(_)) {
-                    continue;
-                }
+                assert!(
+                    matches!(native.resume(budget).unwrap(), ExecutionStatus::Paused(_)),
+                    "{tier:?} {args:?} should pause at {budget}"
+                );
                 let mut resumed = native.recover().unwrap();
+                resumed.set_gc_stress(true);
                 assert_eq!(
                     resumed.resume(LIMITS.fuel),
                     wanted,
@@ -143,6 +150,10 @@ fn check_module(module: VerifiedModule, cases: &[Vec<Scalar>]) {
                     *lines.lock().unwrap(),
                     *wanted_lines.lock().unwrap(),
                     "{tier:?} {args:?} output after recovery at {budget}"
+                );
+                assert_eq!(
+                    resumed.instructions_executed(),
+                    reference.instructions_executed()
                 );
             }
         }
@@ -348,4 +359,160 @@ fn caie_arrays_are_passed_by_value_to_native_functions() {
         "NEXT i\n",
         "OUTPUT Total(a), \" \", Total(a), \" \", a[1], \" \", a[2], \" \", a[3]\n",
     ));
+}
+
+#[test]
+fn scalar_vectors_grow_and_keep_independent_copies_across_native_calls() {
+    let source = r#"
+proc bump(x: &mut i64, by: i64) { x.* += by }
+proc fill(items: &mut Vec<i64>, n: i64) {
+    let original = items.len() as i64
+    for i in 0..n { items.push(i + original) }
+    bump(&mut items[0], n)
+}
+fn duplicate(items: &Vec<i64>) -> Vec<i64> {
+    return std::mem::clone(items)
+}
+proc change(source: Vec<i64>) -> i64 {
+    let mut items = source
+    items[0] = 90
+    items.push(91)
+    return items[0] + (items.len() as i64)
+}
+proc entry(n: i64) -> i64 {
+    let mut items = Vec::from(-2..=0)
+    let copy = duplicate(&items)
+    fill(&mut items, n)
+    std::io::print(items.len(), ":", items[0], ":", copy[0], ":", change(copy))
+    return (items.len() as i64) + items[0]
+}
+"#;
+    let cases = ints(&[0, 1, 7]);
+    check(source, &cases);
+    let deferred = compile_for_execution(source, CompileOptions::default()).unwrap();
+    check_module(lower_entry(&deferred), &cases);
+}
+
+#[test]
+fn empty_and_non_integer_vectors_use_dense_elements() {
+    check(
+        r#"
+proc entry(n: i64) -> i64 {
+    let mut flags = Vec<bool>[]
+    let mut samples = Vec[0.5, 1.0]
+    let empty = Vec::from(4..n)
+    flags.push(n > 0)
+    flags.push(false)
+    let first = &mut samples[0]
+    first.* = first.* + 1.5
+    samples.push(3.0)
+    std::io::print(flags[0], flags[1], samples[0], samples[2], empty.len())
+    return (flags.len() as i64) + (samples.len() as i64)
+}
+"#,
+        &ints(&[0, 1, 4]),
+    );
+}
+
+#[test]
+fn native_vector_bounds_and_range_failures_match_the_interpreter() {
+    for statement in [
+        "std::io::print(items[n])",
+        "items[n] = 7",
+        "let element = &mut items[n]\nelement.* = 3",
+    ] {
+        check(
+            &format!(
+                r#"
+proc entry(n: i64) {{
+    let mut items = Vec[4, 5]
+    items.push(6)
+    std::io::print("before")
+    {statement}
+}}
+"#
+            ),
+            &ints(&[-1, 2, 3, i64::MAX]),
+        );
+    }
+    check(
+        r#"
+proc entry(n: i64) {
+    std::io::print("before")
+    let items = Vec::from(-2..=n)
+    std::io::print(items.len())
+}
+"#,
+        &ints(&[-3, -2, 3, 1 << 22, i64::MAX]),
+    );
+    check(
+        r#"
+proc entry(n: u64) -> i64 {
+    let items = Vec[7]
+    return items[n]
+}
+"#,
+        &[vec![Scalar::U64(0)], vec![Scalar::U64(u64::MAX)]],
+    );
+    check(
+        r#"
+proc entry(n: i64) {
+    let items = Vec[7]
+    std::io::print(items[n as u64])
+}
+"#,
+        &ints(&[-1, 0]),
+    );
+    check(
+        r#"
+proc entry(n: u64) -> i64 {
+    let items = Vec[7]
+    std::io::print(items.len())
+    return n as i64
+}
+"#,
+        &[vec![Scalar::U64(0)], vec![Scalar::U64(u64::MAX)]],
+    );
+}
+
+#[test]
+fn vector_growth_preserves_an_element_reborrow_in_a_native_callee() {
+    check(
+        r#"
+proc append(items: &mut Vec<i64>) {
+    let element = &mut items[0]
+    items.push(2)
+    element.* = 4
+}
+proc entry() -> i64 {
+    let mut items = Vec[1]
+    append(&mut items)
+    return 10 * items[0] + items[1]
+}
+"#,
+        &[vec![]],
+    );
+}
+
+#[test]
+fn the_verifier_rejects_a_direct_push_with_a_live_exclusive_element_loan() {
+    use cyallo::bytecode::verified::{InvalidBytecode, LowerError};
+
+    let source = r#"
+proc append() {
+    let mut items = Vec[1]
+    let element = &mut items[0]
+    items.push(2)
+    element.* = 4
+}
+append()
+"#;
+    for program in [
+        compile(source).unwrap(),
+        compile_for_execution(source, CompileOptions::default()).unwrap(),
+    ] {
+        let error = VerifiedModule::lower(&program, 0).err().unwrap();
+        assert!(matches!(error, LowerError::Verification(error)
+                if matches!(error.kind, InvalidBytecode::ExclusiveOwnerAccess(_))));
+    }
 }

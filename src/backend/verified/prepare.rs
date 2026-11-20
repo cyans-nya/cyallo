@@ -34,8 +34,7 @@ pub struct LayoutId(pub u32);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Layout {
     Scalar(ScalarType),
-    /// A loan: one word holding the address of the borrowed words, which
-    /// stay in the owner's frame.
+    /// A loan: one word holding an address in a frame or collection buffer.
     Loan,
     /// A string: one word indexing the activation's string table.
     Text,
@@ -45,6 +44,8 @@ pub enum Layout {
         element: ScalarType,
         count: u32,
     },
+    /// An owned buffer of dense scalar words.
+    Vec(ScalarType),
     Tuple(Box<[Layout]>),
     Enum(Box<[Option<Layout>]>),
 }
@@ -52,7 +53,7 @@ pub enum Layout {
 impl Layout {
     pub fn words(&self) -> u32 {
         match self {
-            Self::Scalar(_) | Self::Loan | Self::Text | Self::Array { .. } => 1,
+            Self::Scalar(_) | Self::Loan | Self::Text | Self::Array { .. } | Self::Vec(_) => 1,
             Self::Tuple(fields) => fields.iter().map(Layout::words).sum(),
             Self::Enum(variants) => {
                 1 + variants
@@ -65,6 +66,10 @@ impl Layout {
         }
     }
 
+    pub(super) fn owns_buffer(&self) -> bool {
+        matches!(self, Self::Array { .. } | Self::Vec(_))
+    }
+
     /// Words before field `index` of a tuple.
     pub fn field_words(&self, index: usize) -> Option<u32> {
         let Self::Tuple(fields) = self else {
@@ -74,8 +79,7 @@ impl Layout {
     }
 }
 
-/// An operation the runtime performs for native code, which cannot do it in
-/// machine code: it holds strings and writes output.
+/// An operation performed by the runtime using activation-owned state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeCall {
     Print {
@@ -138,20 +142,39 @@ pub enum BridgeCall {
         count: u32,
         elements: Option<Box<[NativeHome]>>,
     },
-    /// An independent copy of an array.
-    CopyArray {
+    /// An independent copy of an array or vector.
+    CopyBuffer {
         destination: NativeHome,
-        source: NativeHome,
+        source: LoanBase,
     },
-    /// The array's lifetime ends here.
-    ReleaseArray(NativeHome),
+    /// The buffer's lifetime ends here.
+    ReleaseBuffer(NativeHome),
+    NewVec {
+        destination: NativeHome,
+        elements: Box<[NativeHome]>,
+    },
+    VecFromRange {
+        destination: NativeHome,
+        range: NativeHome,
+    },
+    VecPush {
+        target: LoanBase,
+        value: NativeHome,
+    },
 }
 
-/// The bounds and index operands of one array access.
+/// The bounds and index operands of one fixed array access.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArrayAccess {
     pub bounds: Box<[(i64, i64)]>,
     pub indices: Box<[NativeHome]>,
+}
+
+/// Indices of a fixed array or a vector whose bound is read from its buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ElementAccess {
+    Array(ArrayAccess),
+    Vec { index: NativeHome },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +273,17 @@ pub enum Operation {
     },
     /// Composite moves, built from word operations.
     Words(WordRange),
+    /// Store the range as the verified pair of signed bounds.
+    Range {
+        destination: NativeHome,
+        start: NativeHome,
+        end: NativeHome,
+        inclusive: bool,
+    },
+    VecLength {
+        destination: NativeHome,
+        base: LoanBase,
+    },
     /// The loan receives the address of the owner's first word.
     Borrow {
         destination: NativeHome,
@@ -279,7 +313,7 @@ pub enum Operation {
     NonZero(NativeHome),
     /// The runtime performs bridge call `index` of the plan.
     Bridge(u32),
-    /// Read an element by checked indices; an unwritten element fails.
+    /// Read a checked element. Reading an unwritten array element fails.
     ArrayLoad {
         destination: NativeHome,
         array: NativeHome,
@@ -291,8 +325,7 @@ pub enum Operation {
         value: NativeHome,
         access: u32,
     },
-    /// A loan of one element, whose address carries a tag in its low bit so
-    /// that a write through it also marks the element written.
+    /// A loan of one element. Array loans carry a tag so writes set the flag.
     ElementLoan {
         destination: NativeHome,
         base: LoanBase,
@@ -330,6 +363,8 @@ pub enum UnaryOp {
     IntegerToFloat,
     /// Truncates toward zero; a value outside the `i64` range or NaN fails.
     FloatToInteger,
+    /// Both directions require the same high bit to be clear.
+    CountConversion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,7 +416,7 @@ pub struct PreparedFunction {
     words: Box<[WordOp]>,
     borrowed: Box<[u32]>,
     bridges: Box<[BridgeCall]>,
-    accesses: Box<[ArrayAccess]>,
+    accesses: Box<[ElementAccess]>,
     sites: Box<[Site]>,
     calls: BTreeMap<InstructionId, Call>,
 }
@@ -499,7 +534,7 @@ impl PreparedFunction {
                 successor,
                 fuel: INSTRUCTION_FUEL,
                 recover,
-                failures: failures(operation),
+                failures: failures(operation, &map.accesses),
             });
             Ok(())
         })?;
@@ -573,6 +608,13 @@ impl PreparedFunction {
     }
 
     pub fn access(&self, index: u32) -> Option<&ArrayAccess> {
+        match self.element_access(index)? {
+            ElementAccess::Array(array) => Some(array),
+            ElementAccess::Vec { .. } => None,
+        }
+    }
+
+    pub(super) fn element_access(&self, index: u32) -> Option<&ElementAccess> {
         self.accesses.get(index as usize)
     }
 
@@ -607,7 +649,7 @@ fn result_kind(
     };
     match ty {
         ValueType::Scalar(scalar) => Ok((Some(scalar), None)),
-        other => match layout_of(body, other) {
+        other => match layout_of_top(body, other) {
             Some(layout) => Ok((None, Some(layout))),
             None => Err(PrepareError::NonScalarResult(FunctionId(0))),
         },
@@ -617,7 +659,6 @@ fn result_kind(
 /// The word layout of a value type, if it is made of scalars, tuples and enums.
 pub(super) fn layout_of(body: &VerifiedFunction, ty: ValueType) -> Option<Layout> {
     match ty {
-        ValueType::Scalar(ScalarType::U64) => None,
         ValueType::Scalar(scalar) => Some(Layout::Scalar(scalar)),
         ValueType::Text => Some(Layout::Text),
         ValueType::Composite(id) => match body.shape_table().get(usize::try_from(id.0).ok()?)? {
@@ -640,20 +681,27 @@ pub(super) fn layout_of(body: &VerifiedFunction, ty: ValueType) -> Option<Layout
     }
 }
 
-/// Like `layout_of`, but a fixed-size array of scalars is allowed: it can
-/// be a register or a loan's pointee, though not part of another value.
+/// Owned buffers may be registers or loan pointees, but do not nest.
 pub(super) fn layout_of_top(body: &VerifiedFunction, ty: ValueType) -> Option<Layout> {
-    if let ValueType::Composite(id) = ty
-        && let Some(Shape::Array { element, bounds }) =
-            body.shape_table().get(usize::try_from(id.0).ok()?)
-        && let ValueType::Scalar(scalar) = element
-        && *scalar != ScalarType::U64
-    {
-        let count = u32::try_from(crate::bytecode::verified::array_len(bounds)?).ok()?;
-        return Some(Layout::Array {
-            element: *scalar,
-            count,
-        });
+    if let ValueType::Composite(id) = ty {
+        match body.shape_table().get(id.0 as usize)? {
+            Shape::Array {
+                element: ValueType::Scalar(element),
+                bounds,
+            } => {
+                let count = u32::try_from(crate::bytecode::verified::array_len(bounds)?).ok()?;
+                return Some(Layout::Array {
+                    element: *element,
+                    count,
+                });
+            }
+            Shape::Vec {
+                element: ValueType::Scalar(element),
+            } => {
+                return Some(Layout::Vec(*element));
+            }
+            _ => {}
+        }
     }
     layout_of(body, ty)
 }
@@ -694,7 +742,7 @@ struct FrameMap<'a> {
     words: Vec<WordOp>,
     borrowed: std::collections::BTreeSet<u32>,
     bridges: Vec<BridgeCall>,
-    accesses: Vec<ArrayAccess>,
+    accesses: Vec<ElementAccess>,
 }
 
 impl<'a> FrameMap<'a> {
@@ -824,29 +872,52 @@ impl<'a> FrameMap<'a> {
         }
     }
 
-    /// Record the bounds and index homes of an array access.
-    fn array_access(
+    fn vector_base(
+        &mut self,
+        register: Register,
+        unsupported: PrepareError,
+    ) -> Result<LoanBase, PrepareError> {
+        let home = self.home(register)?;
+        match self.layout_of_home(home) {
+            Some(Layout::Vec(_)) => Ok(LoanBase::Owner(home.offset)),
+            Some(Layout::Loan) if self.body.projects_from_vec(register) => Ok(LoanBase::Loan(home)),
+            _ => Err(unsupported),
+        }
+    }
+
+    fn element_access(
         &mut self,
         array: Register,
         list: crate::bytecode::verified::OperandListId,
         unsupported: PrepareError,
-    ) -> Result<((), u32), PrepareError> {
-        let Some((_, bounds)) = array_shape(self.body, array) else {
-            return Err(unsupported);
-        };
+    ) -> Result<u32, PrepareError> {
         let indices: Box<[NativeHome]> = self.body.lists()[list.0 as usize]
             .iter()
             .map(|&register| self.home(register))
             .collect::<Result<_, _>>()?;
-        if indices.len() != bounds.len() || indices.iter().any(|home| home.layout.is_some()) {
-            return Err(unsupported);
-        }
+        let access = if self.body.projects_from_vec(array) {
+            self.vector_base(array, unsupported)?;
+            let [index] = *indices else {
+                return Err(unsupported);
+            };
+            ElementAccess::Vec { index }
+        } else {
+            let Some((_, bounds)) = array_shape(self.body, array) else {
+                return Err(unsupported);
+            };
+            if indices.len() != bounds.len()
+                || indices.iter().any(|home| home.ty != ScalarType::I64)
+            {
+                return Err(unsupported);
+            }
+            ElementAccess::Array(ArrayAccess {
+                bounds: bounds.into_boxed_slice(),
+                indices,
+            })
+        };
         let index = u32::try_from(self.accesses.len()).map_err(|_| PrepareError::FrameTooLarge)?;
-        self.accesses.push(ArrayAccess {
-            bounds: bounds.into_boxed_slice(),
-            indices,
-        });
-        Ok(((), index))
+        self.accesses.push(access);
+        Ok(index)
     }
 
     fn bridge(&mut self, call: BridgeCall) -> Result<Operation, PrepareError> {
@@ -984,12 +1055,15 @@ fn prepare_call(
     })
 }
 
-fn failures(operation: Operation) -> &'static [Failure] {
+fn failures(operation: Operation, accesses: &[ElementAccess]) -> &'static [Failure] {
     use IntegerOp::*;
     match operation {
         Operation::Integer {
             operation: Add | Subtract | Multiply,
             ..
+        }
+        | Operation::Range {
+            inclusive: true, ..
         } => &[Failure::Overflow],
         Operation::Integer {
             operation: Divide, ..
@@ -1008,12 +1082,15 @@ fn failures(operation: Operation) -> &'static [Failure] {
             ..
         } => &[Failure::Overflow],
         Operation::Unary {
-            operation: UnaryOp::FloatToInteger,
+            operation: UnaryOp::FloatToInteger | UnaryOp::CountConversion,
             ..
         } => &[Failure::ConversionOutOfRange],
         Operation::Variant { .. } => &[Failure::EnumVariant],
         Operation::NonZero(_) => &[Failure::ZeroStep],
-        Operation::ArrayLoad { .. } => &[Failure::IndexOutOfBounds, Failure::UninitializedElement],
+        Operation::ArrayLoad { access, .. } => match &accesses[access as usize] {
+            ElementAccess::Array(_) => &[Failure::IndexOutOfBounds, Failure::UninitializedElement],
+            ElementAccess::Vec { .. } => &[Failure::IndexOutOfBounds],
+        },
         Operation::ArrayStore { .. } | Operation::ElementLoan { .. } => {
             &[Failure::IndexOutOfBounds]
         }
@@ -1039,9 +1116,11 @@ fn legalize(
         Instruction::StorageLive(reg) => Operation::StorageLive(map.home(reg)?),
         Instruction::StorageDead(reg) => {
             let home = map.home(reg)?;
-            let array = matches!(map.layout_of_home(home), Some(Layout::Array { .. }));
-            if array && state[reg.0 as usize] == StorageState::Initialized {
-                map.bridge(BridgeCall::ReleaseArray(home))?
+            let owned = map
+                .layout_of_home(home)
+                .is_some_and(|layout| layout.owns_buffer());
+            if owned && state[reg.0 as usize] == StorageState::Initialized {
+                map.bridge(BridgeCall::ReleaseBuffer(home))?
             } else {
                 Operation::StorageDead(home)
             }
@@ -1052,13 +1131,24 @@ fn legalize(
         },
         Instruction::Copy(dst, src) | Instruction::Move(dst, src) => {
             let (destination, source) = (map.home(dst)?, map.home(src)?);
-            if matches!(map.layout_of_home(destination), Some(Layout::Array { .. }))
+            if map
+                .layout_of_home(destination)
+                .is_some_and(|layout| layout.owns_buffer())
                 && matches!(instruction, Instruction::Copy(..))
             {
-                return map.bridge(BridgeCall::CopyArray {
+                return map.bridge(BridgeCall::CopyBuffer {
                     destination,
-                    source,
+                    source: LoanBase::Owner(source.offset),
                 });
+            }
+            if matches!(instruction, Instruction::Move(..))
+                && matches!(map.layout_of_home(source), Some(Layout::Vec(_)))
+                && map.body.registers().iter().zip(state).any(|(kind, state)| {
+                    matches!(kind, RegisterType::Loan { origin: LoanOrigin::Local(owner), .. }
+                        if *owner == src && *state == StorageState::Initialized)
+                })
+            {
+                return Err(unsupported);
             }
             if destination.layout.is_some() {
                 if destination.layout != source.layout
@@ -1096,7 +1186,10 @@ fn legalize(
         }
         Instruction::ReadLoan(dst, loan) => {
             let destination = map.home(dst)?;
-            if matches!(map.layout_of_home(destination), Some(Layout::Array { .. })) {
+            if map
+                .layout_of_home(destination)
+                .is_some_and(|layout| layout.owns_buffer())
+            {
                 return Err(unsupported);
             }
             Operation::ReadLoan {
@@ -1107,7 +1200,10 @@ fn legalize(
         }
         Instruction::WriteLoan(loan, src) => {
             let source = map.home(src)?;
-            if matches!(map.layout_of_home(source), Some(Layout::Array { .. })) {
+            if map
+                .layout_of_home(source)
+                .is_some_and(|layout| layout.owns_buffer())
+            {
                 return Err(unsupported);
             }
             Operation::WriteLoan {
@@ -1300,6 +1396,13 @@ fn legalize(
             destination: map.home(dst)?,
             source: map.home(src)?,
         },
+        Instruction::CountToInteger(dst, src) | Instruction::IntegerToCount(dst, src) => {
+            Operation::Unary {
+                operation: UnaryOp::CountConversion,
+                destination: map.home(dst)?,
+                source: map.home(src)?,
+            }
+        }
         Instruction::Jump(to) => Operation::Jump(to),
         Instruction::Branch(condition, yes, no) => Operation::Branch {
             condition: map.home(condition)?,
@@ -1440,6 +1543,50 @@ fn legalize(
                 elements: Some(elements),
             })?
         }
+        Instruction::RangeNew(dst, start, end) | Instruction::RangeInclusive(dst, start, end) => {
+            Operation::Range {
+                destination: map.home(dst)?,
+                start: map.home(start)?,
+                end: map.home(end)?,
+                inclusive: matches!(instruction, Instruction::RangeInclusive(..)),
+            }
+        }
+        Instruction::VecNew(dst, list) => {
+            let destination = map.home(dst)?;
+            let elements = map.body.lists()[list.0 as usize]
+                .iter()
+                .map(|&register| map.home(register))
+                .collect::<Result<_, _>>()?;
+            map.bridge(BridgeCall::NewVec {
+                destination,
+                elements,
+            })?
+        }
+        Instruction::VecFrom(dst, range) => {
+            let (destination, range) = (map.home(dst)?, map.home(range)?);
+            map.bridge(BridgeCall::VecFromRange { destination, range })?
+        }
+        Instruction::VecPush(target, value) => {
+            let target = map.vector_base(target, unsupported)?;
+            let value = map.home(value)?;
+            map.bridge(BridgeCall::VecPush { target, value })?
+        }
+        Instruction::VecLength(dst, vector) => Operation::VecLength {
+            destination: map.home(dst)?,
+            base: map.vector_base(vector, unsupported)?,
+        },
+        Instruction::Clone(dst, src) if map.body.is_vec(dst) => {
+            let destination = map.home(dst)?;
+            let source = map.vector_base(src, unsupported)?;
+            map.bridge(BridgeCall::CopyBuffer {
+                destination,
+                source,
+            })?
+        }
+        Instruction::ArrayLength(dst, vector) if map.body.is_vec(vector) => Operation::VecLength {
+            destination: map.home(dst)?,
+            base: map.vector_base(vector, unsupported)?,
+        },
         Instruction::ArrayLength(dst, array) => {
             let Some((_, bounds)) = array_shape(map.body, array) else {
                 return Err(unsupported);
@@ -1452,7 +1599,7 @@ fn legalize(
             }
         }
         Instruction::ArrayLoad(dst, array, list) => {
-            let (_, access) = map.array_access(array, list, unsupported)?;
+            let access = map.element_access(array, list, unsupported)?;
             Operation::ArrayLoad {
                 destination: map.home(dst)?,
                 array: map.home(array)?,
@@ -1460,7 +1607,7 @@ fn legalize(
             }
         }
         Instruction::ArrayStore(array, list, value) => {
-            let (_, access) = map.array_access(array, list, unsupported)?;
+            let access = map.element_access(array, list, unsupported)?;
             Operation::ArrayStore {
                 array: map.home(array)?,
                 value: map.home(value)?,
@@ -1468,11 +1615,11 @@ fn legalize(
             }
         }
         Instruction::LoanElement(dst, src, list) => {
-            let (_, access) = map.array_access(src, list, unsupported)?;
+            let access = map.element_access(src, list, unsupported)?;
             let source = map.home(src)?;
             let base = match map.layout_of_home(source) {
                 Some(Layout::Loan) => LoanBase::Loan(source),
-                Some(Layout::Array { .. }) => LoanBase::Owner(source.offset),
+                Some(Layout::Array { .. } | Layout::Vec(_)) => LoanBase::Owner(source.offset),
                 _ => return Err(unsupported),
             };
             Operation::ElementLoan {
@@ -1534,12 +1681,6 @@ fn legalize(
         | Instruction::GcNew(..)
         | Instruction::Drop(..)
         | Instruction::MoveOut(..)
-        | Instruction::RangeNew(..)
-        | Instruction::RangeInclusive(..)
-        | Instruction::VecFrom(..)
-        | Instruction::VecNew(..)
-        | Instruction::VecPush(..)
-        | Instruction::VecLength(..)
         | Instruction::CellNew(..)
         | Instruction::CellRead(..)
         | Instruction::CellWrite(..)
@@ -1547,8 +1688,6 @@ fn legalize(
         | Instruction::Clone(..)
         | Instruction::TraitBox(..)
         | Instruction::Abs(..)
-        | Instruction::CountToInteger(..)
-        | Instruction::IntegerToCount(..)
         | Instruction::ParseInteger(..)
         | Instruction::ChannelBounded(..)
         | Instruction::ChannelUnbounded(..)

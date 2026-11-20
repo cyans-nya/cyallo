@@ -13,9 +13,9 @@ pub(super) use host::emit;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 mod host {
     use super::super::{
-        AbiLayout, EmitError, Failure, MachineRange, NativeHome, NativeTarget, NativeTier,
-        Operation, PreparedFunction, ScalarOutcome, Site, UnlinkedImage,
-        abi::{Edge, scalar_word},
+        AbiLayout, ElementAccess, EmitError, Failure, MachineRange, NativeHome, NativeTarget,
+        NativeTier, Operation, PreparedFunction, ScalarOutcome, Site, UnlinkedImage,
+        abi::{Edge, VECTOR_HEADER_BYTES, scalar_word},
         image::checked_source,
     };
     use super::super::{LoanBase, UnaryOp, WordOp, WordRange};
@@ -228,6 +228,28 @@ mod host {
                     self.store_home(VALUE, destination);
                 }
                 Words(range) => self.words(plan, range),
+                Range {
+                    destination,
+                    start,
+                    end,
+                    inclusive,
+                } => {
+                    if inclusive {
+                        self.load_home(LEFT, end);
+                        self.machine.imm(RIGHT, 1);
+                        self.checked(Arithmetic::Add, pc)?;
+                    } else {
+                        self.load_home(VALUE, end);
+                    }
+                    self.load_home(LEFT, start);
+                    self.store_home(LEFT, destination);
+                    self.store_at(VALUE, destination.offset.0 + 8);
+                }
+                VecLength { destination, base } => {
+                    self.buffer(base);
+                    self.machine.load(VALUE, VALUE, 0);
+                    self.store_home(VALUE, destination);
+                }
                 ArrayLoad {
                     destination,
                     array,
@@ -237,18 +259,23 @@ mod host {
                     let uninit = self.machine.label();
                     let done = self.machine.label();
                     self.load_home(VALUE, array);
-                    self.element(plan, access, oob)?;
-                    self.machine.load(LEFT, SAVED_DIVIDEND, 0);
-                    self.machine.imm(TEMP, 0);
-                    self.machine.compare(LEFT, TEMP);
-                    self.machine.branch(Condition::Eq, uninit);
-                    self.machine.load(VALUE, SAVED_DIVIDEND, 8);
+                    let written_flag = self.element(plan, access, oob)?;
+                    if written_flag {
+                        self.machine.load(LEFT, SAVED_DIVIDEND, 0);
+                        self.machine.imm(TEMP, 0);
+                        self.machine.compare(LEFT, TEMP);
+                        self.machine.branch(Condition::Eq, uninit);
+                    }
+                    self.machine
+                        .load(VALUE, SAVED_DIVIDEND, u32::from(written_flag) * 8);
                     self.store_home(VALUE, destination);
                     self.machine.jump(done);
                     self.machine.bind(oob);
                     self.fail(pc, Failure::IndexOutOfBounds)?;
                     self.machine.bind(uninit);
-                    self.fail(pc, Failure::UninitializedElement)?;
+                    if written_flag {
+                        self.fail(pc, Failure::UninitializedElement)?;
+                    }
                     self.machine.bind(done);
                 }
                 ArrayStore {
@@ -259,11 +286,14 @@ mod host {
                     let oob = self.machine.label();
                     let done = self.machine.label();
                     self.load_home(VALUE, array);
-                    self.element(plan, access, oob)?;
-                    self.machine.imm(TEMP, 1);
-                    self.machine.store(TEMP, SAVED_DIVIDEND, 0);
+                    let written_flag = self.element(plan, access, oob)?;
+                    if written_flag {
+                        self.machine.imm(TEMP, 1);
+                        self.machine.store(TEMP, SAVED_DIVIDEND, 0);
+                    }
                     self.load_home(VALUE, value);
-                    self.machine.store(VALUE, SAVED_DIVIDEND, 8);
+                    self.machine
+                        .store(VALUE, SAVED_DIVIDEND, u32::from(written_flag) * 8);
                     self.machine.jump(done);
                     self.machine.bind(oob);
                     self.fail(pc, Failure::IndexOutOfBounds)?;
@@ -276,20 +306,14 @@ mod host {
                 } => {
                     let oob = self.machine.label();
                     let done = self.machine.label();
-                    match base {
-                        LoanBase::Owner(owner) => self.load_at(VALUE, owner.0),
-                        LoanBase::Loan(home) => {
-                            self.load_home(VALUE, home);
-                            self.machine.imm(TEMP, !1u64);
-                            self.machine.binary(Arithmetic::And, VALUE, VALUE, TEMP);
-                            self.machine.load(VALUE, VALUE, 0);
-                        }
+                    self.buffer(base);
+                    let written_flag = self.element(plan, access, oob)?;
+                    if written_flag {
+                        self.machine.imm(TEMP, 9);
+                        self.machine
+                            .binary(Arithmetic::Add, SAVED_DIVIDEND, SAVED_DIVIDEND, TEMP);
                     }
-                    self.element(plan, access, oob)?;
-                    self.machine.imm(TEMP, 9);
-                    self.machine
-                        .binary(Arithmetic::Add, VALUE, SAVED_DIVIDEND, TEMP);
-                    self.store_home(VALUE, destination);
+                    self.store_home(SAVED_DIVIDEND, destination);
                     self.machine.jump(done);
                     self.machine.bind(oob);
                     self.fail(pc, Failure::IndexOutOfBounds)?;
@@ -548,6 +572,15 @@ mod host {
                     self.machine.float_to_bits(VALUE, 0);
                 }
                 UnaryOp::FloatToInteger => return Err(EmitError::UnsupportedOperation(pc)),
+                UnaryOp::CountConversion => {
+                    let valid = self.machine.label();
+                    self.machine.imm(TEMP, 0);
+                    self.machine.compare(LEFT, TEMP);
+                    self.machine.branch(Condition::Ge, valid);
+                    self.fail(pc, Failure::ConversionOutOfRange)?;
+                    self.machine.bind(valid);
+                    self.machine.mov(VALUE, LEFT);
+                }
             }
             Ok(())
         }
@@ -657,20 +690,48 @@ mod host {
             }
         }
 
-        /// Leaves the address of the selected element in SAVED_DIVIDEND, given
-        /// the buffer address in VALUE; an index out of its bounds jumps to `oob`.
+        fn buffer(&mut self, base: LoanBase) {
+            match base {
+                LoanBase::Owner(owner) => self.load_at(VALUE, owner.0),
+                LoanBase::Loan(home) => {
+                    self.load_home(VALUE, home);
+                    self.machine.imm(TEMP, !1u64);
+                    self.machine.binary(Arithmetic::And, VALUE, VALUE, TEMP);
+                    self.machine.load(VALUE, VALUE, 0);
+                }
+            }
+        }
+
+        /// Leaves the selected element address in SAVED_DIVIDEND and returns
+        /// whether it has a written flag. An out-of-bounds index jumps to `oob`.
         fn element(
             &mut self,
             plan: &PreparedFunction,
             access: u32,
             oob: Label,
-        ) -> Result<(), EmitError> {
+        ) -> Result<bool, EmitError> {
             let access = plan
-                .access(access)
-                .ok_or(EmitError::AbiOffsetOutOfRange)?
-                .clone();
+                .element_access(access)
+                .ok_or(EmitError::AbiOffsetOutOfRange)?;
+            let (bounds, indices) = match access {
+                ElementAccess::Vec { index } => {
+                    self.load_home(RIGHT, *index);
+                    self.machine.load(LEFT, VALUE, 0);
+                    // Unsigned comparison also rejects negative signed indices.
+                    self.machine.compare(RIGHT, LEFT);
+                    self.machine.branch(Condition::Hs, oob);
+                    self.machine.imm(TEMP, 8);
+                    self.machine.binary(Arithmetic::Mul, RIGHT, RIGHT, TEMP);
+                    self.machine.imm(TEMP, u64::from(VECTOR_HEADER_BYTES));
+                    self.machine.binary(Arithmetic::Add, RIGHT, RIGHT, TEMP);
+                    self.machine
+                        .binary(Arithmetic::Add, SAVED_DIVIDEND, VALUE, RIGHT);
+                    return Ok(false);
+                }
+                ElementAccess::Array(array) => (&array.bounds, &array.indices),
+            };
             self.machine.imm(LEFT, 0);
-            for (&(lower, upper), &home) in access.bounds.iter().zip(access.indices.iter()) {
+            for (&(lower, upper), &home) in bounds.iter().zip(indices.iter()) {
                 self.load_home(RIGHT, home);
                 self.machine.imm(TEMP, lower as u64);
                 self.machine.compare(RIGHT, TEMP);
@@ -689,7 +750,7 @@ mod host {
             self.machine.binary(Arithmetic::Mul, LEFT, LEFT, TEMP);
             self.machine
                 .binary(Arithmetic::Add, SAVED_DIVIDEND, VALUE, LEFT);
-            Ok(())
+            Ok(true)
         }
 
         /// A base register and displacement for the word `offset` bytes past

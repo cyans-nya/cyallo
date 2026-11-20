@@ -450,7 +450,7 @@ fn native_ineligible_collections_execute_via_verified_dispatch() {
         return;
     }
     let module = verified(
-        "fn entry(input: i64) -> i64 { let items = Vec[input]; return items[0] + 1 }\n",
+        "fn entry(input: i64) -> i64 { let items = Vec[input, 1]; return std::array::sum(items) }\n",
     );
     let mut store = CodeStore::new(module.clone()).unwrap();
     assert!(matches!(

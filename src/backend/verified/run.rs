@@ -1,17 +1,17 @@
 //! Fuel-bounded native execution and transfer to the verified interpreter.
 
 use super::SliceKind;
-use super::{BridgeCall, Layout};
+use super::{BridgeCall, Layout, LoanBase};
 use super::{
     CodeStore, EntryPin, Failure, NativeHome, NativeTier, Operation, Origin, RecoverySlot,
     ScalarOutcome,
-    abi::{Edge, ScalarContext, scalar_word},
+    abi::{Edge, ScalarContext, VECTOR_HEADER_BYTES, VECTOR_HEADER_WORDS, scalar_word},
     platform::Invocation,
 };
 use crate::bytecode::verified::{
-    Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, InstructionId, RecoveredValue,
-    Register, RunError, Scalar, ScalarFrameSnapshot, ScalarRecoveryError, ScalarType,
-    StatementArrival,
+    Activation, ExecutionLimits, ExecutionPosition, ExecutionStatus, InstructionId,
+    MAX_VEC_ELEMENTS, RecoveredValue, Register, RunError, Scalar, ScalarFrameSnapshot,
+    ScalarRecoveryError, ScalarType, StatementArrival,
 };
 use crate::bytecode::verified::{OutputSink, TextFailure, TextMapOp, TextOp, TextTestOp};
 use std::fmt;
@@ -65,7 +65,15 @@ impl EntryPin {
         arguments: &[Scalar],
         limits: ExecutionLimits,
     ) -> Result<NativeActivation, NativeRunError> {
+        if self.plan().result_layout().is_some() {
+            return Err(NativeRunError::Guest(RunError::EntryResultNotScalar));
+        }
         let parameters = self.plan().arguments();
+        if let Some(index) = parameters.iter().position(|home| home.layout.is_some()) {
+            return Err(NativeRunError::Guest(RunError::EntryParameterNotScalar {
+                index,
+            }));
+        }
         if parameters.len() != arguments.len() {
             return Err(NativeRunError::Guest(RunError::ArgumentCount {
                 expected: parameters.len(),
@@ -111,7 +119,7 @@ pub struct EntryEvent {
 
 #[derive(Debug)]
 pub struct NativeActivation {
-    /// Strings held by native frames, which carry indices into this table.
+    /// Strings and collection buffers held by native frames.
     heap: Heap,
     output: OutputSink,
     state: State,
@@ -251,7 +259,7 @@ impl Frame {
         for &slot in &site.recover {
             if let RecoverySlot::Initialized(home) = slot {
                 let value = match self.read(home, heap)? {
-                    RecoveredValue::Loan { .. } => recover_loan(stack, index, home)?,
+                    RecoveredValue::Loan { .. } => recover_loan(stack, index, home, heap)?,
                     other => other,
                 };
                 values.push((home.register, value));
@@ -360,7 +368,7 @@ enum Step {
 }
 
 /// What native frames refer to by index or address: strings, and the
-/// buffers of arrays, which the activation owns until they are released.
+/// buffers of arrays and vectors, which the activation owns until released.
 #[derive(Debug, Default)]
 struct Heap {
     texts: Vec<Arc<str>>,
@@ -375,17 +383,73 @@ impl Heap {
             .get(&address)
             .ok_or(NativeRunError::InvalidActivation)?
             .clone();
-        let new = copy.as_ptr() as u64;
-        self.buffers.insert(new, copy);
-        Ok(new)
+        Ok(self.insert_buffer(copy))
     }
 
     /// A buffer of `count` elements of two words each, and its address.
     fn allocate(&mut self, count: usize) -> u64 {
         let buffer = vec![0u64; count * 2].into_boxed_slice();
-        let address = buffer.as_ptr() as u64;
+        self.insert_buffer(buffer)
+    }
+
+    fn insert_buffer(&mut self, mut buffer: Box<[u64]>) -> u64 {
+        let address = buffer.as_mut_ptr() as u64;
         self.buffers.insert(address, buffer);
         address
+    }
+
+    fn new_vector(&mut self, length: usize, elements: impl Iterator<Item = u64>) -> u64 {
+        let mut buffer = Vec::with_capacity(VECTOR_HEADER_WORDS + length);
+        buffer.extend([length as u64, length as u64]);
+        buffer.extend(elements);
+        self.insert_buffer(buffer.into_boxed_slice())
+    }
+
+    fn vector_buffer(&self, address: u64) -> Result<&[u64], NativeRunError> {
+        let buffer = self
+            .buffers
+            .get(&address)
+            .ok_or(NativeRunError::InvalidActivation)?;
+        match &buffer[..] {
+            [length, capacity, data @ ..]
+                if *length <= *capacity && *capacity == data.len() as u64 =>
+            {
+                Ok(buffer)
+            }
+            _ => Err(NativeRunError::InvalidActivation),
+        }
+    }
+
+    fn vector_elements(&self, address: u64) -> Result<&[u64], NativeRunError> {
+        let buffer = self.vector_buffer(address)?;
+        Ok(&buffer[VECTOR_HEADER_WORDS..VECTOR_HEADER_WORDS + buffer[0] as usize])
+    }
+
+    /// Append to a validated vector below its element limit, returning the new
+    /// address if growth moved the buffer.
+    fn push_vector(&mut self, address: u64, value: u64) -> Result<Option<u64>, NativeRunError> {
+        let buffer = self.vector_buffer(address)?;
+        let length = buffer[0] as usize;
+        let capacity = buffer[1] as usize;
+        if length < capacity {
+            let buffer = self
+                .buffers
+                .get_mut(&address)
+                .ok_or(NativeRunError::InvalidActivation)?;
+            buffer[VECTOR_HEADER_WORDS + length] = value;
+            buffer[0] += 1;
+            return Ok(None);
+        }
+        let capacity = (capacity * 2).clamp(1, MAX_VEC_ELEMENTS);
+        let mut next = vec![0; VECTOR_HEADER_WORDS + capacity].into_boxed_slice();
+        let end = VECTOR_HEADER_WORDS + length;
+        next[VECTOR_HEADER_WORDS..end].copy_from_slice(&buffer[VECTOR_HEADER_WORDS..end]);
+        next[0] = length as u64 + 1;
+        next[1] = capacity as u64;
+        next[end] = value;
+        let next = self.insert_buffer(next);
+        self.buffers.remove(&address);
+        Ok(Some(next))
     }
 }
 
@@ -471,9 +535,10 @@ fn step(
             let bridge = plan
                 .bridge(index)
                 .ok_or(NativeRunError::InvalidPc(context.next))?;
-            if let Some(error) = perform(bridge, frame, runtime, site.origin)? {
+            if let Some(error) = perform(bridge, stack, runtime, site.origin)? {
                 return Ok(Step::Terminal(ExecutionStatus::Failed(error)));
             }
+            let frame = stack.last_mut().ok_or(NativeRunError::InvalidActivation)?;
             frame.position = Position::Ready {
                 next: InstructionId(pc.0 + 1),
                 arrival: StatementArrival::Next(pc),
@@ -496,9 +561,9 @@ fn step(
                 if argument.caller.layout.is_some() {
                     let mut words = frame.words(argument.caller)?.to_vec();
                     if let Some(id) = argument.caller.layout
-                        && matches!(plan.layout(id), Some(Layout::Array { .. }))
+                        && plan.layout(id).is_some_and(Layout::owns_buffer)
                     {
-                        // Arrays are passed by value.
+                        // Owned buffers are passed by value.
                         words[0] = runtime.heap.copy_buffer(words[0])?;
                     }
                     let start = callee.slot(argument.callee)?;
@@ -669,13 +734,83 @@ fn position(origin: Origin) -> ExecutionPosition {
     }
 }
 
+/// Resolve a spilled buffer home, including a loan into another frame.
+fn buffer_slot(stack: &[Frame], base: LoanBase) -> Result<(usize, usize), NativeRunError> {
+    let index = stack
+        .len()
+        .checked_sub(1)
+        .ok_or(NativeRunError::InvalidActivation)?;
+    let frame = &stack[index];
+    match base {
+        LoanBase::Owner(offset) => Ok((index, offset.0 as usize / size_of::<u64>())),
+        LoanBase::Loan(home) => {
+            let address = frame.slots[frame.slot(home)?];
+            let (owner, _) = resolve_loan(stack, index, home.register)?;
+            let slots = &stack[owner].slots;
+            let offset = address
+                .checked_sub(slots.as_ptr() as u64)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .filter(|&offset| {
+                    offset % size_of::<u64>() == 0 && offset / size_of::<u64>() < slots.len()
+                })
+                .ok_or(NativeRunError::InvalidHome(home.register))?;
+            Ok((owner, offset / size_of::<u64>()))
+        }
+    }
+}
+
+/// A reborrow from a vector loan can survive a push through that loan.
+/// On growth, update the spilled element loans into the old buffer.
+fn relocate_vector_loans(
+    stack: &mut [Frame],
+    pc: InstructionId,
+    old: u64,
+    new: u64,
+    length: usize,
+) -> Result<(), NativeRunError> {
+    let first = u64::from(VECTOR_HEADER_BYTES);
+    let elements = first..first + (length * size_of::<u64>()) as u64;
+    let depth = stack.len();
+    for (index, frame) in stack.iter_mut().enumerate() {
+        let pc = match frame.position {
+            _ if index + 1 == depth => pc,
+            Position::Waiting { call, .. } => call,
+            _ => return Err(NativeRunError::InvalidActivation),
+        };
+        let plan = frame.entry.plan();
+        let site = plan
+            .site(pc)
+            .ok_or(NativeRunError::InvalidPc(u64::from(pc.0)))?;
+        for &slot in &site.recover {
+            if let RecoverySlot::Initialized(home) = slot
+                && home.layout.and_then(|id| plan.layout(id)) == Some(&Layout::Loan)
+            {
+                let index = frame.slot(home)?;
+                let pointer = &mut frame.slots[index];
+                if let Some(offset) = pointer.checked_sub(old)
+                    && elements.contains(&offset)
+                {
+                    *pointer = new + offset;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run a bridge call for the frame. `Some` is a failure of the program.
 fn perform(
     bridge: &BridgeCall,
-    frame: &mut Frame,
+    stack: &mut [Frame],
     runtime: &mut Runtime<'_>,
     origin: Origin,
 ) -> Result<Option<RunError>, NativeRunError> {
+    let frame = stack.last_mut().ok_or(NativeRunError::InvalidActivation)?;
+    let heap_exhausted = || RunError::HeapExhausted {
+        function: origin.function,
+        instruction: origin.instruction,
+        span: origin.span,
+    };
     let intern = |runtime: &mut Runtime<'_>, text: Arc<str>| -> u64 {
         runtime.heap.texts.push(text);
         (runtime.heap.texts.len() - 1) as u64
@@ -700,17 +835,59 @@ fn perform(
             }
             frame.put(*destination, address)?;
         }
-        BridgeCall::CopyArray {
+        BridgeCall::CopyBuffer {
             destination,
             source,
         } => {
-            let word = frame.slots[frame.slot(*source)?];
+            let (owner, slot) = buffer_slot(stack, *source)?;
+            let word = stack[owner].slots[slot];
             let address = runtime.heap.copy_buffer(word)?;
+            let frame = stack.last_mut().ok_or(NativeRunError::InvalidActivation)?;
             frame.put(*destination, address)?;
         }
-        BridgeCall::ReleaseArray(home) => {
+        BridgeCall::ReleaseBuffer(home) => {
             let word = frame.slots[frame.slot(*home)?];
             runtime.heap.buffers.remove(&word);
+        }
+        BridgeCall::NewVec {
+            destination,
+            elements,
+        } => {
+            let elements = elements
+                .iter()
+                .map(|&home| frame.load(home).map(scalar_word))
+                .collect::<Result<Vec<_>, _>>()?;
+            let address = runtime
+                .heap
+                .new_vector(elements.len(), elements.into_iter());
+            frame.put(*destination, address)?;
+        }
+        BridgeCall::VecFromRange { destination, range } => {
+            let [start, end] = *frame.words(*range)? else {
+                return Err(NativeRunError::InvalidHome(range.register));
+            };
+            let (start, end) = (start as i64, end as i64);
+            let length = usize::try_from(end.saturating_sub(start).max(0)).unwrap_or(usize::MAX);
+            if length > MAX_VEC_ELEMENTS {
+                return Ok(Some(heap_exhausted()));
+            }
+            let address = runtime
+                .heap
+                .new_vector(length, (start..end).map(|item| item as u64));
+            frame.put(*destination, address)?;
+        }
+        BridgeCall::VecPush { target, value } => {
+            let value = scalar_word(frame.load(*value)?);
+            let (owner, slot) = buffer_slot(stack, *target)?;
+            let address = stack[owner].slots[slot];
+            let length = runtime.heap.vector_elements(address)?.len();
+            if length >= MAX_VEC_ELEMENTS {
+                return Ok(Some(heap_exhausted()));
+            }
+            if let Some(next) = runtime.heap.push_vector(address, value)? {
+                stack[owner].slots[slot] = next;
+                relocate_vector_loans(stack, origin.instruction, address, next, length)?;
+            }
         }
         BridgeCall::TextConstant { destination, text } => {
             let module = frame.entry.module();
@@ -898,6 +1075,7 @@ fn recover_loan(
     stack: &[Frame],
     index: usize,
     home: NativeHome,
+    heap: &Heap,
 ) -> Result<RecoveredValue, NativeRunError> {
     // An element loan carries a tag in its low bit; see `ElementLoan`.
     let tagged = {
@@ -948,14 +1126,32 @@ fn recover_loan(
         });
     }
     let base = holder.slots.as_ptr() as u64 + u64::from(owner_home.offset.0);
-    let delta = pointer.checked_sub(base).ok_or(invalid)?;
-    if delta % 8 != 0 {
-        return Err(invalid);
-    }
     let owner_layout = match owner_home.layout {
         Some(id) => plan.layout(id).ok_or(invalid)?.clone(),
         None => Layout::Scalar(owner_home.ty),
     };
+    if matches!(owner_layout, Layout::Vec(_)) && pointer != base {
+        let buffer = holder.slots[holder.slot(owner_home)?];
+        let elements = heap.vector_elements(buffer)?;
+        let offset = pointer
+            .checked_sub(buffer + u64::from(VECTOR_HEADER_BYTES))
+            .filter(|offset| offset % size_of::<u64>() as u64 == 0)
+            .ok_or(invalid)?
+            / size_of::<u64>() as u64;
+        let offset = usize::try_from(offset)
+            .ok()
+            .filter(|&offset| offset < elements.len())
+            .ok_or(invalid)?;
+        return Ok(RecoveredValue::Loan {
+            frame: owner_frame,
+            register: owner,
+            path: vec![RecoveredStep::Offset(offset)],
+        });
+    }
+    let delta = pointer.checked_sub(base).ok_or(invalid)?;
+    if delta % 8 != 0 {
+        return Err(invalid);
+    }
     let body = frame
         .entry
         .module()
@@ -1090,6 +1286,15 @@ fn decode_layout(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(RecoveredValue::Array(items))
+        }
+        Layout::Vec(element) => {
+            let address = *words.first().ok_or(NativeRunError::InvalidActivation)?;
+            let items = heap
+                .vector_elements(address)?
+                .iter()
+                .map(|&word| decode(*element, word))
+                .collect::<Result<_, _>>()?;
+            Ok(RecoveredValue::Vec(items))
         }
         Layout::Text => {
             let word = *words.first().ok_or(NativeRunError::InvalidActivation)?;
