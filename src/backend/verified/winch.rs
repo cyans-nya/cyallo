@@ -228,6 +228,73 @@ mod host {
                     self.store_home(VALUE, destination);
                 }
                 Words(range) => self.words(plan, range),
+                ArrayLoad {
+                    destination,
+                    array,
+                    access,
+                } => {
+                    let oob = self.machine.label();
+                    let uninit = self.machine.label();
+                    let done = self.machine.label();
+                    self.load_home(VALUE, array);
+                    self.element(plan, access, oob)?;
+                    self.machine.load(LEFT, SAVED_DIVIDEND, 0);
+                    self.machine.imm(TEMP, 0);
+                    self.machine.compare(LEFT, TEMP);
+                    self.machine.branch(Condition::Eq, uninit);
+                    self.machine.load(VALUE, SAVED_DIVIDEND, 8);
+                    self.store_home(VALUE, destination);
+                    self.machine.jump(done);
+                    self.machine.bind(oob);
+                    self.fail(pc, Failure::IndexOutOfBounds)?;
+                    self.machine.bind(uninit);
+                    self.fail(pc, Failure::UninitializedElement)?;
+                    self.machine.bind(done);
+                }
+                ArrayStore {
+                    array,
+                    value,
+                    access,
+                } => {
+                    let oob = self.machine.label();
+                    let done = self.machine.label();
+                    self.load_home(VALUE, array);
+                    self.element(plan, access, oob)?;
+                    self.machine.imm(TEMP, 1);
+                    self.machine.store(TEMP, SAVED_DIVIDEND, 0);
+                    self.load_home(VALUE, value);
+                    self.machine.store(VALUE, SAVED_DIVIDEND, 8);
+                    self.machine.jump(done);
+                    self.machine.bind(oob);
+                    self.fail(pc, Failure::IndexOutOfBounds)?;
+                    self.machine.bind(done);
+                }
+                ElementLoan {
+                    destination,
+                    base,
+                    access,
+                } => {
+                    let oob = self.machine.label();
+                    let done = self.machine.label();
+                    match base {
+                        LoanBase::Owner(owner) => self.load_at(VALUE, owner.0),
+                        LoanBase::Loan(home) => {
+                            self.load_home(VALUE, home);
+                            self.machine.imm(TEMP, !1u64);
+                            self.machine.binary(Arithmetic::And, VALUE, VALUE, TEMP);
+                            self.machine.load(VALUE, VALUE, 0);
+                        }
+                    }
+                    self.element(plan, access, oob)?;
+                    self.machine.imm(TEMP, 9);
+                    self.machine
+                        .binary(Arithmetic::Add, VALUE, SAVED_DIVIDEND, TEMP);
+                    self.store_home(VALUE, destination);
+                    self.machine.jump(done);
+                    self.machine.bind(oob);
+                    self.fail(pc, Failure::IndexOutOfBounds)?;
+                    self.machine.bind(done);
+                }
                 Bridge(_) => self.exit_at(ScalarOutcome::Bridge, pc)?,
                 Borrow { destination, owner } => {
                     self.machine.imm(TEMP, u64::from(owner.0));
@@ -266,6 +333,8 @@ mod host {
                     words,
                 } => {
                     self.load_home(LEFT, loan);
+                    self.machine.imm(TEMP, !1u64);
+                    self.machine.binary(Arithmetic::And, LEFT, LEFT, TEMP);
                     for word in 0..words {
                         let (base, offset) = self.through(LEFT, word * 8);
                         self.machine.load(VALUE, base, offset);
@@ -278,11 +347,26 @@ mod host {
                     words,
                 } => {
                     self.load_home(LEFT, loan);
+                    self.machine.mov(RIGHT, LEFT);
+                    self.machine.imm(TEMP, !1u64);
+                    self.machine.binary(Arithmetic::And, LEFT, LEFT, TEMP);
                     for word in 0..words {
                         self.load_at(VALUE, source.0 + word * 8);
                         let (base, offset) = self.through(LEFT, word * 8);
                         self.machine.store(VALUE, base, offset);
                     }
+                    // A write through an element loan marks the element written.
+                    let plain = self.machine.label();
+                    self.machine.imm(TEMP, 1);
+                    self.machine.binary(Arithmetic::And, RIGHT, RIGHT, TEMP);
+                    self.machine.imm(TEMP, 0);
+                    self.machine.compare(RIGHT, TEMP);
+                    self.machine.branch(Condition::Eq, plain);
+                    self.machine.imm(VALUE, 1);
+                    self.machine.imm(TEMP, 8);
+                    self.machine.binary(Arithmetic::Sub, LEFT, LEFT, TEMP);
+                    self.machine.store(VALUE, LEFT, 0);
+                    self.machine.bind(plain);
                 }
                 NonZero(step) => {
                     let zero = self.machine.label();
@@ -571,6 +655,41 @@ mod host {
                 self.machine.binary(Arithmetic::Add, ADDRESS, base, ADDRESS);
                 (ADDRESS, 0)
             }
+        }
+
+        /// Leaves the address of the selected element in SAVED_DIVIDEND, given
+        /// the buffer address in VALUE; an index out of its bounds jumps to `oob`.
+        fn element(
+            &mut self,
+            plan: &PreparedFunction,
+            access: u32,
+            oob: Label,
+        ) -> Result<(), EmitError> {
+            let access = plan
+                .access(access)
+                .ok_or(EmitError::AbiOffsetOutOfRange)?
+                .clone();
+            self.machine.imm(LEFT, 0);
+            for (&(lower, upper), &home) in access.bounds.iter().zip(access.indices.iter()) {
+                self.load_home(RIGHT, home);
+                self.machine.imm(TEMP, lower as u64);
+                self.machine.compare(RIGHT, TEMP);
+                self.machine.branch(Condition::Lt, oob);
+                self.machine.imm(TEMP, upper as u64);
+                self.machine.compare(RIGHT, TEMP);
+                self.machine.branch(Condition::Gt, oob);
+                self.machine
+                    .imm(TEMP, upper.wrapping_sub(lower).wrapping_add(1) as u64);
+                self.machine.binary(Arithmetic::Mul, LEFT, LEFT, TEMP);
+                self.machine.imm(TEMP, lower as u64);
+                self.machine.binary(Arithmetic::Sub, RIGHT, RIGHT, TEMP);
+                self.machine.binary(Arithmetic::Add, LEFT, LEFT, RIGHT);
+            }
+            self.machine.imm(TEMP, 16);
+            self.machine.binary(Arithmetic::Mul, LEFT, LEFT, TEMP);
+            self.machine
+                .binary(Arithmetic::Add, SAVED_DIVIDEND, VALUE, LEFT);
+            Ok(())
         }
 
         /// A base register and displacement for the word `offset` bytes past

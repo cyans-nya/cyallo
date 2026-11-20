@@ -1932,6 +1932,8 @@ pub struct Activation {
 pub enum RecoveredStep {
     Field(u32),
     Payload(u32),
+    /// An element of an array, by row-major offset.
+    Offset(usize),
 }
 
 /// A value rebuilt from native words: scalars and the tuples and enums of them.
@@ -1939,6 +1941,8 @@ pub enum RecoveredStep {
 pub enum RecoveredValue {
     Scalar(Scalar),
     Text(Arc<str>),
+    /// A fixed-size array of scalars; `None` is an element never written.
+    Array(Vec<Option<Scalar>>),
     /// A loan of the whole register `register` of the frame at stack index `frame`.
     Loan {
         frame: usize,
@@ -1973,6 +1977,28 @@ impl VerifiedFunction {
             }
             (RecoveredValue::Loan { .. }, _) => None,
             (RecoveredValue::Text(text), ValueType::Text) => Some(FrameValue::Text(text.clone())),
+            (RecoveredValue::Array(items), ValueType::Composite(id)) => {
+                let Shape::Array { element, bounds } = self.shape_table().get(usize::try_from(id.0).ok()?)? else {
+                    return None;
+                };
+                let ValueType::Scalar(expected) = element else {
+                    return None;
+                };
+                if super::array_len(bounds) != Some(items.len()) {
+                    return None;
+                }
+                let items = items
+                    .iter()
+                    .map(|item| match item {
+                        Some(scalar) if scalar.ty() == *expected => {
+                            Some(Some(FrameValue::Scalar(*scalar)))
+                        }
+                        Some(_) => None,
+                        None => Some(None),
+                    })
+                    .collect::<Option<Box<[_]>>>()?;
+                Some(FrameValue::Composite(Composite::Array(items)))
+            }
             (RecoveredValue::Tuple(values), ValueType::Composite(id)) => {
                 let Shape::Tuple(fields) = self.shape_table().get(usize::try_from(id.0).ok()?)?
                 else {
@@ -2246,6 +2272,7 @@ impl VerifiedModule {
                             .map(|step| match step {
                                 RecoveredStep::Field(field) => Step::Field(*field),
                                 RecoveredStep::Payload(variant) => Step::Payload(*variant),
+                                RecoveredStep::Offset(offset) => Step::Offset(*offset),
                             })
                             .collect(),
                         window: None,

@@ -244,3 +244,108 @@ fn caie_slicing_prints_and_fails_with_the_same_typed_error() {
         check_module(caie_module(&source), &[vec![]]);
     }
 }
+
+fn caie_check(source: &str) {
+    check_module(caie_module(source), &[vec![]]);
+}
+
+#[test]
+fn caie_arrays_are_filled_summed_and_printed() {
+    caie_check(include_str!("../examples/arrays.psc"));
+    caie_check(concat!(
+        "DECLARE a : ARRAY[1:10] OF INTEGER\n",
+        "DECLARE i : INTEGER\n",
+        "DECLARE total : INTEGER\n",
+        "total <- 0\n",
+        "FOR i <- 1 TO 10\n",
+        "    a[i] <- i * i\n",
+        "NEXT i\n",
+        "FOR i <- 10 TO 1 STEP -3\n",
+        "    total <- total + a[i]\n",
+        "    OUTPUT i, \":\", a[i]\n",
+        "NEXT i\n",
+        "OUTPUT total\n",
+    ));
+}
+
+#[test]
+fn caie_two_dimensional_arrays_and_element_types() {
+    caie_check(concat!(
+        "DECLARE grid : ARRAY[1:3, 0:2] OF INTEGER\n",
+        "DECLARE flags : ARRAY[1:4] OF BOOLEAN\n",
+        "DECLARE reals : ARRAY[0:2] OF REAL\n",
+        "DECLARE r : INTEGER\n",
+        "DECLARE c : INTEGER\n",
+        "FOR r <- 1 TO 3\n",
+        "    FOR c <- 0 TO 2\n",
+        "        grid[r, c] <- r * 10 + c\n",
+        "    NEXT c\n",
+        "NEXT r\n",
+        "FOR r <- 1 TO 4\n",
+        "    flags[r] <- (r MOD 2) = 0\n",
+        "NEXT r\n",
+        "FOR c <- 0 TO 2\n",
+        "    reals[c] <- c / 4\n",
+        "NEXT c\n",
+        "OUTPUT grid[1, 0], \" \", grid[3, 2], \" \", grid[2, 1]\n",
+        "OUTPUT flags[1], \" \", flags[2], \" \", reals[0], \" \", reals[2]\n",
+    ));
+}
+
+#[test]
+fn caie_array_failures_match_the_interpreter() {
+    for access in ["a[0]", "a[4]", "a[2]"] {
+        caie_check(&format!(
+            "DECLARE a : ARRAY[1:3] OF INTEGER\na[1] <- 5\nOUTPUT \"start\"\nOUTPUT {access}\n"
+        ));
+    }
+    caie_check(concat!(
+        "DECLARE a : ARRAY[1:3] OF INTEGER\n",
+        "DECLARE i : INTEGER\n",
+        "i <- 7\n",
+        "OUTPUT \"before\"\n",
+        "a[i] <- 1\n",
+        "OUTPUT \"after\"\n",
+    ));
+}
+
+#[test]
+fn element_loans_and_by_value_arrays_cross_native_calls() {
+    let source = r#"
+proc bump(x: &mut i64, by: i64) { x.* += by }
+proc entry(n: i64) -> i64 {
+    let mut a = [1, 2, 3]
+    let mut i = 0
+    while i < 3 {
+        bump(&mut a[i], n + i)
+        i += 1
+    }
+    bump(&mut a[0], 100)
+    std::io::print(a[0], " ", a[1], " ", a[2])
+    return a[0] * 10 + a[2]
+}
+"#;
+    check(source, &ints(&[0, 5, -4]));
+}
+
+#[test]
+fn caie_arrays_are_passed_by_value_to_native_functions() {
+    caie_check(concat!(
+        "FUNCTION Total(v : ARRAY[1:3] OF INTEGER) RETURNS INTEGER\n",
+        "    DECLARE i : INTEGER\n",
+        "    DECLARE s : INTEGER\n",
+        "    s <- 0\n",
+        "    FOR i <- 1 TO 3\n",
+        "        s <- s + v[i]\n",
+        "        v[i] <- 0\n",
+        "    NEXT i\n",
+        "    RETURN s\n",
+        "ENDFUNCTION\n",
+        "DECLARE a : ARRAY[1:3] OF INTEGER\n",
+        "DECLARE i : INTEGER\n",
+        "FOR i <- 1 TO 3\n",
+        "    a[i] <- i * 7\n",
+        "NEXT i\n",
+        "OUTPUT Total(a), \" \", Total(a), \" \", a[1], \" \", a[2], \" \", a[3]\n",
+    ));
+}

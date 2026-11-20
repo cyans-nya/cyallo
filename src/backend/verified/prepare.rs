@@ -39,6 +39,12 @@ pub enum Layout {
     Loan,
     /// A string: one word indexing the activation's string table.
     Text,
+    /// A fixed-size array of scalars: one word holding the address of a
+    /// buffer of `count` elements, two words each (written flag, value).
+    Array {
+        element: ScalarType,
+        count: u32,
+    },
     Tuple(Box<[Layout]>),
     Enum(Box<[Option<Layout>]>),
 }
@@ -46,7 +52,7 @@ pub enum Layout {
 impl Layout {
     pub fn words(&self) -> u32 {
         match self {
-            Self::Scalar(_) | Self::Loan | Self::Text => 1,
+            Self::Scalar(_) | Self::Loan | Self::Text | Self::Array { .. } => 1,
             Self::Tuple(fields) => fields.iter().map(Layout::words).sum(),
             Self::Enum(variants) => {
                 1 + variants
@@ -125,6 +131,27 @@ pub enum BridgeCall {
         destination: NativeHome,
         source: NativeHome,
     },
+    /// A new array; `elements` are its values in row-major order, and an
+    /// array declared without values has every element unwritten.
+    NewArray {
+        destination: NativeHome,
+        count: u32,
+        elements: Option<Box<[NativeHome]>>,
+    },
+    /// An independent copy of an array.
+    CopyArray {
+        destination: NativeHome,
+        source: NativeHome,
+    },
+    /// The array's lifetime ends here.
+    ReleaseArray(NativeHome),
+}
+
+/// The bounds and index operands of one array access.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrayAccess {
+    pub bounds: Box<[(i64, i64)]>,
+    pub indices: Box<[NativeHome]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,6 +279,25 @@ pub enum Operation {
     NonZero(NativeHome),
     /// The runtime performs bridge call `index` of the plan.
     Bridge(u32),
+    /// Read an element by checked indices; an unwritten element fails.
+    ArrayLoad {
+        destination: NativeHome,
+        array: NativeHome,
+        access: u32,
+    },
+    /// Write an element by checked indices.
+    ArrayStore {
+        array: NativeHome,
+        value: NativeHome,
+        access: u32,
+    },
+    /// A loan of one element, whose address carries a tag in its low bit so
+    /// that a write through it also marks the element written.
+    ElementLoan {
+        destination: NativeHome,
+        base: LoanBase,
+        access: u32,
+    },
     /// Whether the enum with this tag word holds the variant.
     TagIs {
         destination: NativeHome,
@@ -335,6 +381,7 @@ pub struct PreparedFunction {
     words: Box<[WordOp]>,
     borrowed: Box<[u32]>,
     bridges: Box<[BridgeCall]>,
+    accesses: Box<[ArrayAccess]>,
     sites: Box<[Site]>,
     calls: BTreeMap<InstructionId, Call>,
 }
@@ -444,7 +491,7 @@ impl PreparedFunction {
                     prepare_call(module, &mut map, id, origin, next, link_offset)?,
                 );
             }
-            let operation = legalize(&mut map, instruction, origin)?;
+            let operation = legalize(&mut map, instruction, origin, state)?;
             let recover = recovery_map(&mut map, state, origin)?;
             sites.push(Site {
                 origin,
@@ -469,6 +516,7 @@ impl PreparedFunction {
             words: map.words.into_boxed_slice(),
             borrowed: map.borrowed.into_iter().collect(),
             bridges: map.bridges.into_boxed_slice(),
+            accesses: map.accesses.into_boxed_slice(),
             sites: sites.into_boxed_slice(),
             calls,
         })
@@ -522,6 +570,10 @@ impl PreparedFunction {
     /// function, so it must live in the frame and not in a register.
     pub fn is_borrowed(&self, offset: u32) -> bool {
         self.borrowed.binary_search(&offset).is_ok()
+    }
+
+    pub fn access(&self, index: u32) -> Option<&ArrayAccess> {
+        self.accesses.get(index as usize)
     }
 
     pub fn bridge(&self, index: u32) -> Option<&BridgeCall> {
@@ -588,6 +640,48 @@ pub(super) fn layout_of(body: &VerifiedFunction, ty: ValueType) -> Option<Layout
     }
 }
 
+/// Like `layout_of`, but a fixed-size array of scalars is allowed: it can
+/// be a register or a loan's pointee, though not part of another value.
+pub(super) fn layout_of_top(body: &VerifiedFunction, ty: ValueType) -> Option<Layout> {
+    if let ValueType::Composite(id) = ty
+        && let Some(Shape::Array { element, bounds }) =
+            body.shape_table().get(usize::try_from(id.0).ok()?)
+        && let ValueType::Scalar(scalar) = element
+        && *scalar != ScalarType::U64
+    {
+        let count = u32::try_from(crate::bytecode::verified::array_len(bounds)?).ok()?;
+        return Some(Layout::Array {
+            element: *scalar,
+            count,
+        });
+    }
+    layout_of(body, ty)
+}
+
+/// The scalar element type and bounds of an array, or of the array a loan
+/// points at.
+fn array_shape(
+    body: &VerifiedFunction,
+    register: Register,
+) -> Option<(ScalarType, Vec<(i64, i64)>)> {
+    let ty = match body.registers().get(register.0 as usize).copied()? {
+        RegisterType::Composite(id) => ValueType::Composite(id),
+        RegisterType::Loan { pointee, .. } => pointee,
+        _ => return None,
+    };
+    let ValueType::Composite(id) = ty else {
+        return None;
+    };
+    let Shape::Array { element, bounds } = body.shape_table().get(usize::try_from(id.0).ok()?)?
+    else {
+        return None;
+    };
+    let ValueType::Scalar(scalar) = element else {
+        return None;
+    };
+    Some((*scalar, bounds.to_vec()))
+}
+
 /// Placement of one function's registers in its native frame, and the layout
 /// and word tables the plan keeps.
 struct FrameMap<'a> {
@@ -600,6 +694,7 @@ struct FrameMap<'a> {
     words: Vec<WordOp>,
     borrowed: std::collections::BTreeSet<u32>,
     bridges: Vec<BridgeCall>,
+    accesses: Vec<ArrayAccess>,
 }
 
 impl<'a> FrameMap<'a> {
@@ -637,6 +732,7 @@ impl<'a> FrameMap<'a> {
             words: Vec::new(),
             borrowed: Default::default(),
             bridges: Vec::new(),
+            accesses: Vec::new(),
         })
     }
 
@@ -659,13 +755,13 @@ impl<'a> FrameMap<'a> {
                 layout_of(self.body, ValueType::Scalar(ty)).ok_or(PrepareError::NonScalar(register))
             }
             Some(RegisterType::Text) => Ok(Layout::Text),
-            Some(RegisterType::Composite(id)) => layout_of(self.body, ValueType::Composite(id))
+            Some(RegisterType::Composite(id)) => layout_of_top(self.body, ValueType::Composite(id))
                 .ok_or(PrepareError::NonScalar(register)),
             Some(RegisterType::Loan {
                 origin: LoanOrigin::Local(_) | LoanOrigin::Parameter { .. },
                 pointee,
                 ..
-            }) if layout_of(self.body, pointee).is_some() => Ok(Layout::Loan),
+            }) if layout_of_top(self.body, pointee).is_some() => Ok(Layout::Loan),
             _ => Err(PrepareError::NonScalar(register)),
         }
     }
@@ -726,6 +822,31 @@ impl<'a> FrameMap<'a> {
             Some(Layout::Enum(_)) => Ok(home),
             _ => Err(unsupported),
         }
+    }
+
+    /// Record the bounds and index homes of an array access.
+    fn array_access(
+        &mut self,
+        array: Register,
+        list: crate::bytecode::verified::OperandListId,
+        unsupported: PrepareError,
+    ) -> Result<((), u32), PrepareError> {
+        let Some((_, bounds)) = array_shape(self.body, array) else {
+            return Err(unsupported);
+        };
+        let indices: Box<[NativeHome]> = self.body.lists()[list.0 as usize]
+            .iter()
+            .map(|&register| self.home(register))
+            .collect::<Result<_, _>>()?;
+        if indices.len() != bounds.len() || indices.iter().any(|home| home.layout.is_some()) {
+            return Err(unsupported);
+        }
+        let index = u32::try_from(self.accesses.len()).map_err(|_| PrepareError::FrameTooLarge)?;
+        self.accesses.push(ArrayAccess {
+            bounds: bounds.into_boxed_slice(),
+            indices,
+        });
+        Ok(((), index))
     }
 
     fn bridge(&mut self, call: BridgeCall) -> Result<Operation, PrepareError> {
@@ -892,6 +1013,10 @@ fn failures(operation: Operation) -> &'static [Failure] {
         } => &[Failure::ConversionOutOfRange],
         Operation::Variant { .. } => &[Failure::EnumVariant],
         Operation::NonZero(_) => &[Failure::ZeroStep],
+        Operation::ArrayLoad { .. } => &[Failure::IndexOutOfBounds, Failure::UninitializedElement],
+        Operation::ArrayStore { .. } | Operation::ElementLoan { .. } => {
+            &[Failure::IndexOutOfBounds]
+        }
         Operation::Project {
             variant: Some(_), ..
         } => &[Failure::EnumVariant],
@@ -904,6 +1029,7 @@ fn legalize(
     map: &mut FrameMap<'_>,
     instruction: Instruction,
     origin: Origin,
+    state: &[StorageState],
 ) -> Result<Operation, PrepareError> {
     let unsupported = PrepareError::UnsupportedOperation {
         origin,
@@ -911,13 +1037,29 @@ fn legalize(
     };
     Ok(match instruction {
         Instruction::StorageLive(reg) => Operation::StorageLive(map.home(reg)?),
-        Instruction::StorageDead(reg) => Operation::StorageDead(map.home(reg)?),
+        Instruction::StorageDead(reg) => {
+            let home = map.home(reg)?;
+            let array = matches!(map.layout_of_home(home), Some(Layout::Array { .. }));
+            if array && state[reg.0 as usize] == StorageState::Initialized {
+                map.bridge(BridgeCall::ReleaseArray(home))?
+            } else {
+                Operation::StorageDead(home)
+            }
+        }
         Instruction::Constant(reg, value) => Operation::Constant {
             destination: map.home(reg)?,
             value,
         },
         Instruction::Copy(dst, src) | Instruction::Move(dst, src) => {
             let (destination, source) = (map.home(dst)?, map.home(src)?);
+            if matches!(map.layout_of_home(destination), Some(Layout::Array { .. }))
+                && matches!(instruction, Instruction::Copy(..))
+            {
+                return map.bridge(BridgeCall::CopyArray {
+                    destination,
+                    source,
+                });
+            }
             if destination.layout.is_some() {
                 if destination.layout != source.layout
                     && map.words_of(destination) != map.words_of(source)
@@ -954,6 +1096,9 @@ fn legalize(
         }
         Instruction::ReadLoan(dst, loan) => {
             let destination = map.home(dst)?;
+            if matches!(map.layout_of_home(destination), Some(Layout::Array { .. })) {
+                return Err(unsupported);
+            }
             Operation::ReadLoan {
                 destination: destination.offset,
                 loan: map.home(loan)?,
@@ -962,6 +1107,9 @@ fn legalize(
         }
         Instruction::WriteLoan(loan, src) => {
             let source = map.home(src)?;
+            if matches!(map.layout_of_home(source), Some(Layout::Array { .. })) {
+                return Err(unsupported);
+            }
             Operation::WriteLoan {
                 loan: map.home(loan)?,
                 source: source.offset,
@@ -1263,6 +1411,76 @@ fn legalize(
             };
             map.bridge(call)?
         }
+        Instruction::ArrayDeclare(dst) => {
+            let destination = map.home(dst)?;
+            let Some(Layout::Array { count, .. }) = map.layout_of_home(destination) else {
+                return Err(unsupported);
+            };
+            map.bridge(BridgeCall::NewArray {
+                destination,
+                count,
+                elements: None,
+            })?
+        }
+        Instruction::ArrayNew(dst, list) => {
+            let destination = map.home(dst)?;
+            let Some(Layout::Array { count, .. }) = map.layout_of_home(destination) else {
+                return Err(unsupported);
+            };
+            let elements: Box<[NativeHome]> = map.body.lists()[list.0 as usize]
+                .iter()
+                .map(|&register| map.home(register))
+                .collect::<Result<_, _>>()?;
+            if elements.len() != count as usize {
+                return Err(unsupported);
+            }
+            map.bridge(BridgeCall::NewArray {
+                destination,
+                count,
+                elements: Some(elements),
+            })?
+        }
+        Instruction::ArrayLength(dst, array) => {
+            let Some((_, bounds)) = array_shape(map.body, array) else {
+                return Err(unsupported);
+            };
+            let destination = map.home(dst)?;
+            let count = crate::bytecode::verified::array_len(&bounds).ok_or(unsupported)?;
+            Operation::Constant {
+                destination,
+                value: Scalar::I64(i64::try_from(count).map_err(|_| unsupported)?),
+            }
+        }
+        Instruction::ArrayLoad(dst, array, list) => {
+            let (_, access) = map.array_access(array, list, unsupported)?;
+            Operation::ArrayLoad {
+                destination: map.home(dst)?,
+                array: map.home(array)?,
+                access,
+            }
+        }
+        Instruction::ArrayStore(array, list, value) => {
+            let (_, access) = map.array_access(array, list, unsupported)?;
+            Operation::ArrayStore {
+                array: map.home(array)?,
+                value: map.home(value)?,
+                access,
+            }
+        }
+        Instruction::LoanElement(dst, src, list) => {
+            let (_, access) = map.array_access(src, list, unsupported)?;
+            let source = map.home(src)?;
+            let base = match map.layout_of_home(source) {
+                Some(Layout::Loan) => LoanBase::Loan(source),
+                Some(Layout::Array { .. }) => LoanBase::Owner(source.offset),
+                _ => return Err(unsupported),
+            };
+            Operation::ElementLoan {
+                destination: map.home(dst)?,
+                base,
+                access,
+            }
+        }
         Instruction::TextLength(dst, src) => {
             let (destination, source) = (map.home(dst)?, map.home(src)?);
             map.bridge(BridgeCall::TextLength {
@@ -1372,13 +1590,7 @@ fn legalize(
         | Instruction::RcUpgrade(..)
         | Instruction::RcStrongCount(..)
         | Instruction::EnumTake(..)
-        | Instruction::GcBorrow(..)
-        | Instruction::LoanElement(..)
-        | Instruction::ArrayDeclare(..)
-        | Instruction::ArrayNew(..)
-        | Instruction::ArrayLoad(..)
-        | Instruction::ArrayStore(..)
-        | Instruction::ArrayLength(..) => {
+        | Instruction::GcBorrow(..) => {
             return Err(PrepareError::UnsupportedOperation {
                 origin,
                 instruction,

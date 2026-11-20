@@ -333,6 +333,61 @@ impl Lower<'_, '_> {
                 self.store(destination, value)?;
             }
             Words(range) => self.words(plan, range)?,
+            ArrayLoad {
+                destination,
+                array,
+                access,
+            } => {
+                let buffer = self.load(array)?;
+                let element = self.element(plan, access, buffer, pc)?;
+                let written = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), element, 0);
+                let unwritten = self.builder.ins().icmp_imm_s(IntCC::Equal, written, 0);
+                self.guard(unwritten, pc, Failure::UninitializedElement)?;
+                let value = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), element, 8);
+                self.store(destination, value)?;
+            }
+            ArrayStore {
+                array,
+                value,
+                access,
+            } => {
+                let buffer = self.load(array)?;
+                let element = self.element(plan, access, buffer, pc)?;
+                let value = self.load(value)?;
+                let one = self.builder.ins().iconst(types::I64, 1);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::new(), one, element, 0);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::new(), value, element, 8);
+            }
+            ElementLoan {
+                destination,
+                base,
+                access,
+            } => {
+                let buffer = match base {
+                    LoanBase::Owner(owner) => self.load_at(owner.0)?,
+                    LoanBase::Loan(home) => {
+                        let place = self.load(home)?;
+                        let place = self.builder.ins().band_imm_s(place, -2);
+                        self.builder
+                            .ins()
+                            .load(types::I64, MemFlagsData::new(), place, 0)
+                    }
+                };
+                let element = self.element(plan, access, buffer, pc)?;
+                // The value word, tagged so that writes also mark it written.
+                let loan = self.builder.ins().iadd_imm_s(element, 9);
+                self.store(destination, loan)?;
+            }
             Bridge(_) => {
                 self.spill(site, plan)?;
                 return self.exit_at(ScalarOutcome::Bridge, pc);
@@ -376,7 +431,8 @@ impl Lower<'_, '_> {
                 loan,
                 words,
             } => {
-                let address = self.load(loan)?;
+                let tagged = self.load(loan)?;
+                let address = self.builder.ins().band_imm_s(tagged, -2);
                 for word in 0..words {
                     let at = i32::try_from(word * 8).map_err(|_| EmitError::AbiOffsetOutOfRange)?;
                     let value =
@@ -391,7 +447,8 @@ impl Lower<'_, '_> {
                 source,
                 words,
             } => {
-                let address = self.load(loan)?;
+                let tagged = self.load(loan)?;
+                let address = self.builder.ins().band_imm_s(tagged, -2);
                 for word in 0..words {
                     let at = i32::try_from(word * 8).map_err(|_| EmitError::AbiOffsetOutOfRange)?;
                     let value = self.load_at(source.0 + word * 8)?;
@@ -399,6 +456,18 @@ impl Lower<'_, '_> {
                         .ins()
                         .store(MemFlagsData::new(), value, address, at);
                 }
+                // A write through an element loan marks the element written.
+                let mark = self.builder.create_block();
+                let after = self.builder.create_block();
+                let is_element = self.builder.ins().band_imm_s(tagged, 1);
+                self.builder.ins().brif(is_element, mark, &[], after, &[]);
+                self.builder.switch_to_block(mark);
+                let one = self.builder.ins().iconst(types::I64, 1);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::new(), one, address, -8);
+                self.builder.ins().jump(after, &[]);
+                self.builder.switch_to_block(after);
             }
             NonZero(step) => {
                 let value = self.load(step)?;
@@ -534,6 +603,48 @@ impl Lower<'_, '_> {
         };
         self.guard(overflow, pc, Failure::Overflow)?;
         Ok(value)
+    }
+
+    /// The address of the element selected by the access's indices, after
+    /// checking each against its bounds.
+    fn element(
+        &mut self,
+        plan: &PreparedFunction,
+        access: u32,
+        buffer: Value,
+        pc: InstructionId,
+    ) -> Result<Value, EmitError> {
+        let access = plan
+            .access(access)
+            .ok_or(EmitError::AbiOffsetOutOfRange)?
+            .clone();
+        let mut offset = self.builder.ins().iconst(types::I64, 0);
+        let mut bad: Option<Value> = None;
+        for (&(lower, upper), &home) in access.bounds.iter().zip(access.indices.iter()) {
+            let index = self.load(home)?;
+            let below = self
+                .builder
+                .ins()
+                .icmp_imm_s(IntCC::SignedLessThan, index, lower);
+            let above = self
+                .builder
+                .ins()
+                .icmp_imm_s(IntCC::SignedGreaterThan, index, upper);
+            let out = self.builder.ins().bor(below, above);
+            bad = Some(match bad {
+                Some(earlier) => self.builder.ins().bor(earlier, out),
+                None => out,
+            });
+            let extent = upper.wrapping_sub(lower).wrapping_add(1);
+            offset = self.builder.ins().imul_imm_s(offset, extent);
+            let position = self.builder.ins().iadd_imm_s(index, lower.wrapping_neg());
+            offset = self.builder.ins().iadd(offset, position);
+        }
+        if let Some(bad) = bad {
+            self.guard(bad, pc, Failure::IndexOutOfBounds)?;
+        }
+        let bytes = self.builder.ins().ishl_imm_s(offset, 4);
+        Ok(self.builder.ins().iadd(buffer, bytes))
     }
 
     fn bits_as_float(&mut self, word: Value) -> Value {

@@ -123,6 +123,8 @@ pub enum Failure {
     ConversionOutOfRange = 4,
     EnumVariant = 5,
     ZeroStep = 6,
+    IndexOutOfBounds = 7,
+    UninitializedElement = 8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

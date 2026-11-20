@@ -142,14 +142,14 @@ fn caie_real_division_and_its_zero_divisor() {
 }
 
 #[test]
-fn float_routines_stay_in_the_verified_interpreter() {
+fn float_routines_with_output_prepare_for_native_code() {
     use cyallo::backend::verified::{CodeVersion, NativeTarget, PreparedFunction};
     let Some(target) = NativeTarget::host() else {
         return;
     };
     let program = compile("let x = 1.5\nstd::io::print(x + x)\n").unwrap();
     let module = VerifiedModule::lower(&program, 0).unwrap();
-    assert!(PreparedFunction::prepare(&module, module.entry(), CodeVersion(1), target).is_err());
+    assert!(PreparedFunction::prepare(&module, module.entry(), CodeVersion(1), target).is_ok());
 }
 
 mod images {

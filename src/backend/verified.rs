@@ -21,7 +21,7 @@ pub use image::{
     Relocation, RelocationKind, UnlinkedImage,
 };
 pub use prepare::{
-    BridgeCall, Call, CallArgument, CodeVersion, FunctionVersion, Layout, LayoutId, LoanBase, NativeHome, Operation, Origin,
+    ArrayAccess, BridgeCall, Call, CallArgument, CodeVersion, FunctionVersion, Layout, LayoutId, LoanBase, NativeHome, Operation, Origin,
     PrepareError, SliceKind, UnaryOp, WordOp, WordRange,
     PreparedFunction, RecoverySlot, Site,
 };
