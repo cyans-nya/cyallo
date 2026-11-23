@@ -107,3 +107,55 @@ fn an_instance_over_a_record_keeps_the_existing_route() {
         std::io::print(first(P { x: 1 }, P { x: 2 }).x)";
     assert_eq!(run(source), "1\n");
 }
+
+#[test]
+fn a_numeric_bound_gives_a_parameter_arithmetic_and_comparison() {
+    let source = "fn add<T: std::num::Numeric>(a: T, b: T) -> T { return a + b }\n\
+        fn bigger<T: std::num::Numeric>(a: T, b: T) -> bool { return a > b }\n\
+        std::io::print(add(1, 2))\nstd::io::print(add(1.5, 2.0))\nstd::io::print(bigger(3, 2))";
+    assert_eq!(run(source), "3\n3.5\ntrue\n");
+    assert!(lowered(source) >= 3);
+}
+
+#[test]
+fn a_numeric_parameter_is_copy_so_it_may_be_used_twice() {
+    let source = "fn twice<T: std::num::Numeric>(a: T) -> T {\n    let b = a\n    return a + b\n}\nstd::io::print(twice(4))";
+    assert_eq!(run(source), "8\n");
+}
+
+#[test]
+fn a_bound_gives_nothing_beyond_its_own_capabilities() {
+    // A literal is an `i64`, not a `T`.
+    let error =
+        failure("fn inc<T: std::num::Numeric>(a: T) -> T { return a + 1 }\nstd::io::print(inc(1))");
+    assert_eq!(error.code, "E105", "{}", error.message);
+    // `Numeric` is not `Printable`.
+    let error = failure("proc show<T: std::num::Numeric>(a: T) { std::io::print(a) }\nshow(1)");
+    assert_eq!(error.code, "E112", "{}", error.message);
+}
+
+#[test]
+fn printable_allows_print_and_a_string_satisfies_it() {
+    let source = "proc show<T: std::io::Printable>(a: T) { std::io::print(a) }\nshow(7)\nshow(\"s\")\nshow(true)";
+    assert_eq!(run(source), "7\ns\ntrue\n");
+}
+
+#[test]
+fn a_type_argument_must_satisfy_every_bound() {
+    let error = failure(
+        "fn add<T: std::num::Numeric>(a: T, b: T) -> T { return a + b }\nstd::io::print(add(\"a\", \"b\"))",
+    );
+    assert_eq!(error.code, "E151");
+    assert!(error.message.contains("Numeric"), "{}", error.message);
+    let error = failure(
+        "fn half<T: std::num::Integer>(a: T) -> T { return a / a }\nstd::io::print(half(1.5))",
+    );
+    assert_eq!(error.code, "E151");
+}
+
+#[test]
+fn a_bound_the_language_does_not_implement_is_still_rejected() {
+    let error =
+        failure("trait Shape {}\nfn f<T: Shape>(a: T) -> T { return a }\nstd::io::print(1)");
+    assert_eq!(error.code, "E173", "{}", error.message);
+}

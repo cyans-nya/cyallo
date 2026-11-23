@@ -350,10 +350,10 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
     }
     // Type parameters are only spelled in the signature, which the module graph checks;
     // each instance is typed from its own parameter types. Bounds and packs are not lowered.
-    if !ast.get_list(function.type_packs)?.is_empty()
-        || !ast.get_list(function.constraints)?.is_empty()
-    {
-        return decline(|| "generic routine with bounds or packs".into());
+    // Bounds are resolved when the body is bound: the module graph accepts the ones the
+    // pipeline gives meaning to and rejects the rest as unimplemented.
+    if !ast.get_list(function.type_packs)?.is_empty() {
+        return decline(|| "generic routine with packs".into());
     }
     // A routine returns a scalar, or a procedure returns nothing.
     let procedure = match (function.kind, ast.get(function.result)?) {

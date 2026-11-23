@@ -84,6 +84,8 @@ struct Resolver {
     /// The variants of each enum without type parameters, by the enum's linked name, with
     /// their resolved payload types.
     enums: HashMap<Box<str>, Vec<(Box<str>, Option<Type>)>>,
+    /// The standard traits a generic routine may be bounded by, by linked name.
+    bound_traits: HashMap<Box<str>, crate::generics::Bound>,
     /// Enums with type parameters, by linked name: the parameters and the variants'
     /// payload types, which mention them.
     generic_enums: HashMap<Box<str>, (Vec<Box<str>>, Vec<Option<Type>>)>,
@@ -289,6 +291,50 @@ impl Resolver {
         table
     }
 
+    /// The marker traits that bound a type parameter, found in the standard modules.
+    fn bound_trait_table(&self) -> HashMap<Box<str>, crate::generics::Bound> {
+        use crate::generics::Bound;
+        let mut table = HashMap::new();
+        for (module, name, bound) in [
+            ("std::num", "Numeric", Bound::Numeric),
+            ("std::num", "Integer", Bound::Integer),
+            ("std::num", "Floating", Bound::Floating),
+            ("std::io", "Printable", Bound::Printable),
+        ] {
+            if let Some(index) = self.nodes.iter().position(|node| node.path == module)
+                && let Some(symbol) = self.path(index, name, Some(Kind::Type))
+            {
+                table.insert(symbol.target, bound);
+            }
+        }
+        table
+    }
+
+    /// What each type parameter of a routine is bounded by, or `None` when a bound is not
+    /// one the pipeline gives meaning to.
+    fn declared_bounds(
+        &self,
+        module: usize,
+        f: &Function,
+    ) -> Option<Vec<(Box<str>, Vec<crate::generics::Bound>)>> {
+        let mut declared = Vec::new();
+        for constraint in &f.constraints {
+            if !f.type_params.contains(&constraint.parameter) {
+                return None;
+            }
+            let mut bounds = Vec::new();
+            for bound in &constraint.bounds {
+                let Type::Named(name) = bound else {
+                    return None;
+                };
+                let symbol = self.path(module, name, Some(Kind::Type))?;
+                bounds.push(*self.bound_traits.get(&symbol.target)?);
+            }
+            declared.push((constraint.parameter.clone(), bounds));
+        }
+        Some(declared)
+    }
+
     /// The payload types of every enum with type parameters, resolved in its own module with
     /// the parameters left as names.
     fn generic_enum_table(&self) -> HashMap<Box<str>, (Vec<Box<str>>, Vec<Option<Type>>)> {
@@ -469,6 +515,9 @@ impl Resolver {
     > {
         // The routine's own signature must be one the pipeline lowers.
         if !self.pipeline_signature(module, function) {
+            return Ok(Err(body));
+        }
+        if !function.constraints.is_empty() && self.declared_bounds(module, function).is_none() {
             return Ok(Err(body));
         }
         let sites: Vec<_> = body
@@ -3053,6 +3102,7 @@ impl Resolver {
         self.records = self.record_table();
         self.enums = self.enum_table();
         self.generic_enums = self.generic_enum_table();
+        self.bound_traits = self.bound_trait_table();
         self.plain = self.plain_functions();
         for index in 0..self.nodes.len() {
             self.next_binding = 0;
@@ -3074,12 +3124,15 @@ impl Resolver {
                 }
             }
             for f in &mut ast.functions {
+                let mut generic_bounds = None;
                 f.name = self.symbol(index, &f.name, Kind::Value, f.span)?;
                 if f.origin == RoutineOrigin::Source
                     && let Some(body) = self.indexed.remove(&f.span)
                 {
+                    let bounds = self.declared_bounds(index, f);
                     match self.bind_indexed(index, f, body)? {
                         Ok(bound) => {
+                            generic_bounds = bounds;
                             // A generic routine keeps an owned body too: instances the
                             // pipeline does not take are cloned from it by the specializer.
                             if !f.type_params.is_empty() {
@@ -3089,7 +3142,15 @@ impl Resolver {
                         }
                         // The indexed pipeline cannot take this routine: link its
                         // owned body so the existing resolver reports or resolves it.
-                        Err(body) => f.body = body.materialize_owned()?,
+                        Err(body) => {
+                            if !f.constraints.is_empty() {
+                                return Err(declarations::unsupported_source(
+                                    declarations::SourceFeature::GenericConstraints,
+                                    f.span,
+                                ));
+                            }
+                            f.body = body.materialize_owned()?
+                        }
                     }
                 }
                 self.function(index, f, &[], &[])?;
@@ -3098,7 +3159,11 @@ impl Resolver {
                 if !f.type_params.is_empty()
                     && let Some(bound) = self.bound.get_mut(&f.name)
                 {
-                    bound.set_generic_header(&f.params, &f.result);
+                    bound.set_generic_header(
+                        &f.params,
+                        &f.result,
+                        generic_bounds.take().unwrap_or_default(),
+                    );
                 }
             }
             for t in &mut ast.traits {
@@ -3338,7 +3403,21 @@ impl Resolver {
                 }
             });
             ast.inherent_implementations.clear();
-            declarations::validate_source_ast(&ast)?;
+            // A bound the routine pipeline gives meaning to (`T: Numeric`) is not an
+            // unimplemented feature once the body is bound to it: binding rejects a routine
+            // whose bounds it does not know, so those that remain are supported.
+            let bounded: Vec<_> = ast
+                .functions
+                .iter_mut()
+                .enumerate()
+                .filter(|(_, f)| !f.constraints.is_empty() && self.bound.contains_key(&f.name))
+                .map(|(position, f)| (position, std::mem::take(&mut f.constraints)))
+                .collect();
+            let validated = declarations::validate_source_ast(&ast);
+            for (position, constraints) in bounded {
+                ast.functions[position].constraints = constraints;
+            }
+            validated?;
             let nodes = &self.nodes;
             let node = &nodes[index];
             let mut bindings: Vec<_> = node
@@ -3578,6 +3657,7 @@ pub fn link_program(
         records: HashMap::new(),
         enums: HashMap::new(),
         generic_enums: HashMap::new(),
+        bound_traits: HashMap::new(),
         variants: HashMap::new(),
         aliases: HashMap::new(),
         source_names: Default::default(),

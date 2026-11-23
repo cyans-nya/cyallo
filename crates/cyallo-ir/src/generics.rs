@@ -7,21 +7,90 @@ type Result<T> = std::result::Result<T, Diagnostic>;
 fn key(s: &str) -> String {
     s.to_owned()
 }
+/// A bound a generic routine may declare: the capabilities it gives a type parameter. Each
+/// is satisfied by scalars and strings only, so no instance needs more than the pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Bound {
+    /// Arithmetic and comparison, and `Copy`.
+    Numeric,
+    /// As `Numeric`, for the integer types.
+    Integer,
+    /// As `Numeric`, for the floating types.
+    Floating,
+    /// May be given to `print`.
+    Printable,
+}
+
+impl Bound {
+    /// Whether a type argument is allowed by the bound.
+    pub fn satisfied_by(self, ty: &Type) -> bool {
+        match self {
+            Self::Numeric => ty.number_kind().is_some(),
+            Self::Integer => ty.number_kind().is_some_and(|kind| !kind.float()),
+            Self::Floating => ty.number_kind().is_some_and(NumberKind::float),
+            Self::Printable => {
+                ty.number_kind().is_some()
+                    || matches!(ty, Type::String | Type::Char | Type::Boolean)
+            }
+        }
+    }
+
+    /// Whether values of a parameter with this bound are `Copy`.
+    pub fn copy(self) -> bool {
+        matches!(self, Self::Numeric | Self::Integer | Self::Floating)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Numeric => "Numeric",
+            Self::Integer => "Integer",
+            Self::Floating => "Floating",
+            Self::Printable => "Printable",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenericError {
-    SpecializationLimit { limit: usize },
-    TypeArity { expected: usize, actual: usize },
-    UnknownRecord { name: Box<str> },
-    UnknownRoutine { name: Box<str> },
-    ArgumentArity { expected: usize, actual: usize },
+    BoundNotSatisfied {
+        bound: &'static str,
+        argument: Box<str>,
+    },
+    SpecializationLimit {
+        limit: usize,
+    },
+    TypeArity {
+        expected: usize,
+        actual: usize,
+    },
+    UnknownRecord {
+        name: Box<str>,
+    },
+    UnknownRoutine {
+        name: Box<str>,
+    },
+    ArgumentArity {
+        expected: usize,
+        actual: usize,
+    },
     IncompatibleArguments,
-    DuplicateRecord { name: Box<str> },
-    DuplicateRoutine { name: Box<str> },
-    InferenceDidNotConverge { iterations: usize },
+    DuplicateRecord {
+        name: Box<str>,
+    },
+    DuplicateRoutine {
+        name: Box<str>,
+    },
+    InferenceDidNotConverge {
+        iterations: usize,
+    },
 }
 impl std::fmt::Display for GenericError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::BoundNotSatisfied { bound, argument } => write!(
+                f,
+                "type argument `{argument}` does not satisfy the bound `{bound}`"
+            ),
             Self::SpecializationLimit { .. } => {
                 f.write_str("generic specialization limit exceeded")
             }
@@ -231,10 +300,29 @@ impl Specializer {
         }
         f.type_params.clear();
         f.name = id.clone().into();
+        // Every bound is checked against the type argument, whichever route lowers the body.
+        if let Some(template) = self.bodies.get(name) {
+            for (parameter, bounds) in template.generic_bounds() {
+                let Some(argument) = bindings.get(&key(parameter)) else {
+                    continue;
+                };
+                for bound in bounds {
+                    if !bound.satisfied_by(argument) {
+                        return Err(invalid_generic(
+                            GenericError::BoundNotSatisfied {
+                                bound: bound.name(),
+                                argument: argument.to_string().into(),
+                            },
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        f.constraints.clear();
         // The template was bound for the routine pipeline. An instance whose type arguments
         // are all scalars is typed from that body, so it needs no tree of its own.
         if let Some(template) = self.bodies.get(name).cloned()
-            && f.constraints.is_empty()
             && args.iter().all(|arg| {
                 matches!(
                     arg,

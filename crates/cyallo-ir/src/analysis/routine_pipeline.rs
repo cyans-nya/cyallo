@@ -99,6 +99,8 @@ pub struct IndexedRoutineBody {
 struct GenericHeader {
     params: Vec<Param>,
     result: Type,
+    /// What each type parameter may be used for, from its declared bounds.
+    bounds: Vec<(Box<str>, Vec<crate::generics::Bound>)>,
 }
 
 impl fmt::Debug for GenericHeader {
@@ -208,11 +210,22 @@ impl IndexedRoutineBody {
     }
 
     /// Record a generic routine's linked signature, whose type parameters are names.
-    pub(crate) fn set_generic_header(&mut self, params: &[Param], result: &Type) {
+    pub(crate) fn set_generic_header(
+        &mut self,
+        params: &[Param],
+        result: &Type,
+        bounds: Vec<(Box<str>, Vec<crate::generics::Bound>)>,
+    ) {
         self.generic = Some(Arc::new(GenericHeader {
             params: params.to_vec(),
             result: result.clone(),
+            bounds,
         }));
+    }
+
+    /// The bounds each type parameter of a generic routine was declared with.
+    pub fn generic_bounds(&self) -> &[(Box<str>, Vec<crate::generics::Bound>)] {
+        self.generic.as_ref().map_or(&[], |header| &header.bounds)
     }
 
     /// Whether this body is a generic template or an instance of one.
@@ -254,6 +267,7 @@ impl IndexedRoutineBody {
                     definitions,
                     self.handle.unit().syntax(),
                     self.file_span,
+                    &header.bounds,
                 )
                 .map(|_| ())
                 .map_err(|mut error| {
@@ -501,6 +515,7 @@ fn lower_mir(
         definitions,
         syntax,
         file_span,
+        &[],
     ) {
         Ok(body) => body,
         Err(mut error) => {
@@ -897,6 +912,7 @@ mod tests {
             &HashMap::new(),
             prepared.handle.unit().syntax(),
             function.span,
+            &[],
         )
         .unwrap();
         assert!(matches!(

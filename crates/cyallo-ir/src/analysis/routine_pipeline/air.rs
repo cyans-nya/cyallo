@@ -398,6 +398,7 @@ pub(super) fn analyze(
     definitions: &HashMap<String, Type>,
     syntax: &IndexedAst,
     routine_span: Span,
+    bounds: &[(Box<str>, Vec<crate::generics::Bound>)],
 ) -> Result<Body, Diagnostic> {
     // A short-circuit operator ends a block in the middle of an expression, so a
     // MIR block may become several. The count is syntactic, so targets are known
@@ -415,6 +416,7 @@ pub(super) fn analyze(
         callees,
         definitions,
         syntax,
+        bounds,
         start,
         types: Vec::new(),
         operands: Vec::new(),
@@ -614,6 +616,8 @@ struct Analysis<'a> {
     definitions: &'a HashMap<String, Type>,
     /// The body's unit, which holds the text of every name the body mentions.
     syntax: &'a IndexedAst,
+    /// What each type parameter may be used for, when a generic template is being checked.
+    bounds: &'a [(Box<str>, Vec<crate::generics::Bound>)],
     /// The first block built for each MIR block.
     start: Vec<usize>,
     types: Vec<Type>,
@@ -626,6 +630,56 @@ struct Analysis<'a> {
 }
 
 impl Analysis<'_> {
+    /// The bounds of a type parameter, or none for any other type.
+    fn bounds_of(&self, ty: &Type) -> &[crate::generics::Bound] {
+        match ty {
+            Type::Named(name) => self
+                .bounds
+                .iter()
+                .find(|(parameter, _)| **parameter == **name)
+                .map_or(&[], |(_, bounds)| bounds),
+            _ => &[],
+        }
+    }
+
+    /// A value of this type can be copied: it is, or a bound says every instance is.
+    fn is_copy(&self, ty: &Type) -> bool {
+        crate::ownership::copy(ty) || self.bounds_of(ty).iter().any(|bound| bound.copy())
+    }
+
+    /// A type parameter whose bounds give it arithmetic.
+    fn opaque_number(&self, ty: &Type) -> bool {
+        self.bounds_of(ty).iter().any(|bound| bound.copy())
+    }
+
+    /// An operator applied to a type parameter with a numeric bound: both operands must be
+    /// that parameter, arithmetic gives it back and a comparison gives a boolean. `None` when
+    /// no operand is such a parameter.
+    fn opaque_binary(
+        &self,
+        operator: Operator,
+        a: &Type,
+        b: &Type,
+        span: Span,
+    ) -> Result<Option<Type>, Diagnostic> {
+        if !self.opaque_number(a) && !self.opaque_number(b) {
+            return Ok(None);
+        }
+        if a == b {
+            if operator.is_arithmetic() && operator != Operator::RealDivide {
+                return Ok(Some(a.clone()));
+            }
+            if operator.is_comparison() {
+                return Ok(Some(Type::Boolean));
+            }
+        }
+        Err(Diagnostic::new(
+            "E105",
+            format!("operator `{operator}` cannot be applied to `{a}` and `{b}`"),
+            span,
+        ))
+    }
+
     fn emit(&mut self, kind: Operation, span: Span) {
         self.operations.push(Located { kind, span });
     }
@@ -900,6 +954,9 @@ impl Analysis<'_> {
             ExpressionKind::Binary(operator, a, b) => {
                 let ta = self.infer(a)?;
                 let tb = self.infer(b)?;
+                if let Some(ty) = self.opaque_binary(*operator, &ta, &tb, expression.span)? {
+                    return Ok(ty);
+                }
                 if numeric(&ta) && numeric(&tb) {
                     let context = numeric_context(a, &ta, b, &tb);
                     // An operand the context left alone has the type it was just given.
@@ -999,7 +1056,7 @@ impl Analysis<'_> {
                 }
                 ExpressionKind::Read(variable) => {
                     let ty = self.typed(*variable, span)?;
-                    if usage == Use::Move && !crate::ownership::copy(&ty) {
+                    if usage == Use::Move && !self.is_copy(&ty) {
                         if self.guard_aliases.iter().any(|alias| alias.0 == variable.0) {
                             return Err(patterns::invalid_pattern(
                                 patterns::PatternError::GuardMove,
@@ -1020,7 +1077,7 @@ impl Analysis<'_> {
                         .steps
                         .last()
                         .map_or_else(|| place.root_type.clone(), |(_, ty)| ty.clone());
-                    if usage == Use::Move && !crate::ownership::copy(&ty) {
+                    if usage == Use::Move && !self.is_copy(&ty) {
                         return Err(Diagnostic::new(
                             "E118",
                             "cannot move a field out of a record; move the whole record or read the field in place",
@@ -1035,7 +1092,7 @@ impl Analysis<'_> {
                 ExpressionKind::Deref(variable) => {
                     let (reference, ty) = self.read(*variable, span)?;
                     let target = pointee(&ty, span)?;
-                    if usage == Use::Move && !crate::ownership::copy(&target) {
+                    if usage == Use::Move && !self.is_copy(&target) {
                         return Err(Diagnostic::new(
                             "E118",
                             "cannot move an owned value out of borrowed or shared storage; clone it explicitly",
@@ -1073,7 +1130,7 @@ impl Analysis<'_> {
                     let valid = if *operator == Operator::Not {
                         ty == Type::Boolean
                     } else {
-                        numeric(&ty)
+                        numeric(&ty) || self.opaque_number(&ty)
                     };
                     if !valid {
                         return Err(Diagnostic::new("E105", "invalid unary operand", span));
@@ -1097,6 +1154,11 @@ impl Analysis<'_> {
                     };
                     let (left, ta) = self.expression(&a)?;
                     let (right, tb) = self.expression(&b)?;
+                    if let Some(ty) = self.opaque_binary(*operator, &ta, &tb, span)? {
+                        let value = self.value(ty.clone());
+                        self.emit(Operation::Binary(value, *operator, left, right), span);
+                        return Ok((value, ty));
+                    }
                     if numeric(&ta) && numeric(&tb) && ta != tb {
                         return Err(Diagnostic::new(
                             "E109",
@@ -1298,7 +1360,7 @@ impl Analysis<'_> {
                         arm.span,
                     );
                     self.store(*slot, value, arm.span);
-                    if !crate::ownership::copy(ty) {
+                    if !self.is_copy(ty) {
                         owned = true;
                         self.guard_aliases.push(*slot);
                     }
@@ -1331,7 +1393,7 @@ impl Analysis<'_> {
                 }
             } else if let Some((slot, ty, operation)) = &binding {
                 let value = self.value(ty.clone());
-                if crate::ownership::copy(ty) {
+                if self.is_copy(ty) {
                     self.emit(
                         Operation::EnumPayload(value, matched.held, *operation, ty.clone()),
                         arm.span,
@@ -1485,7 +1547,11 @@ impl Analysis<'_> {
             types.push(ty);
         }
         if let Some(_) = types.iter().find(|ty| {
-            ty.number_kind().is_none() && !matches!(ty, Type::String | Type::Char | Type::Boolean)
+            ty.number_kind().is_none()
+                && !matches!(ty, Type::String | Type::Char | Type::Boolean)
+                && !self
+                    .bounds_of(ty)
+                    .contains(&crate::generics::Bound::Printable)
         }) {
             let found = types
                 .iter()
@@ -1910,7 +1976,7 @@ impl Analysis<'_> {
                 let (contract, index) = self.variant_of(&held_type, *name, span)?;
                 let operation = contract.variants[index].operation();
                 let ty = self.typed(*slot, span)?;
-                let copy = crate::ownership::copy(&ty);
+                let copy = self.is_copy(&ty);
                 if *stage == mir::Stage::Take && copy {
                     return Ok(());
                 }
@@ -2159,7 +2225,7 @@ impl Analysis<'_> {
                 no,
             } => {
                 if let Some(slot) = alias
-                    && !crate::ownership::copy(&self.typed(*slot, span)?)
+                    && !self.is_copy(&self.typed(*slot, span)?)
                 {
                     self.guard_aliases.push(*slot);
                 }
