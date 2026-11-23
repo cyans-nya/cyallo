@@ -299,7 +299,17 @@ impl Resolver {
             ("std::num", "Numeric", Bound::Numeric),
             ("std::num", "Integer", Bound::Integer),
             ("std::num", "Floating", Bound::Floating),
-            ("std::io", "Printable", Bound::Printable),
+            ("std::ops", "Add", Bound::Add),
+            ("std::ops", "Sub", Bound::Sub),
+            ("std::ops", "Mul", Bound::Mul),
+            ("std::ops", "Div", Bound::Div),
+            ("std::ops", "Rem", Bound::Rem),
+            ("std::ops", "Neg", Bound::Neg),
+            ("std::cmp", "Eq", Bound::Eq),
+            ("std::cmp", "Ord", Bound::Ord),
+            ("std::mem", "Copy", Bound::Copy),
+            ("std::fmt", "Format", Bound::Format),
+            ("std::fmt", "Debug", Bound::Debug),
         ] {
             if let Some(index) = self.nodes.iter().position(|node| node.path == module)
                 && let Some(symbol) = self.path(index, name, Some(Kind::Type))

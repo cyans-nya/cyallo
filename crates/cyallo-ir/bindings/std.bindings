@@ -81,7 +81,7 @@ std::generator::Step::completed generator_completed
 std::generator::Step::is_complete generator_is_complete
 std::generator::Step::is_yielded generator_is_yielded
 std::generator::Step::yielded generator_yielded
-std::io::Printable printable_trait
+std::fmt::Format format_trait
 std::io::print print
 std::lookup::Element element_type
 std::lookup::Field field_type

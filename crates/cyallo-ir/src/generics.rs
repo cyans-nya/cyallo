@@ -7,45 +7,90 @@ type Result<T> = std::result::Result<T, Diagnostic>;
 fn key(s: &str) -> String {
     s.to_owned()
 }
-/// A bound a generic routine may declare: the capabilities it gives a type parameter. Each
-/// is satisfied by scalars and strings only, so no instance needs more than the pipeline.
+/// A bound a generic routine may declare: the capabilities it gives a type parameter, and
+/// nothing beyond them. Each is satisfied by scalars and strings only for now, so no
+/// instance needs more than the pipeline. The operator traits are `Self op Self -> Self`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Bound {
-    /// Arithmetic and comparison, and `Copy`.
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Neg,
+    /// `==` and `!=`.
+    Eq,
+    /// `<`, `<=`, `>` and `>=`.
+    Ord,
+    /// Values are duplicated by reading them rather than moved.
+    Copy,
+    /// The plain text form, as `print` writes it.
+    Format,
+    /// The text form meant for a programmer.
+    Debug,
+    /// Every operator but `-x`, comparison and `Copy`, over any number.
     Numeric,
-    /// As `Numeric`, for the integer types.
+    /// `Numeric`, over the integer types.
     Integer,
-    /// As `Numeric`, for the floating types.
+    /// `Numeric`, over the floating types.
     Floating,
-    /// May be given to `print`.
-    Printable,
 }
 
 impl Bound {
     /// Whether a type argument is allowed by the bound.
     pub fn satisfied_by(self, ty: &Type) -> bool {
+        let number = ty.number_kind();
         match self {
-            Self::Numeric => ty.number_kind().is_some(),
-            Self::Integer => ty.number_kind().is_some_and(|kind| !kind.float()),
-            Self::Floating => ty.number_kind().is_some_and(NumberKind::float),
-            Self::Printable => {
-                ty.number_kind().is_some()
-                    || matches!(ty, Type::String | Type::Char | Type::Boolean)
+            Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Rem | Self::Numeric => {
+                number.is_some()
             }
+            Self::Neg => number.is_some_and(|kind| kind.signed() || kind.float()),
+            Self::Eq => number.is_some() || matches!(ty, Type::String | Type::Char | Type::Boolean),
+            Self::Ord => number.is_some() || matches!(ty, Type::String | Type::Char),
+            Self::Copy => number.is_some() || matches!(ty, Type::Char | Type::Boolean),
+            Self::Format | Self::Debug => {
+                number.is_some() || matches!(ty, Type::String | Type::Char | Type::Boolean)
+            }
+            Self::Integer => number.is_some_and(|kind| !kind.float()),
+            Self::Floating => number.is_some_and(NumberKind::float),
         }
     }
 
-    /// Whether values of a parameter with this bound are `Copy`.
-    pub fn copy(self) -> bool {
-        matches!(self, Self::Numeric | Self::Integer | Self::Floating)
+    /// Whether a parameter with this bound may use the capability `capability`, which is one
+    /// of the single traits.
+    pub fn grants(self, capability: Bound) -> bool {
+        match self {
+            Self::Numeric | Self::Integer | Self::Floating => matches!(
+                capability,
+                Self::Add
+                    | Self::Sub
+                    | Self::Mul
+                    | Self::Div
+                    | Self::Rem
+                    | Self::Eq
+                    | Self::Ord
+                    | Self::Copy
+            ),
+            single => single == capability,
+        }
     }
 
     pub fn name(self) -> &'static str {
         match self {
+            Self::Add => "Add",
+            Self::Sub => "Sub",
+            Self::Mul => "Mul",
+            Self::Div => "Div",
+            Self::Rem => "Rem",
+            Self::Neg => "Neg",
+            Self::Eq => "Eq",
+            Self::Ord => "Ord",
+            Self::Copy => "Copy",
+            Self::Format => "Format",
+            Self::Debug => "Debug",
             Self::Numeric => "Numeric",
             Self::Integer => "Integer",
             Self::Floating => "Floating",
-            Self::Printable => "Printable",
         }
     }
 }

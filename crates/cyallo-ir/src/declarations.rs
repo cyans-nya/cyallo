@@ -640,7 +640,7 @@ fn validate_native_header(
                                     | NativeTrait::Numeric
                                     | NativeTrait::Integer
                                     | NativeTrait::Floating
-                                    | NativeTrait::Printable
+                                    | NativeTrait::Format
                                     | NativeTrait::LegacyNumeric
                                     | NativeTrait::GcOwner
                                     | NativeTrait::GcView

@@ -4,7 +4,9 @@ pub mod array;
 pub mod cell;
 pub mod channel;
 pub mod char;
+pub mod cmp;
 pub mod collections;
+pub mod fmt;
 pub mod gc;
 pub mod generator;
 pub mod io;
@@ -14,6 +16,7 @@ pub mod num;
 pub mod module;
 pub mod option;
 pub mod object;
+pub mod ops;
 #[cyallo_internal("prelude")]
 pub mod prelude;
 pub mod random;

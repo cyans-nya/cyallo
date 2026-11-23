@@ -1,0 +1,4 @@
+// How a value is written as text. `Format` is the plain form, as `print` writes it, and
+// `Debug` is the form meant for a programmer reading output.
+pub trait Format {}
+pub trait Debug {}

@@ -642,19 +642,21 @@ impl Analysis<'_> {
         }
     }
 
+    /// Whether the bounds of a type parameter allow `capability`.
+    fn allows(&self, ty: &Type, capability: crate::generics::Bound) -> bool {
+        self.bounds_of(ty)
+            .iter()
+            .any(|bound| bound.grants(capability))
+    }
+
     /// A value of this type can be copied: it is, or a bound says every instance is.
     fn is_copy(&self, ty: &Type) -> bool {
-        crate::ownership::copy(ty) || self.bounds_of(ty).iter().any(|bound| bound.copy())
+        crate::ownership::copy(ty) || self.allows(ty, crate::generics::Bound::Copy)
     }
 
-    /// A type parameter whose bounds give it arithmetic.
-    fn opaque_number(&self, ty: &Type) -> bool {
-        self.bounds_of(ty).iter().any(|bound| bound.copy())
-    }
-
-    /// An operator applied to a type parameter with a numeric bound: both operands must be
-    /// that parameter, arithmetic gives it back and a comparison gives a boolean. `None` when
-    /// no operand is such a parameter.
+    /// An operator applied to a type parameter: each operand must be that parameter, and
+    /// one of its bounds must give the operator. Arithmetic gives the parameter back and a
+    /// comparison a boolean. `None` when neither operand is a type parameter with bounds.
     fn opaque_binary(
         &self,
         operator: Operator,
@@ -662,16 +664,27 @@ impl Analysis<'_> {
         b: &Type,
         span: Span,
     ) -> Result<Option<Type>, Diagnostic> {
-        if !self.opaque_number(a) && !self.opaque_number(b) {
+        use crate::generics::Bound;
+        if self.bounds_of(a).is_empty() && self.bounds_of(b).is_empty() {
             return Ok(None);
         }
-        if a == b {
-            if operator.is_arithmetic() && operator != Operator::RealDivide {
-                return Ok(Some(a.clone()));
+        let needed = match operator {
+            Operator::Add => Some((Bound::Add, false)),
+            Operator::Subtract => Some((Bound::Sub, false)),
+            Operator::Multiply => Some((Bound::Mul, false)),
+            Operator::Divide | Operator::IntegerDivide => Some((Bound::Div, false)),
+            Operator::Remainder => Some((Bound::Rem, false)),
+            Operator::Equal | Operator::NotEqual => Some((Bound::Eq, true)),
+            Operator::Less | Operator::LessEqual | Operator::Greater | Operator::GreaterEqual => {
+                Some((Bound::Ord, true))
             }
-            if operator.is_comparison() {
-                return Ok(Some(Type::Boolean));
-            }
+            _ => None,
+        };
+        if a == b
+            && let Some((capability, comparison)) = needed
+            && self.allows(a, capability)
+        {
+            return Ok(Some(if comparison { Type::Boolean } else { a.clone() }));
         }
         Err(Diagnostic::new(
             "E105",
@@ -1130,7 +1143,7 @@ impl Analysis<'_> {
                     let valid = if *operator == Operator::Not {
                         ty == Type::Boolean
                     } else {
-                        numeric(&ty) || self.opaque_number(&ty)
+                        numeric(&ty) || self.allows(&ty, crate::generics::Bound::Neg)
                     };
                     if !valid {
                         return Err(Diagnostic::new("E105", "invalid unary operand", span));
@@ -1551,7 +1564,8 @@ impl Analysis<'_> {
                 && !matches!(ty, Type::String | Type::Char | Type::Boolean)
                 && !self
                     .bounds_of(ty)
-                    .contains(&crate::generics::Bound::Printable)
+                    .iter()
+                    .any(|bound| bound.grants(crate::generics::Bound::Format))
         }) {
             let found = types
                 .iter()

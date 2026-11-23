@@ -757,7 +757,7 @@ fn predicate(env: &TypeEnvironment, predicate: NativeTrait, ty: &Type) -> bool {
         NativeTrait::Numeric => ty.number_kind().is_some(),
         NativeTrait::Integer => ty.number_kind().is_some_and(|kind| !kind.float()),
         NativeTrait::Floating => ty.number_kind().is_some_and(NumberKind::float),
-        NativeTrait::Printable => {
+        NativeTrait::Format => {
             if matches!(ty, Type::Dynamic | Type::Object(_)) {
                 return true;
             }

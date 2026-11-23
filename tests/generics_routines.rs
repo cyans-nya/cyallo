@@ -129,14 +129,14 @@ fn a_bound_gives_nothing_beyond_its_own_capabilities() {
     let error =
         failure("fn inc<T: std::num::Numeric>(a: T) -> T { return a + 1 }\nstd::io::print(inc(1))");
     assert_eq!(error.code, "E105", "{}", error.message);
-    // `Numeric` is not `Printable`.
+    // `Numeric` is not `Format`.
     let error = failure("proc show<T: std::num::Numeric>(a: T) { std::io::print(a) }\nshow(1)");
     assert_eq!(error.code, "E112", "{}", error.message);
 }
 
 #[test]
-fn printable_allows_print_and_a_string_satisfies_it() {
-    let source = "proc show<T: std::io::Printable>(a: T) { std::io::print(a) }\nshow(7)\nshow(\"s\")\nshow(true)";
+fn format_allows_print_and_a_string_satisfies_it() {
+    let source = "proc show<T: std::fmt::Format>(a: T) { std::io::print(a) }\nshow(7)\nshow(\"s\")\nshow(true)";
     assert_eq!(run(source), "7\ns\ntrue\n");
 }
 
@@ -158,4 +158,64 @@ fn a_bound_the_language_does_not_implement_is_still_rejected() {
     let error =
         failure("trait Shape {}\nfn f<T: Shape>(a: T) -> T { return a }\nstd::io::print(1)");
     assert_eq!(error.code, "E173", "{}", error.message);
+}
+
+#[test]
+fn each_operator_is_its_own_capability() {
+    let ok =
+        "fn sum<T: std::ops::Add>(a: T, b: T) -> T { return a + b }\nstd::io::print(sum(2, 3))";
+    assert_eq!(run(ok), "5\n");
+    // `Add` gives `+` and nothing else.
+    let error = failure(
+        "fn diff<T: std::ops::Add>(a: T, b: T) -> T { return a - b }\nstd::io::print(diff(2, 3))",
+    );
+    assert_eq!(error.code, "E105", "{}", error.message);
+    let error =
+        failure("fn flip<T: std::ops::Add>(a: T) -> T { return -a }\nstd::io::print(flip(2))");
+    assert_eq!(error.code, "E105", "{}", error.message);
+}
+
+#[test]
+fn comparison_is_eq_and_ord_and_neither_is_copy() {
+    let ok = "fn same<T: std::cmp::Eq>(a: T, b: T) -> bool { return a == b }\n\
+        fn below<T: std::cmp::Ord>(a: T, b: T) -> bool { return a < b }\n\
+        std::io::print(same(1, 1))\nstd::io::print(same(\"a\", \"b\"))\nstd::io::print(below(1, 2))";
+    assert_eq!(run(ok), "true\nfalse\ntrue\n");
+    let error = failure(
+        "fn below<T: std::cmp::Eq>(a: T, b: T) -> bool { return a < b }\nstd::io::print(below(1, 2))",
+    );
+    assert_eq!(error.code, "E105", "{}", error.message);
+    // Without `Copy` a value is moved: `Eq` alone does not give it.
+    let error = failure(
+        "fn twice<T: std::cmp::Eq>(a: T) -> T {\n    let b = a\n    return a\n}\nstd::io::print(twice(1))",
+    );
+    assert_eq!(error.code, "E118");
+    let ok = "fn twice<T: std::mem::Copy>(a: T) -> T {\n    let b = a\n    return a\n}\nstd::io::print(twice(4))";
+    assert_eq!(run(ok), "4\n");
+}
+
+#[test]
+fn neg_is_not_satisfied_by_an_unsigned_type() {
+    let ok = "fn flip<T: std::ops::Neg>(a: T) -> T { return -a }\nstd::io::print(flip(2))\nstd::io::print(flip(1.5))";
+    assert_eq!(run(ok), "-2\n-1.5\n");
+    let error = failure(
+        "fn flip<T: std::ops::Neg>(a: T) -> T { return -a }\nfn go(x: u8) -> u8 { return flip(x) }\nstd::io::print(go(1))",
+    );
+    assert_eq!(error.code, "E151");
+    assert!(error.message.contains("Neg"), "{}", error.message);
+}
+
+#[test]
+fn several_bounds_add_their_capabilities() {
+    let source = "proc show_sum<T: std::ops::Add + std::fmt::Format>(a: T, b: T) { std::io::print(a + b) }\nshow_sum(1, 2)\nshow_sum(1.5, 1.0)";
+    assert_eq!(run(source), "3\n2.5\n");
+}
+
+#[test]
+fn debug_is_a_bound_with_the_same_types_as_format() {
+    let ok = "fn keep<T: std::fmt::Debug>(a: T) -> T { return a }\nstd::io::print(keep(3))";
+    assert_eq!(run(ok), "3\n");
+    // It gives no way to print yet, and does not stand in for `Format`.
+    let error = failure("proc show<T: std::fmt::Debug>(a: T) { std::io::print(a) }\nshow(1)");
+    assert_eq!(error.code, "E112", "{}", error.message);
 }
