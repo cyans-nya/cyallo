@@ -1719,14 +1719,24 @@ impl Analysis<'_> {
                 changed |= self.declare_match(matched, *span)?;
             }
             for (held, name, slot, span) in &binds {
-                if self.variable_type(*slot).is_none()
-                    && let Some(held) = self.variable_type(*held)
-                {
+                if let Some(held) = self.variable_type(*held) {
                     let (contract, index) = self.variant_of(&held, *name, *span)?;
                     if let Some(payload) = &contract.variants[index].payload {
                         let ty = self.view(payload);
-                        self.declare(*slot, ty, *span)?;
-                        changed = true;
+                        match self.variable_type(*slot) {
+                            None => {
+                                self.declare(*slot, ty, *span)?;
+                                changed = true;
+                            }
+                            // Alternatives of an or-pattern share a binding.
+                            Some(existing) if existing != ty => {
+                                return Err(patterns::invalid_pattern(
+                                    patterns::PatternError::AlternativeBindings,
+                                    *span,
+                                ));
+                            }
+                            Some(_) => {}
+                        }
                     }
                 }
             }

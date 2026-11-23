@@ -345,3 +345,54 @@ fn a_block_arm_moves_its_payload_and_spends_the_value() {
     );
     assert_eq!(failure(&source).code, "E118");
 }
+
+#[test]
+fn the_or_pattern_example_runs_and_is_lowered_by_the_pipeline() {
+    let source = include_str!("../examples/enums/or_patterns.yas");
+    assert_eq!(
+        run(source),
+        "true\ntrue\nfalse\n4\n5\n6\n0\nangular 7\nangular 8\nnothing\nfalse\ntrue\n"
+    );
+    assert_lowered_by_the_pipeline(source);
+}
+
+#[test]
+fn alternatives_cover_their_variants_for_exhaustiveness() {
+    let error = failure(&program(
+        "fn f(s: Shape) -> i64 { return match s { Circle(_) | Empty => 1 } }\nstd::io::print(f(Empty))",
+    ));
+    assert_eq!(error.code, "E185");
+    assert!(error.message.contains("Square"), "{}", error.message);
+    let source = program(
+        "fn f(s: Shape) -> i64 { return match s { Circle(_) | Square(_) | Empty => 1 } }\nstd::io::print(f(Empty))",
+    );
+    assert_eq!(run(&source), "1\n");
+    assert_lowered_by_the_pipeline(&source);
+}
+
+#[test]
+fn a_shared_binding_must_have_one_type() {
+    let error = failure(&messages(
+        "fn f(m: Message) -> i64 { return match m { Text(x) | At(x) => 1, Quiet => 0 } }\nstd::io::print(f(Quiet))",
+    ));
+    assert_eq!(error.code, "E185");
+}
+
+#[test]
+fn an_or_pattern_may_bind_a_moved_payload() {
+    let source = "enum Box {\n    Name: string,\n    Title: string,\n    Nothing,\n}\nuse Box::*\n\
+fn label(b: Box) -> string {\n    return match b { Name(s) | Title(s) => s, Nothing => \"-\" }\n}\n\
+std::io::print(label(Title(\"dr\")))\nstd::io::print(label(Nothing))";
+    assert_eq!(run(source), "dr\n-\n");
+    assert_lowered_by_the_pipeline(source);
+}
+
+#[test]
+fn an_or_pattern_may_be_guarded_when_it_binds_nothing() {
+    let source = program(
+        "fn f(s: Shape, ok: bool) -> i64 { return match s { Empty | Circle(_) if ok => 1, _ => 2 } }\n\
+         std::io::print(f(Empty, true))\nstd::io::print(f(Empty, false))\nstd::io::print(f(Square(1), true))",
+    );
+    assert_eq!(run(&source), "1\n2\n2\n");
+    assert_lowered_by_the_pipeline(&source);
+}

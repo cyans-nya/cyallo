@@ -387,28 +387,27 @@ impl Builder {
         });
     }
 
-    /// A `match` statement: for each arm a test block, an optional guard block, and the
-    /// body, which ends by jumping past the last arm. A test or guard that fails goes to
-    /// the next arm, and falling off the last one is unreachable.
+    /// A `match` statement: for each arm a test block per alternative, an optional guard
+    /// block, and the body, which ends by jumping past the last arm. A test or guard that
+    /// fails goes to the next alternative or arm, and falling off the last one is
+    /// unreachable. The alternatives of an or-pattern each bind in their own block and
+    /// meet before the guard and body.
     fn matching(&mut self, matched: hir::MatchStatement, span: Span) {
-        let covers = matched
-            .arms
-            .iter()
-            .map(|arm| match &arm.pattern {
-                hir::Pattern::Wildcard => Cover {
-                    name: None,
-                    payload: hir::Payload::Absent,
+        let mut covers = Vec::new();
+        for arm in &matched.arms {
+            for pattern in &arm.patterns {
+                let (name, payload) = match pattern {
+                    hir::Pattern::Wildcard => (None, hir::Payload::Absent),
+                    hir::Pattern::Variant { name, payload } => (Some(*name), payload.clone()),
+                };
+                covers.push(Cover {
+                    name,
+                    payload,
                     guarded: arm.guard.is_some(),
                     span: arm.span,
-                },
-                hir::Pattern::Variant { name, payload } => Cover {
-                    name: Some(*name),
-                    payload: payload.clone(),
-                    guarded: arm.guard.is_some(),
-                    span: arm.span,
-                },
-            })
-            .collect();
+                });
+            }
+        }
         if !matched.in_place {
             self.emit(
                 Statement::Assign {
@@ -418,53 +417,85 @@ impl Builder {
                 span,
             );
         }
-        self.emit(
-            Statement::MatchCover {
-                held: matched.held,
-                arms: covers,
-            },
-            span,
-        );
         let held = matched.held;
+        self.emit(Statement::MatchCover { held, arms: covers }, span);
         let mut fails: Vec<(OpenBlock, Exit, Span)> = Vec::new();
         let mut ends: Vec<(OpenBlock, Span)> = Vec::new();
+        // Tests and guards of the arm being lowered, which continue with the next arm.
         let mut pending_no: Vec<usize> = Vec::new();
         for arm in matched.arms {
-            let (name, payload) = match &arm.pattern {
-                hir::Pattern::Variant { name, payload } => (Some(*name), payload.clone()),
-                hir::Pattern::Wildcard => (None, hir::Payload::Absent),
-            };
-            if let Some(name) = name {
-                let test = self.take_block();
-                let yes = self.next_block();
-                pending_no.push(fails.len());
-                fails.push((
-                    test,
-                    Exit::MatchTest {
-                        held,
-                        name,
-                        yes,
-                        no: yes,
-                    },
-                    arm.span,
-                ));
-            }
-            let binding = match (name, &payload) {
-                (Some(name), hir::Payload::Binding(slot)) => Some((name, *slot)),
-                _ => None,
-            };
-            if let Some(guard) = arm.guard {
+            let alternatives = arm.patterns.len();
+            let mut to_shared: Vec<(OpenBlock, Span)> = Vec::new();
+            // The test of the previous alternative, which continues with the next one.
+            let mut previous: Option<usize> = None;
+            let mut binding = None;
+            for (index, pattern) in arm.patterns.into_iter().enumerate() {
+                let last = index + 1 == alternatives;
+                let (name, payload) = match pattern {
+                    hir::Pattern::Variant { name, payload } => (Some(name), payload),
+                    hir::Pattern::Wildcard => (None, hir::Payload::Absent),
+                };
+                if let Some(name) = name {
+                    let test = self.take_block();
+                    let yes = self.next_block();
+                    let at = fails.len();
+                    fails.push((
+                        test,
+                        Exit::MatchTest {
+                            held,
+                            name,
+                            yes,
+                            no: yes,
+                        },
+                        arm.span,
+                    ));
+                    if last {
+                        pending_no.push(at);
+                    } else {
+                        previous = Some(at);
+                    }
+                }
+                binding = match (name, &payload) {
+                    (Some(name), hir::Payload::Binding(slot)) => Some((name, *slot)),
+                    _ => None,
+                };
                 if let Some((name, slot)) = binding {
+                    // With a guard the payload is read where it lies, and taken afterwards.
+                    let stage = if arm.guard.is_some() {
+                        Stage::Alias
+                    } else {
+                        Stage::Direct
+                    };
                     self.emit(
                         Statement::MatchBind {
                             held,
                             name,
                             slot,
-                            stage: Stage::Alias,
+                            stage,
                         },
                         arm.span,
                     );
                 }
+                if alternatives > 1 {
+                    let open = self.take_block();
+                    if last {
+                        let shared = self.next_block();
+                        for (block, span) in to_shared.drain(..) {
+                            block.finish(self, Exit::Jump(shared), span);
+                        }
+                        open.finish(self, Exit::Next(shared), arm.span);
+                    } else {
+                        to_shared.push((open, arm.span));
+                        let next = self.next_block();
+                        if let Some(at) = previous.take()
+                            && let Exit::MatchTest { no, .. } = &mut fails[at].1
+                        {
+                            *no = next;
+                        }
+                    }
+                }
+            }
+            if let Some(guard) = arm.guard {
                 let guard_span = guard.span;
                 let block = self.take_block();
                 let yes = self.next_block();
@@ -490,16 +521,6 @@ impl Builder {
                         arm.span,
                     );
                 }
-            } else if let Some((name, slot)) = binding {
-                self.emit(
-                    Statement::MatchBind {
-                        held,
-                        name,
-                        slot,
-                        stage: Stage::Direct,
-                    },
-                    arm.span,
-                );
             }
             self.statements(arm.body);
             let end_span = self.last_span;

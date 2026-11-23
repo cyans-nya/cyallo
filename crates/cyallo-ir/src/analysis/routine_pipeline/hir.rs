@@ -213,7 +213,9 @@ pub(super) struct MatchStatement {
 }
 
 pub(super) struct StatementArm {
-    pub(super) pattern: Pattern,
+    /// The alternatives of an or-pattern (one for an ordinary pattern). They bind the same
+    /// locals, so the guard and body are shared.
+    pub(super) patterns: Vec<Pattern>,
     pub(super) guard: Option<Expression>,
     pub(super) body: Vec<Statement>,
     pub(super) span: Span,
@@ -481,7 +483,11 @@ impl Context<'_> {
     /// A pattern: `_`, or a variant with its payload ignored or bound to a new local.
     /// A bare capitalized name is a variant; a bare lowercase name would bind the whole
     /// value, which is left to the existing route.
-    fn pattern(&mut self, id: Id<PatternNode>) -> Option<Pattern> {
+    fn pattern(
+        &mut self,
+        id: Id<PatternNode>,
+        mut shared: Option<&mut Vec<(NameId, Variable)>>,
+    ) -> Option<Pattern> {
         let ast = self.ast;
         let node = ast.get(id)?;
         match node.kind {
@@ -507,13 +513,30 @@ impl Context<'_> {
                     Some(inner) => match ast.get(inner)?.kind {
                         PatternSyntax::Wildcard => Payload::Wildcard,
                         PatternSyntax::Binding(binding) => {
-                            let slot = self.declare(LocalName::Source(binding), node.span, true);
-                            self.scopes.last_mut()?.push(Visible {
-                                name: binding,
-                                slot,
-                                mutable: false,
-                                reference: None,
+                            // Alternatives of one pattern bind one local between them.
+                            let earlier = shared.as_deref().and_then(|shared| {
+                                shared
+                                    .iter()
+                                    .find(|(name, _)| *name == binding)
+                                    .map(|(_, slot)| *slot)
                             });
+                            let slot = match earlier {
+                                Some(slot) => slot,
+                                None => {
+                                    let slot =
+                                        self.declare(LocalName::Source(binding), node.span, true);
+                                    self.scopes.last_mut()?.push(Visible {
+                                        name: binding,
+                                        slot,
+                                        mutable: false,
+                                        reference: None,
+                                    });
+                                    if let Some(shared) = shared.as_deref_mut() {
+                                        shared.push((binding, slot));
+                                    }
+                                    slot
+                                }
+                            };
                             Payload::Binding(slot)
                         }
                         ref other => {
@@ -735,11 +758,12 @@ impl Context<'_> {
         let ExprSyntax::Match(scrutinee, arms) = ast.get(id)?.kind else {
             return Some(None);
         };
-        if !ast
-            .get_list(arms)?
-            .iter()
-            .any(|arm| matches!(arm.body, MatchBodyNode::Block(..)))
-        {
+        let mut needs_statements = false;
+        for arm in ast.get_list(arms)? {
+            needs_statements |= matches!(arm.body, MatchBodyNode::Block(..))
+                || matches!(ast.get(arm.pattern)?.kind, PatternSyntax::Or(_));
+        }
+        if !needs_statements {
             return Some(None);
         }
         let result = self.declare(LocalName::Hidden("$match"), span, false);
@@ -791,7 +815,34 @@ impl Context<'_> {
         arm: &MatchArmNode,
         result: Option<Variable>,
     ) -> Option<StatementArm> {
-        let pattern = self.pattern(arm.pattern)?;
+        let ast = self.ast;
+        let patterns = match ast.get(arm.pattern)?.kind {
+            PatternSyntax::Or(alternatives) => {
+                let mut shared = Vec::new();
+                let mut patterns = Vec::new();
+                for &alternative in ast.get_list(alternatives)? {
+                    patterns.push(self.pattern(alternative, Some(&mut shared))?);
+                }
+                // Every alternative must bind the same locals, and a guard could not be
+                // given the payload of whichever alternative matched.
+                let bound = |pattern: &Pattern| match pattern {
+                    Pattern::Variant {
+                        payload: Payload::Binding(slot),
+                        ..
+                    } => Some(slot.0),
+                    _ => None,
+                };
+                let first = bound(patterns.first()?);
+                if patterns.iter().any(|pattern| bound(pattern) != first) {
+                    return decline(|| "or-pattern alternatives bind different names".into());
+                }
+                if first.is_some() && arm.guard.is_some() {
+                    return decline(|| "guarded or-pattern with a binding".into());
+                }
+                patterns
+            }
+            _ => vec![self.pattern(arm.pattern, None)?],
+        };
         let guard = match arm.guard {
             Some(guard) => Some(self.value(guard, true)?),
             None => None,
@@ -831,7 +882,7 @@ impl Context<'_> {
             }
         };
         Some(StatementArm {
-            pattern,
+            patterns,
             guard,
             body,
             span: arm.span,
@@ -1080,7 +1131,7 @@ impl Context<'_> {
                         };
                         // The arm's bindings are visible in its body only.
                         self.scopes.push(Vec::new());
-                        let pattern = self.pattern(arm.pattern);
+                        let pattern = self.pattern(arm.pattern, None);
                         let guard = match (pattern.as_ref(), arm.guard) {
                             (Some(_), Some(guard)) => Some(self.value(guard, true)),
                             _ => None,
