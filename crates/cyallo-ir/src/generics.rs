@@ -34,6 +34,9 @@ pub enum Bound {
     Integer,
     /// `Numeric`, over the floating types.
     Floating,
+    /// A trait the program declares, by its place in the routine's list of user traits. It
+    /// gives the trait's methods, and is satisfied by a type with an `impl` of the trait.
+    User(u32),
 }
 
 impl Bound {
@@ -53,6 +56,8 @@ impl Bound {
             }
             Self::Integer => number.is_some_and(|kind| !kind.float()),
             Self::Floating => number.is_some_and(NumberKind::float),
+            // Decided against the program's implementations.
+            Self::User(_) => false,
         }
     }
 
@@ -71,6 +76,7 @@ impl Bound {
                     | Self::Ord
                     | Self::Copy
             ),
+            Self::User(_) => false,
             single => single == capability,
         }
     }
@@ -91,43 +97,23 @@ impl Bound {
             Self::Numeric => "Numeric",
             Self::Integer => "Integer",
             Self::Floating => "Floating",
+            Self::User(_) => "trait",
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenericError {
-    BoundNotSatisfied {
-        bound: &'static str,
-        argument: Box<str>,
-    },
-    SpecializationLimit {
-        limit: usize,
-    },
-    TypeArity {
-        expected: usize,
-        actual: usize,
-    },
-    UnknownRecord {
-        name: Box<str>,
-    },
-    UnknownRoutine {
-        name: Box<str>,
-    },
-    ArgumentArity {
-        expected: usize,
-        actual: usize,
-    },
+    BoundNotSatisfied { bound: Box<str>, argument: Box<str> },
+    SpecializationLimit { limit: usize },
+    TypeArity { expected: usize, actual: usize },
+    UnknownRecord { name: Box<str> },
+    UnknownRoutine { name: Box<str> },
+    ArgumentArity { expected: usize, actual: usize },
     IncompatibleArguments,
-    DuplicateRecord {
-        name: Box<str>,
-    },
-    DuplicateRoutine {
-        name: Box<str>,
-    },
-    InferenceDidNotConverge {
-        iterations: usize,
-    },
+    DuplicateRecord { name: Box<str> },
+    DuplicateRoutine { name: Box<str> },
+    InferenceDidNotConverge { iterations: usize },
 }
 impl std::fmt::Display for GenericError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -267,11 +253,30 @@ struct Specializer {
     generated_functions: Vec<Function>,
     function_instances: HashMap<String, Box<str>>,
     instances: usize,
+    /// The traits the program implements and for which type: `(trait, receiver)`.
+    implementations: Vec<(Box<str>, Type)>,
+    /// Records the pipeline lowers, by name, with their field types.
+    plain_records: HashMap<String, Vec<Type>>,
     /// Indexed bodies of the routines that kept one. An instance of a generic routine over
     /// scalar types is lowered from its template's body instead of a cloned tree.
     bodies: HashMap<Box<str>, crate::analysis::IndexedRoutineBody>,
 }
 impl Specializer {
+    /// A type argument the routine pipeline lowers: a scalar, a string, or a record of such.
+    fn pipeline_argument(&self, ty: &Type, depth: usize) -> bool {
+        match ty {
+            Type::Integer | Type::Boolean | Type::Real | Type::Numeric(_) | Type::String => true,
+            Type::Named(name) if depth < 8 => {
+                self.plain_records.get(&key(name)).is_some_and(|fields| {
+                    fields
+                        .iter()
+                        .all(|field| self.pipeline_argument(field, depth + 1))
+                })
+            }
+            _ => false,
+        }
+    }
+
     fn reserve(&mut self, span: Span) -> Result<()> {
         self.instances += 1;
         if self.instances > 256 {
@@ -352,10 +357,23 @@ impl Specializer {
                     continue;
                 };
                 for bound in bounds {
-                    if !bound.satisfied_by(argument) {
+                    let (satisfied, bound_name): (bool, Box<str>) = match bound {
+                        Bound::User(index) => {
+                            let traits = template.generic_user_traits();
+                            let trait_name =
+                                traits.get(*index as usize).cloned().unwrap_or_default();
+                            let implemented =
+                                self.implementations.iter().any(|(name, receiver)| {
+                                    *name == trait_name && receiver == argument
+                                });
+                            (implemented, trait_name)
+                        }
+                        builtin => (builtin.satisfied_by(argument), builtin.name().into()),
+                    };
+                    if !satisfied {
                         return Err(invalid_generic(
                             GenericError::BoundNotSatisfied {
-                                bound: bound.name(),
+                                bound: bound_name,
                                 argument: argument.to_string().into(),
                             },
                             span,
@@ -368,12 +386,7 @@ impl Specializer {
         // The template was bound for the routine pipeline. An instance whose type arguments
         // are all scalars is typed from that body, so it needs no tree of its own.
         if let Some(template) = self.bodies.get(name).cloned()
-            && args.iter().all(|arg| {
-                matches!(
-                    arg,
-                    Type::Integer | Type::Boolean | Type::Real | Type::Numeric(_) | Type::String
-                )
-            })
+            && args.iter().all(|arg| self.pipeline_argument(arg, 0))
         {
             f.body.clear();
             self.bodies.insert(id.clone().into(), template);
@@ -784,6 +797,22 @@ pub fn specialize_modules_with_bodies(
         generated_functions: vec![],
         function_instances: HashMap::new(),
         instances: 0,
+        implementations: asts
+            .iter()
+            .flat_map(|ast| &ast.implementations)
+            .map(|imp| (imp.trait_name.clone(), canonical(&imp.receiver)))
+            .collect(),
+        plain_records: asts
+            .iter()
+            .flat_map(|ast| &ast.records)
+            .filter(|record| record.type_params.is_empty())
+            .map(|record| {
+                (
+                    key(&record.name),
+                    record.fields.iter().map(|(_, ty)| ty.clone()).collect(),
+                )
+            })
+            .collect(),
         bodies: std::mem::take(bodies),
     };
     let mut owners = HashMap::new();

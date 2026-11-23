@@ -86,6 +86,8 @@ struct Resolver {
     enums: HashMap<Box<str>, Vec<(Box<str>, Option<Type>)>>,
     /// The standard traits a generic routine may be bounded by, by linked name.
     bound_traits: HashMap<Box<str>, crate::generics::Bound>,
+    /// The traits the program declares (without type parameters), by linked name.
+    user_traits: std::collections::HashSet<Box<str>>,
     /// Enums with type parameters, by linked name: the parameters and the variants'
     /// payload types, which mention them.
     generic_enums: HashMap<Box<str>, (Vec<Box<str>>, Vec<Option<Type>>)>,
@@ -320,14 +322,30 @@ impl Resolver {
         table
     }
 
-    /// What each type parameter of a routine is bounded by, or `None` when a bound is not
-    /// one the pipeline gives meaning to.
-    fn declared_bounds(
-        &self,
-        module: usize,
-        f: &Function,
-    ) -> Option<Vec<(Box<str>, Vec<crate::generics::Bound>)>> {
+    /// The traits declared in source, which a generic routine may use as a bound.
+    fn user_trait_table(&self) -> std::collections::HashSet<Box<str>> {
+        let mut table = std::collections::HashSet::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            for declaration in &node.ast.traits {
+                // A trait with native meaning (`Cloneable`, `Collection`) is decided by the
+                // native contract, not by an `impl`, so it is not one a program declares.
+                if declaration.type_params.is_empty()
+                    && declaration.origin == TraitOrigin::Source
+                    && let Some(symbol) = self.path(index, &declaration.name, Some(Kind::Type))
+                    && symbol.native.is_none()
+                {
+                    table.insert(symbol.target);
+                }
+            }
+        }
+        table
+    }
+
+    /// What each type parameter of a routine is bounded by, with the program's traits it
+    /// names, or `None` when a bound is not one the pipeline gives meaning to.
+    fn declared_bounds(&self, module: usize, f: &Function) -> Option<DeclaredBounds> {
         let mut declared = Vec::new();
+        let mut traits: Vec<Box<str>> = Vec::new();
         for constraint in &f.constraints {
             if !f.type_params.contains(&constraint.parameter) {
                 return None;
@@ -338,11 +356,24 @@ impl Resolver {
                     return None;
                 };
                 let symbol = self.path(module, name, Some(Kind::Type))?;
-                bounds.push(*self.bound_traits.get(&symbol.target)?);
+                if let Some(bound) = self.bound_traits.get(&symbol.target) {
+                    bounds.push(*bound);
+                } else if self.user_traits.contains(&symbol.target) {
+                    let index = match traits.iter().position(|t| *t == symbol.target) {
+                        Some(index) => index,
+                        None => {
+                            traits.push(symbol.target.clone());
+                            traits.len() - 1
+                        }
+                    };
+                    bounds.push(crate::generics::Bound::User(index as u32));
+                } else {
+                    return None;
+                }
             }
             declared.push((constraint.parameter.clone(), bounds));
         }
-        Some(declared)
+        Some((declared, traits))
     }
 
     /// The payload types of every enum with type parameters, resolved in its own module with
@@ -3113,6 +3144,7 @@ impl Resolver {
         self.enums = self.enum_table();
         self.generic_enums = self.generic_enum_table();
         self.bound_traits = self.bound_trait_table();
+        self.user_traits = self.user_trait_table();
         self.plain = self.plain_functions();
         for index in 0..self.nodes.len() {
             self.next_binding = 0;
@@ -3169,11 +3201,8 @@ impl Resolver {
                 if !f.type_params.is_empty()
                     && let Some(bound) = self.bound.get_mut(&f.name)
                 {
-                    bound.set_generic_header(
-                        &f.params,
-                        &f.result,
-                        generic_bounds.take().unwrap_or_default(),
-                    );
+                    let (bounds, user_traits) = generic_bounds.take().unwrap_or_default();
+                    bound.set_generic_header(&f.params, &f.result, bounds, user_traits);
                 }
             }
             for t in &mut ast.traits {
@@ -3668,6 +3697,7 @@ pub fn link_program(
         enums: HashMap::new(),
         generic_enums: HashMap::new(),
         bound_traits: HashMap::new(),
+        user_traits: Default::default(),
         variants: HashMap::new(),
         aliases: HashMap::new(),
         source_names: Default::default(),
@@ -3764,3 +3794,6 @@ fn substitute_named(ty: &mut Type, params: &[Box<str>], arguments: &[Type]) {
         _ => {}
     }
 }
+
+/// A routine's bounds by type parameter, and the program's traits they name.
+type DeclaredBounds = (Vec<(Box<str>, Vec<crate::generics::Bound>)>, Vec<Box<str>>);

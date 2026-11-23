@@ -469,11 +469,12 @@ impl DeferredBody {
                 let _lower =
                     cyallo_startup_profile::stage(cyallo_startup_profile::Stage::BodyLower);
                 let migrated = match &self.indexed {
-                    Some(body) => body.emit(
+                    Some(body) => body.emit_with(
                         &self.function,
                         &c.source_names,
                         &c.signatures,
                         &c.routine_types,
+                        &c.services,
                     )?,
                     None => None,
                 };

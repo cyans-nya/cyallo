@@ -225,6 +225,7 @@ fn analyze_modules_with(
                         &context.signatures,
                         &context.source_names,
                         &context.routine_types,
+                        &context.services,
                     )?;
                 }
             }

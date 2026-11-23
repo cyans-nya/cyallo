@@ -96,11 +96,14 @@ pub struct IndexedRoutineBody {
     generic: Option<Arc<GenericHeader>>,
 }
 
-struct GenericHeader {
-    params: Vec<Param>,
-    result: Type,
+pub(super) struct GenericHeader {
+    pub(super) params: Vec<Param>,
+    pub(super) result: Type,
     /// What each type parameter may be used for, from its declared bounds.
-    bounds: Vec<(Box<str>, Vec<crate::generics::Bound>)>,
+    pub(super) bounds: Vec<(Box<str>, Vec<crate::generics::Bound>)>,
+    /// The linked names of the traits the program declares that bound a parameter; a
+    /// `Bound::User(i)` is the `i`th.
+    pub(super) user_traits: Vec<Box<str>>,
 }
 
 impl fmt::Debug for GenericHeader {
@@ -215,12 +218,21 @@ impl IndexedRoutineBody {
         params: &[Param],
         result: &Type,
         bounds: Vec<(Box<str>, Vec<crate::generics::Bound>)>,
+        user_traits: Vec<Box<str>>,
     ) {
         self.generic = Some(Arc::new(GenericHeader {
             params: params.to_vec(),
             result: result.clone(),
             bounds,
+            user_traits,
         }));
+    }
+
+    /// The linked names of the program's traits that bound a type parameter.
+    pub fn generic_user_traits(&self) -> &[Box<str>] {
+        self.generic
+            .as_ref()
+            .map_or(&[], |header| &header.user_traits)
     }
 
     /// The bounds each type parameter of a generic routine was declared with.
@@ -241,11 +253,12 @@ impl IndexedRoutineBody {
     /// Check a generic template once, with its type parameters opaque: a value of such a
     /// type can be moved and returned and nothing else, whatever the instance turns out to
     /// be. The outcome is shared by the template and all its instances.
-    pub fn check_generic(
+    pub(crate) fn check_generic(
         &self,
         signatures: &HashMap<String, Signature>,
         source_names: &BTreeMap<Box<str>, Box<str>>,
         definitions: &HashMap<String, Type>,
+        services: &crate::services::Metadata,
     ) -> Result<()> {
         let Some(header) = &self.generic else {
             return Ok(());
@@ -268,6 +281,8 @@ impl IndexedRoutineBody {
                     self.handle.unit().syntax(),
                     self.file_span,
                     &header.bounds,
+                    Some(header),
+                    Some(services),
                 )
                 .map(|_| ())
                 .map_err(|mut error| {
@@ -319,12 +334,32 @@ impl IndexedRoutineBody {
 
     /// `Ok(None)` leaves the routine to the existing route: a reference site
     /// that does not bind to a plain `i64` function contract is unsupported.
+    #[cfg(test)]
     pub(super) fn emit(
         &self,
         function: &Function,
         source_names: &BTreeMap<Box<str>, Box<str>>,
         signatures: &HashMap<String, Signature>,
         definitions: &HashMap<String, Type>,
+    ) -> Result<Option<ir::Function>> {
+        self.emit_with(
+            function,
+            source_names,
+            signatures,
+            definitions,
+            &crate::services::Metadata::default(),
+        )
+    }
+
+    /// As `emit`, with the program's traits and implementations, which a method call on a
+    /// generic routine's parameter is resolved against.
+    pub(super) fn emit_with(
+        &self,
+        function: &Function,
+        source_names: &BTreeMap<Box<str>, Box<str>>,
+        signatures: &HashMap<String, Signature>,
+        definitions: &HashMap<String, Type>,
+        services: &crate::services::Metadata,
     ) -> Result<Option<ir::Function>> {
         let Some(callees) = self.bind_callees(Some(function), signatures, source_names)? else {
             return Ok(None);
@@ -338,6 +373,8 @@ impl IndexedRoutineBody {
             &callees,
             definitions,
             self.handle.unit().syntax(),
+            self.generic.as_deref(),
+            services,
         )
     }
 
@@ -500,6 +537,8 @@ fn lower_mir(
     callees: &[air::Site],
     definitions: &HashMap<String, Type>,
     syntax: &IndexedAst,
+    generic: Option<&GenericHeader>,
+    services: &crate::services::Metadata,
 ) -> Result<Option<ir::Function>> {
     let mut locals = collect(&[], &function.params)?;
     for local in &mut locals {
@@ -516,6 +555,8 @@ fn lower_mir(
         syntax,
         file_span,
         &[],
+        generic,
+        Some(services),
     ) {
         Ok(body) => body,
         Err(mut error) => {
@@ -913,6 +954,8 @@ mod tests {
             prepared.handle.unit().syntax(),
             function.span,
             &[],
+            None,
+            None,
         )
         .unwrap();
         assert!(matches!(

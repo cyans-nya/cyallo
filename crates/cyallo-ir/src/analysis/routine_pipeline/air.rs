@@ -399,6 +399,8 @@ pub(super) fn analyze(
     syntax: &IndexedAst,
     routine_span: Span,
     bounds: &[(Box<str>, Vec<crate::generics::Bound>)],
+    generic: Option<&super::GenericHeader>,
+    services: Option<&crate::services::Metadata>,
 ) -> Result<Body, Diagnostic> {
     // A short-circuit operator ends a block in the middle of an expression, so a
     // MIR block may become several. The count is syntactic, so targets are known
@@ -417,6 +419,8 @@ pub(super) fn analyze(
         definitions,
         syntax,
         bounds,
+        generic,
+        services,
         start,
         types: Vec::new(),
         operands: Vec::new(),
@@ -575,6 +579,7 @@ fn extra_blocks(block: &mir::Block) -> usize {
                         .sum::<usize>()
             }
             ExpressionKind::Call(_, arguments) => arguments.iter().map(count).sum(),
+            ExpressionKind::MethodCall(call) => call.arguments.iter().map(count).sum(),
         }
     }
     let statements: usize = block
@@ -607,6 +612,15 @@ fn extra_blocks(block: &mir::Block) -> usize {
         }
 }
 
+/// A method found for a call: the routine that runs it (none while a template is checked),
+/// its parameter and result types, and how it takes its receiver.
+struct MethodTarget {
+    id: usize,
+    params: Vec<(Type, bool)>,
+    result: Type,
+    receiver: crate::services::Receiver,
+}
+
 struct Analysis<'a> {
     parameters: &'a [Param],
     locals: &'a [mir::LocalInfo],
@@ -618,6 +632,10 @@ struct Analysis<'a> {
     syntax: &'a IndexedAst,
     /// What each type parameter may be used for, when a generic template is being checked.
     bounds: &'a [(Box<str>, Vec<crate::generics::Bound>)],
+    /// The routine's declared generic signature, when it is a template or an instance.
+    generic: Option<&'a super::GenericHeader>,
+    /// The program's traits and implementations, to find a method.
+    services: Option<&'a crate::services::Metadata>,
     /// The first block built for each MIR block.
     start: Vec<usize>,
     types: Vec<Type>,
@@ -993,6 +1011,9 @@ impl Analysis<'_> {
                 Some(arm) => self.infer(&arm.body),
                 None => Err(invalid(expression.span)),
             },
+            ExpressionKind::MethodCall(call) => {
+                Ok(self.resolve_method(call, expression.span)?.result)
+            }
             ExpressionKind::Call(site, arguments) => match self.callees.get(site.0) {
                 Some(Site::Builtin(id)) => {
                     let (_, types) = self.builtin_arguments(*id, arguments)?;
@@ -1192,6 +1213,7 @@ impl Analysis<'_> {
                     slot,
                 } => self.short_circuit(*and, left, right, *slot, span),
                 ExpressionKind::Match(matched) => self.matched(matched, span),
+                ExpressionKind::MethodCall(call) => self.method_call(call, span, false),
                 ExpressionKind::Call(site, arguments)
                     if matches!(self.callees.get(site.0), Some(Site::Builtin(_))) =>
                 {
@@ -1588,6 +1610,179 @@ impl Analysis<'_> {
         self.operands.extend(values);
         self.emit(Operation::Print(operands), span);
         Ok(())
+    }
+
+    /// Find the method a call names in the traits that bound the receiver's type parameter,
+    /// and, for an instance, the `impl` method of the concrete type that stands for it.
+    fn resolve_method(
+        &self,
+        call: &hir::MethodCall,
+        span: Span,
+    ) -> Result<MethodTarget, Diagnostic> {
+        let unresolved = |message: String| Diagnostic::new("E106", message, span);
+        let name = self.text(call.name);
+        let (Some(header), Some(services)) = (self.generic, self.services) else {
+            return Err(unresolved(format!("unresolved method `{name}`")));
+        };
+        let peel = |ty: &Type| match ty {
+            Type::Reference { pointee, .. } => (**pointee).clone(),
+            other => other.clone(),
+        };
+        // The parameter's declared type names the type parameter, and so its bounds.
+        let declared = header
+            .params
+            .get(call.receiver.0)
+            .map(|parameter| peel(&parameter.ty))
+            .ok_or_else(|| invalid(span))?;
+        let Type::Named(parameter) = &declared else {
+            return Err(unresolved(format!("unresolved method `{name}`")));
+        };
+        let mut found = None;
+        let bounds = header
+            .bounds
+            .iter()
+            .find(|(candidate, _)| **candidate == **parameter)
+            .map_or(&[][..], |(_, bounds)| &bounds[..]);
+        for bound in bounds {
+            let crate::generics::Bound::User(index) = bound else {
+                continue;
+            };
+            let Some(trait_name) = header.user_traits.get(*index as usize) else {
+                continue;
+            };
+            let Some(trait_id) = services.trait_id(trait_name) else {
+                continue;
+            };
+            use cyallo_ast::IdentifierEq as _;
+            if let Some(method) = services.traits[trait_id]
+                .methods
+                .iter()
+                .position(|method| method.name.eq_identifier(name))
+            {
+                if found.is_some() {
+                    return Err(unresolved(format!(
+                        "method `{name}` is in more than one bound of `{parameter}`"
+                    )));
+                }
+                found = Some((trait_id, method));
+            }
+        }
+        let Some((trait_id, method)) = found else {
+            return Err(unresolved(format!(
+                "`{parameter}` has no method `{}` in its bounds",
+                cyallo_ast::source_name(name)
+            )));
+        };
+        let contract = &services.traits[trait_id].methods[method];
+        // A template is checked against the trait; an instance calls the `impl`'s method.
+        let receiver_type = self.typed(call.receiver, span)?;
+        let concrete = self.view(&peel(&receiver_type));
+        let id = if concrete == declared {
+            usize::MAX
+        } else {
+            let implementation = services
+                .implementations
+                .iter()
+                .find(|implementation| {
+                    implementation.trait_id == trait_id
+                        && self.view(&implementation.receiver) == concrete
+                })
+                .ok_or_else(|| {
+                    unresolved(format!(
+                        "`{concrete}` does not implement the trait of `{name}`"
+                    ))
+                })?;
+            implementation.methods[method]
+        };
+        Ok(MethodTarget {
+            id,
+            params: contract.params.clone(),
+            result: contract.result.clone(),
+            receiver: contract.receiver,
+        })
+    }
+
+    /// `receiver.method(arguments)`: the receiver is passed by reference as the method
+    /// declares, then the arguments against the method's parameter types.
+    fn method_call(
+        &mut self,
+        call: &hir::MethodCall,
+        span: Span,
+        statement: bool,
+    ) -> Result<(Value, Type), Diagnostic> {
+        use crate::services::Receiver;
+        let target = self.resolve_method(call, span)?;
+        if target.result == Type::Void && !statement {
+            return Err(Diagnostic::new(
+                "E110",
+                "procedure cannot be used as an expression",
+                span,
+            ));
+        }
+        let ty = self.typed(call.receiver, span)?;
+        let receiver = match (&ty, target.receiver) {
+            (Type::Reference { mutable: false, .. }, Receiver::Mutable) => {
+                return Err(Diagnostic::new(
+                    "E107",
+                    "cannot modify through a shared reference",
+                    span,
+                ));
+            }
+            (Type::Reference { .. }, Receiver::Value) => {
+                return Err(Diagnostic::new(
+                    "E118",
+                    "cannot move an owned value out of borrowed or shared storage",
+                    span,
+                ));
+            }
+            (Type::Reference { .. }, _) => self.read(call.receiver, span)?.0,
+            (_, Receiver::Value) => {
+                let read = Expression::new(span, ExpressionKind::Read(call.receiver));
+                self.expression_as(&read, Use::Move)?.0
+            }
+            (_, mode) => {
+                let mutable = mode == Receiver::Mutable;
+                if mutable && self.constant(call.receiver) {
+                    return Err(Diagnostic::new("E107", "cannot modify a constant", span));
+                }
+                let reference = Type::Reference {
+                    mutable,
+                    lifetime: None,
+                    pointee: Box::new(ty.clone()),
+                };
+                let value = self.value(reference);
+                self.emit(Operation::Borrow(value, call.receiver), span);
+                value
+            }
+        };
+        if call.arguments.len() != target.params.len() {
+            return Err(invalid(span));
+        }
+        let mut values = vec![receiver];
+        for (argument, (parameter, _)) in call.arguments.iter().zip(&target.params) {
+            let parameter = self.view(parameter);
+            let usage = if matches!(parameter, Type::Reference { .. }) {
+                Use::Read
+            } else {
+                Use::Move
+            };
+            let (value, actual) = self.expected_as(argument, &parameter, usage)?;
+            require_argument(&parameter, &actual, argument.span)?;
+            values.push(value);
+        }
+        let operands = Operands {
+            start: self.operands.len(),
+            len: values.len(),
+        };
+        self.operands.extend(values);
+        let result = self.view(&target.result);
+        let value = self.value(result.clone());
+        if target.result == Type::Void {
+            self.emit(Operation::CallStatement(target.id, operands), span);
+        } else {
+            self.emit(Operation::Call(value, target.id, operands), span);
+        }
+        Ok((value, result))
     }
 
     /// A variant of a generic enum, built as the instance the context asks for: the expected
@@ -2112,6 +2307,10 @@ impl Analysis<'_> {
                 self.emit(Operation::StoreIndirect(pointer, combined), span);
             }
             Statement::CallStatement(call) => {
+                if let ExpressionKind::MethodCall(method) = &call.kind {
+                    self.method_call(method, call.span, true)?;
+                    return Ok(());
+                }
                 let ExpressionKind::Call(site, arguments) = &call.kind else {
                     return Err(invalid(span));
                 };
@@ -2360,6 +2559,13 @@ fn mentions(expression: &Expression, variables: &[Variable]) -> bool {
         | ExpressionKind::ShortCircuit { left, right, .. } => {
             mentions(left, variables) || mentions(right, variables)
         }
+        ExpressionKind::MethodCall(call) => {
+            variables.iter().any(|other| other.0 == call.receiver.0)
+                || call
+                    .arguments
+                    .iter()
+                    .any(|argument| mentions(argument, variables))
+        }
         ExpressionKind::Call(_, arguments) => arguments
             .iter()
             .any(|argument| mentions(argument, variables)),
@@ -2390,6 +2596,11 @@ fn gather_in<'e>(expression: &'e Expression, out: &mut Vec<(&'e hir::Match, Span
         | ExpressionKind::ShortCircuit { left, right, .. } => {
             gather_matches(left, out);
             gather_matches(right, out);
+        }
+        ExpressionKind::MethodCall(call) => {
+            for argument in &call.arguments {
+                gather_matches(argument, out);
+            }
         }
         ExpressionKind::Call(_, arguments) => {
             for argument in arguments {

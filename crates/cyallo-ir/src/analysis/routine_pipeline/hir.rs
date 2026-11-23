@@ -54,6 +54,8 @@ pub(super) enum ExpressionKind {
     Text(NameId),
     /// `match value { Variant(binding) => expression, ... }`.
     Match(Box<Match>),
+    /// `receiver.method(arguments)` on a parameter whose type is a type parameter.
+    MethodCall(Box<MethodCall>),
     /// `p.*`: the value a reference parameter refers to.
     Deref(Variable),
     /// `&x` or `&mut x`, as a call argument: a reference to a local or a by-value parameter.
@@ -63,6 +65,15 @@ pub(super) enum ExpressionKind {
     },
     /// A reference parameter passed on, as a call argument.
     Reborrow(Variable),
+}
+
+/// A method called on a parameter of generic type. Which method it is depends on the
+/// bounds of that type, so it is found when the routine is typed.
+#[derive(Clone, Debug)]
+pub(super) struct MethodCall {
+    pub(super) receiver: Variable,
+    pub(super) name: NameId,
+    pub(super) arguments: Vec<Expression>,
 }
 
 /// A match over an enum. The scrutinee is held in a hidden local (unless it already is a
@@ -125,6 +136,9 @@ impl Expression {
             }
             ExpressionKind::Project { path, .. } => path.len(),
             ExpressionKind::Text(_) => 0,
+            ExpressionKind::MethodCall(call) => {
+                1 + call.arguments.iter().map(Expression::size).sum::<usize>()
+            }
             ExpressionKind::Match(matched) => {
                 matched.scrutinee.size()
                     + matched
@@ -329,6 +343,9 @@ struct Context<'a> {
     loops: usize,
     /// The routine returns no value.
     procedure: bool,
+    /// For each parameter: whether its type is a type parameter, or a reference to one,
+    /// which is what a method may be called on.
+    generic_receiver: Vec<bool>,
     /// Statements to run before the one being lowered (a `match` hoisted out of its value).
     pending: Vec<Statement>,
 }
@@ -401,6 +418,23 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
         loops: 0,
         procedure,
         pending: Vec::new(),
+        generic_receiver: {
+            let type_params = ast.get_list(function.type_params)?;
+            parameters
+                .iter()
+                .map(|parameter| {
+                    let node = ast.get(parameter.ty);
+                    let named = |id: Id<TypeNode>| {
+                        matches!(ast.get(id), Some(TypeNode::Named(name)) if type_params.contains(name))
+                    };
+                    match node {
+                        Some(TypeNode::Named(name)) => type_params.contains(name),
+                        Some(TypeNode::Reference { pointee, lifetime: None, .. }) => named(*pointee),
+                        _ => false,
+                    }
+                })
+                .collect()
+        },
         scopes: vec![
             names
                 .iter()
@@ -653,10 +687,15 @@ impl Context<'_> {
                         StmtSyntax::Evaluate(value) => {
                             let call = self.value(value, false)?;
                             // The linker checks that the callee has a contract this subset knows.
-                            let ExpressionKind::Call(site, _) = &call.kind else {
-                                return decline(|| "statement that is not a call".into());
-                            };
-                            self.sites[site.0].discard = true;
+                            match &call.kind {
+                                ExpressionKind::Call(site, _) => {
+                                    self.sites[site.0].discard = true;
+                                }
+                                ExpressionKind::MethodCall(_) => {}
+                                _ => {
+                                    return decline(|| "statement that is not a call".into());
+                                }
+                            }
                             StatementKind::CallStatement(call)
                         }
                         StmtSyntax::Binding(name, annotation, constant, mutable, value) => {
@@ -1186,6 +1225,36 @@ impl Context<'_> {
                             });
                         }
                     }
+                }
+                ExprSyntax::Invoke(callee, arguments) => {
+                    let ExprSyntax::Field(base, method) = ast.get(callee)?.kind else {
+                        return decline(|| "call of a value".into());
+                    };
+                    let ExprSyntax::Name(receiver) = ast.get(base)?.kind else {
+                        return decline(|| "method call on something other than a name".into());
+                    };
+                    let visible = self.lookup(receiver)?;
+                    if visible.slot.0 >= self.parameters
+                        || !self
+                            .generic_receiver
+                            .get(visible.slot.0)
+                            .copied()
+                            .unwrap_or(false)
+                    {
+                        return decline(|| {
+                            "method call on something other than a generic parameter".into()
+                        });
+                    }
+                    let arguments: Vec<Expression> = ast
+                        .get_list(arguments)?
+                        .iter()
+                        .map(|&argument| self.argument(argument))
+                        .collect::<Option<_>>()?;
+                    ExpressionKind::MethodCall(Box::new(MethodCall {
+                        receiver: visible.slot,
+                        name: method,
+                        arguments,
+                    }))
                 }
                 ExprSyntax::Call(name, arguments) => {
                     // A local of the same name shadows the declaration.
