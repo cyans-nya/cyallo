@@ -9,7 +9,7 @@ use super::{SiteId, Variable, hir, mir};
 use cyallo_ast::{Diagnostic, Literal, Number, NumberKind, Operator, Param, Span, Type};
 use hir::{Expression, ExpressionKind};
 use mir::{Located, Statement};
-use std::{borrow::Cow, fmt};
+use std::{borrow::Cow, collections::HashMap, fmt};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Value(pub(super) usize);
@@ -27,6 +27,21 @@ pub(super) struct Body {
     pub(super) operands: Vec<Value>,
     /// Final types of the locals after the parameters, in slot order.
     pub(super) locals: Vec<Type>,
+}
+
+/// What a reference site was bound to: a callee, or the record type a literal names.
+pub(super) enum Site {
+    Call(Callee),
+    /// The linked name of the record, whose definition the type environment holds.
+    Record(Box<str>),
+}
+
+/// A field place: the root local, whether it is a reference to the record, and the field
+/// index and type at each step.
+pub(super) struct Place {
+    pub(super) root_type: Type,
+    pub(super) via_reference: bool,
+    pub(super) steps: Vec<(usize, Type)>,
 }
 
 /// A callee contract bound to one reference site: the target's routine
@@ -52,6 +67,12 @@ pub(super) enum Operation {
     Unary(Value, Operator, Value),
     Call(Value, usize, Operands),
     CallStatement(usize, Operands),
+    /// Build a record from its fields, in declaration order.
+    Aggregate(Value, Vec<Value>),
+    /// Read a field of a local or of the record a reference parameter refers to.
+    FieldRead(Value, Variable, Box<Place>),
+    /// Write a field.
+    FieldWrite(Variable, Box<Place>, Value),
     /// Move a value out of a local, which is then empty until it is written again.
     TakeVariable(Value, Variable),
     /// Read through a reference value.
@@ -330,7 +351,8 @@ pub(super) fn analyze(
     body: &mir::Body,
     parameters: &[Param],
     result: &Type,
-    callees: &[Callee],
+    callees: &[Site],
+    definitions: &HashMap<String, Type>,
     routine_span: Span,
 ) -> Result<Body, Diagnostic> {
     // A short-circuit operator ends a block in the middle of an expression, so a
@@ -347,6 +369,7 @@ pub(super) fn analyze(
         locals: &body.locals,
         result,
         callees,
+        definitions,
         start,
         types: Vec::new(),
         operands: Vec::new(),
@@ -408,6 +431,8 @@ fn check_moves(blocks: &[Block], variables: usize) -> Result<(), Diagnostic> {
             match operation.kind {
                 Operation::ReadVariable(_, variable)
                 | Operation::Borrow(_, variable)
+                | Operation::FieldRead(_, variable, _)
+                | Operation::FieldWrite(variable, _, _)
                 | Operation::TakeVariable(_, variable) => {
                     if report && let Some(moved) = state[variable.0] {
                         return Err(Diagnostic::new("E118", "use of a moved value", span)
@@ -471,6 +496,10 @@ fn short_circuits(block: &mir::Block) -> usize {
             | ExpressionKind::Deref(_)
             | ExpressionKind::Borrow { .. }
             | ExpressionKind::Reborrow(_) => 0,
+            ExpressionKind::Project { .. } => 0,
+            ExpressionKind::Record { fields, .. } => {
+                fields.iter().map(|(_, value)| count(value)).sum()
+            }
             ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => count(inner),
             ExpressionKind::Binary(_, left, right) => count(left) + count(right),
             ExpressionKind::ShortCircuit { left, right, .. } => 1 + count(left) + count(right),
@@ -485,7 +514,9 @@ fn short_circuits(block: &mir::Block) -> usize {
             | Statement::Assign { value, .. }
             | Statement::Compound { value, .. }
             | Statement::AssignDeref { value, .. }
-            | Statement::CompoundDeref { value, .. } => count(value),
+            | Statement::CompoundDeref { value, .. }
+            | Statement::AssignProject { value, .. }
+            | Statement::CompoundProject { value, .. } => count(value),
             Statement::CallStatement(call) => count(call),
             Statement::RangeStart { start, finish, .. } => count(start) + count(finish),
             Statement::Marker | Statement::RangeBound { .. } | Statement::RangeStep { .. } => 0,
@@ -503,7 +534,9 @@ struct Analysis<'a> {
     parameters: &'a [Param],
     locals: &'a [mir::LocalInfo],
     result: &'a Type,
-    callees: &'a [Callee],
+    callees: &'a [Site],
+    /// Record definitions, to look a field up by name.
+    definitions: &'a HashMap<String, Type>,
     /// The first block built for each MIR block.
     start: Vec<usize>,
     types: Vec<Type>,
@@ -533,6 +566,145 @@ impl Analysis<'_> {
         self.blocks.len() - 1
     }
 
+    /// A type with a record's name replaced by its definition, so fields can be looked up.
+    fn view(&self, ty: &Type) -> Type {
+        match ty {
+            Type::Named(name) | Type::RecordRef(name) => self
+                .definitions
+                .get(&**name)
+                .cloned()
+                .unwrap_or_else(|| ty.clone()),
+            Type::Reference {
+                mutable,
+                lifetime,
+                pointee,
+            } => Type::Reference {
+                mutable: *mutable,
+                lifetime: lifetime.clone(),
+                pointee: Box::new(self.view(pointee)),
+            },
+            other => other.clone(),
+        }
+    }
+
+    /// The record type a literal's site names, and its declared fields.
+    fn record_type(
+        &self,
+        site: SiteId,
+        span: Span,
+    ) -> Result<(Type, Vec<(Box<str>, Type)>), Diagnostic> {
+        let Some(Site::Record(target)) = self.callees.get(site.0) else {
+            return Err(invalid(span));
+        };
+        match self.definitions.get(&**target) {
+            Some(ty @ Type::Record(_, fields)) => Ok((ty.clone(), fields.clone())),
+            _ => Err(Diagnostic::new("E116", "unknown record type", span)),
+        }
+    }
+
+    /// Resolve `root.a.b` to field indexes and types. A reference root is read through
+    /// first; writing needs a `&mut` reference, or a local declared with `mut`.
+    fn place(
+        &self,
+        root: Variable,
+        path: &[Box<str>],
+        write: bool,
+        span: Span,
+    ) -> Result<Place, Diagnostic> {
+        let root_type = self.typed(root, span)?;
+        let (mut current, via_reference) = match &root_type {
+            Type::Reference {
+                mutable, pointee, ..
+            } => {
+                if write && !*mutable {
+                    return Err(Diagnostic::new(
+                        "E107",
+                        "cannot write through a read-only reference",
+                        span,
+                    ));
+                }
+                (self.view(pointee), true)
+            }
+            other => {
+                if write && self.constant(root) {
+                    return Err(Diagnostic::new("E107", "cannot modify a constant", span));
+                }
+                (self.view(other), false)
+            }
+        };
+        let mut steps = Vec::with_capacity(path.len());
+        for name in path {
+            let Type::Record(_, fields) = &current else {
+                return Err(Diagnostic::new(
+                    "E116",
+                    "unknown field or tuple index",
+                    span,
+                ));
+            };
+            let Some((index, (_, field))) = fields
+                .iter()
+                .enumerate()
+                .find(|(_, (field, _))| field == name)
+            else {
+                return Err(Diagnostic::new(
+                    "E116",
+                    "unknown field or tuple index",
+                    span,
+                ));
+            };
+            let field = self.view(field);
+            steps.push((index, field.clone()));
+            current = field;
+        }
+        Ok(Place {
+            root_type,
+            via_reference,
+            steps,
+        })
+    }
+
+    /// A record literal: the fields are evaluated in the order written, each against its
+    /// declared type, then gathered in declaration order.
+    fn record(
+        &mut self,
+        site: SiteId,
+        fields: &[(Box<str>, Expression)],
+        span: Span,
+    ) -> Result<(Value, Type), Diagnostic> {
+        let (ty, declared) = self.record_type(site, span)?;
+        let mut gathered: Vec<Option<Value>> = vec![None; declared.len()];
+        for (name, value) in fields {
+            let Some(index) = declared.iter().position(|(field, _)| field == name) else {
+                return Err(Diagnostic::new(
+                    "E116",
+                    format!("unknown field `{}`", cyallo_ast::source_name(name)),
+                    value.span,
+                ));
+            };
+            if gathered[index].is_some() {
+                return Err(Diagnostic::new(
+                    "E101",
+                    "duplicate record field",
+                    value.span,
+                ));
+            }
+            let wanted = self.view(&declared[index].1);
+            let (stored, actual) = self.expected_as(value, &wanted, Use::Move)?;
+            require(&wanted, &actual, value.span)?;
+            gathered[index] = Some(stored);
+        }
+        let Some(values) = gathered.into_iter().collect::<Option<Vec<_>>>() else {
+            return Err(Diagnostic::new(
+                "E116",
+                "record literal must initialize every field",
+                span,
+            ));
+        };
+        let value = self.value(ty.clone());
+        self.emit(Operation::Aggregate(value, values), span);
+        Ok((value, ty))
+    }
+
     /// Whether a local was declared without `mut` (parameters were not).
     fn constant(&self, variable: Variable) -> bool {
         variable
@@ -544,7 +716,7 @@ impl Analysis<'_> {
 
     fn variable_type(&self, variable: Variable) -> Option<Type> {
         match variable.0.checked_sub(self.parameters.len()) {
-            None => Some(self.parameters[variable.0].ty.clone()),
+            None => Some(self.view(&self.parameters[variable.0].ty)),
             Some(local) => self.local_types.get(local).cloned().flatten(),
         }
     }
@@ -610,6 +782,16 @@ impl Analysis<'_> {
                 })?;
                 pointee(&ty, expression.span)
             }
+            ExpressionKind::Project { root, path } => {
+                let place = self.place(*root, path, false, expression.span)?;
+                Ok(place
+                    .steps
+                    .last()
+                    .map_or(place.root_type, |(_, ty)| ty.clone()))
+            }
+            ExpressionKind::Record { site, .. } => {
+                self.record_type(*site, expression.span).map(|(ty, _)| ty)
+            }
             ExpressionKind::Reborrow(variable) => self
                 .variable_type(*variable)
                 .ok_or_else(|| Diagnostic::new("E114", "type is not known yet", expression.span)),
@@ -652,7 +834,10 @@ impl Analysis<'_> {
     }
 
     fn callee(&self, site: SiteId, span: Span) -> Result<&Callee, Diagnostic> {
-        self.callees.get(site.0).ok_or_else(|| invalid(span))
+        match self.callees.get(site.0) {
+            Some(Site::Call(callee)) => Ok(callee),
+            _ => Err(invalid(span)),
+        }
     }
 
     /// `expr_expected`: contextualize to the wanted type, then lower.
@@ -706,6 +891,24 @@ impl Analysis<'_> {
                     }
                 }
                 ExpressionKind::Reborrow(variable) => self.read(*variable, span),
+                ExpressionKind::Project { root, path } => {
+                    let place = self.place(*root, path, false, span)?;
+                    let ty = place
+                        .steps
+                        .last()
+                        .map_or_else(|| place.root_type.clone(), |(_, ty)| ty.clone());
+                    if usage == Use::Move && !crate::ownership::copy(&ty) {
+                        return Err(Diagnostic::new(
+                            "E118",
+                            "cannot move a field out of a record; move the whole record or read the field in place",
+                            span,
+                        ));
+                    }
+                    let value = self.value(ty.clone());
+                    self.emit(Operation::FieldRead(value, *root, Box::new(place)), span);
+                    Ok((value, ty))
+                }
+                ExpressionKind::Record { site, fields } => self.record(*site, fields, span),
                 ExpressionKind::Deref(variable) => {
                     let (reference, ty) = self.read(*variable, span)?;
                     let target = pointee(&ty, span)?;
@@ -809,8 +1012,16 @@ impl Analysis<'_> {
     ) -> Result<(usize, Type, Operands), Diagnostic> {
         // The callee table outlives the analysis, so its parameters need no copy.
         let callees = self.callees;
-        let callee = callees.get(site.0).ok_or_else(|| invalid(span))?;
-        let (target, result, parameters) = (callee.id, callee.result.clone(), &callee.parameters);
+        let Some(Site::Call(callee)) = callees.get(site.0) else {
+            return Err(invalid(span));
+        };
+        let result = self.view(&callee.result);
+        let parameters: Vec<Type> = callee
+            .parameters
+            .iter()
+            .map(|parameter| self.view(parameter))
+            .collect();
+        let (target, parameters) = (callee.id, &parameters);
         if arguments.len() != parameters.len() {
             return Err(invalid(span));
         }
@@ -1036,6 +1247,48 @@ impl Analysis<'_> {
                 self.emit(Operation::Binary(combined, operator, old, operand), span);
                 self.store(*slot, combined, span);
             }
+            Statement::AssignProject { root, path, value } => {
+                let place = self.place(*root, path, true, span)?;
+                let target = place
+                    .steps
+                    .last()
+                    .map_or_else(|| place.root_type.clone(), |(_, ty)| ty.clone());
+                let (stored, actual) = self.expected_as(value, &target, Use::Move)?;
+                require(&target, &actual, value.span)?;
+                self.emit(Operation::FieldWrite(*root, Box::new(place), stored), span);
+            }
+            Statement::CompoundProject {
+                root,
+                path,
+                operator,
+                value,
+            } => {
+                let place = self.place(*root, path, true, span)?;
+                let target = place
+                    .steps
+                    .last()
+                    .map_or_else(|| place.root_type.clone(), |(_, ty)| ty.clone());
+                let old = self.value(target.clone());
+                self.emit(
+                    Operation::FieldRead(
+                        old,
+                        *root,
+                        Box::new(self.place(*root, path, false, span)?),
+                    ),
+                    span,
+                );
+                let contextual = contextualize(value, &target)?;
+                let (operand, operand_type) = self.expression(&contextual)?;
+                let result = super::super::binary_type(*operator, &target, &operand_type, span)?;
+                require(&target, &result, span)?;
+                let combined = self.value(result.clone());
+                let operator = super::super::specialized_operator(*operator, &result);
+                self.emit(Operation::Binary(combined, operator, old, operand), span);
+                self.emit(
+                    Operation::FieldWrite(*root, Box::new(place), combined),
+                    span,
+                );
+            }
             Statement::AssignDeref { variable, value } => {
                 let reference = self.typed(*variable, span)?;
                 let target = writable(&reference, span)?;
@@ -1236,8 +1489,12 @@ fn mentions(expression: &Expression, variables: &[Variable]) -> bool {
         ExpressionKind::Read(variable)
         | ExpressionKind::Deref(variable)
         | ExpressionKind::Reborrow(variable)
+        | ExpressionKind::Project { root: variable, .. }
         | ExpressionKind::Borrow { variable, .. } => {
             variables.iter().any(|other| other.0 == variable.0)
+        }
+        ExpressionKind::Record { fields, .. } => {
+            fields.iter().any(|(_, value)| mentions(value, variables))
         }
         ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => {
             mentions(inner, variables)

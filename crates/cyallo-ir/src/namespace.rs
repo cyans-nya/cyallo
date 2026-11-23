@@ -78,6 +78,9 @@ struct Resolver {
     /// Linked symbols of plain `i64` functions a migrated body may call.
     /// Parameter count and whether the callee returns nothing.
     plain: HashMap<Box<str>, (usize, bool)>,
+    /// Resolved field types of each record declared without type parameters, by the
+    /// record's linked name.
+    records: HashMap<Box<str>, Vec<(Box<str>, Type)>>,
     /// Source-file mode: the entry runs `proc main()` and no top level may hold statements.
     entry_mode: crate::EntryMode,
     aliases: HashMap<Box<str>, (usize, Type)>,
@@ -224,7 +227,78 @@ impl Resolver {
         }
         Ok(())
     }
-    /// Linked symbols of source functions with a plain `i64` contract.
+    /// The fields of every record without type parameters, resolved in its own module.
+    fn record_table(&self) -> HashMap<Box<str>, Vec<(Box<str>, Type)>> {
+        let mut table = HashMap::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            for record in &node.ast.records {
+                if !record.type_params.is_empty() {
+                    continue;
+                }
+                let Some(symbol) = self.path(index, &record.name, Some(Kind::Type)) else {
+                    continue;
+                };
+                let fields: Option<Vec<_>> = record
+                    .fields
+                    .iter()
+                    .map(|(name, ty)| Some((name.clone(), self.resolved(index, ty, record.span)?)))
+                    .collect();
+                if let Some(fields) = fields {
+                    table.insert(symbol.target, fields);
+                }
+            }
+        }
+        table
+    }
+
+    /// A type as the module graph resolves it, or `None` if it does not resolve.
+    fn resolved(&self, module: usize, ty: &Type, span: Span) -> Option<Type> {
+        let mut resolved = ty.clone();
+        self.ty(module, &mut resolved, &[], span).ok()?;
+        Some(resolved)
+    }
+
+    /// Whether the routine pipeline lowers values of this type: scalars, strings, records
+    /// whose fields are all such types, and references to one of those.
+    fn pipeline_type(&self, ty: &Type, depth: usize) -> bool {
+        match ty {
+            Type::Integer | Type::Boolean | Type::Real | Type::Numeric(_) | Type::String => true,
+            Type::Reference {
+                lifetime: None,
+                pointee,
+                ..
+            } => !matches!(**pointee, Type::Reference { .. }) && self.pipeline_type(pointee, depth),
+            Type::Named(target) if depth < 8 => self.records.get(target).is_some_and(|fields| {
+                fields.iter().all(|(_, field)| {
+                    !matches!(field, Type::Reference { .. }) && self.pipeline_type(field, depth + 1)
+                })
+            }),
+            _ => false,
+        }
+    }
+
+    /// Whether a routine's parameters and result are all types the pipeline lowers, with
+    /// every parameter passed by value and no reference as a result.
+    fn pipeline_signature(&self, module: usize, f: &Function) -> bool {
+        let parameters = f.params.iter().all(|parameter| {
+            parameter.arity == ParameterArity::One
+                && parameter.passing == ParameterPassing::Value
+                && !parameter.by_ref
+                && !parameter.receiver
+                && self
+                    .resolved(module, &parameter.ty, parameter.span)
+                    .is_some_and(|ty| self.pipeline_type(&ty, 0))
+        });
+        let result = match f.kind {
+            RoutineKind::Procedure if f.result == Type::Void => true,
+            _ => self.resolved(module, &f.result, f.span).is_some_and(|ty| {
+                !matches!(ty, Type::Reference { .. }) && self.pipeline_type(&ty, 0)
+            }),
+        };
+        parameters && result
+    }
+
+    /// Linked symbols of source functions with a signature the pipeline lowers.
     fn plain_functions(&self) -> HashMap<Box<str>, (usize, bool)> {
         let mut plain = HashMap::new();
         for (index, node) in self.nodes.iter().enumerate() {
@@ -234,7 +308,7 @@ impl Resolver {
                     && !f.generator
                     && f.type_params.is_empty()
                     && f.annotations.is_empty()
-                    && crate::analysis::plain_contract(f.kind, &f.params, &f.result, f.params.len())
+                    && self.pipeline_signature(index, f)
                     && let Ok(target) = self.symbol(index, &f.name, Kind::Value, f.span)
                 {
                     plain.insert(target, (f.params.len(), f.result == Type::Void));
@@ -259,14 +333,36 @@ impl Resolver {
             crate::analysis::IndexedRoutineBody,
         >,
     > {
+        // The routine's own signature must be one the pipeline lowers.
+        if !self.pipeline_signature(module, function) {
+            return Ok(Err(body));
+        }
         let sites: Vec<_> = body
             .reference_sites()
-            .map(|(path, arguments, discard, span)| {
-                (Box::<str>::from(path), arguments, discard, span)
+            .map(|site| {
+                (
+                    Box::<str>::from(site.path),
+                    site.arguments,
+                    site.discard,
+                    site.record,
+                    site.span,
+                )
             })
             .collect();
         let mut targets = Vec::with_capacity(sites.len());
-        for (path, arguments, discard, span) in sites {
+        for (path, arguments, discard, record, span) in sites {
+            if record {
+                // A record literal names a record type whose fields the pipeline lowers.
+                let Some(symbol) = self.path(module, &path, Some(Kind::Type)) else {
+                    return Ok(Err(body));
+                };
+                self.check_import(module, &symbol, span)?;
+                if !self.pipeline_type(&Type::Named(symbol.target.clone()), 0) {
+                    return Ok(Err(body));
+                }
+                targets.push(symbol.target);
+                continue;
+            }
             if function.params.iter().any(|param| param.name == path) {
                 return Ok(Err(body));
             }
@@ -2772,6 +2868,7 @@ impl Resolver {
                 linked.native.functions.push(declaration);
             }
         }
+        self.records = self.record_table();
         self.plain = self.plain_functions();
         for index in 0..self.nodes.len() {
             self.next_binding = 0;
@@ -3282,6 +3379,7 @@ pub fn link_program(
             .collect(),
         bound: HashMap::new(),
         plain: HashMap::new(),
+        records: HashMap::new(),
         aliases: HashMap::new(),
         source_names: Default::default(),
         nodes: Vec::new(),

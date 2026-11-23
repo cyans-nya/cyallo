@@ -4,8 +4,7 @@ use crate::intrinsic::{Intrinsic, Lowering};
 use crate::ir::{self, Op, Reg, Slot};
 use cyallo_ast::IdentifierEq as _;
 use cyallo_ast::*;
-pub use routine_pipeline::IndexedRoutineBody;
-pub(crate) use routine_pipeline::plain_contract;
+pub use routine_pipeline::{IndexedRoutineBody, bodies_emitted_on_this_thread};
 use std::collections::HashMap;
 type Result<T> = std::result::Result<T, Diagnostic>;
 fn key(s: &str) -> String {
@@ -470,7 +469,12 @@ impl DeferredBody {
                 let _lower =
                     cyallo_startup_profile::stage(cyallo_startup_profile::Stage::BodyLower);
                 let migrated = match &self.indexed {
-                    Some(body) => body.emit(&self.function, &c.source_names, &c.signatures)?,
+                    Some(body) => body.emit(
+                        &self.function,
+                        &c.source_names,
+                        &c.signatures,
+                        &c.routine_types,
+                    )?,
                     None => None,
                 };
                 match migrated {

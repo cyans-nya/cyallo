@@ -39,6 +39,17 @@ pub(super) enum ExpressionKind {
     },
     /// A call; the site holds the callee path that the module graph binds later.
     Call(SiteId, Vec<Expression>),
+    /// `Name { field: value, ... }`, the fields in the order written. The site holds the
+    /// record's path, which the module graph binds to its declaration.
+    Record {
+        site: SiteId,
+        fields: Vec<(Box<str>, Expression)>,
+    },
+    /// `p.a.b`: a field of a local or of a reference parameter, found by name.
+    Project {
+        root: Variable,
+        path: Vec<Box<str>>,
+    },
     /// `p.*`: the value a reference parameter refers to.
     Deref(Variable),
     /// `&x` or `&mut x`, as a call argument: a reference to a local or a by-value parameter.
@@ -68,6 +79,10 @@ impl Expression {
             | ExpressionKind::Borrow { .. }
             | ExpressionKind::Reborrow(_) => 0,
             ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => inner.size(),
+            ExpressionKind::Record { fields, .. } => {
+                fields.iter().map(|(_, value)| value.size()).sum()
+            }
+            ExpressionKind::Project { path, .. } => path.len(),
             ExpressionKind::Binary(_, left, right)
             | ExpressionKind::ShortCircuit { left, right, .. } => left.size() + right.size(),
             ExpressionKind::Call(_, arguments) => arguments.iter().map(Expression::size).sum(),
@@ -103,6 +118,19 @@ pub(super) enum StatementKind {
     ForRange(Box<ForRange>),
     Break,
     Continue,
+    /// `p.a.b = value`.
+    AssignProject {
+        root: Variable,
+        path: Vec<Box<str>>,
+        value: Expression,
+    },
+    /// `p.a.b op= value`.
+    CompoundProject {
+        root: Variable,
+        path: Vec<Box<str>>,
+        operator: Operator,
+        value: Expression,
+    },
     /// `p.* = value`.
     AssignDeref {
         variable: Variable,
@@ -160,7 +188,9 @@ impl Routine {
                         | StatementKind::Assign { value, .. }
                         | StatementKind::Compound { value, .. }
                         | StatementKind::AssignDeref { value, .. }
-                        | StatementKind::CompoundDeref { value, .. } => value.size(),
+                        | StatementKind::CompoundDeref { value, .. }
+                        | StatementKind::AssignProject { value, .. }
+                        | StatementKind::CompoundProject { value, .. } => value.size(),
                         StatementKind::CallStatement(call) => call.size(),
                         StatementKind::Break
                         | StatementKind::Continue
@@ -238,7 +268,7 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
     }
     // A routine returns a scalar, or a procedure returns nothing.
     let procedure = match (function.kind, ast.get(function.result)?) {
-        (_, node) if scalar_type(node).is_some() => false,
+        (_, node) if signature_type(ast, node).is_some() => false,
         (RoutineKind::Procedure, TypeNode::Void) => true,
         (_, node) => return decline(|| format!("result type {}", variant(node))),
     };
@@ -254,7 +284,7 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
             return decline(|| "method receiver".into());
         }
         match ast.get(parameter.ty) {
-            Some(node) if scalar_type(node).is_some() => {}
+            Some(node) if signature_type(ast, node).is_some() => {}
             Some(node) if reference_type(ast, node).is_some() => {}
             node => {
                 return decline(|| format!("parameter type {}", node.map_or("?".into(), variant)));
@@ -390,12 +420,20 @@ impl Context<'_> {
         Some(Expression::new(node.span, kind))
     }
 
-    fn site(&mut self, path: &str, span: Span, arguments: usize, discard: bool) -> SiteId {
+    fn site(
+        &mut self,
+        path: &str,
+        span: Span,
+        arguments: usize,
+        discard: bool,
+        record: bool,
+    ) -> SiteId {
         self.sites.push(ReferenceSite {
             path: path.into(),
             span,
             arguments,
             discard,
+            record,
         });
         SiteId(self.sites.len() - 1)
     }
@@ -444,7 +482,13 @@ impl Context<'_> {
                             }
                             let annotation = match annotation {
                                 None => None,
-                                Some(ty) => Some(scalar_type(ast.get(ty)?)?),
+                                Some(ty) => match scalar_type(ast.get(ty)?) {
+                                    Some(ty) => Some(ty),
+                                    None => {
+                                        let shape = ast.get(ty).map_or("?".into(), variant);
+                                        return decline(|| format!("local annotated {shape}"));
+                                    }
+                                },
                             };
                             // The initializer cannot see the name it declares.
                             let value = self.expression(value)?;
@@ -462,7 +506,13 @@ impl Context<'_> {
                             }
                         }
                         StmtSyntax::Assign(target, value) => {
-                            if let Some(variable) = self.dereferenced(target) {
+                            if let Some((root, path)) = self.projected(target) {
+                                StatementKind::AssignProject {
+                                    root,
+                                    path,
+                                    value: self.expression(value)?,
+                                }
+                            } else if let Some(variable) = self.dereferenced(target) {
                                 StatementKind::AssignDeref {
                                     variable,
                                     value: self.expression(value)?,
@@ -477,7 +527,14 @@ impl Context<'_> {
                         StmtSyntax::Compound(target, operator, value)
                             if operator.is_arithmetic() && operator != Operator::RealDivide =>
                         {
-                            if let Some(variable) = self.dereferenced(target) {
+                            if let Some((root, path)) = self.projected(target) {
+                                StatementKind::CompoundProject {
+                                    root,
+                                    path,
+                                    operator,
+                                    value: self.value(value, false)?,
+                                }
+                            } else if let Some(variable) = self.dereferenced(target) {
                                 StatementKind::CompoundDeref {
                                     variable,
                                     operator,
@@ -518,6 +575,29 @@ impl Context<'_> {
     /// The slot of a mutable local named by `target`. Parameters, immutable names,
     /// loop counters and anything else stay with the existing route, which owns
     /// those diagnostics.
+    /// The root variable and field names of a place such as `p.a.b`.
+    fn projected(&self, target: Id<ExprNode>) -> Option<(Variable, Vec<Box<str>>)> {
+        let ExprSyntax::Field(base, name) = self.ast.get(target)?.kind else {
+            return None;
+        };
+        let mut path = vec![self.name(name)?];
+        let mut current = base;
+        loop {
+            match self.ast.get(current)?.kind {
+                ExprSyntax::Field(inner, name) => {
+                    path.push(self.name(name)?);
+                    current = inner;
+                }
+                ExprSyntax::Name(root) => {
+                    let visible = self.lookup(root)?;
+                    path.reverse();
+                    return Some((visible.slot, path));
+                }
+                _ => return decline(|| "field of something other than a name".into()),
+            }
+        }
+    }
+
     /// The reference parameter `p` when `target` is `p.*`.
     fn dereferenced(&self, target: Id<ExprNode>) -> Option<Variable> {
         let ExprSyntax::Unary(Operator::Dereference, inner) = self.ast.get(target)?.kind else {
@@ -650,6 +730,24 @@ impl Context<'_> {
                 ExprSyntax::Unary(operator @ (Operator::Not | Operator::Subtract), operand) => {
                     ExpressionKind::Unary(operator, Box::new(self.value(operand, split)?))
                 }
+                ExprSyntax::Field(..) => {
+                    let Some((root, path)) = self.projected(id) else {
+                        return None;
+                    };
+                    ExpressionKind::Project { root, path }
+                }
+                ExprSyntax::Record(name, fields) => {
+                    let mut written = Vec::new();
+                    for &(field, value) in ast.get_list(fields)? {
+                        written.push((self.name(field)?, self.value(value, false)?));
+                    }
+                    let site =
+                        self.site(ast.name(name)?, expression.span, written.len(), false, true);
+                    ExpressionKind::Record {
+                        site,
+                        fields: written,
+                    }
+                }
                 ExprSyntax::Unary(Operator::Dereference, inner) => {
                     let ExprSyntax::Name(name) = ast.get(inner)?.kind else {
                         return decline(|| {
@@ -677,7 +775,13 @@ impl Context<'_> {
                         .iter()
                         .map(|&argument| self.argument(argument))
                         .collect::<Option<_>>()?;
-                    let site = self.site(ast.name(name)?, expression.span, arguments.len(), false);
+                    let site = self.site(
+                        ast.name(name)?,
+                        expression.span,
+                        arguments.len(),
+                        false,
+                        false,
+                    );
                     ExpressionKind::Call(site, arguments)
                 }
                 ref other => return decline(|| format!("expression {}", variant(other))),
@@ -731,7 +835,7 @@ fn reference_type(ast: &IndexedAst, node: &TypeNode) -> Option<(bool, Type)> {
     else {
         return None;
     };
-    let pointee = scalar_type(ast.get(*pointee)?)?;
+    let pointee = signature_type(ast, ast.get(*pointee)?)?;
     Some((
         *mutable,
         Type::Reference {
@@ -740,6 +844,16 @@ fn reference_type(ast: &IndexedAst, node: &TypeNode) -> Option<(bool, Type)> {
             pointee: Box::new(pointee),
         },
     ))
+}
+
+/// A type a signature may use: a scalar, or a named type, which the module graph then
+/// checks is a record whose fields are all supported (HIR cannot resolve names).
+fn signature_type(_ast: &IndexedAst, node: &TypeNode) -> Option<Type> {
+    match node {
+        // Only the fact that it is acceptable is used; the type itself is resolved later.
+        TypeNode::Named(_) => Some(Type::Void),
+        other => scalar_type(other),
+    }
 }
 
 /// The scalar types the subset accepts: `i64`, `bool`, `f64` and the sized numbers.

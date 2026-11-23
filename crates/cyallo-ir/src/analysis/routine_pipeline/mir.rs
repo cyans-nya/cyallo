@@ -54,6 +54,19 @@ pub(super) enum Statement {
         operator: cyallo_ast::Operator,
         value: Expression,
     },
+    /// `p.a.b = value`.
+    AssignProject {
+        root: Variable,
+        path: Vec<Box<str>>,
+        value: Expression,
+    },
+    /// `p.a.b op= value`.
+    CompoundProject {
+        root: Variable,
+        path: Vec<Box<str>>,
+        operator: cyallo_ast::Operator,
+        value: Expression,
+    },
     /// `p.* = value`, through a reference parameter.
     AssignDeref {
         variable: Variable,
@@ -225,6 +238,23 @@ impl Builder {
                     } => self.emit(
                         Statement::Compound {
                             slot,
+                            operator,
+                            value,
+                        },
+                        span,
+                    ),
+                    hir::StatementKind::AssignProject { root, path, value } => {
+                        self.emit(Statement::AssignProject { root, path, value }, span)
+                    }
+                    hir::StatementKind::CompoundProject {
+                        root,
+                        path,
+                        operator,
+                        value,
+                    } => self.emit(
+                        Statement::CompoundProject {
+                            root,
+                            path,
                             operator,
                             value,
                         },

@@ -4,10 +4,7 @@ mod hir;
 mod mir;
 
 use super::{Result, Signature, collect, ir, key, routine_function};
-use cyallo_ast::{
-    Expr, ExprKind, Function, Literal, ParameterArity, ParameterPassing, RoutineKind, Span, Stmt,
-    StmtKind, Type,
-};
+use cyallo_ast::{Expr, ExprKind, Function, Literal, Span, Stmt, StmtKind, Type};
 use cyallo_parser::BodyHandle;
 use ir::{Op, Reg, Slot};
 use std::{
@@ -20,6 +17,26 @@ use std::{
 #[derive(Clone, Copy, Debug, Hash)]
 struct Variable(usize);
 
+thread_local! {
+    static EMITTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many routine bodies this thread has lowered through the pipeline. A test that
+/// compiles with one job can read it before and after to see which route a body took.
+pub fn bodies_emitted_on_this_thread() -> usize {
+    EMITTED.with(std::cell::Cell::get)
+}
+
+/// What the module graph needs to bind one reference site.
+pub(crate) struct SiteFacts<'a> {
+    pub(crate) path: &'a str,
+    pub(crate) arguments: usize,
+    pub(crate) discard: bool,
+    /// A record literal: the path names a record type.
+    pub(crate) record: bool,
+    pub(crate) span: Span,
+}
+
 /// A use of a name whose meaning depends on declarations outside this body.
 #[derive(Clone, Debug, Hash)]
 struct ReferenceSite {
@@ -29,6 +46,8 @@ struct ReferenceSite {
     arguments: usize,
     /// The call is a statement: the callee is a procedure and no value is used.
     discard: bool,
+    /// A record literal: the path names a record type, not a callee.
+    record: bool,
 }
 
 #[derive(Clone, Copy, Debug, Hash)]
@@ -126,10 +145,13 @@ impl IndexedRoutineBody {
     }
 
     /// Reference sites in source order as `(path, argument count, is a statement, archived span)`.
-    pub(crate) fn reference_sites(&self) -> impl Iterator<Item = (&str, usize, bool, Span)> {
-        self.sites.iter().map(|site| {
-            let span = shift(site.span, self.offset).unwrap_or(site.span);
-            (&*site.path, site.arguments, site.discard, span)
+    pub(crate) fn reference_sites(&self) -> impl Iterator<Item = SiteFacts<'_>> {
+        self.sites.iter().map(|site| SiteFacts {
+            path: &site.path,
+            arguments: site.arguments,
+            discard: site.discard,
+            record: site.record,
+            span: shift(site.span, self.offset).unwrap_or(site.span),
         })
     }
 
@@ -186,6 +208,7 @@ impl IndexedRoutineBody {
         function: &Function,
         source_names: &BTreeMap<Box<str>, Box<str>>,
         signatures: &HashMap<String, Signature>,
+        definitions: &HashMap<String, Type>,
     ) -> Result<Option<ir::Function>> {
         let Some(callees) = self.bind_callees(function, signatures)? else {
             return Ok(None);
@@ -197,6 +220,7 @@ impl IndexedRoutineBody {
             function,
             source_names,
             &callees,
+            definitions,
         )
     }
 
@@ -207,7 +231,7 @@ impl IndexedRoutineBody {
         &self,
         function: &Function,
         signatures: &HashMap<String, Signature>,
-    ) -> Result<Option<Vec<air::Callee>>> {
+    ) -> Result<Option<Vec<air::Site>>> {
         if self.sites.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -217,6 +241,15 @@ impl IndexedRoutineBody {
         }
         let mut callees = Vec::with_capacity(self.sites.len());
         for (index, site) in self.sites.iter().enumerate() {
+            if site.record {
+                // The record literal's type, which the linker already checked.
+                let Some(target) = self.overlay.as_ref().and_then(|overlay| overlay.get(index))
+                else {
+                    return Ok(None);
+                };
+                callees.push(air::Site::Record(target.clone()));
+                continue;
+            }
             let target = match &self.overlay {
                 Some(overlay) => overlay.get(index).map(|target| &**target),
                 None => targets.get(&shift(site.span, self.offset)?).copied(),
@@ -225,60 +258,20 @@ impl IndexedRoutineBody {
                 return Ok(None);
             };
             // A statement may discard any result; a value must come from a callee that has one.
-            if !plain_contract(
-                signature.kind,
-                &signature.params,
-                &signature.result,
-                site.arguments,
-            ) || (signature.result == Type::Void && !site.discard)
+            // The linker has already checked the callee's types.
+            if signature.params.len() != site.arguments
+                || (signature.result == Type::Void && !site.discard)
             {
                 return Ok(None);
             }
-            callees.push(air::Callee {
+            callees.push(air::Site::Call(air::Callee {
                 id: signature.id,
                 parameters: signature.params.iter().map(|p| p.ty.clone()).collect(),
                 result: signature.result.clone(),
-            });
+            }));
         }
         Ok(Some(callees))
     }
-}
-
-/// A callee the first slice can call: a function over by-value `i64` parameters
-/// returning `i64`, called with exactly its parameter count.
-pub(crate) fn plain_contract(
-    kind: RoutineKind,
-    parameters: &[cyallo_ast::Param],
-    result: &Type,
-    arguments: usize,
-) -> bool {
-    let scalar_reference = |ty: &Type| {
-        matches!(
-            ty,
-            Type::Reference { lifetime: None, pointee, .. }
-                if matches!(
-                    **pointee,
-                    Type::Integer | Type::Boolean | Type::Real | Type::Numeric(_) | Type::String
-                )
-        )
-    };
-    let scalar = |ty: &Type| {
-        matches!(
-            ty,
-            Type::Integer | Type::Boolean | Type::Real | Type::Numeric(_) | Type::String
-        )
-    };
-    let returns = scalar(result) || (kind == RoutineKind::Procedure && *result == Type::Void);
-    returns
-        && parameters.len() == arguments
-        && parameters.iter().all(|parameter| {
-            scalar(&parameter.ty)
-                || scalar_reference(&parameter.ty)
-                    && parameter.arity == ParameterArity::One
-                    && parameter.passing == ParameterPassing::Value
-                    && !parameter.by_ref
-                    && !parameter.receiver
-        })
 }
 
 fn call_targets<'a>(statements: &'a [Stmt], targets: &mut HashMap<Span, &'a str>) {
@@ -323,7 +316,8 @@ fn lower_mir(
     offset: u32,
     function: &Function,
     source_names: &BTreeMap<Box<str>, Box<str>>,
-    callees: &[air::Callee],
+    callees: &[air::Site],
+    definitions: &HashMap<String, Type>,
 ) -> Result<Option<ir::Function>> {
     let mut locals = collect(&[], &function.params)?;
     for local in &mut locals {
@@ -331,7 +325,14 @@ fn lower_mir(
             local.display_name = Some(name.clone());
         }
     }
-    let air = match air::analyze(mir, &function.params, &function.result, callees, file_span) {
+    let air = match air::analyze(
+        mir,
+        &function.params,
+        &function.result,
+        callees,
+        definitions,
+        file_span,
+    ) {
         Ok(body) => body,
         Err(mut error) => {
             cyallo_ast::spans::shift_diagnostic(&mut error, offset)?;
@@ -355,7 +356,58 @@ fn lower_mir(
         }
     }
     cyallo_startup_profile::count(cyallo_startup_profile::Counter::BodiesEmittedFromAir, 1);
+    EMITTED.with(|count| count.set(count.get() + 1));
     Ok(Some(emitted))
+}
+
+/// How many instructions an operation expands to.
+fn instruction_count(operation: &air::Operation) -> usize {
+    match operation {
+        air::Operation::ReadVariable(..)
+        | air::Operation::TakeVariable(..)
+        | air::Operation::Store(..)
+        | air::Operation::Borrow(..) => 2,
+        // The root's address, a read through it when the root is a reference, one
+        // projection per field, and the final load or store.
+        air::Operation::FieldRead(_, _, place) | air::Operation::FieldWrite(_, place, _) => {
+            1 + usize::from(place.via_reference) + place.steps.len() + 1
+        }
+        _ => 1,
+    }
+}
+
+/// The address of a field: the root local's address (and the reference stored there,
+/// when the root is one), followed through each field index.
+fn field_address(
+    function: &mut ir::Function,
+    root: Variable,
+    place: &air::Place,
+    span: Span,
+) -> Reg {
+    let address = register(function, &place.root_type);
+    push(
+        function,
+        Op::Address(
+            address,
+            Slot {
+                global: false,
+                index: root.0,
+            },
+        ),
+        span,
+    );
+    let mut current = address;
+    if place.via_reference {
+        let reference = register(function, &place.root_type);
+        push(function, Op::Load(reference, address), span);
+        current = reference;
+    }
+    for (index, ty) in &place.steps {
+        let next = register(function, ty);
+        push(function, Op::Field(next, current, *index), span);
+        current = next;
+    }
+    current
 }
 
 fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
@@ -368,13 +420,7 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
         pc += block
             .operations
             .iter()
-            .map(|operation| match operation.kind {
-                air::Operation::ReadVariable(..)
-                | air::Operation::TakeVariable(..)
-                | air::Operation::Store(..)
-                | air::Operation::Borrow(..) => 2,
-                _ => 1,
-            })
+            .map(|operation| instruction_count(&operation.kind))
             .sum::<usize>();
         if !matches!(block.exit.kind, air::Exit::Next) {
             pc += 1;
@@ -455,6 +501,21 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                     let dst = register(&mut function, &checked.types[value.0]);
                     registers[value.0] = dst;
                     Op::Call(Some(dst), target, arguments)
+                }
+                air::Operation::Aggregate(value, fields) => {
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::Aggregate(dst, fields.iter().map(|field| registers[field.0]).collect())
+                }
+                air::Operation::FieldRead(value, root, place) => {
+                    let address = field_address(&mut function, root, &place, span);
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::Load(dst, address)
+                }
+                air::Operation::FieldWrite(root, place, value) => {
+                    let address = field_address(&mut function, root, &place, span);
+                    Op::Store(address, registers[value.0])
                 }
                 air::Operation::Load(value, reference) => {
                     let dst = register(&mut function, &checked.types[value.0]);
@@ -570,8 +631,15 @@ mod tests {
             mir::Exit::Return { .. }
         ));
         let locals = collect(&[], &function.params).unwrap();
-        let body =
-            air::analyze(mir, &function.params, &function.result, &[], function.span).unwrap();
+        let body = air::analyze(
+            mir,
+            &function.params,
+            &function.result,
+            &[],
+            &HashMap::new(),
+            function.span,
+        )
+        .unwrap();
         assert!(matches!(
             body.types.as_slice(),
             [Type::Integer, Type::Integer, Type::Boolean, ..]
@@ -597,7 +665,12 @@ mod tests {
         ] {
             let (function, body) = prepare(source);
             let diagnostic = body
-                .emit(&function, &BTreeMap::new(), &HashMap::new())
+                .emit(
+                    &function,
+                    &BTreeMap::new(),
+                    &HashMap::new(),
+                    &HashMap::new(),
+                )
                 .unwrap_err();
             assert_eq!(diagnostic.span.source_text(source), diagnostic_span);
             assert!(matches!(diagnostic.code, "E109" | "E105"));
@@ -637,7 +710,12 @@ mod tests {
         assert!(body.sites.iter().all(|site| &*site.path == "bump"));
         let signatures = HashMap::from([("bump".to_owned(), signature(&functions[0], 7))]);
         let emitted = body
-            .emit(&functions[1], &BTreeMap::new(), &signatures)
+            .emit(
+                &functions[1],
+                &BTreeMap::new(),
+                &signatures,
+                &HashMap::new(),
+            )
             .unwrap()
             .expect("a plain i64 callee is bound");
         let calls: Vec<_> = emitted
@@ -666,9 +744,19 @@ mod tests {
         let source = "fn bump(n: i64) -> i64 { return n + 1 }\nfn twice(n: i64) -> i64 { return bump(n, n) }";
         let (functions, body) = prepare_nth(source, 1);
         let signatures = HashMap::from([("bump".to_owned(), signature(&functions[0], 0))]);
-        let emitted = body.emit(&functions[1], &BTreeMap::new(), &signatures);
+        let emitted = body.emit(
+            &functions[1],
+            &BTreeMap::new(),
+            &signatures,
+            &HashMap::new(),
+        );
         assert!(emitted.unwrap().is_none(), "arity mismatch is unsupported");
-        let emitted = body.emit(&functions[1], &BTreeMap::new(), &HashMap::new());
+        let emitted = body.emit(
+            &functions[1],
+            &BTreeMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(emitted.unwrap().is_none(), "unbound site is unsupported");
     }
 
@@ -694,7 +782,12 @@ mod tests {
         ] {
             let (function, body) = prepare(source);
             let error = body
-                .emit(&function, &BTreeMap::new(), &HashMap::new())
+                .emit(
+                    &function,
+                    &BTreeMap::new(),
+                    &HashMap::new(),
+                    &HashMap::new(),
+                )
                 .unwrap_err();
             assert_eq!(error.code, "E109", "{source}");
             // The error is on the whole `&&` or `||` expression.
@@ -705,9 +798,14 @@ mod tests {
         }
         let (function, body) = prepare("fn f(n: i64) -> bool { return n > 0 && n < 9 }");
         assert!(
-            body.emit(&function, &BTreeMap::new(), &HashMap::new())
-                .unwrap()
-                .is_some()
+            body.emit(
+                &function,
+                &BTreeMap::new(),
+                &HashMap::new(),
+                &HashMap::new()
+            )
+            .unwrap()
+            .is_some()
         );
     }
 
@@ -716,12 +814,22 @@ mod tests {
         let (complete, body) =
             prepare("fn choose(n: i64) -> i64 { if n > 1 { return n }\nreturn 1 }");
         assert!(
-            body.emit(&complete, &BTreeMap::new(), &HashMap::new())
-                .is_ok()
+            body.emit(
+                &complete,
+                &BTreeMap::new(),
+                &HashMap::new(),
+                &HashMap::new()
+            )
+            .is_ok()
         );
         let (incomplete, body) = prepare("fn choose(n: i64) -> i64 { if n > 1 { return n } }");
         let diagnostic = body
-            .emit(&incomplete, &BTreeMap::new(), &HashMap::new())
+            .emit(
+                &incomplete,
+                &BTreeMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
             .unwrap_err();
         assert_eq!(diagnostic.code, "E103");
         assert_eq!(diagnostic.span, incomplete.span);

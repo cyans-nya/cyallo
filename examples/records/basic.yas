@@ -1,0 +1,56 @@
+// Records: construct, read and write fields, pass and return by value, and use
+// through a reference.
+// Run: cargo run -- run examples/records/basic.yas
+record Point {
+    x: i64,
+    y: i64,
+}
+
+record Named {
+    label: string,
+    at: Point,
+}
+
+fn origin() -> Point {
+    return Point { x: 0, y: 0 }
+}
+
+fn sum(p: Point) -> i64 {
+    return p.x + p.y
+}
+
+fn shifted(p: Point, dx: i64) -> Point {
+    return Point { y: p.y, x: p.x + dx }
+}
+
+proc move_right(p: &mut Point, by: i64) {
+    p.x += by
+}
+
+fn height(p: &Point) -> i64 {
+    return p.y
+}
+
+fn describe(n: Named) -> string {
+    return n.label + "!"
+}
+
+fn reach(n: &Named) -> i64 {
+    return n.at.x * 10 + n.at.y
+}
+
+proc build(x: i64) -> i64 {
+    let mut p = origin()
+    p.x = x
+    p.y += 5
+    move_right(&mut p, 2)
+    let q = shifted(p, 1)
+    // Borrow before the move: a record is handed on whole, and not usable afterwards.
+    return height(&q) + sum(q)
+}
+
+std::io::print(sum(Point { x: 3, y: 4 }))
+std::io::print(build(10))
+let named = Named { label: "start", at: Point { x: 1, y: 2 } }
+std::io::print(reach(&named))
+std::io::print(describe(named))
