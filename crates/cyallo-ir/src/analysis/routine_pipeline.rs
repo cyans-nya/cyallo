@@ -15,7 +15,7 @@ use std::{
 };
 
 /// A parameter or local slot: parameters first, then locals in declaration order.
-#[derive(Clone, Copy, Debug, Hash)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct Variable(usize);
 
 thread_local! {
@@ -43,6 +43,8 @@ pub(crate) struct SiteFacts<'a> {
     pub(crate) discard: bool,
     /// A record literal: the path names a record type.
     pub(crate) record: bool,
+    /// A name used as a value that is not a local.
+    pub(crate) name_use: bool,
     pub(crate) span: Span,
 }
 
@@ -58,6 +60,8 @@ struct ReferenceSite {
     discard: bool,
     /// A record literal: the path names a record type, not a callee.
     record: bool,
+    /// A name used as a value that is not a local: acceptable only as a unit variant.
+    name_use: bool,
 }
 
 #[derive(Clone, Copy, Debug, Hash)]
@@ -166,6 +170,7 @@ impl IndexedRoutineBody {
             arguments: site.arguments,
             discard: site.discard,
             record: site.record,
+            name_use: site.name_use,
             span: shift(site.span, self.offset).unwrap_or(site.span),
         })
     }
@@ -225,7 +230,7 @@ impl IndexedRoutineBody {
         signatures: &HashMap<String, Signature>,
         definitions: &HashMap<String, Type>,
     ) -> Result<Option<ir::Function>> {
-        let Some(callees) = self.bind_callees(function, signatures)? else {
+        let Some(callees) = self.bind_callees(function, signatures, source_names)? else {
             return Ok(None);
         };
         lower_mir(
@@ -247,6 +252,7 @@ impl IndexedRoutineBody {
         &self,
         function: &Function,
         signatures: &HashMap<String, Signature>,
+        source_names: &BTreeMap<Box<str>, Box<str>>,
     ) -> Result<Option<Vec<air::Site>>> {
         if self.sites.is_empty() {
             return Ok(Some(Vec::new()));
@@ -273,6 +279,29 @@ impl IndexedRoutineBody {
             let Some(signature) = target.and_then(|target| signatures.get(&key(target))) else {
                 return Ok(None);
             };
+            if let Some(target) = target
+                && target.starts_with("$variant")
+            {
+                // A variant constructor is built in place: its tag and payload, no call.
+                let Some(name) = source_names.get(target) else {
+                    return Ok(None);
+                };
+                let Type::Enum(contract) = &signature.result else {
+                    return Ok(None);
+                };
+                let Some(variant) = contract.variants.iter().find(|v| *v.name == **name) else {
+                    return Ok(None);
+                };
+                if signature.params.len() != site.arguments || site.discard {
+                    return Ok(None);
+                }
+                callees.push(air::Site::Variant {
+                    variant: variant.operation(),
+                    payload: variant.payload.clone(),
+                    result: signature.result.clone(),
+                });
+                continue;
+            }
             // A statement may discard any result; a value must come from a callee that has one.
             // The linker has already checked the callee's types.
             if signature.params.len() != site.arguments
@@ -387,6 +416,8 @@ fn lower_mir(
 fn instruction_count(operation: &air::Operation) -> usize {
     match operation {
         air::Operation::ReadVariable(..)
+        | air::Operation::EnumTest(..)
+        | air::Operation::EnumPayload(..)
         | air::Operation::TakeVariable(..)
         | air::Operation::Store(..)
         | air::Operation::Borrow(..) => 2,
@@ -579,6 +610,29 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                         .collect();
                     Op::Call(None, target, arguments)
                 }
+                air::Operation::EnumConstruct(value, variant, payload) => {
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::EnumConstruct(dst, variant, payload.map(|value| registers[value.0]))
+                }
+                air::Operation::EnumTest(value, variable, variant) => {
+                    let address = enum_address(&mut function, variable, span);
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::EnumTest(dst, address, variant)
+                }
+                air::Operation::EnumPayload(value, variable, variant, ty) => {
+                    let address = enum_address(&mut function, variable, span);
+                    let dst = register(&mut function, &ty);
+                    registers[value.0] = dst;
+                    Op::EnumPayload(
+                        dst,
+                        address,
+                        variant,
+                        crate::enums::Projection::Value,
+                        Box::new(ty),
+                    )
+                }
                 air::Operation::Unary(value, operator, operand) => {
                     let dst = register(&mut function, &checked.types[value.0]);
                     registers[value.0] = dst;
@@ -600,11 +654,30 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
             air::Exit::Next => continue,
             air::Exit::Return(value) => Op::Return(Some(registers[value.0])),
             air::Exit::End | air::Exit::ReturnVoid => Op::Return(None),
+            air::Exit::Unreachable => Op::Unreachable,
         };
         push(&mut function, operation, block.exit.span);
     }
     debug_assert_eq!(function.code.len(), pc);
     function
+}
+
+/// The address of the local that holds an enum.
+fn enum_address(function: &mut ir::Function, variable: Variable, span: Span) -> Reg {
+    let ty = function.locals[variable.0].ty.clone();
+    let address = register(function, &ty);
+    push(
+        function,
+        Op::Address(
+            address,
+            Slot {
+                global: false,
+                index: variable.0,
+            },
+        ),
+        span,
+    );
+    address
 }
 
 fn register(function: &mut ir::Function, ty: &Type) -> Reg {

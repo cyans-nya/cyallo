@@ -1,0 +1,169 @@
+//! Enums and `match` through the HIR/MIR/AIR pipeline: unit and scalar-payload variants,
+//! matching a local or a call's result, wildcard arms, bindings scoped to their arm, and
+//! the exhaustiveness and arm-type errors. An enum is an owned value that is not `Copy`.
+//! These tests state what the language does, and each checks which route lowered the
+//! routines it relies on.
+use cyallo::{CompileOptions, Diagnostic, Session, Status, compile_with_options};
+use cyallo_ir::analysis::{IndexedRoutineBody, bodies_emitted_on_this_thread};
+use std::sync::Arc;
+
+fn options() -> CompileOptions {
+    // One job keeps compilation on this thread, so the lowering counter is readable.
+    CompileOptions {
+        jobs: 1,
+        ..Default::default()
+    }
+}
+
+fn function_bodies(source: &str) -> usize {
+    let file = cyallo_parser::parse_modern_snapshot(source.into(), false, cyallo::Jobs(1)).unwrap();
+    file.units()
+        .iter()
+        .flat_map(|unit| unit.bodies())
+        .filter(|handle| IndexedRoutineBody::decline_reason(handle).is_none())
+        .count()
+}
+
+/// Compile, returning the program and how many bodies the pipeline lowered.
+fn compiled(source: &str) -> (cyallo::ir::Program, usize) {
+    let before = bodies_emitted_on_this_thread();
+    let program = compile_with_options(source, options())
+        .unwrap_or_else(|error| panic!("{source}\n{error:?}"));
+    (program, bodies_emitted_on_this_thread() - before)
+}
+
+fn run(source: &str) -> String {
+    let (program, _) = compiled(source);
+    let mut session = Session::new(Arc::new(program)).unwrap();
+    for _ in 0..4096 {
+        match session.run(1 << 16) {
+            Status::Finished => break,
+            Status::Paused => {}
+            other => panic!("unexpected status {other:?}\n{source}"),
+        }
+    }
+    assert!(matches!(session.status(), Status::Finished), "{source}");
+    session.context.output
+}
+
+fn failure(source: &str) -> Diagnostic {
+    compile_with_options(source, options()).expect_err(source)
+}
+
+/// Every routine that could be lowered by the pipeline was.
+fn assert_lowered_by_the_pipeline(source: &str) {
+    let eligible = function_bodies(source);
+    assert!(eligible > 0);
+    let (_, lowered) = compiled(source);
+    assert_eq!(lowered, eligible, "{source}");
+}
+
+const SHAPE: &str =
+    "enum Shape {\n    Circle: i64,\n    Square: i64,\n    Empty,\n}\nuse Shape::*\n";
+
+fn program(rest: &str) -> String {
+    format!("{SHAPE}{rest}")
+}
+
+#[test]
+fn the_example_runs_and_is_lowered_by_the_pipeline() {
+    let source = include_str!("../examples/enums/basic.yas");
+    assert_eq!(run(source), "12\n25\n0\ntrue\nfalse\n22\n");
+    assert_lowered_by_the_pipeline(source);
+}
+
+#[test]
+fn a_payload_binding_is_visible_only_in_its_arm() {
+    let source = program(
+        "fn pick(s: Shape) -> i64 { return match s { Circle(r) => r, Square(r) => r + 100, Empty => 0 } }\n\
+         std::io::print(pick(Circle(3)))\nstd::io::print(pick(Square(3)))\nstd::io::print(pick(Empty))",
+    );
+    assert_eq!(run(&source), "3\n103\n0\n");
+    assert_lowered_by_the_pipeline(&source);
+}
+
+#[test]
+fn a_local_is_matched_in_place_and_stays_usable() {
+    let source = program(
+        "fn twice(s: Shape) -> i64 {\n    let a = match s { Circle(r) => r, _ => 0 }\n    let b = match s { Circle(r) => r * 2, _ => 0 }\n    return a + b\n}\n\
+         std::io::print(twice(Circle(7)))",
+    );
+    assert_eq!(run(&source), "21\n");
+    assert_lowered_by_the_pipeline(&source);
+}
+
+#[test]
+fn a_call_result_is_matched_and_a_wildcard_catches_the_rest() {
+    let source = program(
+        "fn make(n: i64) -> Shape {\n    if n > 0 { return Circle(n) }\n    return Empty\n}\n\
+         fn size(n: i64) -> i64 { return match make(n) { Circle(r) => r, _ => -1 } }\n\
+         std::io::print(size(5))\nstd::io::print(size(0))",
+    );
+    assert_eq!(run(&source), "5\n-1\n");
+    assert_lowered_by_the_pipeline(&source);
+}
+
+#[test]
+fn arms_may_short_circuit_and_nest_matches() {
+    let source = program(
+        "fn both(a: Shape, b: Shape) -> bool {\n    return match a { Circle(x) => match b { Circle(y) => x > 0 && y > 0, _ => false }, _ => false }\n}\n\
+         std::io::print(both(Circle(1), Circle(2)))\nstd::io::print(both(Circle(1), Empty))\nstd::io::print(both(Circle(0), Circle(2)))",
+    );
+    assert_eq!(run(&source), "true\nfalse\nfalse\n");
+    assert_lowered_by_the_pipeline(&source);
+}
+
+#[test]
+fn a_match_in_a_loop_body_feeds_a_local() {
+    let source = program(
+        "fn count(n: i64) -> i64 {\n    let mut total = 0\n    for i in 0..n {\n        let v = match Square(i) { Square(s) => s, _ => 0 }\n        total += v\n    }\n    return total\n}\n\
+         std::io::print(count(5))",
+    );
+    assert_eq!(run(&source), "10\n");
+    assert_lowered_by_the_pipeline(&source);
+}
+
+#[test]
+fn a_missing_variant_is_a_non_exhaustive_match() {
+    let error = failure(&program(
+        "fn f(s: Shape) -> i64 { return match s { Circle(r) => r, Empty => 0 } }\nstd::io::print(f(Empty))",
+    ));
+    assert_eq!(error.code, "E185");
+    assert!(error.message.contains("missing"), "{}", error.message);
+    assert!(error.message.contains("Square"), "{}", error.message);
+}
+
+#[test]
+fn arms_must_agree_on_a_type() {
+    let error = failure(&program(
+        "fn f(s: Shape) -> i64 { return match s { Circle(r) => r, _ => true } }\nstd::io::print(f(Empty))",
+    ));
+    assert_eq!(error.code, "E185");
+}
+
+#[test]
+fn a_payload_pattern_must_match_the_declaration() {
+    let error = failure(&program(
+        "fn f(s: Shape) -> i64 { return match s { Empty(r) => r, _ => 0 } }\nstd::io::print(f(Empty))",
+    ));
+    assert_eq!(error.code, "E185");
+}
+
+#[test]
+fn an_enum_handed_on_cannot_be_matched_again() {
+    let error = failure(&program(
+        "fn eat(s: Shape) -> i64 { return 0 }\n\
+         fn f(s: Shape) -> i64 {\n    let n = eat(s)\n    return n + match s { Empty => 1, _ => 2 }\n}\nstd::io::print(f(Empty))",
+    ));
+    // The match cannot sit under `+`, so the program leaves the pipeline: still a move error.
+    assert_eq!(error.code, "E118");
+}
+
+#[test]
+fn a_moved_enum_is_reported_at_the_match() {
+    let error = failure(&program(
+        "fn eat(s: Shape) -> i64 { return 0 }\n\
+         fn f(s: Shape) -> i64 {\n    let n = eat(s)\n    let m = match s { Empty => 1, _ => 2 }\n    return n + m\n}\nstd::io::print(f(Empty))",
+    ));
+    assert_eq!(error.code, "E118");
+}

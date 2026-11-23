@@ -76,7 +76,7 @@ fn report_what_the_pipeline_accepts() {
     assert!(total >= 50, "the corpus shrank: {total} routines");
     // The recorded floor: raise it when coverage grows, and look into any drop.
     assert!(
-        accepted >= 32,
+        accepted >= 36,
         "coverage fell to {accepted} of {total} routines"
     );
 }

@@ -181,14 +181,30 @@ fn programs_outside_the_subset_keep_the_existing_route() {
         "fn f(n: i64) -> i64 { let x = 1\n x = 2\n return x }",
         "fn f(n: i64) -> i64 { for i in 0..n { i = 1 }\n return n }",
         // A name used before or outside its scope, and a repeated name.
-        "fn f(n: i64) -> i64 { let y = x\n let x = 1\n return y }",
-        "fn f(n: i64) -> i64 { if n > 0 { let x = 1 }\n return x }",
         "fn f(n: i64) -> i64 { let x = 1\n let x = 2\n return x }",
-        "fn f(n: i64) -> i64 { for i in 0..n { }\n return i }",
         // A call to a local name, and `break`/`continue`.
         "fn f(n: i64) -> i64 { let g = 1\n return g(n) }",
     ] {
         assert_fallback(source);
+    }
+    // A name that is not a local at the point of use is left to the module graph, which
+    // accepts it only as a unit variant, so these reach the existing route at link time.
+    for source in [
+        "fn f(n: i64) -> i64 { let y = x\n let x = 1\n return y }",
+        "fn f(n: i64) -> i64 { if n > 0 { let x = 1 }\n return x }",
+        "fn f(n: i64) -> i64 { for i in 0..n { }\n return i }",
+    ] {
+        let before = cyallo_ir::analysis::bodies_emitted_on_this_thread();
+        let options = cyallo::CompileOptions {
+            jobs: 1,
+            ..Default::default()
+        };
+        let _ = cyallo::compile_with_options(source, options);
+        assert_eq!(
+            cyallo_ir::analysis::bodies_emitted_on_this_thread(),
+            before,
+            "{source}"
+        );
     }
 }
 

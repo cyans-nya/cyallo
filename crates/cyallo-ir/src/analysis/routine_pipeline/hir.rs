@@ -1,7 +1,7 @@
 use super::{LocalName, ReferenceSite, SiteId, Variable};
 use cyallo_ast::indexed::{
-    ExprNode, ExprSyntax, FunctionNode, Id, IndexedAst, List, LiteralNode, NameId, StmtNode,
-    StmtSyntax, TypeNode,
+    ExprNode, ExprSyntax, FunctionNode, Id, IndexedAst, List, LiteralNode, MatchBodyNode, NameId,
+    PatternNode, PatternSyntax, StmtNode, StmtSyntax, TypeNode,
 };
 use std::sync::OnceLock;
 
@@ -52,6 +52,8 @@ pub(super) enum ExpressionKind {
     },
     /// A string literal: its text is interned in the body's unit.
     Text(NameId),
+    /// `match value { Variant(binding) => expression, ... }`.
+    Match(Box<Match>),
     /// `p.*`: the value a reference parameter refers to.
     Deref(Variable),
     /// `&x` or `&mut x`, as a call argument: a reference to a local or a by-value parameter.
@@ -61,6 +63,41 @@ pub(super) enum ExpressionKind {
     },
     /// A reference parameter passed on, as a call argument.
     Reborrow(Variable),
+}
+
+/// A match over an enum. The scrutinee is held in a hidden local (unless it already is a
+/// local) and the value of the arm that runs is gathered in another.
+#[derive(Clone, Debug)]
+pub(super) struct Match {
+    pub(super) scrutinee: Expression,
+    pub(super) held: Variable,
+    pub(super) result: Variable,
+    pub(super) arms: Vec<Arm>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct Arm {
+    pub(super) pattern: Pattern,
+    pub(super) body: Expression,
+    pub(super) span: Span,
+}
+
+/// What an arm matches: any value, or one variant, whose payload is ignored or bound.
+#[derive(Clone, Debug)]
+pub(super) enum Pattern {
+    Wildcard,
+    /// The variant's name as written, possibly qualified (`Shape::Circle`).
+    Variant {
+        name: NameId,
+        payload: Payload,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum Payload {
+    Absent,
+    Wildcard,
+    Binding(Variable),
 }
 
 impl Expression {
@@ -86,6 +123,14 @@ impl Expression {
             }
             ExpressionKind::Project { path, .. } => path.len(),
             ExpressionKind::Text(_) => 0,
+            ExpressionKind::Match(matched) => {
+                matched.scrutinee.size()
+                    + matched
+                        .arms
+                        .iter()
+                        .map(|arm| 1 + arm.body.size())
+                        .sum::<usize>()
+            }
             ExpressionKind::Binary(_, left, right)
             | ExpressionKind::ShortCircuit { left, right, .. } => left.size() + right.size(),
             ExpressionKind::Call(_, arguments) => arguments.iter().map(Expression::size).sum(),
@@ -395,6 +440,55 @@ impl Context<'_> {
         slot
     }
 
+    /// A pattern: `_`, or a variant with its payload ignored or bound to a new local.
+    /// A bare capitalized name is a variant; a bare lowercase name would bind the whole
+    /// value, which is left to the existing route.
+    fn pattern(&mut self, id: Id<PatternNode>) -> Option<Pattern> {
+        let ast = self.ast;
+        let node = ast.get(id)?;
+        match node.kind {
+            PatternSyntax::Wildcard => Some(Pattern::Wildcard),
+            PatternSyntax::Binding(name) => {
+                if ast
+                    .name(name)?
+                    .rsplit("::")
+                    .next()?
+                    .starts_with(char::is_uppercase)
+                {
+                    Some(Pattern::Variant {
+                        name,
+                        payload: Payload::Absent,
+                    })
+                } else {
+                    decline(|| "pattern that binds the whole value".into())
+                }
+            }
+            PatternSyntax::Variant(name, payload) => {
+                let payload = match payload {
+                    None => Payload::Absent,
+                    Some(inner) => match ast.get(inner)?.kind {
+                        PatternSyntax::Wildcard => Payload::Wildcard,
+                        PatternSyntax::Binding(binding) => {
+                            let slot = self.declare(LocalName::Source(binding), node.span, true);
+                            self.scopes.last_mut()?.push(Visible {
+                                name: binding,
+                                slot,
+                                mutable: false,
+                                reference: None,
+                            });
+                            Payload::Binding(slot)
+                        }
+                        ref other => {
+                            return decline(|| format!("payload pattern {}", variant(other)));
+                        }
+                    },
+                };
+                Some(Pattern::Variant { name, payload })
+            }
+            ref other => decline(|| format!("pattern {}", variant(other))),
+        }
+    }
+
     /// A call argument: a plain value, or the one place a borrow may appear.
     fn argument(&mut self, id: Id<ExprNode>) -> Option<Expression> {
         let ast = self.ast;
@@ -430,6 +524,7 @@ impl Context<'_> {
         arguments: usize,
         discard: bool,
         record: bool,
+        name_use: bool,
     ) -> SiteId {
         self.sites.push(ReferenceSite {
             path,
@@ -437,6 +532,7 @@ impl Context<'_> {
             arguments,
             discard,
             record,
+            name_use,
         });
         SiteId(self.sites.len() - 1)
     }
@@ -709,8 +805,12 @@ impl Context<'_> {
                         return decline(|| "reference parameter used as a value".into());
                     }
                     Some(visible) => ExpressionKind::Read(visible.slot),
-                    // A module variable, a constant, a function value, or a name out of scope.
-                    None => return decline(|| "name that is not a local".into()),
+                    // Not a local: a unit variant, a module variable, a constant, or a function
+                    // value. The module graph accepts it only as a unit variant.
+                    None => {
+                        let site = self.site(name, expression.span, 0, false, false, true);
+                        ExpressionKind::Call(site, Vec::new())
+                    }
                 },
                 ExprSyntax::Parenthesized(inner) => {
                     ExpressionKind::Group(Box::new(self.value(inner, split)?))
@@ -750,11 +850,59 @@ impl Context<'_> {
                     for &(field, value) in ast.get_list(fields)? {
                         written.push((field, self.value(value, false)?));
                     }
-                    let site = self.site(name, expression.span, written.len(), false, true);
+                    let site = self.site(name, expression.span, written.len(), false, true, false);
                     ExpressionKind::Record {
                         site,
                         fields: written,
                     }
+                }
+                ExprSyntax::Match(scrutinee, arms) => {
+                    // A match starts new blocks, so like `&&` it may not sit under an operator.
+                    if !split {
+                        return decline(|| "match under an operator".into());
+                    }
+                    let scrutinee = self.value(scrutinee, false)?;
+                    // A local is tested in place; a call's result is first held in a local.
+                    let held = match &scrutinee.kind {
+                        ExpressionKind::Read(variable) => *variable,
+                        ExpressionKind::Call(..) => {
+                            self.declare(LocalName::Hidden("$scrutinee"), expression.span, false)
+                        }
+                        _ => {
+                            return decline(|| {
+                                "match on something other than a local or call".into()
+                            });
+                        }
+                    };
+                    if ast.get_list(arms)?.is_empty() {
+                        return decline(|| "match without arms".into());
+                    }
+                    let result = self.declare(LocalName::Hidden("$match"), expression.span, false);
+                    let mut lowered = Vec::new();
+                    for arm in ast.get_list(arms)? {
+                        if arm.guard.is_some() {
+                            return decline(|| "match guard".into());
+                        }
+                        let MatchBodyNode::Expression(body) = arm.body else {
+                            return decline(|| "match arm with a block".into());
+                        };
+                        // The arm's bindings are visible in its body only.
+                        self.scopes.push(Vec::new());
+                        let pattern = self.pattern(arm.pattern);
+                        let body = pattern.as_ref().and_then(|_| self.value(body, true));
+                        self.scopes.pop();
+                        lowered.push(Arm {
+                            pattern: pattern?,
+                            body: body?,
+                            span: arm.span,
+                        });
+                    }
+                    ExpressionKind::Match(Box::new(Match {
+                        scrutinee,
+                        held,
+                        result,
+                        arms: lowered,
+                    }))
                 }
                 ExprSyntax::Unary(Operator::Dereference, inner) => {
                     let ExprSyntax::Name(name) = ast.get(inner)?.kind else {
@@ -783,7 +931,8 @@ impl Context<'_> {
                         .iter()
                         .map(|&argument| self.argument(argument))
                         .collect::<Option<_>>()?;
-                    let site = self.site(name, expression.span, arguments.len(), false, false);
+                    let site =
+                        self.site(name, expression.span, arguments.len(), false, false, false);
                     ExpressionKind::Call(site, arguments)
                 }
                 ref other => return decline(|| format!("expression {}", variant(other))),

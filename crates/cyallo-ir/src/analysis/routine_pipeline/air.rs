@@ -6,6 +6,7 @@
 //! each statement to typed operations and builds the blocks, because `&&` and `||`
 //! end a block in the middle of an expression.
 use super::{LocalName, SiteId, Variable, hir, mir};
+use crate::patterns;
 use cyallo_ast::indexed::{IndexedAst, NameId};
 use cyallo_ast::{Diagnostic, Literal, Number, NumberKind, Operator, Param, Span, Type};
 use hir::{Expression, ExpressionKind};
@@ -35,6 +36,12 @@ pub(super) enum Site {
     Call(Callee),
     /// The linked name of the record, whose definition the type environment holds.
     Record(Box<str>),
+    /// A variant constructor, built in place rather than by calling a function.
+    Variant {
+        variant: cyallo_ast::EnumVariant,
+        payload: Option<Type>,
+        result: Type,
+    },
 }
 
 /// A field place: the root local, whether it is a reference to the record, and the field
@@ -84,6 +91,12 @@ pub(super) enum Operation {
     StoreIndirect(Value, Value),
     /// A reference to a local: its address, moved into a reference value.
     Borrow(Value, Variable),
+    /// Build an enum value of a variant, with its payload if it has one.
+    EnumConstruct(Value, cyallo_ast::EnumVariant, Option<Value>),
+    /// Whether the enum held in a local is this variant.
+    EnumTest(Value, Variable, cyallo_ast::EnumVariant),
+    /// The payload of the variant the local holds, read as a value.
+    EnumPayload(Value, Variable, cyallo_ast::EnumVariant, Type),
 }
 
 /// Targets are indexes into `Body::blocks`.
@@ -99,6 +112,8 @@ pub(super) enum Exit {
     Return(Value),
     ReturnVoid,
     End,
+    /// No arm of a match applied, which exhaustiveness rules out.
+    Unreachable,
 }
 
 #[derive(Debug)]
@@ -263,6 +278,14 @@ fn contextualize<'e>(
     let Some(kind) = wanted.number_kind() else {
         return Ok(Cow::Borrowed(expression));
     };
+    cyallo_ast::with_stack(|| contextualize_number(expression, wanted, kind))
+}
+
+fn contextualize_number<'e>(
+    expression: &'e Expression,
+    wanted: &Type,
+    kind: NumberKind,
+) -> Result<Cow<'e, Expression>, Diagnostic> {
     let span = expression.span;
     match &expression.kind {
         ExpressionKind::Literal(literal @ (Literal::Integer(_) | Literal::Real(_))) => {
@@ -366,7 +389,7 @@ pub(super) fn analyze(
     let mut total = 0;
     for block in &body.blocks {
         start.push(total);
-        total += 1 + 2 * short_circuits(block);
+        total += 1 + extra_blocks(block);
     }
     let mut analysis = Analysis {
         parameters,
@@ -410,7 +433,7 @@ pub(super) fn analyze(
             Exit::End if *result != Type::Void => {
                 return Err(routine_diagnostic(CheckError::MissingReturn, routine_span));
             }
-            Exit::Return(_) | Exit::ReturnVoid | Exit::End => {}
+            Exit::Return(_) | Exit::ReturnVoid | Exit::End | Exit::Unreachable => {}
         }
     }
     let locals = analysis
@@ -437,6 +460,8 @@ fn check_moves(blocks: &[Block], variables: usize) -> Result<(), Diagnostic> {
                 Operation::ReadVariable(_, variable)
                 | Operation::Borrow(_, variable)
                 | Operation::FieldRead(_, variable, _)
+                | Operation::EnumTest(_, variable, _)
+                | Operation::EnumPayload(_, variable, _, _)
                 | Operation::FieldWrite(variable, _, _)
                 | Operation::TakeVariable(_, variable) => {
                     if report && let Some(moved) = state[variable.0] {
@@ -466,7 +491,7 @@ fn check_moves(blocks: &[Block], variables: usize) -> Result<(), Diagnostic> {
             Exit::Branch { yes, no, .. } => vec![yes, no],
             Exit::Jump(target) => vec![target],
             Exit::Next => vec![index + 1],
-            Exit::Return(_) | Exit::ReturnVoid | Exit::End => vec![],
+            Exit::Return(_) | Exit::ReturnVoid | Exit::End | Exit::Unreachable => vec![],
         }
     };
     let mut entry: Vec<Vec<Option<Span>>> = vec![vec![None; variables]; blocks.len()];
@@ -493,7 +518,10 @@ fn check_moves(blocks: &[Block], variables: usize) -> Result<(), Diagnostic> {
     Ok(())
 }
 
-fn short_circuits(block: &mir::Block) -> usize {
+/// How many blocks beyond its own a MIR block becomes: two for each short-circuit
+/// operator, and for a match one test block and one jump block per arm plus the block
+/// that holds the unreachable exit.
+fn extra_blocks(block: &mir::Block) -> usize {
     fn count(expression: &Expression) -> usize {
         match &expression.kind {
             ExpressionKind::Literal(_)
@@ -508,7 +536,17 @@ fn short_circuits(block: &mir::Block) -> usize {
             }
             ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => count(inner),
             ExpressionKind::Binary(_, left, right) => count(left) + count(right),
-            ExpressionKind::ShortCircuit { left, right, .. } => 1 + count(left) + count(right),
+            ExpressionKind::ShortCircuit { left, right, .. } => 2 + count(left) + count(right),
+            ExpressionKind::Match(matched) => {
+                2 * matched.arms.len()
+                    + 1
+                    + count(&matched.scrutinee)
+                    + matched
+                        .arms
+                        .iter()
+                        .map(|arm| count(&arm.body))
+                        .sum::<usize>()
+            }
             ExpressionKind::Call(_, arguments) => arguments.iter().map(count).sum(),
         }
     }
@@ -587,7 +625,7 @@ impl Analysis<'_> {
     /// A type with a record's name replaced by its definition, so fields can be looked up.
     fn view(&self, ty: &Type) -> Type {
         match ty {
-            Type::Named(name) | Type::RecordRef(name) => self
+            Type::Named(name) | Type::RecordRef(name) | Type::EnumRef(_, name) => self
                 .definitions
                 .get(&**name)
                 .cloned()
@@ -848,9 +886,14 @@ impl Analysis<'_> {
                 }
             }
             ExpressionKind::ShortCircuit { .. } => Ok(Type::Boolean),
-            ExpressionKind::Call(site, _) => {
-                Ok(self.callee(*site, expression.span)?.result.clone())
-            }
+            ExpressionKind::Match(matched) => match matched.arms.first() {
+                Some(arm) => self.infer(&arm.body),
+                None => Err(invalid(expression.span)),
+            },
+            ExpressionKind::Call(site, _) => match self.callees.get(site.0) {
+                Some(Site::Variant { result, .. }) => Ok(self.view(result)),
+                _ => Ok(self.callee(*site, expression.span)?.result.clone()),
+            },
         })
     }
 
@@ -1020,6 +1063,12 @@ impl Analysis<'_> {
                     right,
                     slot,
                 } => self.short_circuit(*and, left, right, *slot, span),
+                ExpressionKind::Match(matched) => self.matched(matched, span),
+                ExpressionKind::Call(site, arguments)
+                    if matches!(self.callees.get(site.0), Some(Site::Variant { .. })) =>
+                {
+                    self.construct(*site, arguments, span)
+                }
                 ExpressionKind::Call(site, arguments) => {
                     let (target, result, operands) = self.arguments(*site, arguments, span)?;
                     let value = self.value(result.clone());
@@ -1028,6 +1077,236 @@ impl Analysis<'_> {
                 }
             }
         })
+    }
+
+    /// The variant a pattern names in the enum being matched, and its index.
+    fn variant_of(
+        &self,
+        scrutinee: &Type,
+        name: NameId,
+        span: Span,
+    ) -> Result<(Arc<cyallo_ast::EnumType>, usize), Diagnostic> {
+        let Type::Enum(contract) = self.view(scrutinee) else {
+            return Err(patterns::invalid_pattern(
+                patterns::PatternError::ExpectedEnum {
+                    actual: scrutinee.clone(),
+                },
+                span,
+            ));
+        };
+        let written = self.text(name);
+        let last = |text: &str| text.rsplit("::").next().unwrap_or(text).to_owned();
+        let found = contract
+            .variants
+            .iter()
+            .position(|variant| last(&variant.name) == last(written));
+        let qualifier = written.rsplit_once("::").map(|(owner, _)| last(owner));
+        match found {
+            None => Err(patterns::invalid_pattern(
+                patterns::PatternError::UnknownVariant {
+                    name: written.into(),
+                },
+                span,
+            )),
+            Some(_) if qualifier.is_some_and(|owner| owner != last(&contract.name)) => {
+                Err(patterns::invalid_pattern(
+                    patterns::PatternError::WrongVariant {
+                        enumeration: contract.name.clone(),
+                    },
+                    span,
+                ))
+            }
+            Some(index) => Ok((contract, index)),
+        }
+    }
+
+    /// Give a match's hidden locals and arm bindings their types, once the type of the
+    /// value matched is known. Returns whether anything was declared.
+    fn declare_match(&mut self, matched: &hir::Match, span: Span) -> Result<bool, Diagnostic> {
+        let mut changed = false;
+        if self.variable_type(matched.held).is_none()
+            && let Ok(ty) = self.infer(&matched.scrutinee)
+        {
+            self.declare(matched.held, ty, span)?;
+            changed = true;
+        }
+        let Some(held) = self.variable_type(matched.held) else {
+            return Ok(changed);
+        };
+        for arm in &matched.arms {
+            let hir::Pattern::Variant { name, payload } = &arm.pattern else {
+                continue;
+            };
+            let (contract, index) = self.variant_of(&held, *name, arm.span)?;
+            let declared = contract.variants[index].payload.as_ref();
+            match (declared, payload) {
+                (Some(_), hir::Payload::Binding(slot)) if self.variable_type(*slot).is_none() => {
+                    let ty = self.view(declared.expect("matched a payload"));
+                    self.declare(*slot, ty, arm.span)?;
+                    changed = true;
+                }
+                (Some(_), hir::Payload::Binding(_) | hir::Payload::Wildcard)
+                | (None, hir::Payload::Absent) => {}
+                _ => {
+                    return Err(patterns::invalid_pattern(
+                        patterns::PatternError::PayloadArity,
+                        arm.span,
+                    ));
+                }
+            }
+        }
+        if self.variable_type(matched.result).is_none()
+            && let Some(first) = matched.arms.first()
+            && let Ok(ty) = self.infer(&first.body)
+        {
+            self.declare(matched.result, ty, span)?;
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    /// `match`: a test block and a body block per arm, joined where the value is read.
+    /// Control that falls off the last arm reaches `Unreachable`, which the
+    /// exhaustiveness check makes impossible.
+    fn matched(&mut self, matched: &hir::Match, span: Span) -> Result<(Value, Type), Diagnostic> {
+        let in_place = matches!(&matched.scrutinee.kind, ExpressionKind::Read(variable) if *variable == matched.held);
+        let held = if in_place {
+            self.typed(matched.held, span)?
+        } else {
+            let (value, ty) = self.expression_as(&matched.scrutinee, Use::Move)?;
+            self.store(matched.held, value, span);
+            ty
+        };
+        let result = self.typed(matched.result, span)?;
+        let mut covered = Vec::new();
+        let mut total = 0;
+        let mut wildcard = false;
+        let (mut tests, mut jumps) = (Vec::new(), Vec::new());
+        for arm in &matched.arms {
+            let test_block = match &arm.pattern {
+                hir::Pattern::Wildcard => {
+                    wildcard = true;
+                    self.close(Exit::Next, arm.span)
+                }
+                hir::Pattern::Variant { name, .. } => {
+                    let (contract, index) = self.variant_of(&held, *name, arm.span)?;
+                    total = contract.variants.len();
+                    covered.push(index);
+                    let operation = contract.variants[index].operation();
+                    let found = self.value(Type::Boolean);
+                    self.emit(
+                        Operation::EnumTest(found, matched.held, operation),
+                        arm.span,
+                    );
+                    let next = self.blocks.len() + 1;
+                    self.close(
+                        Exit::Branch {
+                            condition: found,
+                            yes: next,
+                            no: usize::MAX,
+                        },
+                        arm.span,
+                    )
+                }
+            };
+            if let hir::Pattern::Variant {
+                name,
+                payload: hir::Payload::Binding(slot),
+            } = &arm.pattern
+            {
+                let (contract, index) = self.variant_of(&held, *name, arm.span)?;
+                let variant = &contract.variants[index];
+                let ty = self.typed(*slot, arm.span)?;
+                let value = self.value(ty.clone());
+                self.emit(
+                    Operation::EnumPayload(value, matched.held, variant.operation(), ty),
+                    arm.span,
+                );
+                self.store(*slot, value, arm.span);
+            }
+            let (value, ty) = self.expected_as(&arm.body, &result, Use::Move)?;
+            if ty != result {
+                return Err(patterns::invalid_pattern(
+                    patterns::PatternError::ArmType {
+                        expected: result.clone(),
+                        actual: ty,
+                    },
+                    arm.body.span,
+                ));
+            }
+            self.store(matched.result, value, arm.span);
+            let jump = self.close(Exit::Jump(usize::MAX), arm.span);
+            tests.push(test_block);
+            jumps.push(jump);
+            if matches!(self.blocks[test_block].exit.kind, Exit::Branch { .. }) {
+                self.blocks[test_block].exit.kind = match self.blocks[test_block].exit.kind {
+                    Exit::Branch { condition, yes, .. } => Exit::Branch {
+                        condition,
+                        yes,
+                        no: jump + 1,
+                    },
+                    _ => unreachable!(),
+                };
+            }
+        }
+        if !wildcard {
+            covered.sort_unstable();
+            covered.dedup();
+            if covered.len() != total {
+                let missing = match self.view(&held) {
+                    Type::Enum(contract) => contract
+                        .variants
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| !covered.contains(index))
+                        .map(|(_, variant)| variant.name.clone())
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                return Err(patterns::invalid_pattern(
+                    patterns::PatternError::NonExhaustive { missing },
+                    span,
+                ));
+            }
+        }
+        let end = self.close(Exit::Unreachable, span) + 1;
+        for jump in jumps {
+            self.blocks[jump].exit.kind = Exit::Jump(end);
+        }
+        let _ = tests;
+        self.read(matched.result, span)
+    }
+
+    /// A variant constructor: the variant's tag and its payload, built in place.
+    fn construct(
+        &mut self,
+        site: SiteId,
+        arguments: &[Expression],
+        span: Span,
+    ) -> Result<(Value, Type), Diagnostic> {
+        let callees = self.callees;
+        let Some(Site::Variant {
+            variant,
+            payload,
+            result,
+        }) = callees.get(site.0)
+        else {
+            return Err(invalid(span));
+        };
+        let result = self.view(result);
+        let operand = match (payload, arguments) {
+            (None, []) => None,
+            (Some(parameter), [argument]) => {
+                let parameter = self.view(parameter);
+                let (value, ty) = self.expected_as(argument, &parameter, Use::Move)?;
+                require_argument(&parameter, &ty, argument.span)?;
+                Some(value)
+            }
+            _ => return Err(invalid(span)),
+        };
+        let value = self.value(result.clone());
+        self.emit(Operation::EnumConstruct(value, *variant, operand), span);
+        Ok((value, result))
     }
 
     /// Lower call arguments against the callee's parameter types, in order.
@@ -1140,9 +1419,30 @@ impl Analysis<'_> {
         let mut candidates = Vec::new();
         let mut ranges = Vec::new();
         let mut bounds = Vec::new();
+        let mut matches: Vec<(&hir::Match, Span)> = Vec::new();
         for block in &body.blocks {
+            match &block.exit.kind {
+                mir::Exit::Branch { condition, .. } => gather_matches(condition, &mut matches),
+                mir::Exit::Return(value) => gather_matches(value, &mut matches),
+                _ => {}
+            }
             for statement in &block.statements {
                 let span = statement.span;
+                match &statement.kind {
+                    Statement::Define { value, .. }
+                    | Statement::Assign { value, .. }
+                    | Statement::Compound { value, .. }
+                    | Statement::AssignDeref { value, .. }
+                    | Statement::CompoundDeref { value, .. }
+                    | Statement::AssignProject { value, .. }
+                    | Statement::CompoundProject { value, .. }
+                    | Statement::CallStatement(value) => gather_matches(value, &mut matches),
+                    Statement::RangeStart { start, finish, .. } => {
+                        gather_matches(start, &mut matches);
+                        gather_matches(finish, &mut matches);
+                    }
+                    _ => {}
+                }
                 match &statement.kind {
                     Statement::Define {
                         slot,
@@ -1194,8 +1494,21 @@ impl Analysis<'_> {
                     changed = true;
                 }
             }
+            for (matched, span) in &matches {
+                changed |= self.declare_match(matched, *span)?;
+            }
             if !changed {
                 break;
+            }
+        }
+        for (matched, span) in &matches {
+            if self.variable_type(matched.result).is_none() {
+                return Err(
+                    match matched.arms.first().map(|arm| self.infer(&arm.body)) {
+                        Some(Err(error)) => error,
+                        _ => Diagnostic::new("E114", "type of the match is not known", *span),
+                    },
+                );
             }
         }
         let unresolved: Vec<Variable> = candidates
@@ -1526,6 +1839,13 @@ fn mentions(expression: &Expression, variables: &[Variable]) -> bool {
         ExpressionKind::Record { fields, .. } => {
             fields.iter().any(|(_, value)| mentions(value, variables))
         }
+        ExpressionKind::Match(matched) => {
+            mentions(&matched.scrutinee, variables)
+                || matched
+                    .arms
+                    .iter()
+                    .any(|arm| mentions(&arm.body, variables))
+        }
         ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => {
             mentions(inner, variables)
         }
@@ -1536,5 +1856,41 @@ fn mentions(expression: &Expression, variables: &[Variable]) -> bool {
         ExpressionKind::Call(_, arguments) => arguments
             .iter()
             .any(|argument| mentions(argument, variables)),
+    }
+}
+
+/// Every match in an expression, outer before inner.
+fn gather_matches<'e>(expression: &'e Expression, out: &mut Vec<(&'e hir::Match, Span)>) {
+    cyallo_ast::with_stack(|| gather_in(expression, out))
+}
+
+fn gather_in<'e>(expression: &'e Expression, out: &mut Vec<(&'e hir::Match, Span)>) {
+    match &expression.kind {
+        ExpressionKind::Match(matched) => {
+            out.push((matched, expression.span));
+            gather_matches(&matched.scrutinee, out);
+            for arm in &matched.arms {
+                gather_matches(&arm.body, out);
+            }
+        }
+        ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => {
+            gather_matches(inner, out)
+        }
+        ExpressionKind::Binary(_, left, right)
+        | ExpressionKind::ShortCircuit { left, right, .. } => {
+            gather_matches(left, out);
+            gather_matches(right, out);
+        }
+        ExpressionKind::Call(_, arguments) => {
+            for argument in arguments {
+                gather_matches(argument, out);
+            }
+        }
+        ExpressionKind::Record { fields, .. } => {
+            for (_, value) in fields {
+                gather_matches(value, out);
+            }
+        }
+        _ => {}
     }
 }

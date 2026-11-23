@@ -81,6 +81,11 @@ struct Resolver {
     /// Resolved field types of each record declared without type parameters, by the
     /// record's linked name.
     records: HashMap<Box<str>, Vec<(Box<str>, Type)>>,
+    /// The variants of each enum without type parameters, by the enum's linked name, with
+    /// their resolved payload types.
+    enums: HashMap<Box<str>, Vec<(Box<str>, Option<Type>)>>,
+    /// The enum each variant belongs to, and whether it carries a payload.
+    variants: HashMap<DeclarationId, (Box<str>, bool)>,
     /// Source-file mode: the entry runs `proc main()` and no top level may hold statements.
     entry_mode: crate::EntryMode,
     aliases: HashMap<Box<str>, (usize, Type)>,
@@ -251,6 +256,36 @@ impl Resolver {
         table
     }
 
+    /// The variants of every enum without type parameters, resolved in its own module.
+    fn enum_table(&self) -> HashMap<Box<str>, Vec<(Box<str>, Option<Type>)>> {
+        let mut table = HashMap::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            for declaration in &node.ast.enums {
+                if !declaration.type_params.is_empty() || declaration.open {
+                    continue;
+                }
+                let Some(symbol) = self.path(index, &declaration.name, Some(Kind::Type)) else {
+                    continue;
+                };
+                let variants: Option<Vec<_>> = declaration
+                    .variants
+                    .iter()
+                    .map(|variant| {
+                        let payload = match &variant.payload {
+                            Some(ty) => Some(self.resolved(index, ty, variant.span)?),
+                            None => None,
+                        };
+                        Some((variant.name.clone(), payload))
+                    })
+                    .collect();
+                if let Some(variants) = variants {
+                    table.insert(symbol.target, variants);
+                }
+            }
+        }
+        table
+    }
+
     /// A type as the module graph resolves it, or `None` if it does not resolve.
     fn resolved(&self, module: usize, ty: &Type, span: Span) -> Option<Type> {
         let mut resolved = ty.clone();
@@ -268,11 +303,23 @@ impl Resolver {
                 pointee,
                 ..
             } => !matches!(**pointee, Type::Reference { .. }) && self.pipeline_type(pointee, depth),
-            Type::Named(target) if depth < 8 => self.records.get(target).is_some_and(|fields| {
-                fields.iter().all(|(_, field)| {
-                    !matches!(field, Type::Reference { .. }) && self.pipeline_type(field, depth + 1)
+            Type::Named(target) if depth < 8 => {
+                self.records.get(target).is_some_and(|fields| {
+                    fields.iter().all(|(_, field)| {
+                        !matches!(field, Type::Reference { .. })
+                            && self.pipeline_type(field, depth + 1)
+                    })
+                }) || self.enums.get(target).is_some_and(|variants| {
+                    variants.iter().all(|(_, payload)| {
+                        // A payload is bound by copy, so only copyable values are carried.
+                        payload.as_ref().is_none_or(|payload| {
+                            crate::ownership::copy(payload)
+                                && !matches!(payload, Type::Reference { .. })
+                                && self.pipeline_type(payload, depth + 1)
+                        })
+                    })
                 })
-            }),
+            }
             _ => false,
         }
     }
@@ -345,12 +392,13 @@ impl Resolver {
                     site.arguments,
                     site.discard,
                     site.record,
+                    site.name_use,
                     site.span,
                 )
             })
             .collect();
         let mut targets = Vec::with_capacity(sites.len());
-        for (path, arguments, discard, record, span) in sites {
+        for (path, arguments, discard, record, name_use, span) in sites {
             if record {
                 // A record literal names a record type whose fields the pipeline lowers.
                 let Some(symbol) = self.path(module, &path, Some(Kind::Type)) else {
@@ -366,18 +414,47 @@ impl Resolver {
             if function.params.iter().any(|param| param.name == path) {
                 return Ok(Err(body));
             }
+            if name_use {
+                // A name that is not a local: acceptable only as a unit variant.
+                let Some(symbol) = self.path(module, &path, Some(Kind::Value)) else {
+                    return Ok(Err(body));
+                };
+                self.check_import(module, &symbol, span)?;
+                let supported = self
+                    .variants
+                    .get(&symbol.id)
+                    .is_some_and(|(owner, payload)| {
+                        !payload && self.pipeline_type(&Type::Named(owner.clone()), 0)
+                    });
+                if !supported {
+                    return Ok(Err(body));
+                }
+                targets.push(symbol.target);
+                continue;
+            }
             let Some(symbol) = self.path(module, &path, Some(Kind::Value)) else {
                 return Ok(Err(body));
             };
             self.check_import(module, &symbol, span)?;
+            // A constructor of a supported enum's variant with a payload is a plain callee.
+            let constructor = self
+                .variants
+                .get(&symbol.id)
+                .is_some_and(|(owner, payload)| {
+                    *payload
+                        && arguments == 1
+                        && !discard
+                        && self.pipeline_type(&Type::Named(owner.clone()), 0)
+                });
             if symbol.intrinsic.is_some()
                 || self.unit_variants.contains(&symbol.id)
-                || !self
-                    .plain
-                    .get(&symbol.target)
-                    .is_some_and(|&(parameters, void)| {
-                        parameters == arguments && (discard || !void)
-                    })
+                || !(constructor
+                    || self
+                        .plain
+                        .get(&symbol.target)
+                        .is_some_and(|&(parameters, void)| {
+                            parameters == arguments && (discard || !void)
+                        }))
             {
                 return Ok(Err(body));
             }
@@ -1639,6 +1716,8 @@ impl Resolver {
                     self.source_names
                         .insert(target.clone(), variant.name.clone());
                     self.variant_ids.insert(id);
+                    self.variants
+                        .insert(id, (owner.target.clone(), variant.payload.is_some()));
                     if variant.payload.is_none() {
                         self.unit_variants.insert(id);
                     }
@@ -2869,6 +2948,7 @@ impl Resolver {
             }
         }
         self.records = self.record_table();
+        self.enums = self.enum_table();
         self.plain = self.plain_functions();
         for index in 0..self.nodes.len() {
             self.next_binding = 0;
@@ -3380,6 +3460,8 @@ pub fn link_program(
         bound: HashMap::new(),
         plain: HashMap::new(),
         records: HashMap::new(),
+        enums: HashMap::new(),
+        variants: HashMap::new(),
         aliases: HashMap::new(),
         source_names: Default::default(),
         nodes: Vec::new(),
