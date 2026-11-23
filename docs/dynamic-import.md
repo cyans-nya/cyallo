@@ -52,14 +52,14 @@ package; `super::` stops at its root. They cannot access the caller's private
 namespace. Initialization permits constants; effects belong in explicit
 procedures. Loading never replays the caller's top-level code.
 
-Run [the example](../examples/modules/dynamic/main.ya):
+Run [the example](../examples/modules/dynamic/main.yas):
 
 ```sh
-cargo run -- run examples/modules/dynamic/main.ya --engine cranelift_speed --gc-stress
+cargo run -- run examples/modules/dynamic/main.yas --engine cranelift_speed --gc-stress
 ```
 
 It prints `runtime`, `42`, `42`, and `true` on separate lines. The
-[coroutine example](../examples/concurrency/modules/main.ya) prints `42`.
+[coroutine example](../examples/concurrency/modules/main.yas) prints `42`.
 
 ## Authority and ownership
 

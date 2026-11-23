@@ -63,14 +63,15 @@ class Workload:
     body: int = 8  # statements per ordinary routine
     modules: int = 0  # M: extra files holding the routines (0: all in the entry)
     big: int = 1500  # statements in the large routine
+    scalar: bool = False  # routines use only the migrated scalar subset (branches, returns, calls)
 
     @property
     def label(self) -> str:
-        return f"{self.kind.value} n={self.routines} b{self.body} m{self.modules}"
+        return f"{self.kind.value} n={self.routines} b{self.body} m{self.modules}{' scalar' if self.scalar else ''}"
 
     @property
     def slug(self) -> str:
-        return f"{self.kind.value}-n{self.routines}-b{self.body}-m{self.modules}"
+        return f"{self.kind.value}-n{self.routines}-b{self.body}-m{self.modules}{'-scalar' if self.scalar else ''}"
 
 
 # --------------------------------------------------------------------------- generation
@@ -93,6 +94,17 @@ def statements(count: int, seed: int) -> str:
     return "\n".join(lines)
 
 
+def scalar_routine(name: str, count: int, seed: int, public: bool, callee: str | None) -> str:
+    """By-value i64 parameters, arithmetic, branches, explicit returns and one direct call."""
+    lines = []
+    for s in range(count):
+        lines.append(f"    if x > {1000 + seed + s} {{ return x - {s % 89 + 1} }}")
+    tail = f"x * {seed % 7 + 2} + {seed % 97}"
+    if callee:
+        tail = f"{callee}(x + {seed % 5}) + {tail}"
+    return f"{'pub ' if public else ''}fn {name}(x: i64) -> i64 {{\n" + "\n".join(lines) + f"\n    return {tail}\n}}\n"
+
+
 def routine(name: str, count: int, seed: int, public: bool) -> str:
     return (
         f"{'pub ' if public else ''}fn {name}(x: i64) -> i64 {{\n"
@@ -102,17 +114,21 @@ def routine(name: str, count: int, seed: int, public: bool) -> str:
 
 
 def render(w: Workload) -> dict[str, str]:
-    """Return {relative path: source}. `main.ya` is the entry."""
+    """Return {relative path: source}. `main.yas` is the entry."""
     has_big = w.kind is not Kind.unused and w.kind is not Kind.call_all
-    files: dict[str, list[str]] = {"main.ya": []}
+    files: dict[str, list[str]] = {"main.yas": []}
     homes: list[str] = []  # module name or "" for each routine
     for k in range(w.routines):
         home = f"m{k % w.modules}" if w.modules else ""
         homes.append(home)
-        files.setdefault(f"{home}.ya" if home else "main.ya", []).append(
-            routine(f"r{k}", w.body, k, public=bool(home))
+        text = (
+            # A scalar routine calls its predecessor when both live in the same file.
+            scalar_routine(f"r{k}", w.body, k, bool(home), f"r{k - 1}" if k and homes[k - 1] == home else None)
+            if w.scalar
+            else routine(f"r{k}", w.body, k, public=bool(home))
         )
-    entry = files["main.ya"]
+        files.setdefault(f"{home}.ya" if home else "main.yas", []).append(text)
+    entry = files["main.yas"]
     prefix = [f"mod m{j};" for j in range(w.modules)]
     if w.kind is Kind.call_all:
         calls = [
@@ -136,7 +152,7 @@ def render(w: Workload) -> dict[str, str]:
     ]
     out = {}
     for name, parts in files.items():
-        if name == "main.ya":
+        if name == "main.yas":
             head = "\n".join(prefix + uses) + ("\n" if prefix or uses else "")
             out[name] = head + "\n".join(parts) + "\n" + "\n".join(tail) + "\n"
         else:
@@ -148,7 +164,7 @@ def write(w: Workload, directory: Path) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     for name, text in render(w).items():
         (directory / name).write_text(text)
-    return directory / "main.ya"
+    return directory / "main.yas"
 
 
 COMMITTED = [
@@ -168,6 +184,9 @@ SWEEPS: dict[str, list[Workload]] = {
     "import count (files), n=1024": [Workload(Kind.unused, 1024, modules=m) for m in (0, 4, 16, 64)],
     "first call of one large routine": [
         Workload(k, n) for n in (0, 1024, 4096) for k in (Kind.unused_big, Kind.call_one)
+    ],
+    "scalar routines (migrated subset)": [
+        Workload(k, n, scalar=True) for n in (256, 1024, 4096) for k in (Kind.unused, Kind.call_all)
     ],
     "call every routine": [Workload(k, n) for n in (256, 1024, 4096) for k in (Kind.unused, Kind.call_all)],
 }
@@ -474,7 +493,7 @@ def report(
         print(f"\n#### Time to first output\n\n`{bench['meta']}`\n")
         head = ["sweep", "jobs", "workload", "first out med", "first out p95", "Δ vs n=0 (paired)", "after-output med", "after-output p95", "exit med"]
         body = [
-            [r["sweep"], str(r["jobs"]), short(Workload(Kind(r["workload"]["kind"]), r["workload"]["routines"], r["workload"]["body"], r["workload"]["modules"]).label),
+            [r["sweep"], str(r["jobs"]), short(Workload(Kind(r["workload"]["kind"]), r["workload"]["routines"], r["workload"]["body"], r["workload"]["modules"], scalar=r["workload"].get("scalar", False)).label),
              f"{r['first_median_ms']:.1f}", f"{r['first_p95_ms']:.1f}", f"{r['first_delta_vs_control_ms']:+.1f}",
              f"{r['after_median_ms']:.1f}", f"{r['after_p95_ms']:.1f}", f"{r['total_median_ms']:.1f}"]
             for r in bench["summary"]

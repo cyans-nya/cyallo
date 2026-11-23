@@ -87,7 +87,14 @@ pub(crate) struct ArchivedSyntax {
 
 impl ArchivedSyntax {
     pub(crate) fn materialize(&self) -> Result<Ast, ast::Diagnostic> {
-        let mut tree = self.file.to_source_tree();
+        self.materialize_with_bodies(&|_| true)
+    }
+
+    fn materialize_with_bodies(
+        &self,
+        include_body: &impl Fn(Span) -> bool,
+    ) -> Result<Ast, ast::Diagnostic> {
+        let mut tree = self.file.to_source_tree_with_bodies(include_body);
         if self.offset != 0 {
             ast::spans::shift_ast(&mut tree, self.offset)?;
         }
@@ -111,22 +118,102 @@ impl SourceTrees {
         }
     }
 
-    pub(crate) fn materialize(&self, entry: usize) -> Result<Vec<Ast>, ast::Diagnostic> {
+    pub(crate) fn materialize_with_indexed(
+        &self,
+        entry: usize,
+        prepare_indexed: bool,
+    ) -> Result<(Vec<Ast>, Vec<cyallo_ir::analysis::IndexedRoutineBody>), ast::Diagnostic> {
         let _materialize =
             cyallo_startup_profile::stage(cyallo_startup_profile::Stage::Materialize);
-        let mut files = self
-            .files
-            .iter()
-            .map(ArchivedSyntax::materialize)
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut files = Vec::with_capacity(self.files.len());
+        let mut bodies = Vec::new();
+        let mut omitted = 0;
+        for archive in &self.files {
+            let mut prepared = std::collections::HashSet::new();
+            if prepare_indexed {
+                for handle in archive.file.units().iter().flat_map(|unit| unit.bodies()) {
+                    if let Some(body) =
+                        cyallo_ir::analysis::IndexedRoutineBody::prepare(&handle, archive.offset)?
+                    {
+                        // Every prepared body leaves the owned tree. The linker binds
+                        // its call sites, or materializes it again as a fallback.
+                        prepared.insert(handle.function().span);
+                        bodies.push(body);
+                    }
+                }
+            }
+            omitted += prepared.len();
+            files.push(archive.materialize_with_bodies(&|span| !prepared.contains(&span))?);
+        }
         cyallo_startup_profile::count(
             cyallo_startup_profile::Counter::BodiesMaterialized,
-            files.iter().map(|f| f.functions.len()).sum(),
+            files.iter().map(|f| f.functions.len()).sum::<usize>() - omitted,
+        );
+        cyallo_startup_profile::count(
+            cyallo_startup_profile::Counter::BodiesPreparedFromIndexedSyntax,
+            bodies.len(),
         );
         files[entry]
             .modules
             .extend(self.packages.iter().map(|package| (**package).clone()));
-        Ok(files)
+        Ok((files, bodies))
+    }
+}
+
+#[cfg(test)]
+mod indexed_body_tests {
+    use super::*;
+
+    #[test]
+    fn every_prepared_body_leaves_the_owned_tree_until_the_linker_binds_it() {
+        let source = "fn indexed(n: i64) -> i64 { return n + 1 }\n\
+                      fn caller(n: i64) -> i64 { return indexed(n) }\n";
+        let file =
+            cyallo_parser::parse_modern_snapshot(source.into(), false, crate::Jobs(1)).unwrap();
+        let trees = SourceTrees::new(vec![ArchivedSyntax {
+            file: Arc::new(file),
+            offset: 17,
+        }]);
+        let (files, bodies) = trees.materialize_with_indexed(0, true).unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0].archived_span(), files[0].functions[0].span);
+        assert!(files[0].functions.iter().all(|f| f.body.is_empty()));
+    }
+
+    #[test]
+    fn the_linker_binds_call_sites_over_indexed_syntax_and_falls_back_to_a_tree() {
+        let source = "fn indexed(n: i64) -> i64 { return n + 1 }\n\
+                      fn caller(n: i64) -> i64 { return indexed(n) }\n\
+                      fn arity(n: i64) -> i64 { return caller(n, n) }\n\
+                      fn missing(n: i64) -> i64 { return nowhere(n) }\n\
+                      fn local(indexed: i64) -> i64 { return indexed(1) }\n";
+        let file =
+            cyallo_parser::parse_modern_snapshot(source.into(), false, crate::Jobs(1)).unwrap();
+        let trees = SourceTrees::new(vec![ArchivedSyntax {
+            file: Arc::new(file),
+            offset: 0,
+        }]);
+        let (files, bodies) = trees.materialize_with_indexed(0, true).unwrap();
+        let program =
+            cyallo_ir::namespace::link_with_indexed_bodies(files, &["main.ya".into()], 0, bodies)
+                .unwrap();
+        let by_name = |suffix: &str| {
+            program
+                .functions()
+                .find(|function| function.name.ends_with(suffix))
+                .unwrap()
+        };
+        // Plain calls keep only MIR and the resolved overlay: no owned tree.
+        for name in ["indexed", "caller"] {
+            assert!(by_name(name).body.is_empty(), "{name}");
+            assert!(program.has_indexed_body(&by_name(name).name), "{name}");
+        }
+        // Anything else is materialized and linked as a tree, so the existing
+        // resolver resolves or reports it.
+        for name in ["arity", "missing", "local"] {
+            assert!(!by_name(name).body.is_empty(), "{name}");
+            assert!(!program.has_indexed_body(&by_name(name).name), "{name}");
+        }
     }
 }
 
@@ -369,22 +456,27 @@ pub(crate) fn load(
         plan.loaded.len() - 1
     };
     let core = plan.core.view();
-    let trees = plan.trees.materialize(plan.entry).map_err(|diagnostic| {
-        localize(
-            &plan,
-            LoadError::Check {
-                path: canonical.clone(),
-                diagnostic,
-            },
-        )
-    })?;
-    let mut linked = crate::namespace::link_with_core(
+    let (trees, indexed_bodies) = plan
+        .trees
+        .materialize_with_indexed(plan.entry, plan.options.dialect == crate::Dialect::Modern)
+        .map_err(|diagnostic| {
+            localize(
+                &plan,
+                LoadError::Check {
+                    path: canonical.clone(),
+                    diagnostic,
+                },
+            )
+        })?;
+    let mut linked = crate::namespace::link_program(
         trees,
         &plan.paths,
         plan.entry,
         &plan.policy,
         &core,
         plan.core_base,
+        crate::EntryMode::Script,
+        indexed_bodies,
     )
     .map_err(|diagnostic| {
         localize(

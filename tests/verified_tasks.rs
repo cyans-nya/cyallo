@@ -238,22 +238,22 @@ fn the_concurrency_examples_run_under_gc_stress_and_in_tiny_slices() {
     for (path, source, expected) in [
         (
             "rendezvous",
-            include_str!("../examples/concurrency/channels/rendezvous.ya"),
+            include_str!("../examples/concurrency/channels/rendezvous.yas"),
             vec!["42", "7"],
         ),
         (
             "mpmc",
-            include_str!("../examples/concurrency/channels/mpmc.ya"),
+            include_str!("../examples/concurrency/channels/mpmc.yas"),
             vec!["21"],
         ),
         (
             "cancellation",
-            include_str!("../examples/concurrency/scheduling/cancellation.ya"),
+            include_str!("../examples/concurrency/scheduling/cancellation.yas"),
             vec!["true", "true", "99"],
         ),
         (
             "clock",
-            include_str!("../examples/concurrency/scheduling/clock.ya"),
+            include_str!("../examples/concurrency/scheduling/clock.yas"),
             vec!["before", "after"],
         ),
     ] {

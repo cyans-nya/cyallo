@@ -60,7 +60,7 @@ numeric-cast arm masking checked conversions from `dynamic`.
 
 ## Measured scope
 
-The internal benchmark runs [native-ic.ya](../examples/objects/native-ic.ya):
+The internal benchmark runs [native-ic.ya](../examples/objects/native-ic.yas):
 200,000 writes and 200,000 reads of one typed field. Samples use fresh Sessions
 and the same compiled artifact. Initial artifact compilation is outside the timer; tiered promotion work may
 occur during execution. Reproduce the

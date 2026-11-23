@@ -86,9 +86,9 @@ on the Session thread, preserving effect order.
 ## Inspection
 
 ```sh
-cargo run --release -- run examples/modern.ya --jit-trace=summary
-cargo run --release -- run examples/modern.ya --jit-notices
-cargo run --release -- run examples/modern.ya --engine cranelift_speed \
+cargo run --release -- run examples/modern.yas --jit-trace=summary
+cargo run --release -- run examples/modern.yas --jit-notices
+cargo run --release -- run examples/modern.yas --engine cranelift_speed \
   --emit ir,bytecode,clif --emit-dir /tmp/caie-ir
 ```
 

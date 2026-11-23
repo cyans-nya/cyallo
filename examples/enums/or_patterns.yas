@@ -1,0 +1,56 @@
+// Or-patterns: alternatives share one arm, and may share a payload binding.
+// Run: cargo run -- run examples/enums/or_patterns.yas
+enum Shape {
+    Circle: i64,
+    Square: i64,
+    Triangle: i64,
+    Empty,
+    Unknown,
+}
+use Shape::*
+
+fn rounded(s: Shape) -> bool {
+    return match s {
+        Circle(_) | Empty => true,
+        _ => false,
+    }
+}
+
+fn size(s: Shape) -> i64 {
+    return match s {
+        Circle(n) | Square(n) => n,
+        Triangle(n) => n * 3,
+        Empty | Unknown => 0,
+    }
+}
+
+proc show(s: Shape) {
+    match s {
+        Square(n) | Triangle(n) => {
+            std::io::print("angular ", n)
+        }
+        Empty | Unknown => std::io::print("nothing"),
+        _ => {}
+    }
+}
+
+fn big(s: Shape) -> bool {
+    return match s {
+        Empty | Unknown if true => false,
+        _ => true,
+    }
+}
+
+std::io::print(rounded(Circle(1)))
+std::io::print(rounded(Empty))
+std::io::print(rounded(Square(1)))
+std::io::print(size(Circle(4)))
+std::io::print(size(Square(5)))
+std::io::print(size(Triangle(2)))
+std::io::print(size(Unknown))
+show(Square(7))
+show(Triangle(8))
+show(Unknown)
+show(Circle(1))
+std::io::print(big(Empty))
+std::io::print(big(Circle(1)))

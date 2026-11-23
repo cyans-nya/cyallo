@@ -73,7 +73,7 @@ std::io::print(shape.name(), " ", shape.area())
 #[test]
 fn imported_traits_records_constants_and_closures_work_across_modules() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/modules/static");
-    let sources = ["model.ya", "math.ya", "main.ya"]
+    let sources = ["model.ya", "math.ya", "main.yas"]
         .map(|name| SourceModule::new(name, std::fs::read_to_string(dir.join(name)).unwrap()));
     let program = compile_modules(2, &sources, Default::default(), false).unwrap();
     assert_eq!(run_program(&program, true), ["42:retained"]);

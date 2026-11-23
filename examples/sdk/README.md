@@ -3,9 +3,9 @@
 Run these from the repository root:
 
 ```sh
-cargo run -- run examples/sdk/worlds.ya --engine interpreter
+cargo run -- run examples/sdk/worlds.yas --engine interpreter
 cargo run -- run examples/sdk/unbound.ya --engine interpreter
-cargo run -- run examples/sdk/prelude.ya --engine interpreter
+cargo run -- run examples/sdk/prelude.yas --engine interpreter
 ```
 
 | Example | Demonstrates | Expected output |

@@ -57,6 +57,52 @@ pub fn canonical(name: &str) -> Option<Intrinsic> {
         .find(|(declaration, _)| *declaration == name)
         .map(|(_, id)| *id)
 }
+/// The utilities the routine pipeline lowers: they are resolved from their operand types
+/// alone (`result_type`) and emitted as `Op::Builtin`.
+pub fn pipeline_utility(id: Intrinsic) -> bool {
+    use Intrinsic::*;
+    matches!(
+        id,
+        NumAbs
+            | NumMin
+            | NumMax
+            | NumClamp
+            | FloatRound
+            | FloatFloor
+            | FloatCeil
+            | FloatSqrt
+            | FloatPow
+            | StringLength
+            | Trim
+            | Upper
+            | Lower
+            | Contains
+            | StartsWith
+            | EndsWith
+            | Replace
+            | StringFrom
+            | CharCode
+            | CharFromCode
+    )
+}
+
+/// Utilities whose numeric arguments share one type, which literals take from the others.
+pub fn shares_numeric_type(id: Intrinsic) -> bool {
+    use Intrinsic::*;
+    matches!(
+        id,
+        NumAbs
+            | NumMin
+            | NumMax
+            | NumClamp
+            | FloatRound
+            | FloatFloor
+            | FloatCeil
+            | FloatSqrt
+            | FloatPow
+    )
+}
+
 pub fn result_type(n: Intrinsic, ts: &[Type]) -> Option<Type> {
     use Type::*;
     // `std::num` functions take one numeric type and return it; nothing mixes implicitly.

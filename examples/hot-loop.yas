@@ -1,0 +1,10 @@
+// A scalar loop workload. The entry count stays one across tier changes.
+// Run: cargo run -- run examples/hot-loop.yas --jit-trace=summary
+let mut entries = 0
+proc sum_to(limit: i64) -> i64 {
+    entries += 1
+    let mut total = 0
+    for i in 1..=limit { total += i }
+    return total
+}
+std::io::print(sum_to(100000), ":", entries)

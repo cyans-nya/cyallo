@@ -167,10 +167,14 @@ pub enum Counter {
     BytecodeWords,
     /// Routines translated into verified function images.
     VerifiedBodiesLowered,
+    /// Scalar routines emitted from the new HIR → MIR → AIR pipeline.
+    BodiesEmittedFromAir,
+    /// Routine bodies lowered from indexed syntax without AST materialization.
+    BodiesPreparedFromIndexedSyntax,
 }
 
 impl Counter {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 19] = [
         Self::SourceBytes,
         Self::Tokens,
         Self::Files,
@@ -188,6 +192,8 @@ impl Counter {
         Self::CheckedInstructions,
         Self::BytecodeWords,
         Self::VerifiedBodiesLowered,
+        Self::BodiesEmittedFromAir,
+        Self::BodiesPreparedFromIndexedSyntax,
     ];
     pub const fn name(self) -> &'static str {
         match self {
@@ -208,6 +214,8 @@ impl Counter {
             Self::CheckedInstructions => "checked_instructions",
             Self::BytecodeWords => "bytecode_words",
             Self::VerifiedBodiesLowered => "verified_bodies_lowered",
+            Self::BodiesEmittedFromAir => "bodies_emitted_from_air",
+            Self::BodiesPreparedFromIndexedSyntax => "bodies_prepared_from_indexed_syntax",
         }
     }
 }

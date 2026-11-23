@@ -149,11 +149,11 @@ std::io::print(bag.total)
 #[test]
 fn the_object_examples_run_under_gc_stress() {
     assert_eq!(
-        lines(include_str!("../examples/objects/open.ya")),
+        lines(include_str!("../examples/objects/open.yas")),
         ["Grace:true", "ten:true", "Grace:11"]
     );
     assert_eq!(
-        lines(include_str!("../examples/objects/native-ic.ya")),
+        lines(include_str!("../examples/objects/native-ic.yas")),
         ["19999900000"]
     );
 }

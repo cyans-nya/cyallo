@@ -220,7 +220,7 @@ reason for each (`docs/native-tier-samples.md`):
 #### Interpreter to native OSR
 
 ```sh
-CYALLO_JIT_START=interpreter cargo run --release -- run examples/osr-loop.ya --engine ng_jit
+CYALLO_JIT_START=interpreter cargo run --release -- run examples/osr-loop.yas --engine ng_jit
 ```
 
 The example prints `500000500000:1`. The interpreter-first mode uses shared-runtime
@@ -373,7 +373,7 @@ These points are not covered by a failing test; check them before building on th
    `src/report/model.rs`, and one `verified_composites` test failing only with them.
    Commit or discard that work before starting new slices on the same files.
 
-Benchmark note (hyperfine, `examples/hot-loop.ya`, 100k-iteration scalar loop, 400 runs
+Benchmark note (hyperfine, `examples/hot-loop.yas`, 100k-iteration scalar loop, 400 runs
 each): `legacy_jit` 7.0 ms and 16.6 MiB, `ng_jit` 7.7 ms (+9.9%) and 14.0 MiB (-15.4%).
 At this size wall time is dominated by startup (compile, lowering, tier publication), not
 the loop, so the +0.7 ms is startup cost; use a longer loop (millions of iterations) and a
@@ -408,8 +408,8 @@ Implemented in `src/backend/verified/tiering.rs` (`Tiered`, `TierPolicy`), used 
 `ng_jit` through `vm::start_jit`; `CYALLO_TIERING=off` disables it and
 `CYALLO_TIER_REQUEST_PERCENT=n` sets how early the compile is requested. Tests:
 `tests/verified_tiering.rs`. Measured with `hyperfine -N` (no `env` wrapper: it adds
-about 3 ms to every run) on `examples/osr-loop.ya` (27M instructions) and
-`examples/hot-loop.ya`:
+about 3 ms to every run) on `examples/osr-loop.yas` (27M instructions) and
+`examples/hot-loop.yas`:
 
 | | osr-loop | hot-loop |
 | --- | --- | --- |

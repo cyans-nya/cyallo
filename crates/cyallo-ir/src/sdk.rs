@@ -5,7 +5,6 @@
 //! Comments, formatting, declaration order and parameter names do not affect it.
 //! Opaque types digest as their identity and generic arity only.
 use cyallo_ast::{DeclarationAnnotation, Span};
-use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -36,12 +35,12 @@ impl fmt::Display for Version {
 pub struct Digest(pub [u8; 32]);
 impl Digest {
     pub fn of(text: &str) -> Self {
-        Self(Sha256::digest(text.as_bytes()).into())
+        Self(*blake3::hash(text.as_bytes()).as_bytes())
     }
 }
 impl fmt::Display for Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("sha256:")?;
+        f.write_str("blake3:")?;
         self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
     }
 }

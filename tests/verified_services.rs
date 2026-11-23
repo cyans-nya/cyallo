@@ -161,7 +161,7 @@ let child = ctx.extend()
 #[test]
 fn the_services_example_runs_under_gc_stress() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/services");
-    let sources = ["logging.ya", "console.ya", "main.ya"]
+    let sources = ["logging.ya", "console.ya", "main.yas"]
         .map(|name| SourceModule::new(name, std::fs::read_to_string(dir.join(name)).unwrap()));
     let program = compile_modules(2, &sources, Default::default(), false).unwrap();
     let module = VerifiedModule::lower(&program, 0).unwrap();

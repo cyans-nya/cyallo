@@ -7,8 +7,104 @@ type Result<T> = std::result::Result<T, Diagnostic>;
 fn key(s: &str) -> String {
     s.to_owned()
 }
+/// A bound a generic routine may declare: the capabilities it gives a type parameter, and
+/// nothing beyond them. Each is satisfied by scalars and strings only for now, so no
+/// instance needs more than the pipeline. The operator traits are `Self op Self -> Self`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Bound {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Neg,
+    /// `==` and `!=`.
+    Eq,
+    /// `<`, `<=`, `>` and `>=`.
+    Ord,
+    /// Values are duplicated by reading them rather than moved.
+    Copy,
+    /// The plain text form, as `print` writes it.
+    Format,
+    /// The text form meant for a programmer.
+    Debug,
+    /// Every operator but `-x`, comparison and `Copy`, over any number.
+    Numeric,
+    /// `Numeric`, over the integer types.
+    Integer,
+    /// `Numeric`, over the floating types.
+    Floating,
+    /// A trait the program declares, by its place in the routine's list of user traits. It
+    /// gives the trait's methods, and is satisfied by a type with an `impl` of the trait.
+    User(u32),
+}
+
+impl Bound {
+    /// Whether a type argument is allowed by the bound.
+    pub fn satisfied_by(self, ty: &Type) -> bool {
+        let number = ty.number_kind();
+        match self {
+            Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Rem | Self::Numeric => {
+                number.is_some()
+            }
+            Self::Neg => number.is_some_and(|kind| kind.signed() || kind.float()),
+            Self::Eq => number.is_some() || matches!(ty, Type::String | Type::Char | Type::Boolean),
+            Self::Ord => number.is_some() || matches!(ty, Type::String | Type::Char),
+            Self::Copy => number.is_some() || matches!(ty, Type::Char | Type::Boolean),
+            Self::Format | Self::Debug => {
+                number.is_some() || matches!(ty, Type::String | Type::Char | Type::Boolean)
+            }
+            Self::Integer => number.is_some_and(|kind| !kind.float()),
+            Self::Floating => number.is_some_and(NumberKind::float),
+            // Decided against the program's implementations.
+            Self::User(_) => false,
+        }
+    }
+
+    /// Whether a parameter with this bound may use the capability `capability`, which is one
+    /// of the single traits.
+    pub fn grants(self, capability: Bound) -> bool {
+        match self {
+            Self::Numeric | Self::Integer | Self::Floating => matches!(
+                capability,
+                Self::Add
+                    | Self::Sub
+                    | Self::Mul
+                    | Self::Div
+                    | Self::Rem
+                    | Self::Eq
+                    | Self::Ord
+                    | Self::Copy
+            ),
+            Self::User(_) => false,
+            single => single == capability,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Add => "Add",
+            Self::Sub => "Sub",
+            Self::Mul => "Mul",
+            Self::Div => "Div",
+            Self::Rem => "Rem",
+            Self::Neg => "Neg",
+            Self::Eq => "Eq",
+            Self::Ord => "Ord",
+            Self::Copy => "Copy",
+            Self::Format => "Format",
+            Self::Debug => "Debug",
+            Self::Numeric => "Numeric",
+            Self::Integer => "Integer",
+            Self::Floating => "Floating",
+            Self::User(_) => "trait",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenericError {
+    BoundNotSatisfied { bound: Box<str>, argument: Box<str> },
     SpecializationLimit { limit: usize },
     TypeArity { expected: usize, actual: usize },
     UnknownRecord { name: Box<str> },
@@ -22,6 +118,10 @@ pub enum GenericError {
 impl std::fmt::Display for GenericError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::BoundNotSatisfied { bound, argument } => write!(
+                f,
+                "type argument `{argument}` does not satisfy the bound `{bound}`"
+            ),
             Self::SpecializationLimit { .. } => {
                 f.write_str("generic specialization limit exceeded")
             }
@@ -153,8 +253,30 @@ struct Specializer {
     generated_functions: Vec<Function>,
     function_instances: HashMap<String, Box<str>>,
     instances: usize,
+    /// The traits the program implements and for which type: `(trait, receiver)`.
+    implementations: Vec<(Box<str>, Type)>,
+    /// Records the pipeline lowers, by name, with their field types.
+    plain_records: HashMap<String, Vec<Type>>,
+    /// Indexed bodies of the routines that kept one. An instance of a generic routine over
+    /// scalar types is lowered from its template's body instead of a cloned tree.
+    bodies: HashMap<Box<str>, crate::analysis::IndexedRoutineBody>,
 }
 impl Specializer {
+    /// A type argument the routine pipeline lowers: a scalar, a string, or a record of such.
+    fn pipeline_argument(&self, ty: &Type, depth: usize) -> bool {
+        match ty {
+            Type::Integer | Type::Boolean | Type::Real | Type::Numeric(_) | Type::String => true,
+            Type::Named(name) if depth < 8 => {
+                self.plain_records.get(&key(name)).is_some_and(|fields| {
+                    fields
+                        .iter()
+                        .all(|field| self.pipeline_argument(field, depth + 1))
+                })
+            }
+            _ => false,
+        }
+    }
+
     fn reserve(&mut self, span: Span) -> Result<()> {
         self.instances += 1;
         if self.instances > 256 {
@@ -228,6 +350,47 @@ impl Specializer {
         }
         f.type_params.clear();
         f.name = id.clone().into();
+        // Every bound is checked against the type argument, whichever route lowers the body.
+        if let Some(template) = self.bodies.get(name) {
+            for (parameter, bounds) in template.generic_bounds() {
+                let Some(argument) = bindings.get(&key(parameter)) else {
+                    continue;
+                };
+                for bound in bounds {
+                    let (satisfied, bound_name): (bool, Box<str>) = match bound {
+                        Bound::User(index) => {
+                            let traits = template.generic_user_traits();
+                            let trait_name =
+                                traits.get(*index as usize).cloned().unwrap_or_default();
+                            let implemented =
+                                self.implementations.iter().any(|(name, receiver)| {
+                                    *name == trait_name && receiver == argument
+                                });
+                            (implemented, trait_name)
+                        }
+                        builtin => (builtin.satisfied_by(argument), builtin.name().into()),
+                    };
+                    if !satisfied {
+                        return Err(invalid_generic(
+                            GenericError::BoundNotSatisfied {
+                                bound: bound_name,
+                                argument: argument.to_string().into(),
+                            },
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        f.constraints.clear();
+        // The template was bound for the routine pipeline. An instance whose type arguments
+        // are all scalars is typed from that body, so it needs no tree of its own.
+        if let Some(template) = self.bodies.get(name).cloned()
+            && args.iter().all(|arg| self.pipeline_argument(arg, 0))
+        {
+            f.body.clear();
+            self.bodies.insert(id.clone().into(), template);
+        }
         substitute_function(&mut f, &bindings)?;
         self.generated_functions.push(f);
         Ok(id.into())
@@ -604,6 +767,17 @@ pub fn specialize_modules(
     native: &NativeDeclarations,
     options: crate::CompileOptions,
 ) -> Result<()> {
+    specialize_modules_with_bodies(asts, native, options, &mut HashMap::new())
+}
+
+/// Like `specialize_modules`, and registers in `bodies` the instances of generic routines
+/// that the routine pipeline lowers from their template's indexed body.
+pub fn specialize_modules_with_bodies(
+    asts: &mut [Ast],
+    native: &NativeDeclarations,
+    options: crate::CompileOptions,
+    bodies: &mut HashMap<Box<str>, crate::analysis::IndexedRoutineBody>,
+) -> Result<()> {
     crate::enums::validate_templates(asts)?;
     if !asts.iter().any(|a| {
         a.enums.iter().any(|e| !e.type_params.is_empty())
@@ -623,6 +797,23 @@ pub fn specialize_modules(
         generated_functions: vec![],
         function_instances: HashMap::new(),
         instances: 0,
+        implementations: asts
+            .iter()
+            .flat_map(|ast| &ast.implementations)
+            .map(|imp| (imp.trait_name.clone(), canonical(&imp.receiver)))
+            .collect(),
+        plain_records: asts
+            .iter()
+            .flat_map(|ast| &ast.records)
+            .filter(|record| record.type_params.is_empty())
+            .map(|record| {
+                (
+                    key(&record.name),
+                    record.fields.iter().map(|(_, ty)| ty.clone()).collect(),
+                )
+            })
+            .collect(),
+        bodies: std::mem::take(bodies),
     };
     let mut owners = HashMap::new();
     for (owner, ast) in asts.iter_mut().enumerate() {
@@ -763,6 +954,7 @@ pub fn specialize_modules(
             }
         }
         if !changed && s.generated_functions.is_empty() {
+            *bodies = s.bodies;
             return Ok(());
         }
     }

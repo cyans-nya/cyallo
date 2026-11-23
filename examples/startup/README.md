@@ -24,7 +24,7 @@ Directory names read `<kind>-n<routines>-b<statements per routine>-m<extra files
 | `call_all` | calls every routine once through a single routine `run_all` |
 
 Run one with, for example,
-`echo go | cargo run --release -- run examples/startup/call_one-n1024-b8-m0/main.ya`.
+`echo go | cargo run --release -- run examples/startup/call_one-n1024-b8-m0/main.yas`.
 `unused`, `unused_big` and `call_one` print `done` or the large routine's result;
 `call_all` prints a checksum. The full measured matrix is generated into a
 temporary directory by the `bench` and `profile` commands.

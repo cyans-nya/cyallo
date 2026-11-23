@@ -100,6 +100,21 @@ separately ([06](06-components.md#supplying-component-imports)).
    that module and does not reexport it. Its constructors and methods are reachable
    only if the environment provides them.
 
+## Revision 2026-11-23
+
+An environment is now `Bindings`, built with `Bindings::none()` (pure std present),
+`.bind(path, module_or_instance)` and the explicit sugar `Bindings::inherit()`. It
+is passed to `load(source, bindings)` together with a `Source`
+([revision](README.md#revision-2026-11-23)). Rules 1 to 8 are unchanged. Additions:
+
+9. **Unresolved names are uniformly not found.** A name that is unbound, out of the
+   host's `std::fs` scope, absent or reached through an escaping symlink is
+   indistinguishable to the child. The host may see the cause.
+10. **Attenuation is structural.** A child only receives bindings its parent holds,
+    so a subset check is unnecessary.
+11. **The loader has no filesystem policy.** `Source::read` uses the caller's
+    `std::fs`, and a wrapper `std::fs` is the scope.
+
 ## Remaining problem
 
 The loaded component's names now depend on a runtime value, so its editor and

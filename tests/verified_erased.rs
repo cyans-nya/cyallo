@@ -93,7 +93,7 @@ std::io::print(joined, " ", i, " ", i - 1 >= 2 as usize)
 #[test]
 fn a_service_registry_in_source_follows_replacement_and_withdrawal() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/lookup-services");
-    let sources = ["registry.ya", "logging.ya", "console.ya", "main.ya"]
+    let sources = ["registry.ya", "logging.ya", "console.ya", "main.yas"]
         .map(|name| SourceModule::new(name, std::fs::read_to_string(dir.join(name)).unwrap()));
     let program = compile_modules(3, &sources, Default::default(), false).unwrap();
     for stress in [false, true] {

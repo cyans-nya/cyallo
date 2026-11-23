@@ -3,13 +3,13 @@
 These are Cyallo `.ya` programs, executed by the Cyallo compiler and VM.
 
 ```sh
-cargo run -- run examples/concurrency/generators/sequence.ya
-cargo run -- run examples/concurrency/generators/resume-result.ya --gc-stress
-cargo run -- run examples/concurrency/generators/delegation.ya --engine cranelift_speed
+cargo run -- run examples/concurrency/generators/sequence.yas
+cargo run -- run examples/concurrency/generators/resume-result.yas --gc-stress
+cargo run -- run examples/concurrency/generators/delegation.yas --engine cranelift_speed
 cargo test --test generators
-cargo run -- run examples/concurrency/channels/mpmc.ya --gc-stress
+cargo run -- run examples/concurrency/channels/mpmc.yas --gc-stress
 cargo test --test concurrency
-cargo run -- run examples/concurrency/ownership/local-managed.ya --gc-stress
+cargo run -- run examples/concurrency/ownership/local-managed.yas --gc-stress
 ```
 
 | Example | Behavior | Expected output |

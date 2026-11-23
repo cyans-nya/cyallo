@@ -1,0 +1,10 @@
+// cargo run -- run examples/objects/native-ic.yas --engine cranelift_speed
+// Expected: 19999900000
+// Repeated reads/writes keep one shape; native tiers guard cached field slots.
+let counter = object { value: 1 }
+let mut total = 0
+for i in 0..200000 {
+    counter.value = i
+    total += counter.value
+}
+std::io::print(total)

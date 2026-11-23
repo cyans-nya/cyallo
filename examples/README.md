@@ -3,13 +3,13 @@
 Run commands from the repository root. Modern examples use `.ya`; CAIE compatibility examples use `.psc`. The extension selects the dialect:
 
 ```sh
-cargo run -- run examples/tour.ya
-cargo run -- check examples/generics.ya --jobs 4
-cargo run -- run examples/lookups.ya --engine legacy_cranelift_speed --gc-stress
+cargo run -- run examples/tour.yas
+cargo run -- check examples/generics.yas --jobs 4
+cargo run -- run examples/lookups.yas --engine legacy_cranelift_speed --gc-stress
 ```
 
 `--engine ng` selects the default verified interpreter. For native execution,
-try `run examples/hot-loop.ya --engine ng_jit`.
+try `run examples/hot-loop.yas --engine ng_jit`.
 `--engine legacy_interpreter` selects the legacy interpreter, and
 `--engine legacy_jit` selects the legacy tiered JIT. `legacy_cranelift` and
 `legacy_cranelift_speed` compile eagerly. `--jobs` controls front-end
@@ -23,9 +23,9 @@ programs. The sets cover generators, task scheduling, timers, cancellation,
 and MPMC channels, with run commands and expected output:
 
 ```sh
-cargo run -- run examples/concurrency/generators/sequence.ya
+cargo run -- run examples/concurrency/generators/sequence.yas
 cargo test --test generators
-cargo run -- run examples/concurrency/channels/mpmc.ya --gc-stress
+cargo run -- run examples/concurrency/channels/mpmc.yas --gc-stress
 cargo test --test concurrency
 ```
 
@@ -109,9 +109,9 @@ for the primitives and cache contracts.
 Start with the three short ownership examples:
 
 ```sh
-cargo run -- run examples/gc-sharing.ya --gc-stress
-cargo run -- run examples/rc-ownership.ya
-cargo run -- run examples/gc-rc.ya --gc-stress
+cargo run -- run examples/gc-sharing.yas --gc-stress
+cargo run -- run examples/rc-ownership.yas
+cargo run -- run examples/gc-rc.yas --gc-stress
 ```
 
 `gc` and `rc` enable their required tracing automatically, including without
@@ -139,7 +139,7 @@ directions. Its cells hold Copy handles to GC-owned edge vectors. Once an
 invocation returns, its unreachable cycle can be collected:
 
 ```sh
-cargo run -- run examples/gc-cycles.ya --gc-stress --jit-trace=summary
+cargo run -- run examples/gc-cycles.yas --gc-stress --jit-trace=summary
 ```
 
 ```text
@@ -182,8 +182,8 @@ for the full contracts.
 Run an entry file; the other `.ya` files in its directory are library modules:
 
 ```sh
-cargo run -- run examples/lookup-services/main.ya --gc-stress --jobs 4
-cargo run -- run examples/services/main.ya --gc-stress
+cargo run -- run examples/lookup-services/main.yas --gc-stress --jobs 4
+cargo run -- run examples/services/main.yas --gc-stress
 ```
 
 The [user-defined registry walkthrough](lookup-services/README.md) follows these files:
@@ -249,7 +249,7 @@ fixed secret of 42. It handles invalid text, fractional guesses, and out-of-rang
 values. Try it interactively or supply a reproducible session:
 
 ```sh
-printf '%s\n' hello 2.5 20 70 42 | cargo run -- run examples/secret-number.ya
+printf '%s\n' hello 2.5 20 70 42 | cargo run -- run examples/secret-number.yas
 ```
 
 ```text

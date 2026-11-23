@@ -3,10 +3,10 @@
 Run these from the repository root:
 
 ```sh
-cargo run -- run examples/enums/result.ya --engine interpreter
-cargo run -- run examples/enums/patterns.ya --gc-stress
-cargo run -- run examples/enums/ownership.ya --engine cranelift_speed --gc-stress
-cargo run -- run examples/enums/recursive.ya --gc-stress
+cargo run -- run examples/enums/result.yas --engine interpreter
+cargo run -- run examples/enums/patterns.yas --gc-stress
+cargo run -- run examples/enums/ownership.yas --engine cranelift_speed --gc-stress
+cargo run -- run examples/enums/recursive.yas --gc-stress
 ```
 
 | Example | Demonstrates | Expected output |

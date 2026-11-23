@@ -1,0 +1,42 @@
+// Enums with unit and scalar-payload variants, and `match` over them.
+// Run: cargo run -- run examples/enums/basic.yas
+enum Shape {
+    Circle: i64,
+    Square: i64,
+    Empty,
+}
+use Shape::*
+
+fn area(shape: Shape) -> i64 {
+    return match shape {
+        Circle(r) => r * r * 3,
+        Square(s) => s * s,
+        Empty => 0,
+    }
+}
+
+fn is_empty(shape: Shape) -> bool {
+    return match shape {
+        Empty => true,
+        _ => false,
+    }
+}
+
+fn sum_to(n: i64) -> i64 {
+    let mut total = 0
+    for i in 0..n {
+        if i % 2 == 0 {
+            total += area(Circle(i))
+        } else {
+            total += area(Square(i))
+        }
+    }
+    return total
+}
+
+std::io::print(area(Circle(2)))
+std::io::print(area(Square(5)))
+std::io::print(area(Empty))
+std::io::print(is_empty(Empty))
+std::io::print(is_empty(Circle(1)))
+std::io::print(sum_to(4))

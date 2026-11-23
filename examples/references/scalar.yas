@@ -1,0 +1,48 @@
+// Scalar references: read and write through a parameter, borrow a local, pass a
+// reference on, and use references to bool and float.
+// Run: cargo run -- run examples/references/scalar.yas
+fn read(value: &i64) -> i64 {
+    return value.* + 1
+}
+
+proc bump(counter: &mut i64) {
+    counter.* += 1
+}
+
+proc add(counter: &mut i64, amount: i64) {
+    counter.* += amount
+    bump(counter)
+}
+
+proc swap(a: &mut i64, b: &mut i64) {
+    let held = a.*
+    a.* = b.*
+    b.* = held
+}
+
+proc scale(flag: &mut bool, ratio: &mut f64) {
+    flag.* = !flag.*
+    ratio.* *= 2.0
+}
+
+proc local_borrow(n: i64) -> i64 {
+    let mut total = n
+    add(&mut total, 10)
+    return read(&total)
+}
+
+let mut total = 10
+add(&mut total, 5)
+std::io::print(total, " ", read(&total))
+
+let mut left = 1
+let mut right = 2
+swap(&mut left, &mut right)
+std::io::print(left, " ", right)
+
+let mut flag = false
+let mut ratio = 1.5
+scale(&mut flag, &mut ratio)
+std::io::print(flag, " ", ratio)
+
+std::io::print(local_borrow(1))

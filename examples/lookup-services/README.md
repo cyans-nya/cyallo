@@ -1,7 +1,7 @@
 # A service registry in user code
 
 ```sh
-cargo run -- run examples/lookup-services/main.ya --gc-stress --jobs 4
+cargo run -- run examples/lookup-services/main.yas --gc-stress --jobs 4
 ```
 
 ```text

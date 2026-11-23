@@ -1,0 +1,44 @@
+// Iterative depth-first search of a reproducible directed graph.
+// Run: cargo run -- run examples/dfs.yas
+// These algorithms use explicitly zero-filled growable buffers.
+fn zeros(count: i64) -> std::collections::Vec<i64> {
+    let mut result = std::collections::Vec<i64>[]
+    for position in 0..=count - 1 {
+        result.push(0)
+    }
+    return result
+}
+
+let n = 300
+let mut adj = zeros(n * n)
+let mut seen = zeros(n)
+let mut stack = std::collections::Vec::from(0..n)
+let mut seed = 12345
+for i in 0..=n - 1 {
+    for j in 0..=n - 1 {
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        if seed % 5 == 0 {
+            adj[i * n + j] = 1
+        }
+    }
+}
+
+// Mark on push so each vertex enters the stack at most once.
+let mut top = 1
+stack[0] = 0
+seen[0] = 1
+let mut visited = 0
+while top > 0 {
+    top -= 1
+    let node = stack[top]
+    visited += 1
+    for j in 0..=n - 1 {
+        if adj[node * n + j] == 1 && seen[j] == 0 {
+            seen[j] = 1
+            stack[top] = j
+            top += 1
+        }
+    }
+}
+// Every visited vertex has exactly one mark; top is zero when traversal ends.
+std::io::print(visited, ":", top, ":", std::array::sum(seen))

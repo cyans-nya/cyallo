@@ -35,11 +35,24 @@ struct Symbol {
     public: bool,
     intrinsic: Option<Intrinsic>,
 }
+/// Where a module's contents come from, which decides how files beside it
+/// become child modules.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModuleSource {
+    /// A source file (the entry, `x.ya` or `x/mod.ya`). It gates its children:
+    /// an implicit child file is private unless this module re-exports it.
+    File,
+    /// A directory with no `mod.ya`: an open namespace whose children are public.
+    Namespace,
+    /// An inline `mod x { ... }`. Files are never scanned beside it.
+    Inline,
+}
 #[derive(Clone, Copy)]
 struct Placement {
     trust: SourceTrust,
     parent: Option<usize>,
     boundary: ModuleBoundary,
+    source: ModuleSource,
 }
 struct Node {
     interface: bool,
@@ -58,6 +71,30 @@ struct Local {
     writable: bool,
 }
 struct Resolver {
+    /// Indexed routine bodies not yet bound to their linked routine, by archived span.
+    indexed: HashMap<Span, crate::analysis::IndexedRoutineBody>,
+    /// Indexed bodies bound by the linker: MIR plus resolved call targets.
+    bound: HashMap<Box<str>, crate::analysis::IndexedRoutineBody>,
+    /// Linked symbols of plain `i64` functions a migrated body may call.
+    /// Parameter count and whether the callee returns nothing.
+    plain: HashMap<Box<str>, (usize, bool)>,
+    /// Resolved field types of each record declared without type parameters, by the
+    /// record's linked name.
+    records: HashMap<Box<str>, Vec<(Box<str>, Type)>>,
+    /// The variants of each enum without type parameters, by the enum's linked name, with
+    /// their resolved payload types.
+    enums: HashMap<Box<str>, Vec<(Box<str>, Option<Type>)>>,
+    /// The standard traits a generic routine may be bounded by, by linked name.
+    bound_traits: HashMap<Box<str>, crate::generics::Bound>,
+    /// The traits the program declares (without type parameters), by linked name.
+    user_traits: std::collections::HashSet<Box<str>>,
+    /// Enums with type parameters, by linked name: the parameters and the variants'
+    /// payload types, which mention them.
+    generic_enums: HashMap<Box<str>, (Vec<Box<str>>, Vec<Option<Type>>)>,
+    /// The enum each variant belongs to, and whether it carries a payload.
+    variants: HashMap<DeclarationId, (Box<str>, bool)>,
+    /// Source-file mode: the entry runs `proc main()` and no top level may hold statements.
+    entry_mode: crate::EntryMode,
     aliases: HashMap<Box<str>, (usize, Type)>,
     source_names: std::collections::BTreeMap<Box<str>, Box<str>>,
     nodes: Vec<Node>,
@@ -94,6 +131,534 @@ fn error(message: impl Into<String>, span: Span) -> Diagnostic {
     Diagnostic::new("E140", message, span)
 }
 impl Resolver {
+    /// Files are modules: each unclaimed source below `dir` that no `mod` line
+    /// declared becomes a child. `x.ya` and `x/mod.ya` name module `x`; a
+    /// directory with no `mod.ya` is an empty open namespace. Children of a
+    /// file module are private (its gate); children of a namespace are public.
+    fn implicit_modules(
+        declared: &[ModuleDeclaration],
+        files: &[Option<Ast>],
+        paths: &[String],
+        dir: &Path,
+        gated: bool,
+    ) -> Result<(Vec<ModuleDeclaration>, std::collections::HashSet<Box<str>>)> {
+        // An inline `mod b { .. }` and a file for `b` would define it twice.
+        for declaration in declared.iter().filter(|d| d.body.is_some()) {
+            let name = declaration.name.as_ref();
+            let owns_file = [
+                dir.join(format!("{name}.ya")),
+                dir.join(name).join("mod.ya"),
+            ]
+            .iter()
+            .any(|candidate| {
+                paths
+                    .iter()
+                    .enumerate()
+                    .any(|(index, path)| files[index].is_some() && Path::new(path) == candidate)
+            });
+            if owns_file {
+                return Err(error(
+                    format!("module `{name}` is declared inline and also defined by a source file"),
+                    declaration.span,
+                ));
+            }
+        }
+        let mut children: std::collections::BTreeSet<String> = Default::default();
+        for (index, path) in paths.iter().enumerate() {
+            if files[index].is_none() {
+                continue;
+            }
+            let Ok(relative) = Path::new(path).strip_prefix(dir) else {
+                continue;
+            };
+            let mut parts = relative.components();
+            let (Some(first), rest) = (parts.next(), parts.as_path()) else {
+                continue;
+            };
+            let first = first.as_os_str().to_string_lossy();
+            let name = if rest.as_os_str().is_empty() {
+                match first.strip_suffix(".ya") {
+                    Some("mod") | None => continue,
+                    Some(name) => name,
+                }
+            } else {
+                first.as_ref()
+            };
+            if !declared.iter().any(|d| d.name.as_ref() == name) {
+                children.insert(name.to_owned());
+            }
+        }
+        for name in &children {
+            Self::reject_two_layouts(name, paths, dir, Span::default())?;
+        }
+        let mut namespaces = std::collections::HashSet::new();
+        let modules = children
+            .into_iter()
+            .map(|name| {
+                let child_dir = dir.join(&name);
+                let file_backed = paths.iter().enumerate().any(|(index, path)| {
+                    files[index].is_some()
+                        && (Path::new(path) == dir.join(format!("{name}.ya"))
+                            || Path::new(path) == child_dir.join("mod.ya"))
+                });
+                if !file_backed {
+                    namespaces.insert(Box::<str>::from(name.as_str()));
+                }
+                ModuleDeclaration {
+                    interface: false,
+                    boundary: ModuleBoundary::Lexical,
+                    annotations: Vec::new(),
+                    name: name.into(),
+                    public: !gated,
+                    // A directory without `mod.ya` is a namespace with no items.
+                    body: (!file_backed).then(|| Box::new(Ast::default())),
+                    span: Span::default(),
+                }
+            })
+            .collect();
+        Ok((modules, namespaces))
+    }
+    /// `x.ya` beside a directory `x/` of sources is ambiguous: a module is either
+    /// one file, or a directory with `x/mod.ya`.
+    fn reject_two_layouts(name: &str, paths: &[String], dir: &Path, span: Span) -> Result<()> {
+        let file = dir.join(format!("{name}.ya"));
+        let child_dir = dir.join(name);
+        let has_file = paths.iter().any(|path| Path::new(path) == file);
+        let has_directory = paths.iter().any(|path| {
+            let path = Path::new(path);
+            path.starts_with(&child_dir) && path.extension().is_some_and(|e| e == "ya")
+        });
+        if has_file && has_directory {
+            return Err(error(
+                format!(
+                    "module `{name}` is defined by both `{name}.ya` and the directory `{name}/`; \
+                     use `{name}/mod.ya`"
+                ),
+                span,
+            ));
+        }
+        Ok(())
+    }
+    /// The fields of every record without type parameters, resolved in its own module.
+    fn record_table(&self) -> HashMap<Box<str>, Vec<(Box<str>, Type)>> {
+        let mut table = HashMap::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            for record in &node.ast.records {
+                if !record.type_params.is_empty() {
+                    continue;
+                }
+                let Some(symbol) = self.path(index, &record.name, Some(Kind::Type)) else {
+                    continue;
+                };
+                let fields: Option<Vec<_>> = record
+                    .fields
+                    .iter()
+                    .map(|(name, ty)| Some((name.clone(), self.resolved(index, ty, record.span)?)))
+                    .collect();
+                if let Some(fields) = fields {
+                    table.insert(symbol.target, fields);
+                }
+            }
+        }
+        table
+    }
+
+    /// The variants of every enum without type parameters, resolved in its own module.
+    fn enum_table(&self) -> HashMap<Box<str>, Vec<(Box<str>, Option<Type>)>> {
+        let mut table = HashMap::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            for declaration in &node.ast.enums {
+                if !declaration.type_params.is_empty() || declaration.open {
+                    continue;
+                }
+                let Some(symbol) = self.path(index, &declaration.name, Some(Kind::Type)) else {
+                    continue;
+                };
+                let variants: Option<Vec<_>> = declaration
+                    .variants
+                    .iter()
+                    .map(|variant| {
+                        let payload = match &variant.payload {
+                            Some(ty) => Some(self.resolved(index, ty, variant.span)?),
+                            None => None,
+                        };
+                        Some((variant.name.clone(), payload))
+                    })
+                    .collect();
+                if let Some(variants) = variants {
+                    table.insert(symbol.target, variants);
+                }
+            }
+        }
+        table
+    }
+
+    /// The marker traits that bound a type parameter, found in the standard modules.
+    fn bound_trait_table(&self) -> HashMap<Box<str>, crate::generics::Bound> {
+        use crate::generics::Bound;
+        let mut table = HashMap::new();
+        for (module, name, bound) in [
+            ("std::num", "Numeric", Bound::Numeric),
+            ("std::num", "Integer", Bound::Integer),
+            ("std::num", "Floating", Bound::Floating),
+            ("std::ops", "Add", Bound::Add),
+            ("std::ops", "Sub", Bound::Sub),
+            ("std::ops", "Mul", Bound::Mul),
+            ("std::ops", "Div", Bound::Div),
+            ("std::ops", "Rem", Bound::Rem),
+            ("std::ops", "Neg", Bound::Neg),
+            ("std::cmp", "Eq", Bound::Eq),
+            ("std::cmp", "Ord", Bound::Ord),
+            ("std::mem", "Copy", Bound::Copy),
+            ("std::fmt", "Format", Bound::Format),
+            ("std::fmt", "Debug", Bound::Debug),
+        ] {
+            if let Some(index) = self.nodes.iter().position(|node| node.path == module)
+                && let Some(symbol) = self.path(index, name, Some(Kind::Type))
+            {
+                table.insert(symbol.target, bound);
+            }
+        }
+        table
+    }
+
+    /// The traits declared in source, which a generic routine may use as a bound.
+    fn user_trait_table(&self) -> std::collections::HashSet<Box<str>> {
+        let mut table = std::collections::HashSet::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            for declaration in &node.ast.traits {
+                // A trait with native meaning (`Cloneable`, `Collection`) is decided by the
+                // native contract, not by an `impl`, so it is not one a program declares.
+                if declaration.type_params.is_empty()
+                    && declaration.origin == TraitOrigin::Source
+                    && let Some(symbol) = self.path(index, &declaration.name, Some(Kind::Type))
+                    && symbol.native.is_none()
+                {
+                    table.insert(symbol.target);
+                }
+            }
+        }
+        table
+    }
+
+    /// What each type parameter of a routine is bounded by, with the program's traits it
+    /// names, or `None` when a bound is not one the pipeline gives meaning to.
+    fn declared_bounds(&self, module: usize, f: &Function) -> Option<DeclaredBounds> {
+        let mut declared = Vec::new();
+        let mut traits: Vec<Box<str>> = Vec::new();
+        for constraint in &f.constraints {
+            if !f.type_params.contains(&constraint.parameter) {
+                return None;
+            }
+            let mut bounds = Vec::new();
+            for bound in &constraint.bounds {
+                let Type::Named(name) = bound else {
+                    return None;
+                };
+                let symbol = self.path(module, name, Some(Kind::Type))?;
+                if let Some(bound) = self.bound_traits.get(&symbol.target) {
+                    bounds.push(*bound);
+                } else if self.user_traits.contains(&symbol.target) {
+                    let index = match traits.iter().position(|t| *t == symbol.target) {
+                        Some(index) => index,
+                        None => {
+                            traits.push(symbol.target.clone());
+                            traits.len() - 1
+                        }
+                    };
+                    bounds.push(crate::generics::Bound::User(index as u32));
+                } else {
+                    return None;
+                }
+            }
+            declared.push((constraint.parameter.clone(), bounds));
+        }
+        Some((declared, traits))
+    }
+
+    /// The payload types of every enum with type parameters, resolved in its own module with
+    /// the parameters left as names.
+    fn generic_enum_table(&self) -> HashMap<Box<str>, (Vec<Box<str>>, Vec<Option<Type>>)> {
+        let mut table = HashMap::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            for declaration in &node.ast.enums {
+                if declaration.type_params.is_empty() || declaration.open {
+                    continue;
+                }
+                let Some(symbol) = self.path(index, &declaration.name, Some(Kind::Type)) else {
+                    continue;
+                };
+                let payloads: Option<Vec<_>> = declaration
+                    .variants
+                    .iter()
+                    .map(|variant| match &variant.payload {
+                        Some(ty) => {
+                            let mut ty = ty.clone();
+                            self.ty(index, &mut ty, &declaration.type_params, variant.span)
+                                .ok()?;
+                            Some(Some(ty))
+                        }
+                        None => Some(None),
+                    })
+                    .collect();
+                if let Some(payloads) = payloads {
+                    table.insert(symbol.target, (declaration.type_params.to_vec(), payloads));
+                }
+            }
+        }
+        table
+    }
+
+    /// Whether every instance of a generic enum with scalar type arguments is a type the
+    /// pipeline lowers, which decides whether its constructors may be built in place.
+    fn generic_enum_supported(&self, owner: &str) -> bool {
+        let Some((params, payloads)) = self.generic_enums.get(owner) else {
+            return false;
+        };
+        let probe: Vec<Type> = params.iter().map(|_| Type::Integer).collect();
+        self.applied_supported(params, payloads, &probe, 0)
+    }
+
+    fn applied_supported(
+        &self,
+        params: &[Box<str>],
+        payloads: &[Option<Type>],
+        arguments: &[Type],
+        depth: usize,
+    ) -> bool {
+        params.len() == arguments.len()
+            && arguments.iter().all(|argument| {
+                !matches!(argument, Type::Reference { .. })
+                    && self.pipeline_type(argument, depth + 1)
+            })
+            && payloads.iter().flatten().all(|payload| {
+                let mut payload = payload.clone();
+                substitute_named(&mut payload, params, arguments);
+                !matches!(payload, Type::Reference { .. })
+                    && self.pipeline_type(&payload, depth + 1)
+            })
+    }
+
+    /// A type as the module graph resolves it, or `None` if it does not resolve.
+    fn resolved(&self, module: usize, ty: &Type, span: Span) -> Option<Type> {
+        self.resolved_with(module, ty, span, &[])
+    }
+
+    /// As `resolved`, with the names of a routine's type parameters left as they are.
+    fn resolved_with(
+        &self,
+        module: usize,
+        ty: &Type,
+        span: Span,
+        params: &[Box<str>],
+    ) -> Option<Type> {
+        let mut resolved = ty.clone();
+        self.ty(module, &mut resolved, params, span).ok()?;
+        Some(resolved)
+    }
+
+    /// Whether the routine pipeline lowers values of this type: scalars, strings, records
+    /// whose fields are all such types, and references to one of those.
+    fn pipeline_type(&self, ty: &Type, depth: usize) -> bool {
+        match ty {
+            Type::Integer | Type::Boolean | Type::Real | Type::Numeric(_) | Type::String => true,
+            Type::Reference {
+                lifetime: None,
+                pointee,
+                ..
+            } => !matches!(**pointee, Type::Reference { .. }) && self.pipeline_type(pointee, depth),
+            Type::Applied(target, arguments) if depth < 8 => self
+                .generic_enums
+                .get(target)
+                .is_some_and(|(params, payloads)| {
+                    self.applied_supported(params, payloads, arguments, depth)
+                }),
+            Type::Named(target) if depth < 8 => {
+                self.records.get(target).is_some_and(|fields| {
+                    fields.iter().all(|(_, field)| {
+                        !matches!(field, Type::Reference { .. })
+                            && self.pipeline_type(field, depth + 1)
+                    })
+                }) || self.enums.get(target).is_some_and(|variants| {
+                    variants.iter().all(|(_, payload)| {
+                        payload.as_ref().is_none_or(|payload| {
+                            !matches!(payload, Type::Reference { .. })
+                                && self.pipeline_type(payload, depth + 1)
+                        })
+                    })
+                })
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a routine's parameters and result are all types the pipeline lowers, with
+    /// every parameter passed by value and no reference as a result.
+    fn pipeline_signature(&self, module: usize, f: &Function) -> bool {
+        // A type parameter stands for a scalar here: each instance is checked when made.
+        let probe: Vec<Type> = f.type_params.iter().map(|_| Type::Integer).collect();
+        let resolved = |ty: &Type, span: Span| {
+            let mut ty = self.resolved_with(module, ty, span, &f.type_params)?;
+            substitute_named(&mut ty, &f.type_params, &probe);
+            Some(ty)
+        };
+        let parameters = f.params.iter().all(|parameter| {
+            parameter.arity == ParameterArity::One
+                && parameter.passing == ParameterPassing::Value
+                && !parameter.by_ref
+                && !parameter.receiver
+                && resolved(&parameter.ty, parameter.span)
+                    .is_some_and(|ty| self.pipeline_type(&ty, 0))
+        });
+        let result = match f.kind {
+            RoutineKind::Procedure if f.result == Type::Void => true,
+            _ => resolved(&f.result, f.span).is_some_and(|ty| {
+                !matches!(ty, Type::Reference { .. }) && self.pipeline_type(&ty, 0)
+            }),
+        };
+        parameters && result
+    }
+
+    /// Linked symbols of source functions with a signature the pipeline lowers.
+    fn plain_functions(&self) -> HashMap<Box<str>, (usize, bool)> {
+        let mut plain = HashMap::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            for f in &node.ast.functions {
+                if f.origin == RoutineOrigin::Source
+                    && f.body_kind == FunctionBodyKind::Source
+                    && !f.generator
+                    && f.type_params.is_empty()
+                    && f.annotations.is_empty()
+                    && self.pipeline_signature(index, f)
+                    && let Ok(target) = self.symbol(index, &f.name, Kind::Value, f.span)
+                {
+                    plain.insert(target, (f.params.len(), f.result == Type::Void));
+                }
+            }
+        }
+        plain
+    }
+
+    /// Resolve an indexed body's call sites against the module namespace, with no
+    /// owned tree. `Err(body)` gives the body back when a site is not a plain call
+    /// (a local, an intrinsic, a unit variant, an unresolved name or another
+    /// contract); the caller then links the body as a tree, and reports its errors.
+    fn bind_indexed(
+        &self,
+        module: usize,
+        function: &Function,
+        body: crate::analysis::IndexedRoutineBody,
+    ) -> Result<
+        std::result::Result<
+            crate::analysis::IndexedRoutineBody,
+            crate::analysis::IndexedRoutineBody,
+        >,
+    > {
+        // The routine's own signature must be one the pipeline lowers.
+        if !self.pipeline_signature(module, function) {
+            return Ok(Err(body));
+        }
+        if !function.constraints.is_empty() && self.declared_bounds(module, function).is_none() {
+            return Ok(Err(body));
+        }
+        let sites: Vec<_> = body
+            .reference_sites()
+            .map(|site| {
+                (
+                    Box::<str>::from(site.path),
+                    site.arguments,
+                    site.discard,
+                    site.record,
+                    site.name_use,
+                    site.contextual,
+                    site.span,
+                )
+            })
+            .collect();
+        let mut targets = Vec::with_capacity(sites.len());
+        for (path, arguments, discard, record, name_use, contextual, span) in sites {
+            if record {
+                // A record literal names a record type whose fields the pipeline lowers.
+                let Some(symbol) = self.path(module, &path, Some(Kind::Type)) else {
+                    return Ok(Err(body));
+                };
+                self.check_import(module, &symbol, span)?;
+                if !self.pipeline_type(&Type::Named(symbol.target.clone()), 0) {
+                    return Ok(Err(body));
+                }
+                targets.push(symbol.target);
+                continue;
+            }
+            if function.params.iter().any(|param| param.name == path) {
+                return Ok(Err(body));
+            }
+            if name_use {
+                // A name that is not a local: acceptable only as a unit variant.
+                let Some(symbol) = self.path(module, &path, Some(Kind::Value)) else {
+                    return Ok(Err(body));
+                };
+                self.check_import(module, &symbol, span)?;
+                let supported = self
+                    .variants
+                    .get(&symbol.id)
+                    .is_some_and(|(owner, payload)| {
+                        !payload
+                            && (self.pipeline_type(&Type::Named(owner.clone()), 0)
+                                || (contextual && self.generic_enum_supported(owner)))
+                    });
+                if !supported {
+                    return Ok(Err(body));
+                }
+                targets.push(symbol.target);
+                continue;
+            }
+            let Some(symbol) = self.path(module, &path, Some(Kind::Value)) else {
+                return Ok(Err(body));
+            };
+            self.check_import(module, &symbol, span)?;
+            // A constructor of a supported enum's variant with a payload is a plain callee.
+            let constructor = self
+                .variants
+                .get(&symbol.id)
+                .is_some_and(|(owner, payload)| {
+                    *payload
+                        && arguments == 1
+                        && !discard
+                        && (self.pipeline_type(&Type::Named(owner.clone()), 0)
+                            || (contextual && self.generic_enum_supported(owner)))
+                });
+            if symbol.intrinsic == Some(crate::intrinsic::Intrinsic::Print) && discard {
+                // `print` is built in: the pipeline lowers it to an output, with no callee.
+                targets.push("$print".into());
+                continue;
+            }
+            if let Some(id) = symbol.intrinsic
+                && crate::builtins::pipeline_utility(id)
+            {
+                // A utility is typed from its operands and emitted as one operation.
+                targets.push(format!("$builtin:{}", id as u16).into());
+                continue;
+            }
+            if symbol.intrinsic.is_some()
+                || self.unit_variants.contains(&symbol.id)
+                || !(constructor
+                    || self
+                        .plain
+                        .get(&symbol.target)
+                        .is_some_and(|&(parameters, void)| {
+                            parameters == arguments && (discard || !void)
+                        }))
+            {
+                return Ok(Err(body));
+            }
+            targets.push(symbol.target);
+        }
+        Ok(Ok(if targets.is_empty() {
+            body
+        } else {
+            body.with_targets(targets)
+        }))
+    }
     fn declaration_id(&mut self) -> DeclarationId {
         let id = DeclarationId(self.next_declaration);
         self.next_declaration += 1;
@@ -117,7 +682,19 @@ impl Resolver {
         }
         let index = self.nodes.len();
         let id = self.declaration_id();
-        let declarations = std::mem::take(&mut ast.modules);
+        let mut declarations = std::mem::take(&mut ast.modules);
+        let mut namespaces = std::collections::HashSet::new();
+        if trust != SourceTrust::Core && placement.source != ModuleSource::Inline {
+            let (implicit, empty) = Self::implicit_modules(
+                &declarations,
+                files,
+                paths,
+                dir,
+                placement.source == ModuleSource::File,
+            )?;
+            declarations.extend(implicit);
+            namespaces = empty;
+        }
         let package = if placement.boundary == ModuleBoundary::Package {
             index
         } else {
@@ -139,9 +716,17 @@ impl Resolver {
         for declaration in declarations {
             let child_path = format!("{path}::{}", declaration.name);
             let child_dir = dir.join(declaration.name.as_ref());
+            let mut source = ModuleSource::Inline;
             let body = if let Some(body) = declaration.body {
+                if namespaces.contains(&declaration.name) {
+                    source = ModuleSource::Namespace;
+                }
                 *body
             } else {
+                source = ModuleSource::File;
+                if trust != SourceTrust::Core {
+                    Self::reject_two_layouts(&declaration.name, paths, dir, declaration.span)?;
+                }
                 let candidates = [
                     dir.join(format!("{}.ya", declaration.name)),
                     child_dir.join("mod.ya"),
@@ -180,6 +765,7 @@ impl Resolver {
                     trust,
                     parent: Some(index),
                     boundary: declaration.boundary,
+                    source,
                 },
             )?;
             if semantic == Some(InternalSemantic::Prelude) && self.prelude.replace(child).is_some()
@@ -1323,6 +1909,8 @@ impl Resolver {
                     self.source_names
                         .insert(target.clone(), variant.name.clone());
                     self.variant_ids.insert(id);
+                    self.variants
+                        .insert(id, (owner.target.clone(), variant.payload.is_some()));
                     if variant.payload.is_none() {
                         self.unit_variants.insert(id);
                     }
@@ -1678,7 +2266,10 @@ impl Resolver {
                     )) {
                         continue;
                     }
-                    if import.public && !symbol.public {
+                    // A module may publish its own child module: the file gate opens
+                    // with `pub use b`, as `pub mod b` would in Rust.
+                    let own_child = symbol.kind == Kind::Module && symbol.owner == *module;
+                    if import.public && !symbol.public && !own_child {
                         return Err(error(
                             "cannot publicly reexport a private declaration",
                             import.span,
@@ -1691,6 +2282,14 @@ impl Resolver {
                         .iter_mut()
                         .find(|existing| existing.kind == symbol.kind)
                     {
+                        if own_child && existing.target == symbol.target {
+                            if import.public && !existing.public {
+                                existing.public = true;
+                                changed = true;
+                            }
+                            previous.push(ordinal);
+                            continue;
+                        }
                         if existing.target != symbol.target
                             || (!import.glob
                                 && (previous.is_empty()
@@ -2541,6 +3140,12 @@ impl Resolver {
                 linked.native.functions.push(declaration);
             }
         }
+        self.records = self.record_table();
+        self.enums = self.enum_table();
+        self.generic_enums = self.generic_enum_table();
+        self.bound_traits = self.bound_trait_table();
+        self.user_traits = self.user_trait_table();
+        self.plain = self.plain_functions();
         for index in 0..self.nodes.len() {
             self.next_binding = 0;
             let mut ast = std::mem::take(&mut self.nodes[index].ast);
@@ -2561,8 +3166,44 @@ impl Resolver {
                 }
             }
             for f in &mut ast.functions {
+                let mut generic_bounds = None;
                 f.name = self.symbol(index, &f.name, Kind::Value, f.span)?;
+                if f.origin == RoutineOrigin::Source
+                    && let Some(body) = self.indexed.remove(&f.span)
+                {
+                    let bounds = self.declared_bounds(index, f);
+                    match self.bind_indexed(index, f, body)? {
+                        Ok(bound) => {
+                            generic_bounds = bounds;
+                            // A generic routine keeps an owned body too: instances the
+                            // pipeline does not take are cloned from it by the specializer.
+                            if !f.type_params.is_empty() {
+                                f.body = bound.materialize_owned()?;
+                            }
+                            self.bound.insert(f.name.clone(), bound);
+                        }
+                        // The indexed pipeline cannot take this routine: link its
+                        // owned body so the existing resolver reports or resolves it.
+                        Err(body) => {
+                            if !f.constraints.is_empty() {
+                                return Err(declarations::unsupported_source(
+                                    declarations::SourceFeature::GenericConstraints,
+                                    f.span,
+                                ));
+                            }
+                            f.body = body.materialize_owned()?
+                        }
+                    }
+                }
                 self.function(index, f, &[], &[])?;
+                // The template is checked once with its type parameters opaque, against the
+                // signature as linked.
+                if !f.type_params.is_empty()
+                    && let Some(bound) = self.bound.get_mut(&f.name)
+                {
+                    let (bounds, user_traits) = generic_bounds.take().unwrap_or_default();
+                    bound.set_generic_header(&f.params, &f.result, bounds, user_traits);
+                }
             }
             for t in &mut ast.traits {
                 let symbol = self.path(index, &t.name, Some(Kind::Type)).unwrap();
@@ -2717,7 +3358,17 @@ impl Resolver {
                 }
                 _ => true,
             });
-            if index != entry
+            let strict = self.entry_mode == crate::EntryMode::Main;
+            if strict {
+                // An immutable `let` at the top level is a compile-time constant.
+                for statement in &mut ast.body {
+                    if let StmtKind::Binding(_, _, constant @ false, false, _) = &mut statement.kind
+                    {
+                        *constant = true;
+                    }
+                }
+            }
+            if (index != entry || strict)
                 && ast.body.iter().any(|s| {
                     !matches!(
                         s.kind,
@@ -2726,9 +3377,39 @@ impl Resolver {
                 })
             {
                 return Err(error(
-                    "module initialization requires constants or an explicit procedure",
+                    if strict {
+                        "top level allows declarations, `const` and immutable `let`; \
+                         put statements in `proc main()`"
+                    } else {
+                        "module initialization requires constants or an explicit procedure"
+                    },
                     ast.body[0].span,
                 ));
+            }
+            if strict && index == entry {
+                // The entry file's program is its `proc main()`.
+                let main_span = ast
+                    .functions
+                    .iter()
+                    .find(|f| {
+                        cyallo_ast::source_name(&f.name) == "main"
+                            && f.kind == RoutineKind::Procedure
+                            && f.params.is_empty()
+                            && f.result == Type::Void
+                    })
+                    .map(|f| f.span);
+                match main_span {
+                    Some(span) => ast.body.push(Stmt {
+                        kind: StmtKind::Call("main".into(), Vec::new()),
+                        span,
+                    }),
+                    None => {
+                        return Err(error(
+                            "the entry file must declare `proc main()`",
+                            ast.body.first().map_or(Span::default(), |s| s.span),
+                        ));
+                    }
+                }
             }
             self.block(index, &mut ast.body, &mut Vec::new(), &[], true)?;
             ast.functions.append(&mut associated[index]);
@@ -2761,7 +3442,21 @@ impl Resolver {
                 }
             });
             ast.inherent_implementations.clear();
-            declarations::validate_source_ast(&ast)?;
+            // A bound the routine pipeline gives meaning to (`T: Numeric`) is not an
+            // unimplemented feature once the body is bound to it: binding rejects a routine
+            // whose bounds it does not know, so those that remain are supported.
+            let bounded: Vec<_> = ast
+                .functions
+                .iter_mut()
+                .enumerate()
+                .filter(|(_, f)| !f.constraints.is_empty() && self.bound.contains_key(&f.name))
+                .map(|(position, f)| (position, std::mem::take(&mut f.constraints)))
+                .collect();
+            let validated = declarations::validate_source_ast(&ast);
+            for (position, constraints) in bounded {
+                ast.functions[position].constraints = constraints;
+            }
+            validated?;
             let nodes = &self.nodes;
             let node = &nodes[index];
             let mut bindings: Vec<_> = node
@@ -2876,6 +3571,14 @@ impl Resolver {
                 requesters: self.requesting_modules,
             });
         }
+        // Every indexed body was left out of the owned tree, so each must be bound
+        // to a linked routine or materialized. An unbound one would lose its body.
+        if !self.indexed.is_empty() {
+            return Err(error(
+                "internal error: an indexed routine body has no linked routine",
+                Span::default(),
+            ));
+        }
         let graph = ResolvedProgram {
             interface,
             interface_declarations,
@@ -2886,6 +3589,7 @@ impl Resolver {
             native: linked.native,
             source_names: linked.source_names,
             exports: linked.resolved_modules,
+            indexed_bodies: std::mem::take(&mut self.bound),
         };
         graph
             .constant_order()
@@ -2912,6 +3616,24 @@ pub fn link(asts: Vec<Ast>, paths: &[String], entry: usize) -> Result<ResolvedPr
         &crate::import_policy::ImportPolicy::default(),
     )
 }
+/// Link a single source set with indexed routine bodies, as the compiler does.
+pub fn link_with_indexed_bodies(
+    asts: Vec<Ast>,
+    paths: &[String],
+    entry: usize,
+    indexed: Vec<crate::analysis::IndexedRoutineBody>,
+) -> Result<ResolvedProgram> {
+    link_program(
+        asts,
+        paths,
+        entry,
+        &crate::import_policy::ImportPolicy::default(),
+        &crate::core_package::CorePackage::embedded(),
+        0,
+        crate::EntryMode::Script,
+        indexed,
+    )
+}
 pub fn link_with_policy(
     asts: Vec<Ast>,
     paths: &[String],
@@ -2935,6 +3657,28 @@ pub fn link_with_core(
     package: &crate::core_package::CorePackage<'_>,
     core_offset: u32,
 ) -> Result<ResolvedProgram> {
+    link_program(
+        asts,
+        paths,
+        entry,
+        policy,
+        package,
+        core_offset,
+        crate::EntryMode::Script,
+        Vec::new(),
+    )
+}
+/// Link with an explicit entry mode. `EntryMode::Main` is for source files.
+pub fn link_program(
+    asts: Vec<Ast>,
+    paths: &[String],
+    entry: usize,
+    policy: &crate::import_policy::ImportPolicy,
+    package: &crate::core_package::CorePackage<'_>,
+    core_offset: u32,
+    mode: crate::EntryMode,
+    indexed: Vec<crate::analysis::IndexedRoutineBody>,
+) -> Result<ResolvedProgram> {
     let _resolve = cyallo_startup_profile::stage(cyallo_startup_profile::Stage::Resolve);
     let mut files: Vec<_> = asts.into_iter().map(Some).collect();
     let root = files[entry]
@@ -2942,6 +3686,19 @@ pub fn link_with_core(
         .ok_or_else(|| error("missing entry module", Span::default()))?;
     let dir = Path::new(&paths[entry]).parent().unwrap_or(Path::new(""));
     let mut resolver = Resolver {
+        entry_mode: mode,
+        indexed: indexed
+            .into_iter()
+            .map(|body| (body.archived_span(), body))
+            .collect(),
+        bound: HashMap::new(),
+        plain: HashMap::new(),
+        records: HashMap::new(),
+        enums: HashMap::new(),
+        generic_enums: HashMap::new(),
+        bound_traits: HashMap::new(),
+        user_traits: Default::default(),
+        variants: HashMap::new(),
         aliases: HashMap::new(),
         source_names: Default::default(),
         nodes: Vec::new(),
@@ -2988,6 +3745,7 @@ pub fn link_with_core(
             trust: SourceTrust::Core,
             parent: None,
             boundary: ModuleBoundary::Package,
+            source: ModuleSource::File,
         },
     )?;
     resolver.packages.insert(core_name, core);
@@ -3005,6 +3763,7 @@ pub fn link_with_core(
             trust: SourceTrust::User,
             parent: None,
             boundary: ModuleBoundary::Package,
+            source: ModuleSource::File,
         },
     )?;
     resolver.packages.insert("crate".into(), user);
@@ -3017,3 +3776,24 @@ pub fn link_with_core(
 pub fn single(ast: Ast) -> Result<ResolvedProgram> {
     link(vec![ast], &["main.ya".into()], 0)
 }
+
+/// Replace type parameters named in `params` by the matching `arguments`.
+fn substitute_named(ty: &mut Type, params: &[Box<str>], arguments: &[Type]) {
+    match ty {
+        Type::Named(name) => {
+            if let Some(index) = params.iter().position(|param| param == name) {
+                *ty = arguments[index].clone();
+            }
+        }
+        Type::Applied(_, inner) => {
+            for argument in inner {
+                substitute_named(argument, params, arguments);
+            }
+        }
+        Type::Reference { pointee, .. } => substitute_named(pointee, params, arguments),
+        _ => {}
+    }
+}
+
+/// A routine's bounds by type parameter, and the program's traits they name.
+type DeclaredBounds = (Vec<(Box<str>, Vec<crate::generics::Bound>)>, Vec<Box<str>>);

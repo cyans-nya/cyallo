@@ -159,7 +159,9 @@ print(rx.recv().unwrap())
 #[test]
 fn the_buffered_example_runs_under_gc_stress() {
     assert_eq!(
-        lines(include_str!("../examples/concurrency/channels/buffered.ya")),
+        lines(include_str!(
+            "../examples/concurrency/channels/buffered.yas"
+        )),
         ["true", "42", "true", "99"]
     );
 }

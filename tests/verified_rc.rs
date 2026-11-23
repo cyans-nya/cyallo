@@ -38,7 +38,7 @@ fn run_with(source: &str, stress: bool) -> Result<(Vec<String>, HeapStats), RunE
 
 #[test]
 fn the_documented_ownership_example_prints_its_counts_and_leaves_nothing_counted() {
-    let source = include_str!("../examples/rc-ownership.ya");
+    let source = include_str!("../examples/rc-ownership.yas");
     let (lines, stats) = run_with(source, false).unwrap();
     assert_eq!(
         lines,
@@ -114,7 +114,7 @@ std::mem::drop(watch)
 
 #[test]
 fn a_moved_owner_keeps_the_count_and_a_partial_move_drops_only_the_rest() {
-    let source = include_str!("../examples/enums/ownership.ya");
+    let source = include_str!("../examples/enums/ownership.yas");
     for stress in [false, true] {
         let (lines, stats) = run_with(source, stress).unwrap();
         assert_eq!(lines, ["first:1:1:true"]);

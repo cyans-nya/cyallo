@@ -8,6 +8,9 @@ pub record AllocError {}
 
 pub trait Cloneable {}
 
+// A value that is duplicated by reading it, rather than moved.
+pub trait Copy {}
+
 pub trait Allocator {
     proc allocate(self: &mut Self, layout: Layout) -> Result<Allocation, AllocError>;
     proc deallocate(self: &mut Self, allocation: Allocation);

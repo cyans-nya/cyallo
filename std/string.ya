@@ -1,4 +1,4 @@
-use std::io::Printable;
+use std::fmt::Format;
 
 pub fn len(read value: string) -> i64;
 pub fn trim(read value: string) -> string;
@@ -8,4 +8,4 @@ pub fn contains(read value: string, read pattern: string) -> bool;
 pub fn starts_with(read value: string, read pattern: string) -> bool;
 pub fn ends_with(read value: string, read pattern: string) -> bool;
 pub fn replace(read value: string, read pattern: string, read replacement: string) -> string;
-pub fn from<T: Printable>(read value: T) -> string;
+pub fn from<T: Format>(read value: T) -> string;

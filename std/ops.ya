@@ -1,0 +1,9 @@
+// Operator capabilities. A type parameter bounded by one of these may be used with that
+// operator and nothing else: `a + b` needs `Add`, `-a` needs `Neg`. Each is `Self op Self`
+// giving `Self`.
+pub trait Add {}
+pub trait Sub {}
+pub trait Mul {}
+pub trait Div {}
+pub trait Rem {}
+pub trait Neg {}

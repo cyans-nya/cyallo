@@ -551,3 +551,139 @@ uv run scripts/startup_baseline.py profile --engine default --reps 5 --jobs 1 \
   --sweep 'unused-routine count' --sweep 'call every' \
   --out docs/measurements/startup-verified-profile.json
 ```
+
+## Pipeline slices rerun
+
+Rerun after the call-aware routine pipeline, files-as-modules and the `.ya`/`.yas`
+entry modes. Same host, harness and commands as the verified baseline, with the
+generator now writing `main.yas` scripts. Release build of the `ir-pipeline`
+worktree on `9ac74ed` plus uncommitted work. Raw data:
+[bench](measurements/startup-pipeline-bench.json) and
+[profile](measurements/startup-pipeline-profile.json).
+
+**Verdict: no startup change attributable to the new stages.** The generated
+workloads do not use the migrated subset, so `bodies_prepared_from_indexed_syntax` and
+`bodies_emitted_from_air` are both 0. Work counts match the verified baseline: bodies checked
+before first output (4,098 at n=4,096), verified images (1), and allocated bytes (1.503 GB
+against 1.503 GB, +0.05%).
+
+The first sweep measured 3% to 10% slower than the earlier baseline, and the stage
+profile showed the same uniform drift (parse +4%, body lowering +3%) with identical
+allocations. A back-to-back A/B on the same machine state showed the drift was the host.
+A release binary from the main checkout (built 21 Nov, so older than `9ac74ed`) and the new
+binary alternated, median first output with `--jobs 1`, 15 rounds:
+
+| Unused routines | Old (run 1) | New | Old (run 2) |
+| ---: | ---: | ---: | ---: |
+| 0 | 6.5 ms | 6.4 ms | 6.8 ms |
+| 256 | 36.8 ms | 35.8 ms | 37.6 ms |
+| 1,024 | 131.9 ms | 128.2 ms | 133.6 ms |
+| 4,096 | 520.0 ms | 505.2 ms | 522.7 ms |
+| 16,384 | 2,145 ms | 2,089 ms | 2,162 ms |
+
+Caveats: the A/B baseline is an older binary, not `9ac74ed` itself, and the
+host is shared with other sessions. Absolute figures between the two sweeps are
+not comparable. Use the paired table. The migrated subset (scalar routines with direct
+calls) is not exercised by these workloads, so this run shows only that the new stages add
+no startup cost to code they do not touch. It does not measure the benefit.
+
+## Scalar workloads through the new pipeline
+
+The generator gained a `scalar` workload shape (sweep "scalar routines (migrated subset)"):
+by-value `i64` routines with branches, explicit returns and one direct call to the preceding
+routine. Resolution now binds call sites over indexed syntax (`bind_indexed` in the linker), so a
+migrated body never materializes an owned tree. Raw data:
+[bench](measurements/startup-scalar-bench.json), [profile](measurements/startup-scalar-profile.json).
+
+Counters confirm the route: at n=4,096, `bodies_prepared_from_indexed_syntax` and
+`bodies_emitted_from_air` are 4,096 and `bodies_materialized` is 0 (a few entry-side bodies
+remain owned).
+
+Paired medians of 15 rounds, `--jobs 1`, first output. "Old" is the older release binary from
+the main checkout run on the same files, alternated with the new build (two passes each):
+
+| Workload | Old | New | Change |
+| --- | ---: | ---: | ---: |
+| unused 256 | 26.2 ms | 13.8 ms | −47% |
+| unused 1,024 | 87.1 ms | 36.5 ms | −58% |
+| unused 4,096 | 343 ms | 128.7 ms | −62% |
+| call all 256 | 35.3 ms | 22.8 ms | −35% |
+| call all 1,024 | 125.4 ms | 72.5 ms | −42% |
+| call all 4,096 | 502 ms | 277 ms | −45% |
+
+Caveats: the old binary predates `9ac74ed` and the host is shared, so use the paired numbers.
+The new route also does less work per body in this shape (no `let`, no loops), so the gain
+applies to the migrated subset only, as measured by workloads written for it. The
+previous workloads (mutable `let`) are unchanged. Call-all still pays for lowering every body
+after output; first output also includes bodies forced by verified metadata scans.
+
+## Locals, assignment and loops through the pipeline
+
+The migrated subset now includes `let`/`let mut` (optionally annotated `i64` or `bool`),
+assignment and compound assignment to mutable locals, `while`, and `for i in a..b` / `a..=b`
+over `i64`, in addition to scalar expressions, `if`/`else`, `return` and direct `i64` calls.
+The original generator routines (`let mut`, assignment, `if`) fall inside it, so the first
+sweeps now measure the new route directly: at every size, `bodies_prepared_from_indexed_syntax`
+and `bodies_emitted_from_air` equal the routine count and `bodies_materialized` is 0. Raw data:
+[bench](measurements/startup-widened-bench.json), [profile](measurements/startup-widened-profile.json).
+
+Paired medians of 15 rounds, `--jobs 1`, first output, against the older release binary from the
+main checkout run on the same files (two alternating passes each):
+
+| Workload | Old | New | Change |
+| --- | ---: | ---: | ---: |
+| unused 256 | 38.3 ms | 13.4 ms | −65% |
+| unused 1,024 | 134.8 ms | 35.2 ms | −74% |
+| unused 4,096 | 528 ms | 122 ms | −77% |
+| unused 16,384 | 2,180 ms | 483 ms | −78% |
+| call all 256 | 47.7 ms | 20.0 ms | −58% |
+| call all 1,024 | 170.5 ms | 61.6 ms | −64% |
+| call all 4,096 | 679 ms | 230 ms | −66% |
+
+The control with no user routines is unchanged (6.9 to 6.6 ms). Caveats as before: the old binary
+predates `9ac74ed`, the host is shared, and the generated routines are straight-line arithmetic with
+branches, so the figures show the gain for code in the subset, not for arbitrary programs.
+
+Parity against the existing route is checked by `tests/routine_ir_parity.rs`. Each program runs
+twice, with routines in the subset and with an inert out-of-subset statement that keeps them on the
+old route. Outputs and diagnostics (code, message, source text of the span) must match, covering
+counting and backwards ranges, collatz-style `while`, nested loops, annotations, early returns from
+loops, type errors in `let`, assignment, `+=`, range bounds and conditions, and a missing return after
+a loop. Anything else declines the subset: assignment to a parameter, an immutable local or a loop
+counter, names used out of scope or declared twice (a counter name may repeat across loops that do not
+nest), calls to local names, and `break`/`continue`. The existing route then runs and reports it.
+
+## Demand-driven metadata discovery
+
+Verified lowering used to read every checked body to find module variables and boxed trait
+implementations, which forced analysis of every routine before the worklist emitted a single image
+(4,098 bodies checked at n=4,096 although one image was emitted). It now computes the set of routines
+that can run first (`demanded_routines` in `src/bytecode/verified/lower.rs`): the entry, the extra
+roots, and everything reached through direct calls, function values, allocator callbacks and the
+methods of implementations that a reached body boxes. Globals and implementations are collected over
+that set only. If lowering ever reaches a routine outside it, a reference kind was missed, and lowering
+runs again over every routine as before, so the result is never narrower than the old scan.
+
+Effect (profile, `--jobs 1`): bodies checked before first output went from N+2 to 0 for the unused
+workloads, and the verified module lowering stage fell from about 31 ms to under 1 ms at n=4,096.
+Call-all still checks and lowers every routine, as it must. Raw data:
+[bench](measurements/startup-demand-bench.json), [profile](measurements/startup-demand-profile.json).
+
+Paired medians of 15 rounds, `--jobs 1`, first output, against the older release binary (two
+alternating passes):
+
+| Workload | Old | New | Change |
+| --- | ---: | ---: | ---: |
+| unused 256 | 36.3 ms | 11.1 ms | −69% |
+| unused 1,024 | 128.6 ms | 26.4 ms | −79% |
+| unused 4,096 | 505 ms | 87.7 ms | −83% |
+| unused 16,384 | 2,075 ms | 339 ms | −84% |
+| call all 1,024 | 162.6 ms | 59.0 ms | −64% |
+| call all 4,096 | 650 ms | 223.5 ms | −66% |
+
+What remains at n=4,096 unused is front-end work: lex, parse and freeze (~40 ms), building MIR for each
+body during materialize (~35 ms), and smaller passes. Caveats as before: the old binary predates
+`9ac74ed` and the host is shared.
+
+Test status: the `constants`, `effects` and `native_contract` failures fail identically on a pristine
+`9ac74ed` checkout, so they are not caused by this branch.

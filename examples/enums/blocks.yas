@@ -1,0 +1,44 @@
+// `match` arms that are blocks: as statements, and as values with a tail expression.
+// Run: cargo run -- run examples/enums/blocks.yas
+enum Event {
+    Click: i64,
+    Key: string,
+    Quit,
+}
+use Event::*
+
+proc handle(e: Event) {
+    match e {
+        Click(n) => {
+            let doubled = n * 2
+            std::io::print("click ", doubled)
+        }
+        Key(k) if std::string::len(k) > 1 => {
+            std::io::print("long key ", k)
+        }
+        Key(k) => std::io::print("key ", k),
+        Quit => {}
+    }
+}
+
+fn score(e: Event) -> i64 {
+    let base = match e {
+        Click(n) => {
+            let bonus = n + 1
+            bonus * 10
+        }
+        Key(_) => 5,
+        Quit => {
+            return -1
+        }
+    }
+    return base + 1
+}
+
+handle(Click(4))
+handle(Key("a"))
+handle(Key("ab"))
+handle(Quit)
+std::io::print(score(Click(2)))
+std::io::print(score(Key("x")))
+std::io::print(score(Quit))

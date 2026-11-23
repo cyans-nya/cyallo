@@ -1,4 +1,4 @@
-use std::io::Printable;
+use std::fmt::Format;
 
 pub trait Lengthable {}
 pub trait Number {}
@@ -8,7 +8,7 @@ pub use std::random::uniform as rand;
 pub use std::char::{code as asc, from_code as chr};
 pub use std::string::from as num_to_str;
 
-pub proc input<T: Printable>(target: &mut T);
+pub proc input<T: Format>(target: &mut T);
 pub fn left(read value: string, count: i64) -> string;
 pub fn right(read value: string, count: i64) -> string;
 pub fn mid(read value: string, start: i64, count: i64) -> string;

@@ -1,0 +1,17 @@
+// Run: cargo run -- run examples/gc-cells.yas --gc --jit-trace=summary
+// Repeated aggregate moves keep 64 saved values and each invocation's temporary
+// arrays. Observe collection and peak occupied cells with --gc --jit-trace=summary.
+let mut saved = std::collections::Vec::from(0..64)
+
+proc work(n: i64) -> i64 {
+    let a = [n, n + 1]
+    let b = a
+    saved[n % 64] = b[0]
+    return b[0] + b[1]
+}
+
+let mut total = 0
+for i in 0..=200000 {
+    total += work(i)
+}
+std::io::print(total, ":", saved[0])

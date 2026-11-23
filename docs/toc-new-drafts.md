@@ -18,6 +18,7 @@ components. Reworked from the earlier plugin-worlds draft (renamed from
 | [04 Versioning, loading and lifecycle](component-worlds/04-versioning-and-loading.md) | Semver, load-time checks, `LoadError`, caching, lifecycle |
 | [05 SDK coordination](component-worlds/05-sdk-coordination.md) | Layered SDKs, `#[since]`, digests, lockfiles, load handshake |
 | [06 Components](component-worlds/06-components.md) | Components, recipes, generative instances, catalogs, the root component |
+| [07 Demo](component-worlds/07-demo.md) | A project that should work after implementation; part A runs today |
 
 ## [Data enums and anonymous records](data-enums-draft.md)
 

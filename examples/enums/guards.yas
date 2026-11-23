@@ -1,0 +1,38 @@
+// `match` arms with guards: the guard sees the arm's bindings, and a failed guard falls
+// through to the next arm.
+// Run: cargo run -- run examples/enums/guards.yas
+enum Reading {
+    Level: i64,
+    Label: string,
+    Missing,
+}
+use Reading::*
+
+fn classify(r: Reading) -> i64 {
+    return match r {
+        Level(n) if n < 0 => -1,
+        Level(n) if n == 0 => 0,
+        Level(n) => n,
+        Label(s) if std::string::len(s) > 3 => 100,
+        Label(_) => 1,
+        Missing => -2,
+    }
+}
+
+fn name(r: Reading) -> string {
+    return match r {
+        Label(s) if std::string::starts_with(s, "a") => s,
+        Label(_) => "other",
+        _ => "none",
+    }
+}
+
+std::io::print(classify(Level(-5)))
+std::io::print(classify(Level(0)))
+std::io::print(classify(Level(9)))
+std::io::print(classify(Label("long!")))
+std::io::print(classify(Label("ab")))
+std::io::print(classify(Missing))
+std::io::print(name(Label("apple")))
+std::io::print(name(Label("pear")))
+std::io::print(name(Missing))

@@ -1,0 +1,38 @@
+// Strings: literals, concatenation, comparison, moving a string into a call or a local,
+// and reading or appending through a reference.
+// Run: cargo run -- run examples/strings/basic.yas
+fn greet(name: string) -> string {
+    return "Hello, " + name + "!"
+}
+
+fn doubled(text: string) -> string {
+    let kept = text
+    return kept + kept
+}
+
+fn same(a: &string, b: &string) -> bool {
+    return a.* == b.*
+}
+
+fn before(a: &string, b: &string) -> bool {
+    return a.* < b.*
+}
+
+proc append(text: &mut string, tail: string) {
+    text.* += tail
+}
+
+fn pick(first: string, second: string, use_first: bool) -> string {
+    if use_first {
+        return first
+    }
+    return second
+}
+
+let mut word = "ab"
+append(&mut word, "cd")
+std::io::print(word)
+std::io::print(greet("Ada"))
+std::io::print(doubled("xy"))
+std::io::print(same(&word, &word), " ", before(&word, &word))
+std::io::print(pick("one", "two", false))

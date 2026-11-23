@@ -26,7 +26,11 @@ use cyallo_ir::{
     services::Metadata,
 };
 use cyallo_startup_profile::{Counter, Stage, count, stage};
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt,
+    sync::Arc,
+};
 
 #[derive(Debug)]
 pub enum LowerError {
@@ -204,12 +208,51 @@ impl VerifiedModule {
         checked: &[Routine],
         routine: usize,
         host_ids: &HashMap<usize, HostBindingId>,
-        host_bindings: Vec<ScalarHostBinding>,
+        mut host_bindings: Vec<ScalarHostBinding>,
         services: Option<Arc<Metadata>>,
         extra_roots: &[usize],
         every_main_variable: bool,
     ) -> Result<Self, LowerError> {
+        // Module variables and trait implementations are discovered from the bodies
+        // that can run, so a routine nothing reaches is never analyzed. If lowering
+        // meets a routine the discovery did not, the scan missed a reference kind:
+        // lower again over every routine, as the module always did before.
+        let demanded = demanded_routines(checked, routine, extra_roots, services.as_deref());
+        let mut attempt = |scope: Option<&BTreeSet<usize>>| {
+            Self::lower_scoped(
+                checked,
+                routine,
+                host_ids,
+                &mut host_bindings,
+                services.clone(),
+                extra_roots,
+                every_main_variable,
+                scope,
+            )
+        };
+        match attempt(Some(&demanded))? {
+            Some(module) => Ok(module),
+            None => Ok(attempt(None)?.expect("a full scan reaches every routine")),
+        }
+    }
+
+    /// `Ok(None)`: lowering reached a routine outside `scope`.
+    fn lower_scoped(
+        checked: &[Routine],
+        routine: usize,
+        host_ids: &HashMap<usize, HostBindingId>,
+        host_bindings: &mut Vec<ScalarHostBinding>,
+        services: Option<Arc<Metadata>>,
+        extra_roots: &[usize],
+        every_main_variable: bool,
+        scope: Option<&BTreeSet<usize>>,
+    ) -> Result<Option<Self>, LowerError> {
         let _module_lower = stage(Stage::VerifiedModuleLower);
+        let scanned: Vec<&Routine> = match scope {
+            Some(scope) => scope.iter().filter_map(|&id| checked.get(id)).collect(),
+            None => checked.iter().collect(),
+        };
+        let mut escaped = false;
         let entry = FunctionId(0);
         let mut pending_roots = extra_roots.iter().copied();
         let mut ids = HashMap::from([(routine, entry)]);
@@ -229,8 +272,8 @@ impl VerifiedModule {
             }
         };
         let mut shapes = Shapes::new(services.clone());
-        let globals = Globals::collect(checked, &mut shapes, every_main_variable)?;
-        let implementations = Implementations::collect(checked, services.as_deref(), &mut shapes)?;
+        let globals = Globals::collect(checked, &scanned, &mut shapes, every_main_variable)?;
+        let implementations = Implementations::collect(&scanned, services.as_deref(), &mut shapes)?;
         // Every method of an implementation can be called through an object.
         for draft in &implementations.drafts {
             for &method in &draft.routines {
@@ -266,6 +309,7 @@ impl VerifiedModule {
                             return Ok(CallTarget::Direct(candidate));
                         }
                         let next = lower_index(id, routines.len()).map(FunctionId)?;
+                        escaped |= scope.is_some_and(|scope| !scope.contains(&target));
                         routines.push(target);
                         ids.insert(target, next);
                         Ok(CallTarget::Direct(next))
@@ -282,6 +326,9 @@ impl VerifiedModule {
                 routines.push(root);
                 slot.insert(next);
             }
+        }
+        if escaped {
+            return Ok(None);
         }
         let table = implementations
             .drafts
@@ -320,12 +367,51 @@ impl VerifiedModule {
             implementations: table,
             functions: functions.into_boxed_slice(),
         }
-        .verify_with_host_bindings(host_bindings)
+        .verify_with_host_bindings(std::mem::take(host_bindings))
         .map_err(LowerError::Verification)?;
         module.routine_ids = routine_ids;
         module.roots = Arc::from(extra_roots);
-        Ok(module)
+        Ok(Some(module))
     }
+}
+
+/// The routines that can run once the entry does: the entry, the extra roots, and
+/// everything reached through direct calls, function values, allocator callbacks
+/// and the methods of any implementation a reached body boxes. Reading a body
+/// forces its analysis, so this is the set whose analysis lowering needs.
+fn demanded_routines(
+    checked: &[Routine],
+    entry: usize,
+    extra_roots: &[usize],
+    services: Option<&Metadata>,
+) -> BTreeSet<usize> {
+    let mut seen = BTreeSet::new();
+    let mut work: Vec<usize> = std::iter::once(entry)
+        .chain(extra_roots.iter().copied())
+        .collect();
+    while let Some(id) = work.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(Ok(function)) = checked.get(id).map(Routine::checked) else {
+            continue;
+        };
+        for record in &function.code {
+            match &record.op {
+                Op::Call(_, target, _) | Op::FunctionValue(_, target, _) => work.push(*target),
+                Op::Lookup(_, Operation::RcNewIn { deallocate, .. }, _) => work.push(*deallocate),
+                Op::TraitBox(_, _, implementation) => {
+                    if let Some(implementation) =
+                        services.and_then(|services| services.implementations.get(*implementation))
+                    {
+                        work.extend(implementation.methods.iter().copied());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    seen
 }
 
 pub(super) fn storage(routine: usize, detail: impl Into<String>) -> LowerError {
@@ -773,12 +859,12 @@ pub(super) struct Implementations {
 
 impl Implementations {
     fn collect(
-        checked: &[Routine],
+        scope: &[&Routine],
         services: Option<&Metadata>,
         shapes: &mut Shapes,
     ) -> Result<Self, LowerError> {
         let mut used = std::collections::BTreeSet::new();
-        for routine in checked {
+        for routine in scope {
             let Ok(function) = routine.checked() else {
                 continue;
             };
@@ -840,6 +926,7 @@ pub(super) struct Globals {
 impl Globals {
     fn collect(
         checked: &[Routine],
+        scope: &[&Routine],
         shapes: &mut Shapes,
         every_main_variable: bool,
     ) -> Result<Self, LowerError> {
@@ -862,7 +949,7 @@ impl Globals {
                     .map(|(index, _)| index),
             );
         }
-        for routine in checked {
+        for routine in scope {
             let Ok(function) = routine.checked() else {
                 continue;
             };

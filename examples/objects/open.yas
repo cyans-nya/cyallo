@@ -1,0 +1,18 @@
+// cargo run -- run examples/objects/open.yas --gc-stress
+// Expected: Grace:true, ten:true, Grace:11 (one value per line).
+type Named = object { name: string, .. }
+let item = object { name: "Ada", score: 10 }
+let named: Named = item
+named.name = "Grace"
+named.active = true
+std::io::print(item.name, ":", named.active)
+
+let bag = dynamic { score: 10 }
+bag["score"] = "ten"
+let score = bag.score
+let removed = delete bag.score
+std::io::print(score, ":", removed)
+
+item.extra = 10
+item.extra += 1
+std::io::print(item.name, ":", named.extra)

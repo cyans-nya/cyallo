@@ -5,7 +5,7 @@ use cyallo::runtime::{GeneratorError, RuntimeError};
 #[test]
 fn pure_factory_and_owned_delegation_forward_input_and_return() {
     output(
-        include_str!("../examples/concurrency/generators/delegation.ya"),
+        include_str!("../examples/concurrency/generators/delegation.yas"),
         "yielded: 7\ncomplete: 42\n",
     );
 }

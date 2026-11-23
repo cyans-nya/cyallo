@@ -1,0 +1,32 @@
+// cargo run -- run examples/enums/patterns.yas --gc-stress
+// Output: "positive: 7", "changed", "2" (one line each).
+enum Message<T> {
+    Empty,
+    Value: T,
+    Text: record { message: string },
+    Pair: (T, bool),
+}
+use Message::*
+
+fn describe(value: Message<i64>) -> string {
+    return match value {
+        Empty => "empty",
+        Value(n) if n > 0 => "positive",
+        Value(_) => "nonpositive",
+        Text { .. } => "text",
+        Pair((_, true)) | Pair((_, false)) => "pair",
+    }
+}
+let value = Value(7)
+let description = describe(std::mem::clone(&value))
+if let Value(n) = &value {
+    std::io::print(description, ": ", n.*)
+}
+let mut text: Message<i64> = Text { message: "initial" }
+if let Text { message } = &mut text { message.* = "changed" }
+match text { Text { message } => std::io::print(message), _ => {} }
+std::io::print(match (true, false) {
+    (true, true) => 1,
+    (true, false) => 2,
+    (false, _) => 3,
+})

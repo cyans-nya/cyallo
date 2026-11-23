@@ -75,27 +75,43 @@ impl Freeze for Function {
     }
 
     fn thaw(id: &Self::Stored, ast: &IndexedAst) -> Self {
-        with_stack(|| {
-            let node = ast.node(*id);
-            Self {
-                annotations: Freeze::thaw(&node.annotations, ast),
-                body_kind: node.body_kind,
-                constraints: Freeze::thaw(&node.constraints, ast),
-                type_packs: Freeze::thaw(&node.type_packs, ast),
-                generator: node.generator,
-                source_name: Freeze::thaw(&node.source_name, ast),
-                origin: RoutineOrigin::Source,
-                attributes: node.attributes,
-                type_params: Freeze::thaw(&node.type_params, ast),
-                kind: node.kind,
-                name: Freeze::thaw(&node.name, ast),
-                params: Freeze::thaw(&node.params, ast),
-                result: Freeze::thaw(&node.result, ast),
-                body: Freeze::thaw(&node.body, ast),
-                span: node.span,
-            }
-        })
+        thaw_function(*id, ast, true)
     }
+}
+
+impl IndexedAst {
+    /// Materialize only one routine's body, with file-relative spans. Used when a
+    /// routine the indexed pipeline cannot take must be linked as an owned tree.
+    pub fn thaw_body(&self, id: Id<FunctionNode>) -> Vec<Stmt> {
+        with_stack(|| Freeze::thaw(&self.node(id).body, self))
+    }
+}
+
+fn thaw_function(id: Id<FunctionNode>, ast: &IndexedAst, include_body: bool) -> Function {
+    with_stack(|| {
+        let node = ast.node(id);
+        Function {
+            annotations: Freeze::thaw(&node.annotations, ast),
+            body_kind: node.body_kind,
+            constraints: Freeze::thaw(&node.constraints, ast),
+            type_packs: Freeze::thaw(&node.type_packs, ast),
+            generator: node.generator,
+            source_name: Freeze::thaw(&node.source_name, ast),
+            origin: RoutineOrigin::Source,
+            attributes: node.attributes,
+            type_params: Freeze::thaw(&node.type_params, ast),
+            kind: node.kind,
+            name: Freeze::thaw(&node.name, ast),
+            params: Freeze::thaw(&node.params, ast),
+            result: Freeze::thaw(&node.result, ast),
+            body: if include_body {
+                Freeze::thaw(&node.body, ast)
+            } else {
+                Vec::new()
+            },
+            span: node.span,
+        }
+    })
 }
 
 #[derive(Debug)]
@@ -459,31 +475,44 @@ impl Freeze for Ast {
     }
 
     fn thaw(id: &Self::Stored, ast: &IndexedAst) -> Self {
-        with_stack(|| {
-            let node = ast.node(*id);
-            Self {
-                enums: Freeze::thaw(&node.enums, ast),
-                type_aliases: Freeze::thaw(&node.type_aliases, ast),
-                resolved_modules: Vec::new(),
-                native: NativeDeclarations::default(),
-                source_names: Vec::<(Box<str>, Box<str>)>::thaw(&node.source_names, ast)
-                    .into_iter()
-                    .collect(),
-                body: Freeze::thaw(&node.body, ast),
-                functions: Freeze::thaw(&node.functions, ast),
-                records: Freeze::thaw(&node.records, ast),
-                imports: Freeze::thaw(&node.imports, ast),
-                exports: Freeze::thaw(&node.exports, ast),
-                traits: Freeze::thaw(&node.traits, ast),
-                implementations: Freeze::thaw(&node.implementations, ast),
-                properties: Freeze::thaw(&node.properties, ast),
-                modules: Freeze::thaw(&node.modules, ast),
-                inherent_implementations: Freeze::thaw(&node.inherent_implementations, ast),
-                worlds: Freeze::thaw(&node.worlds, ast),
-                interface_implementations: Freeze::thaw(&node.interface_implementations, ast),
-            }
-        })
+        thaw_module(*id, ast, &|_| true)
     }
+}
+
+pub(super) fn thaw_module(
+    id: Id<ModuleNode>,
+    ast: &IndexedAst,
+    include_body: &impl Fn(Span) -> bool,
+) -> Ast {
+    with_stack(|| {
+        let node = ast.node(id);
+        Ast {
+            enums: Freeze::thaw(&node.enums, ast),
+            type_aliases: Freeze::thaw(&node.type_aliases, ast),
+            resolved_modules: Vec::new(),
+            native: NativeDeclarations::default(),
+            source_names: Vec::<(Box<str>, Box<str>)>::thaw(&node.source_names, ast)
+                .into_iter()
+                .collect(),
+            body: Freeze::thaw(&node.body, ast),
+            functions: ast
+                .get_list(node.functions)
+                .expect("root functions belong to the unit")
+                .iter()
+                .map(|&id| thaw_function(id, ast, include_body(ast.node(id).span)))
+                .collect(),
+            records: Freeze::thaw(&node.records, ast),
+            imports: Freeze::thaw(&node.imports, ast),
+            exports: Freeze::thaw(&node.exports, ast),
+            traits: Freeze::thaw(&node.traits, ast),
+            implementations: Freeze::thaw(&node.implementations, ast),
+            properties: Freeze::thaw(&node.properties, ast),
+            modules: Freeze::thaw(&node.modules, ast),
+            inherent_implementations: Freeze::thaw(&node.inherent_implementations, ast),
+            worlds: Freeze::thaw(&node.worlds, ast),
+            interface_implementations: Freeze::thaw(&node.interface_implementations, ast),
+        }
+    })
 }
 
 #[cfg(test)]

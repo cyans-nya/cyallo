@@ -88,7 +88,7 @@ fn sized_cases() -> Vec<Case> {
     for (label, n, sessions) in [("small", 100, 50), ("medium", 1000, 10), ("large", 4000, 3)] {
         cases.push(Case::new(
             format!("quicksort-{label}"),
-            include_str!("../examples/quicksort.ya")
+            include_str!("../examples/quicksort.yas")
                 .replace("let n = 1000", &format!("let n = {n}")),
             7,
             sessions,
@@ -97,7 +97,7 @@ fn sized_cases() -> Vec<Case> {
     for (label, n, sessions) in [("small", 100, 50), ("medium", 800, 10), ("large", 3200, 3)] {
         cases.push(Case::new(
             format!("mergesort-{label}"),
-            include_str!("../examples/mergesort.ya")
+            include_str!("../examples/mergesort.yas")
                 .replace("let n = 800", &format!("let n = {n}")),
             7,
             sessions,
@@ -106,7 +106,7 @@ fn sized_cases() -> Vec<Case> {
     for (label, n, sessions) in [("small", 18, 20), ("medium", 22, 5), ("large", 26, 2)] {
         cases.push(Case::new(
             format!("fib-{label}"),
-            include_str!("../examples/fib.ya").replace(
+            include_str!("../examples/fib.yas").replace(
                 "std::io::print(fib(22))",
                 &format!("std::io::print(fib({n}))"),
             ),
@@ -121,7 +121,7 @@ fn sized_cases() -> Vec<Case> {
     ] {
         cases.push(Case::new(
             format!("knapsack-{label}"),
-            include_str!("../examples/knapsack.ya")
+            include_str!("../examples/knapsack.yas")
                 .replace("let items = 40", &format!("let items = {items}"))
                 .replace("let capacity = 200", &format!("let capacity = {capacity}")),
             7,
@@ -131,7 +131,7 @@ fn sized_cases() -> Vec<Case> {
     for (label, n, sessions) in [("small", 100, 30), ("medium", 300, 5), ("large", 600, 2)] {
         cases.push(Case::new(
             format!("dfs-{label}"),
-            include_str!("../examples/dfs.ya").replace("let n = 300", &format!("let n = {n}")),
+            include_str!("../examples/dfs.yas").replace("let n = 300", &format!("let n = {n}")),
             7,
             sessions,
         ));
@@ -139,7 +139,7 @@ fn sized_cases() -> Vec<Case> {
     for (label, reps, sessions) in [("small", 20, 20), ("medium", 50, 5), ("large", 150, 2)] {
         cases.push(Case::new(
             format!("parser-{label}"),
-            include_str!("../examples/parser.ya")
+            include_str!("../examples/parser.yas")
                 .replace("let reps = 200", &format!("let reps = {reps}")),
             7,
             sessions,
@@ -226,7 +226,7 @@ fn main() {
     .collect();
     cases.push(Case::new(
         "modern",
-        include_str!("../examples/modern.ya"),
+        include_str!("../examples/modern.yas"),
         15,
         5,
     ));

@@ -1,4 +1,4 @@
-pub trait Printable {}
+use std::fmt::Format;
 
-// Each pack element has its own concrete Printable type. No values are erased.
-pub proc print<...T: Printable>(...read values: T);
+// Each pack element has its own concrete Format type. No values are erased.
+pub proc print<...T: Format>(...read values: T);

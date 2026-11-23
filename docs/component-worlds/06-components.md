@@ -26,7 +26,26 @@ component instantiates and calls through a world. A library is a component other
 components import. One component can be both. "Host" is the instantiating role: any
 component that builds an environment for another.
 
-## Recipes
+## Revised first cut (2026-11-23)
+
+The [revision](README.md#revision-2026-11-23) supersedes the recipe, supply and
+catalog sections below for the first cut. A component is loaded with
+`std::module::load(loader.entry(path), bindings)`. A `Loader` (the in-memory `Source`,
+a directory, a pack or a lazy fetch) supplies the files and `Bindings` is
+the only source of names beyond pure std and the component's own files. A
+component import is one more binding, so there is no separate `Supply`. The host
+reads the manifest with `Manifest::parse`, resolves dependencies by its own policy
+and builds the bindings. A catalog is a plain name-to-`Source` map in host code,
+and bundled fallback is dropped. Instances stay generative, and type identity
+follows instances as described below.
+
+The init host for `cyallo run`: a `.ya` entry's `proc main()` is the root's export
+under a default world that grants all of std plus the CLI's grants; a `.yas` script
+runs its top-level statements instead. Both are built natively in Rust. This
+replaces "the root file's top-level code is its entry point" in the root section
+below.
+
+## Recipes (earlier draft)
 
 Everything that loads or instantiates takes a `std::module::Recipe`. How its source
 text was obtained is the host's business: downloaded with the host's own
@@ -172,7 +191,7 @@ types can, so plain data crosses instances as an anonymous record, while a decla
 record stays with its instance and can keep invariants. Binding a name to one
 (`const Event = record { ... }`) does not change that.
 
-## Supplying component imports
+## Supplying component imports (earlier draft)
 
 A recipe's component imports that are not part of its SDK world are not known to
 the instantiator statically, so they are satisfied at load from a **supply**:
@@ -200,7 +219,7 @@ Fresh instances get the consumer's environment limited to their own declared
 imports, plus the same supply for their own component imports. A component can
 never reach more than the consumer that imports it.
 
-## Catalogs
+## Catalogs (earlier draft)
 
 A catalog is an immutable value. Every operation returns a new catalog; nothing
 already instantiated changes.

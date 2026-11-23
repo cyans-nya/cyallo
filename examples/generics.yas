@@ -1,0 +1,36 @@
+// Generic records, higher-order routines, and closures with owned captures.
+// Run: cargo run -- run examples/generics.yas
+record Pair<A, B> {
+    first: A
+    second: B
+}
+
+fn pair_of<A, B>(first: A, second: B) -> Pair<A, B> {
+    return Pair<A, B> { first: first, second: second }
+}
+
+fn transform<A, B>(items: &[]A, convert: fn(A) -> B) -> std::collections::Vec<B> {
+    let mut result = std::collections::Vec<B>[]
+    for i in 0..=std::array::len(items) - 1 {
+        result.push(convert(std::mem::clone(&items[i])))
+    }
+    return result
+}
+
+// Each returned closure owns value and can outlive this call.
+fn keep<T>(value: T) -> fn() -> T {
+    return fn() -> T { return std::mem::clone(&value) }
+}
+
+// A and B are inferred from the borrowed slice and callback.
+let values = [1, 2, 3]
+let labels = transform(&values, fn(n: i64) -> string {
+    return "item-" + std::string::from(n)
+})
+let summary = pair_of<string, i64>("items", std::array::len(labels))
+std::io::print(summary.first, ":", summary.second)
+std::io::print(labels[0], ",", labels[2])
+
+let read_number = keep(42)
+let message = keep("hello")
+std::io::print(read_number(), ":", message())

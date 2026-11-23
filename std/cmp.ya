@@ -1,0 +1,3 @@
+// Comparison capabilities: `==` and `!=` need `Eq`, `<`, `<=`, `>` and `>=` need `Ord`.
+pub trait Eq {}
+pub trait Ord {}

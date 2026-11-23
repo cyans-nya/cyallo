@@ -40,7 +40,7 @@ fn emit_bytecode_shows_verified_routines() {
 
 #[test]
 fn emit_ir_prints_the_typed_ir_of_each_routine() {
-    let result = cli(&["emit", "ir", "examples/fib.ya"]).output().unwrap();
+    let result = cli(&["emit", "ir", "examples/fib.yas"]).output().unwrap();
     assert!(
         result.status.success(),
         "{}",
@@ -100,7 +100,7 @@ fn extensions_select_dialects_and_simplified_is_explicit() {
         strict.stdout,
         "OK: CAIE 9618 compatibility (2027–2029)\n".as_bytes()
     );
-    let modern = cli(&["check", "examples/tour.ya"]).output().unwrap();
+    let modern = cli(&["check", "examples/tour.yas"]).output().unwrap();
     assert!(modern.status.success());
     assert_eq!(modern.stdout, b"OK: modern\n");
     let invalid = cli(&["check", "examples/simplified.psc"]).output().unwrap();
@@ -192,7 +192,7 @@ fn verified_engines_read_standard_input() {
     for (example, input, expected) in [
         ("examples/input.psc", "42\n", "Number?\n42\n"),
         (
-            "examples/secret-number.ya",
+            "examples/secret-number.yas",
             "50\nabc\n10\n42\n",
             "Guess a whole number from 1 to 100.\nTry lower.\nPlease enter a whole number.\nTry higher.\nCorrect!\n",
         ),
@@ -357,18 +357,18 @@ fn diagnostic_color_modes_work_when_redirected() {
 }
 #[test]
 fn modern_syntax_and_bytecode_are_inspectable() {
-    let modern = cli(&["run", "examples/modern.ya"]).output().unwrap();
+    let modern = cli(&["run", "examples/modern.yas"]).output().unwrap();
     assert!(
         modern.status.success(),
         "{}",
         String::from_utf8_lossy(&modern.stderr)
     );
     assert_eq!(modern.stdout, b"ADA\n288212784234102776:10:3\n");
-    let compat = cli(&["check", "examples/modern.ya", "--dialect", "compatibility"])
+    let compat = cli(&["check", "examples/modern.yas", "--dialect", "compatibility"])
         .output()
         .unwrap();
     assert!(!compat.status.success());
-    let bytecode = cli(&["emit", "bytecode", "examples/modern.ya"])
+    let bytecode = cli(&["emit", "bytecode", "examples/modern.yas"])
         .output()
         .unwrap();
     assert!(bytecode.status.success());
@@ -430,7 +430,7 @@ fn reports_show_metrics_without_changing_program_output() {
 fn jit_report_preserves_inlining_and_has_compact_output() {
     let result = cli(&[
         "run",
-        "examples/modern.ya",
+        "examples/modern.yas",
         "--engine",
         "legacy_cranelift_speed",
         "--jit-trace=summary",
@@ -487,21 +487,21 @@ fn concurrency_language_examples_execute_through_the_cli() {
     ] {
         for (path, expected) in [
             (
-                "examples/concurrency/ownership/local-managed.ya",
+                "examples/concurrency/ownership/local-managed.yas",
                 "42\n2\n7\ntrue\n",
             ),
             (
-                "examples/concurrency/channels/buffered.ya",
+                "examples/concurrency/channels/buffered.yas",
                 "true\n42\ntrue\n99\n",
             ),
-            ("examples/concurrency/channels/rendezvous.ya", "42\n7\n"),
-            ("examples/concurrency/channels/mpmc.ya", "21\n"),
+            ("examples/concurrency/channels/rendezvous.yas", "42\n7\n"),
+            ("examples/concurrency/channels/mpmc.yas", "21\n"),
             (
-                "examples/concurrency/scheduling/clock.ya",
+                "examples/concurrency/scheduling/clock.yas",
                 "before\nafter\n",
             ),
             (
-                "examples/concurrency/scheduling/cancellation.ya",
+                "examples/concurrency/scheduling/cancellation.yas",
                 "true\ntrue\n99\n",
             ),
         ] {
@@ -528,10 +528,10 @@ fn runtime_import_examples_execute_and_report_published_functions() {
     ] {
         for (path, expected) in [
             (
-                "examples/modules/dynamic/main.ya",
+                "examples/modules/dynamic/main.yas",
                 "runtime\n42\n42\ntrue\n",
             ),
-            ("examples/concurrency/modules/main.ya", "42\n"),
+            ("examples/concurrency/modules/main.yas", "42\n"),
         ] {
             let result = cli(&[
                 "run",
@@ -583,7 +583,7 @@ fn routine_row(report: &str, name: &str) -> (u64, u64) {
 fn trace_keeps_inlining_and_no_inline_turns_it_off() {
     let traced = cli(&[
         "run",
-        "examples/modern.ya",
+        "examples/modern.yas",
         "--engine",
         "legacy_cranelift_speed",
         "--jit-trace",
@@ -597,7 +597,7 @@ fn trace_keeps_inlining_and_no_inline_turns_it_off() {
 
     let untraced = cli(&[
         "run",
-        "examples/modern.ya",
+        "examples/modern.yas",
         "--engine",
         "legacy_cranelift_speed",
         "--jit-trace",
@@ -679,7 +679,7 @@ fn live_block_is_not_drawn_when_stderr_is_not_a_terminal() {
 fn json_trace_carries_the_timeline_for_the_viewer() {
     let result = cli(&[
         "run",
-        "examples/mergesort.ya",
+        "examples/mergesort.yas",
         "--engine",
         "legacy_jit",
         "--jit-trace",
@@ -709,7 +709,7 @@ fn json_trace_carries_the_timeline_for_the_viewer() {
 
 #[test]
 fn trace_viewer_needs_an_interactive_terminal() {
-    let result = cli(&["trace", "examples/mergesort.ya"]).output().unwrap();
+    let result = cli(&["trace", "examples/mergesort.yas"]).output().unwrap();
     assert!(!result.status.success());
     let text = String::from_utf8_lossy(&result.stderr);
     assert!(text.contains("interactive"), "{text}");
@@ -720,7 +720,7 @@ fn jit_trace_out_writes_the_report_to_a_file_and_keeps_stderr_quiet() {
     let path = std::env::temp_dir().join(format!("cyallo-trace-out-{}.json", std::process::id()));
     let result = cli(&[
         "run",
-        "examples/mergesort.ya",
+        "examples/mergesort.yas",
         "--engine",
         "legacy_jit",
         "--jit-trace",
@@ -741,7 +741,7 @@ fn jit_trace_out_writes_the_report_to_a_file_and_keeps_stderr_quiet() {
     std::fs::remove_file(&path).ok();
     assert!(text.contains("\"trace\":{\"version\":1"), "{text}");
 
-    let rejected = cli(&["run", "examples/mergesort.ya", "--jit-trace-out", "x.json"])
+    let rejected = cli(&["run", "examples/mergesort.yas", "--jit-trace-out", "x.json"])
         .output()
         .unwrap();
     assert!(!rejected.status.success());
@@ -757,10 +757,10 @@ fn enum_examples_execute_through_the_cli() {
         "legacy_cranelift_speed",
     ] {
         for (path, expected) in [
-            ("examples/enums/result.ya", "4\ncannot divide by 0\n"),
-            ("examples/enums/patterns.ya", "positive: 7\nchanged\n2\n"),
-            ("examples/enums/ownership.ya", "first:1:1:true\n"),
-            ("examples/enums/recursive.ya", "5\n"),
+            ("examples/enums/result.yas", "4\ncannot divide by 0\n"),
+            ("examples/enums/patterns.yas", "positive: 7\nchanged\n2\n"),
+            ("examples/enums/ownership.yas", "first:1:1:true\n"),
+            ("examples/enums/recursive.yas", "5\n"),
         ] {
             let result = cli(&["run", path, "--engine", engine, "--gc-stress"])
                 .output()
@@ -780,50 +780,50 @@ fn verified_engines_match_the_interpreter_on_supported_programs() {
     for example in [
         "examples/functions.psc",
         "examples/loops.psc",
-        "examples/fib.ya",
+        "examples/fib.yas",
         "examples/arrays.psc",
         "examples/strings.psc",
-        "examples/composites.ya",
-        "examples/hot-loop.ya",
-        "examples/enums/recursive.ya",
-        "examples/rc-ownership.ya",
-        "examples/enums/ownership.ya",
-        "examples/mergesort.ya",
-        "examples/quicksort.ya",
-        "examples/knapsack.ya",
-        "examples/gc-cycles.ya",
-        "examples/gc-sharing.ya",
-        "examples/modern.ya",
-        "examples/tour.ya",
-        "examples/generics.ya",
-        "examples/parser.ya",
-        "examples/postfix-dereference.ya",
-        "examples/enums/patterns.ya",
-        "examples/enums/result.ya",
-        "examples/gc-rc.ya",
-        "examples/dfs.ya",
-        "examples/traits.ya",
-        "examples/lookups.ya",
-        "examples/locations.ya",
-        "examples/managed.ya",
-        "examples/concurrency/generators/sequence.ya",
-        "examples/concurrency/generators/resume-result.ya",
-        "examples/concurrency/generators/delegation.ya",
-        "examples/concurrency/channels/buffered.ya",
-        "examples/concurrency/channels/rendezvous.ya",
-        "examples/concurrency/channels/mpmc.ya",
-        "examples/concurrency/scheduling/cancellation.ya",
-        "examples/concurrency/scheduling/clock.ya",
-        "examples/concurrency/enums.ya",
-        "examples/concurrency/status-enums.ya",
-        "examples/objects/open.ya",
-        "examples/objects/native-ic.ya",
-        "examples/modules/static/main.ya",
-        "examples/modules/dynamic/main.ya",
-        "examples/services/main.ya",
-        "examples/lookup-services/main.ya",
-        "examples/objects/views.ya",
-        "examples/concurrency/modules/main.ya",
+        "examples/composites.yas",
+        "examples/hot-loop.yas",
+        "examples/enums/recursive.yas",
+        "examples/rc-ownership.yas",
+        "examples/enums/ownership.yas",
+        "examples/mergesort.yas",
+        "examples/quicksort.yas",
+        "examples/knapsack.yas",
+        "examples/gc-cycles.yas",
+        "examples/gc-sharing.yas",
+        "examples/modern.yas",
+        "examples/tour.yas",
+        "examples/generics.yas",
+        "examples/parser.yas",
+        "examples/postfix-dereference.yas",
+        "examples/enums/patterns.yas",
+        "examples/enums/result.yas",
+        "examples/gc-rc.yas",
+        "examples/dfs.yas",
+        "examples/traits.yas",
+        "examples/lookups.yas",
+        "examples/locations.yas",
+        "examples/managed.yas",
+        "examples/concurrency/generators/sequence.yas",
+        "examples/concurrency/generators/resume-result.yas",
+        "examples/concurrency/generators/delegation.yas",
+        "examples/concurrency/channels/buffered.yas",
+        "examples/concurrency/channels/rendezvous.yas",
+        "examples/concurrency/channels/mpmc.yas",
+        "examples/concurrency/scheduling/cancellation.yas",
+        "examples/concurrency/scheduling/clock.yas",
+        "examples/concurrency/enums.yas",
+        "examples/concurrency/status-enums.yas",
+        "examples/objects/open.yas",
+        "examples/objects/native-ic.yas",
+        "examples/modules/static/main.yas",
+        "examples/modules/dynamic/main.yas",
+        "examples/services/main.yas",
+        "examples/lookup-services/main.yas",
+        "examples/objects/views.yas",
+        "examples/concurrency/modules/main.yas",
     ] {
         let run = |engine| cli(&["run", example, "--engine", engine]).output().unwrap();
         let verified = run("ng");
@@ -846,7 +846,7 @@ fn verified_engines_match_the_interpreter_on_supported_programs() {
 /// A program the verified engine cannot lower yet: it keeps a character, which
 /// has no verified representation.
 fn unsupported_program() -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!("cyallo-unsupported-{}.ya", std::process::id()));
+    let path = std::env::temp_dir().join(format!("cyallo-unsupported-{}.yas", std::process::id()));
     std::fs::write(&path, "let c = 'a'\nstd::io::print(c)\n").unwrap();
     path
 }
@@ -866,9 +866,9 @@ fn verified_engine_refuses_unsupported_programs_before_running() {
 fn the_default_engine_is_the_verified_interpreter() {
     // Output and input match the older engines.
     for example in [
-        "examples/fib.ya",
-        "examples/composites.ya",
-        "examples/rc-ownership.ya",
+        "examples/fib.yas",
+        "examples/composites.yas",
+        "examples/rc-ownership.yas",
     ] {
         let default = cli(&["run", example]).output().unwrap();
         let older = cli(&["run", example, "--engine", "legacy_interpreter"])
@@ -877,7 +877,7 @@ fn the_default_engine_is_the_verified_interpreter() {
         assert!(default.status.success(), "{example}");
         assert_eq!(default.stdout, older.stdout, "{example}");
     }
-    let mut child = cli(&["run", "examples/secret-number.ya"])
+    let mut child = cli(&["run", "examples/secret-number.yas"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -891,7 +891,7 @@ fn the_default_engine_is_the_verified_interpreter() {
     let result = child.wait_with_output().unwrap();
     assert!(String::from_utf8_lossy(&result.stdout).ends_with("Correct!\n"));
     // A failure is a diagnostic with a code and the failing source line.
-    let failing = std::env::temp_dir().join(format!("cyallo-default-{}.ya", std::process::id()));
+    let failing = std::env::temp_dir().join(format!("cyallo-default-{}.yas", std::process::id()));
     std::fs::write(&failing, "let zero = 0\nstd::io::print(1 / zero)\n").unwrap();
     let result = cli(&["run", failing.to_str().unwrap()]).output().unwrap();
     let error = String::from_utf8_lossy(&result.stderr);
@@ -926,8 +926,8 @@ fn programs_the_verified_engine_cannot_lower_are_refused_without_fallback() {
 #[test]
 fn ng_jit_runs_a_native_loop_and_an_interpreted_recursive_program() {
     for (example, expected) in [
-        ("examples/hot-loop.ya", "5000050000:1\n"),
-        ("examples/fib.ya", "17711\n"),
+        ("examples/hot-loop.yas", "5000050000:1\n"),
+        ("examples/fib.yas", "17711\n"),
     ] {
         let result = cli(&["run", example, "--engine", "ng_jit"])
             .output()
@@ -999,4 +999,64 @@ fn the_default_repl_runs_on_the_verified_interpreter() {
         &["--max-instructions", "5000"],
     );
     assert_eq!(String::from_utf8_lossy(&result.stdout), "true\n");
+}
+
+#[test]
+fn the_extension_selects_script_or_module_mode_without_fallback() {
+    let directory = std::env::temp_dir().join(format!("cyallo-modes-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let write = |name: &str, source: &str| {
+        let path = directory.join(name);
+        std::fs::write(&path, source).unwrap();
+        path
+    };
+    let run = |path: &std::path::Path| cli(&["run", path.to_str().unwrap()]).output().unwrap();
+    // `.ya` runs its `proc main()`.
+    let module = write("program.ya", "proc main() {\n    std::io::print(1)\n}\n");
+    assert_eq!(run(&module).stdout, b"1\n");
+    // `.ya` never falls back to script mode.
+    let statements = run(&write("statements.ya", "std::io::print(2)\n"));
+    assert!(!statements.status.success());
+    assert!(statements.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&statements.stderr).contains("proc main()"));
+    // A `.ya` entry without `main` is an error.
+    assert!(
+        !run(&write("library.ya", "pub fn one() -> i64 { return 1 }\n"))
+            .status
+            .success()
+    );
+    // `.yas` runs its statements and never searches for or runs `main`.
+    let script = run(&write(
+        "script.yas",
+        "proc main() {\n    std::io::print(3)\n}\nstd::io::print(4)\n",
+    ));
+    assert!(script.status.success());
+    assert_eq!(script.stdout, b"4\n");
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn a_module_entry_runs_a_directory_component_without_mod_lines() {
+    let directory = std::env::temp_dir().join(format!("cyallo-component-{}", std::process::id()));
+    std::fs::create_dir_all(directory.join("net")).unwrap();
+    std::fs::write(
+        directory.join("main.ya"),
+        "use crate::net::client::ping\nproc main() {\n    std::io::print(ping())\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.join("net/client.ya"),
+        "pub fn ping() -> i64 { return 5 }\n",
+    )
+    .unwrap();
+    let result = cli(&["run", directory.join("main.ya").to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(result.stdout, b"5\n");
+    let _ = std::fs::remove_dir_all(&directory);
 }

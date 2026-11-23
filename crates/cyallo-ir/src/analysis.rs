@@ -1,8 +1,10 @@
 mod patterns;
+mod routine_pipeline;
 use crate::intrinsic::{Intrinsic, Lowering};
 use crate::ir::{self, Op, Reg, Slot};
 use cyallo_ast::IdentifierEq as _;
 use cyallo_ast::*;
+pub use routine_pipeline::{IndexedRoutineBody, bodies_emitted_on_this_thread};
 use std::collections::HashMap;
 type Result<T> = std::result::Result<T, Diagnostic>;
 fn key(s: &str) -> String {
@@ -276,6 +278,7 @@ pub fn analyze(
             routines.push(ir::Routine::deferred(
                 DeferredBody {
                     function: f,
+                    indexed: None,
                     context: context.clone(),
                     index: index + 1,
                 },
@@ -361,26 +364,7 @@ fn lower_routine(
     };
     let mut lower = Lower {
         guard_aliases: HashMap::new(),
-        function: ir::Function {
-            generator: f.generator.then(|| crate::generator::factory_type(f)),
-            symbol: f.name.clone(),
-            origin: f.origin,
-            attributes: f.attributes,
-            analysis_error: None,
-            resume: Default::default(),
-            gc: Default::default(),
-            kind: f.kind,
-            span: f.span,
-            pure: options.dialect == Dialect::Modern && f.kind == RoutineKind::Function,
-            effects: Default::default(),
-            name: f.source_name.clone(),
-            locals,
-            local_storage: Default::default(),
-            params: f.params.iter().map(|p| p.by_ref).collect(),
-            result: crate::generator::result(f),
-            registers: vec![],
-            code: vec![],
-        },
+        function: routine_function(f, locals, options.dialect == Dialect::Modern),
         globals,
         signatures,
         types: routine_types,
@@ -408,6 +392,34 @@ fn lower_routine(
     lower.emit(Op::Return(None));
     Ok(lower.function)
 }
+
+fn routine_function(
+    f: &cyallo_ast::Function,
+    locals: Vec<ir::Local>,
+    modern: bool,
+) -> ir::Function {
+    ir::Function {
+        generator: f.generator.then(|| crate::generator::factory_type(f)),
+        symbol: f.name.clone(),
+        origin: f.origin,
+        attributes: f.attributes,
+        analysis_error: None,
+        resume: Default::default(),
+        gc: Default::default(),
+        kind: f.kind,
+        span: f.span,
+        pure: modern && f.kind == RoutineKind::Function,
+        effects: Default::default(),
+        name: f.source_name.clone(),
+        locals,
+        local_storage: Default::default(),
+        params: f.params.iter().map(|p| p.by_ref).collect(),
+        result: crate::generator::result(f),
+        registers: vec![],
+        code: vec![],
+    }
+}
+
 #[derive(Debug)]
 struct DeferredContext {
     source_names: std::collections::BTreeMap<Box<str>, Box<str>>,
@@ -421,6 +433,7 @@ struct DeferredContext {
 #[derive(Debug)]
 pub struct DeferredBody {
     pub function: cyallo_ast::Function,
+    indexed: Option<IndexedRoutineBody>,
     context: std::sync::Arc<DeferredContext>,
     index: usize,
 }
@@ -455,15 +468,28 @@ impl DeferredBody {
             let function = {
                 let _lower =
                     cyallo_startup_profile::stage(cyallo_startup_profile::Stage::BodyLower);
-                lower_routine(
-                    &self.function,
-                    &c.globals,
-                    &c.signatures,
-                    &c.routine_types,
-                    c.options,
-                    &c.services,
-                    &c.source_names,
-                )?
+                let migrated = match &self.indexed {
+                    Some(body) => body.emit_with(
+                        &self.function,
+                        &c.source_names,
+                        &c.signatures,
+                        &c.routine_types,
+                        &c.services,
+                    )?,
+                    None => None,
+                };
+                match migrated {
+                    Some(function) => function,
+                    None => lower_routine(
+                        &self.function,
+                        &c.globals,
+                        &c.signatures,
+                        &c.routine_types,
+                        c.options,
+                        &c.services,
+                        &c.source_names,
+                    )?,
+                }
             };
             cyallo_startup_profile::count(
                 cyallo_startup_profile::Counter::CheckedInstructions,

@@ -19,7 +19,7 @@ The viewer reads a file that the run wrote. It does not run the program.
 
 ```bash
 cargo build --release
-./target/release/cyallo run examples/mergesort.ya --jit-trace --jit-trace-format=json --jit-trace-out trace.json
+./target/release/cyallo run examples/mergesort.yas --jit-trace --jit-trace-format=json --jit-trace-out trace.json
 ```
 
 `--jit-trace-out PATH` writes the report to `PATH`. Program output still goes to
@@ -58,7 +58,7 @@ Requirements:
 
 ## 3. Read the screen
 
-Here is a real screen for `examples/mergesort.ya`, at the start of the run:
+Here is a real screen for `examples/mergesort.yas`, at the start of the run:
 
 ```text
  cyallo trace · guide-trace.json · jit Finished · wall 183.918 ms · view 0.000–183.918 ms · cursor 0.000 ms · events: al

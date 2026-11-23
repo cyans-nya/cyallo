@@ -34,7 +34,7 @@ promote a local owner. Whole-graph uniqueness, shared tracing/RC, and guarded
 shared mutation remain pending. Local does not imply unique. See the
 [concurrency tracker](concurrency-language-progress.md).
 
-The [local managed example](../examples/concurrency/ownership/local-managed.ya)
+The [local managed example](../examples/concurrency/ownership/local-managed.yas)
 exercises both explicit and default locality. Local managed values cannot be
 captured by a new task or sent through a channel, including via aggregates.
 
@@ -59,7 +59,7 @@ Borrowing remains prefix: `&value.*` borrows the dereferenced place, while
 `(&value).*` dereferences the borrow. Existing read-only and Cell restrictions
 still apply. The former prefix `*value` syntax is rejected with E180.
 
-Run the [postfix dereference example](../examples/postfix-dereference.ya) to
+Run the [postfix dereference example](../examples/postfix-dereference.yas) to
 exercise mutable references, GC cells, tuple projections, and borrowed RC owners.
 
 An RC assignment moves ownership. `std::rc::clone(&owner)` explicitly creates a
@@ -100,7 +100,7 @@ their own type. Direct recursive value layouts, including recursion through an
 owned Cell or fixed array alone, are rejected because they require infinite
 storage. Resolution retains nominal type identities at recursive edges.
 
-[gc-cycles.ya](../examples/gc-cycles.ya) connects two nodes using strong GC
+[gc-cycles.ya](../examples/gc-cycles.yas) connects two nodes using strong GC
 references in both directions. Traversal prints `10 -> 20 -> 10`. Once the
 procedure returns, neither node is reachable from a root, and the collector
 reclaims the cycle. No weak edge is needed. RC ownership still needs weak
@@ -156,7 +156,7 @@ VM snapshots with new owners. REPL edits relink deallocation method identities.
 
 Pure functions may use effectless references to RC values, but cannot own,
 construct, clone, observe counts, or destroy effectful lifecycle values, including
-through aggregates or captures. Start with [gc-sharing.ya](../examples/gc-sharing.ya)
-and [rc-ownership.ya](../examples/rc-ownership.ya) for the individual ownership models,
-then [gc-rc.ya](../examples/gc-rc.ya) for aliased local GC state inside RC allocations.
-[managed.ya](../examples/managed.ya) demonstrates a custom allocator.
+through aggregates or captures. Start with [gc-sharing.ya](../examples/gc-sharing.yas)
+and [rc-ownership.ya](../examples/rc-ownership.yas) for the individual ownership models,
+then [gc-rc.ya](../examples/gc-rc.yas) for aliased local GC state inside RC allocations.
+[managed.ya](../examples/managed.yas) demonstrates a custom allocator.

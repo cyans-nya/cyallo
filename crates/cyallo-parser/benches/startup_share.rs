@@ -35,7 +35,7 @@ fn main() {
         sources.push(std::fs::read_to_string(p).unwrap());
     }
     let bytes: usize = sources.iter().map(String::len).sum();
-    let fib = std::fs::read_to_string(root.join("examples/fib.ya")).unwrap();
+    let fib = std::fs::read_to_string(root.join("examples/fib.yas")).unwrap();
     println!("std sources: {} files, {} bytes", sources.len(), bytes);
     let lex = median_us(
         || {

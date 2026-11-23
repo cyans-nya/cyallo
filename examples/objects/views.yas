@@ -1,0 +1,13 @@
+// cargo run -- run examples/objects/views.yas --gc-stress
+// Expected: true, Grace:7, 42 (one value per line).
+type Named = object { name: string, .. }
+let bag = dynamic { name: "Ada", extra: 7 }
+let alias = std::mem::clone(&bag)
+let named = std::object::view<Named>(bag).unwrap()
+named.name = "Grace"
+std::io::print(bag == alias)
+std::io::print(alias.name, ":", named.extra)
+
+let callback: dynamic = std::num::abs
+std::io::print(callback(-42))
+std::object::freeze(named)

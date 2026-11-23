@@ -1,0 +1,10 @@
+// cargo run -- run examples/modules/static/main.yas --gc-stress
+// Expected: 42:retained
+mod model;
+mod math;
+use crate::math::{reading as make_reading, keep}
+use crate::model::Readable
+
+let value = make_reading() as dyn Readable
+let label = keep("retained")
+std::io::print(value.value(), ":", label())

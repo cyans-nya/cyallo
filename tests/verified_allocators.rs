@@ -106,7 +106,7 @@ std::io::print("after ", releases.*.*)
 #[test]
 fn the_managed_example_runs_under_gc_stress() {
     assert_eq!(
-        run(include_str!("../examples/managed.ya"), true),
+        run(include_str!("../examples/managed.yas"), true),
         ["owned:1", "1:false"]
     );
 }

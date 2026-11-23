@@ -239,12 +239,12 @@ fn the_generator_examples_run_under_gc_stress_and_in_tiny_slices() {
     for (path, source, expected) in [
         (
             "sequence",
-            include_str!("../examples/concurrency/generators/sequence.ya"),
+            include_str!("../examples/concurrency/generators/sequence.yas"),
             vec!["10", "11", "12", "complete: 3"],
         ),
         (
             "delegation",
-            include_str!("../examples/concurrency/generators/delegation.ya"),
+            include_str!("../examples/concurrency/generators/delegation.yas"),
             vec!["yielded: 7", "complete: 42"],
         ),
     ] {

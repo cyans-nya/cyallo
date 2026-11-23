@@ -1,0 +1,29 @@
+// Built-in string and numeric helpers called from routines.
+// Run: cargo run -- run examples/builtins/basic.yas
+fn shout(s: string) -> string {
+    return std::string::upper(std::string::trim(s))
+}
+
+fn width(s: string) -> i64 {
+    return std::string::len(s) * 2
+}
+
+fn has(s: string, part: string) -> bool {
+    return std::string::contains(s, part) && std::string::starts_with(s, part)
+}
+
+fn limit(n: i64) -> i64 {
+    return std::num::max(0, std::num::min(n, 10))
+}
+
+fn smallest(a: i64, b: i64) -> i64 {
+    return std::num::min(a, b) + std::num::abs(0 - 3)
+}
+
+std::io::print(shout("  hello "))
+std::io::print(width("abc"))
+std::io::print(has("hello", "he"))
+std::io::print(has("hello", "lo"))
+std::io::print(limit(25))
+std::io::print(limit(0 - 4))
+std::io::print(smallest(7, 2))

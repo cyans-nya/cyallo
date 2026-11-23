@@ -1,0 +1,21 @@
+// cargo run -- run examples/concurrency/ownership/local-managed.yas --gc-stress
+// Expected: 42, 2, 7, true (one value per line).
+use std::io::print
+
+// Storage and locality are independent. Local is the default.
+let state: gc Cell<i64> = @local gc Cell::new(40)
+let alias: @local gc Cell<i64> = state
+alias.*.* = state.*.* + 2
+print(state.*.*)
+
+let owner: @local rc i64 = rc 7
+let other: rc i64 = owner.clone()
+let weak = owner.downgrade()
+print(owner.strong_count())
+std::mem::drop(owner)
+print(other.*)
+std::mem::drop(other)
+print(weak.upgrade().is_none())
+
+// These managed owners stay inside this coroutine, including across calls.
+// A new task or channel cannot receive a local managed object.

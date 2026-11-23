@@ -1,0 +1,26 @@
+// `print` inside routines: numbers, strings, booleans, several arguments.
+// Run: cargo run -- run examples/print/basic.yas
+proc show(n: i64) {
+    std::io::print("n = ", n)
+}
+
+proc report(flag: bool, label: string) {
+    if flag {
+        std::io::print(label, ": yes")
+    } else {
+        std::io::print(label, ": no")
+    }
+}
+
+proc countdown(from: i64) {
+    let mut i = from
+    while i > 0 {
+        show(i)
+        i -= 1
+    }
+}
+
+show(7)
+report(true, "ready")
+report(false, "done")
+countdown(3)

@@ -1,0 +1,25 @@
+// A larger arithmetic workload for observing calls and tiering. Start with tour.ya for a short introduction.
+// Run: cargo run -- run examples/modern.yas --jit-trace=summary
+const limit = 163840
+let mut total = 0
+let names = ["  Ada  ", "Grace", "Linus"]
+
+fn square(n: i64) -> i64 {
+    return n * n
+}
+
+fn cube(n: i64) -> i64 {
+    return square(n) * n
+}
+
+proc announce(message: &string) {
+    std::io::print(std::string::upper(std::string::trim(message.*)))
+}
+
+for i in 0..=limit {
+    if i == 2 { continue }
+    if i == 32768 { break }
+    total += cube(i)
+}
+announce(&names[0])
+std::io::print(total, ":", std::array::sum(std::collections::Vec::from(1..5)), ":", std::array::len(names))
