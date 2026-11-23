@@ -1,4 +1,4 @@
-use super::{ReferenceSite, SiteId, Variable};
+use super::{LocalName, ReferenceSite, SiteId, Variable};
 use cyallo_ast::indexed::{
     ExprNode, ExprSyntax, FunctionNode, Id, IndexedAst, List, LiteralNode, NameId, StmtNode,
     StmtSyntax, TypeNode,
@@ -43,13 +43,15 @@ pub(super) enum ExpressionKind {
     /// record's path, which the module graph binds to its declaration.
     Record {
         site: SiteId,
-        fields: Vec<(Box<str>, Expression)>,
+        fields: Vec<(NameId, Expression)>,
     },
     /// `p.a.b`: a field of a local or of a reference parameter, found by name.
     Project {
         root: Variable,
-        path: Vec<Box<str>>,
+        path: Vec<NameId>,
     },
+    /// A string literal: its text is interned in the body's unit.
+    Text(NameId),
     /// `p.*`: the value a reference parameter refers to.
     Deref(Variable),
     /// `&x` or `&mut x`, as a call argument: a reference to a local or a by-value parameter.
@@ -83,6 +85,7 @@ impl Expression {
                 fields.iter().map(|(_, value)| value.size()).sum()
             }
             ExpressionKind::Project { path, .. } => path.len(),
+            ExpressionKind::Text(_) => 0,
             ExpressionKind::Binary(_, left, right)
             | ExpressionKind::ShortCircuit { left, right, .. } => left.size() + right.size(),
             ExpressionKind::Call(_, arguments) => arguments.iter().map(Expression::size).sum(),
@@ -121,13 +124,13 @@ pub(super) enum StatementKind {
     /// `p.a.b = value`.
     AssignProject {
         root: Variable,
-        path: Vec<Box<str>>,
+        path: Vec<NameId>,
         value: Expression,
     },
     /// `p.a.b op= value`.
     CompoundProject {
         root: Variable,
-        path: Vec<Box<str>>,
+        path: Vec<NameId>,
         operator: Operator,
         value: Expression,
     },
@@ -162,7 +165,7 @@ pub(super) struct ForRange {
 }
 
 pub(super) struct Local {
-    pub(super) name: Box<str>,
+    pub(super) name: LocalName,
     pub(super) span: Span,
     pub(super) constant: bool,
 }
@@ -382,7 +385,7 @@ impl Context<'_> {
             .copied()
     }
 
-    fn declare(&mut self, name: Box<str>, span: Span, constant: bool) -> Variable {
+    fn declare(&mut self, name: LocalName, span: Span, constant: bool) -> Variable {
         let slot = Variable(self.parameters + self.locals.len());
         self.locals.push(Local {
             name,
@@ -422,24 +425,20 @@ impl Context<'_> {
 
     fn site(
         &mut self,
-        path: &str,
+        path: NameId,
         span: Span,
         arguments: usize,
         discard: bool,
         record: bool,
     ) -> SiteId {
         self.sites.push(ReferenceSite {
-            path: path.into(),
+            path,
             span,
             arguments,
             discard,
             record,
         });
         SiteId(self.sites.len() - 1)
-    }
-
-    fn name(&self, name: NameId) -> Option<Box<str>> {
-        self.ast.name(name).map(Box::from)
     }
 
     fn block(&mut self, list: List<Id<StmtNode>>) -> Option<Vec<Statement>> {
@@ -492,7 +491,8 @@ impl Context<'_> {
                             };
                             // The initializer cannot see the name it declares.
                             let value = self.expression(value)?;
-                            let slot = self.declare(self.name(name)?, statement.span, !mutable);
+                            let slot =
+                                self.declare(LocalName::Source(name), statement.span, !mutable);
                             self.scopes.last_mut()?.push(Visible {
                                 name,
                                 slot,
@@ -576,16 +576,16 @@ impl Context<'_> {
     /// loop counters and anything else stay with the existing route, which owns
     /// those diagnostics.
     /// The root variable and field names of a place such as `p.a.b`.
-    fn projected(&self, target: Id<ExprNode>) -> Option<(Variable, Vec<Box<str>>)> {
+    fn projected(&self, target: Id<ExprNode>) -> Option<(Variable, Vec<NameId>)> {
         let ExprSyntax::Field(base, name) = self.ast.get(target)?.kind else {
             return None;
         };
-        let mut path = vec![self.name(name)?];
+        let mut path = vec![name];
         let mut current = base;
         loop {
             match self.ast.get(current)?.kind {
                 ExprSyntax::Field(inner, name) => {
-                    path.push(self.name(name)?);
+                    path.push(name);
                     current = inner;
                 }
                 ExprSyntax::Name(root) => {
@@ -635,9 +635,9 @@ impl Context<'_> {
             return None;
         }
         let (start, finish, inclusive, iterable_span) = self.bounds(iterable)?;
-        let variable = self.declare(self.name(name)?, span, false);
-        let end = self.declare("$for_end".into(), span, false);
-        let bound = self.declare("$for_bound".into(), span, false);
+        let variable = self.declare(LocalName::Source(name), span, false);
+        let end = self.declare(LocalName::Hidden("$for_end"), span, false);
+        let bound = self.declare(LocalName::Hidden("$for_bound"), span, false);
         // The counter is visible in the body only, not in the bounds.
         self.scopes.push(vec![Visible {
             name,
@@ -688,12 +688,20 @@ impl Context<'_> {
             let ast = self.ast;
             let expression = ast.get(id)?;
             let kind = match expression.kind {
+                // The text of a string literal is already interned: reference it.
+                ExprSyntax::Literal(value)
+                    if matches!(ast.get(value), Some(LiteralNode::String(_))) =>
+                {
+                    let Some(LiteralNode::String(text)) = ast.get(value) else {
+                        return None;
+                    };
+                    ExpressionKind::Text(*text)
+                }
                 ExprSyntax::Literal(value) => ExpressionKind::Literal(match ast.get(value)? {
                     LiteralNode::Number(number) => Literal::Number(*number),
                     LiteralNode::Integer(value) => Literal::Integer(*value),
                     LiteralNode::Real(value) => Literal::Real(*value),
                     LiteralNode::Boolean(value) => Literal::Boolean(*value),
-                    LiteralNode::String(text) => Literal::String(ast.name(*text)?.into()),
                     other => return decline(|| format!("literal {}", variant(other))),
                 }),
                 ExprSyntax::Name(name) => match self.lookup(name) {
@@ -712,7 +720,8 @@ impl Context<'_> {
                 {
                     let left = Box::new(self.value(left, true)?);
                     let right = Box::new(self.value(right, true)?);
-                    let slot = self.declare("$short_circuit".into(), expression.span, false);
+                    let slot =
+                        self.declare(LocalName::Hidden("$short_circuit"), expression.span, false);
                     ExpressionKind::ShortCircuit {
                         and: operator == Operator::And,
                         left,
@@ -739,10 +748,9 @@ impl Context<'_> {
                 ExprSyntax::Record(name, fields) => {
                     let mut written = Vec::new();
                     for &(field, value) in ast.get_list(fields)? {
-                        written.push((self.name(field)?, self.value(value, false)?));
+                        written.push((field, self.value(value, false)?));
                     }
-                    let site =
-                        self.site(ast.name(name)?, expression.span, written.len(), false, true);
+                    let site = self.site(name, expression.span, written.len(), false, true);
                     ExpressionKind::Record {
                         site,
                         fields: written,
@@ -775,13 +783,7 @@ impl Context<'_> {
                         .iter()
                         .map(|&argument| self.argument(argument))
                         .collect::<Option<_>>()?;
-                    let site = self.site(
-                        ast.name(name)?,
-                        expression.span,
-                        arguments.len(),
-                        false,
-                        false,
-                    );
+                    let site = self.site(name, expression.span, arguments.len(), false, false);
                     ExpressionKind::Call(site, arguments)
                 }
                 ref other => return decline(|| format!("expression {}", variant(other))),

@@ -1,7 +1,7 @@
 //! File-local control flow: blocks of statements joined by explicit exits. Expressions
 //! stay trees, so typed analysis can infer upward and push expected types downward
 //! exactly as the existing route does. Nothing here depends on an imported declaration.
-use super::{Variable, hir};
+use super::{LocalName, Variable, hir};
 use cyallo_ast::Span;
 use hir::Expression;
 
@@ -16,7 +16,7 @@ pub(super) struct Located<T> {
 
 #[derive(Clone, Debug)]
 pub(super) struct LocalInfo {
-    pub(super) name: Box<str>,
+    pub(super) name: LocalName,
     pub(super) span: Span,
     pub(super) constant: bool,
 }
@@ -57,13 +57,13 @@ pub(super) enum Statement {
     /// `p.a.b = value`.
     AssignProject {
         root: Variable,
-        path: Vec<Box<str>>,
+        path: Vec<cyallo_ast::indexed::NameId>,
         value: Expression,
     },
     /// `p.a.b op= value`.
     CompoundProject {
         root: Variable,
-        path: Vec<Box<str>>,
+        path: Vec<cyallo_ast::indexed::NameId>,
         operator: cyallo_ast::Operator,
         value: Expression,
     },

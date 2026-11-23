@@ -4,7 +4,8 @@ mod hir;
 mod mir;
 
 use super::{Result, Signature, collect, ir, key, routine_function};
-use cyallo_ast::{Expr, ExprKind, Function, Literal, Span, Stmt, StmtKind, Type};
+use cyallo_ast::indexed::{IndexedAst, NameId};
+use cyallo_ast::{Expr, ExprKind, Function, Span, Stmt, StmtKind, Type};
 use cyallo_parser::BodyHandle;
 use ir::{Op, Reg, Slot};
 use std::{
@@ -27,6 +28,14 @@ pub fn bodies_emitted_on_this_thread() -> usize {
     EMITTED.with(std::cell::Cell::get)
 }
 
+/// A local's name: written in the source, so interned in the body's unit, or made up by
+/// the lowering (a loop's hidden counter and the like).
+#[derive(Clone, Copy, Debug)]
+pub(super) enum LocalName {
+    Source(cyallo_ast::indexed::NameId),
+    Hidden(&'static str),
+}
+
 /// What the module graph needs to bind one reference site.
 pub(crate) struct SiteFacts<'a> {
     pub(crate) path: &'a str,
@@ -38,9 +47,10 @@ pub(crate) struct SiteFacts<'a> {
 }
 
 /// A use of a name whose meaning depends on declarations outside this body.
-#[derive(Clone, Debug, Hash)]
+#[derive(Clone, Debug)]
 struct ReferenceSite {
-    path: Box<str>,
+    /// The path as written, interned in the body's unit; resolved when a site is bound.
+    path: NameId,
     span: Span,
     /// Number of ordered arguments written at the site.
     arguments: usize,
@@ -147,7 +157,12 @@ impl IndexedRoutineBody {
     /// Reference sites in source order as `(path, argument count, is a statement, archived span)`.
     pub(crate) fn reference_sites(&self) -> impl Iterator<Item = SiteFacts<'_>> {
         self.sites.iter().map(|site| SiteFacts {
-            path: &site.path,
+            path: self
+                .handle
+                .unit()
+                .syntax()
+                .name(site.path)
+                .unwrap_or_default(),
             arguments: site.arguments,
             discard: site.discard,
             record: site.record,
@@ -221,6 +236,7 @@ impl IndexedRoutineBody {
             source_names,
             &callees,
             definitions,
+            self.handle.unit().syntax(),
         )
     }
 
@@ -318,6 +334,7 @@ fn lower_mir(
     source_names: &BTreeMap<Box<str>, Box<str>>,
     callees: &[air::Site],
     definitions: &HashMap<String, Type>,
+    syntax: &IndexedAst,
 ) -> Result<Option<ir::Function>> {
     let mut locals = collect(&[], &function.params)?;
     for local in &mut locals {
@@ -331,6 +348,7 @@ fn lower_mir(
         &function.result,
         callees,
         definitions,
+        syntax,
         file_span,
     ) {
         Ok(body) => body,
@@ -340,9 +358,14 @@ fn lower_mir(
         }
     };
     for (info, ty) in mir.locals.iter().zip(&air.locals) {
+        // The one place a local's name becomes owned text: the IR keeps it.
+        let name: Box<str> = match info.name {
+            LocalName::Source(id) => syntax.name(id).unwrap_or_default().into(),
+            LocalName::Hidden(text) => text.into(),
+        };
         locals.push(ir::Local {
-            display_name: Some(info.name.clone()),
-            name: info.name.clone(),
+            display_name: Some(name.clone()),
+            name,
             ty: ty.clone(),
             constant: info.constant,
             span: shift(info.span, offset)?,
@@ -435,10 +458,13 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                 air::Operation::Constant(value, literal) => {
                     let dst = register(&mut function, &checked.types[value.0]);
                     registers[value.0] = dst;
-                    match literal {
-                        Literal::String(text) => Op::LiteralString(dst, Arc::from(&*text)),
-                        literal => Op::Literal(dst, literal),
-                    }
+                    Op::Literal(dst, literal)
+                }
+                air::Operation::Text(value, text) => {
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    // The interned text is shared, not copied.
+                    Op::LiteralString(dst, text)
                 }
                 air::Operation::TakeVariable(value, variable) => {
                     // Moving a value out empties the local it came from.
@@ -637,6 +663,7 @@ mod tests {
             &function.result,
             &[],
             &HashMap::new(),
+            prepared.handle.unit().syntax(),
             function.span,
         )
         .unwrap();
@@ -707,7 +734,12 @@ mod tests {
         let (functions, body) = prepare_nth(source, 1);
         // Two sites in source order; MIR holds no resolved target.
         assert_eq!(body.sites.len(), 2);
-        assert!(body.sites.iter().all(|site| &*site.path == "bump"));
+        let syntax = body.handle.unit().syntax();
+        assert!(
+            body.sites
+                .iter()
+                .all(|site| syntax.name(site.path) == Some("bump"))
+        );
         let signatures = HashMap::from([("bump".to_owned(), signature(&functions[0], 7))]);
         let emitted = body
             .emit(

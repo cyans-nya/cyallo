@@ -5,11 +5,12 @@
 //! diagnostic a mixed-type expression gets, so it is kept. While walking, AIR flattens
 //! each statement to typed operations and builds the blocks, because `&&` and `||`
 //! end a block in the middle of an expression.
-use super::{SiteId, Variable, hir, mir};
+use super::{LocalName, SiteId, Variable, hir, mir};
+use cyallo_ast::indexed::{IndexedAst, NameId};
 use cyallo_ast::{Diagnostic, Literal, Number, NumberKind, Operator, Param, Span, Type};
 use hir::{Expression, ExpressionKind};
 use mir::{Located, Statement};
-use std::{borrow::Cow, collections::HashMap, fmt};
+use std::{borrow::Cow, collections::HashMap, fmt, sync::Arc};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Value(pub(super) usize);
@@ -60,6 +61,8 @@ pub(super) struct Block {
 pub(super) enum Operation {
     Statement,
     Constant(Value, Literal),
+    /// A string literal, sharing the text interned in the body's unit.
+    Text(Value, Arc<str>),
     ReadVariable(Value, Variable),
     /// Store into a declared local (its first store is its definition).
     Store(Variable, Value),
@@ -353,6 +356,7 @@ pub(super) fn analyze(
     result: &Type,
     callees: &[Site],
     definitions: &HashMap<String, Type>,
+    syntax: &IndexedAst,
     routine_span: Span,
 ) -> Result<Body, Diagnostic> {
     // A short-circuit operator ends a block in the middle of an expression, so a
@@ -370,6 +374,7 @@ pub(super) fn analyze(
         result,
         callees,
         definitions,
+        syntax,
         start,
         types: Vec::new(),
         operands: Vec::new(),
@@ -492,6 +497,7 @@ fn short_circuits(block: &mir::Block) -> usize {
     fn count(expression: &Expression) -> usize {
         match &expression.kind {
             ExpressionKind::Literal(_)
+            | ExpressionKind::Text(_)
             | ExpressionKind::Read(_)
             | ExpressionKind::Deref(_)
             | ExpressionKind::Borrow { .. }
@@ -537,6 +543,8 @@ struct Analysis<'a> {
     callees: &'a [Site],
     /// Record definitions, to look a field up by name.
     definitions: &'a HashMap<String, Type>,
+    /// The body's unit, which holds the text of every name the body mentions.
+    syntax: &'a IndexedAst,
     /// The first block built for each MIR block.
     start: Vec<usize>,
     types: Vec<Type>,
@@ -564,6 +572,16 @@ impl Analysis<'_> {
             exit: Located { kind: exit, span },
         });
         self.blocks.len() - 1
+    }
+
+    /// The interned text of a name, shared rather than copied.
+    fn name(&self, name: NameId, span: Span) -> Result<Arc<str>, Diagnostic> {
+        self.syntax.get(name).cloned().ok_or_else(|| invalid(span))
+    }
+
+    /// The text of a name, for comparing and for messages.
+    fn text(&self, name: NameId) -> &str {
+        self.syntax.name(name).unwrap_or_default()
     }
 
     /// A type with a record's name replaced by its definition, so fields can be looked up.
@@ -607,7 +625,7 @@ impl Analysis<'_> {
     fn place(
         &self,
         root: Variable,
-        path: &[Box<str>],
+        path: &[NameId],
         write: bool,
         span: Span,
     ) -> Result<Place, Diagnostic> {
@@ -634,6 +652,7 @@ impl Analysis<'_> {
         };
         let mut steps = Vec::with_capacity(path.len());
         for name in path {
+            let name = self.text(*name);
             let Type::Record(_, fields) = &current else {
                 return Err(Diagnostic::new(
                     "E116",
@@ -644,7 +663,7 @@ impl Analysis<'_> {
             let Some((index, (_, field))) = fields
                 .iter()
                 .enumerate()
-                .find(|(_, (field, _))| field == name)
+                .find(|(_, (field, _))| &**field == name)
             else {
                 return Err(Diagnostic::new(
                     "E116",
@@ -668,13 +687,14 @@ impl Analysis<'_> {
     fn record(
         &mut self,
         site: SiteId,
-        fields: &[(Box<str>, Expression)],
+        fields: &[(NameId, Expression)],
         span: Span,
     ) -> Result<(Value, Type), Diagnostic> {
         let (ty, declared) = self.record_type(site, span)?;
         let mut gathered: Vec<Option<Value>> = vec![None; declared.len()];
         for (name, value) in fields {
-            let Some(index) = declared.iter().position(|(field, _)| field == name) else {
+            let name = self.text(*name);
+            let Some(index) = declared.iter().position(|(field, _)| &**field == name) else {
                 return Err(Diagnostic::new(
                     "E116",
                     format!("unknown field `{}`", cyallo_ast::source_name(name)),
@@ -772,6 +792,7 @@ impl Analysis<'_> {
     fn infer_uncached(&self, expression: &Expression) -> Result<Type, Diagnostic> {
         cyallo_ast::with_stack(|| match &expression.kind {
             ExpressionKind::Literal(literal) => Ok(super::super::literal_type(literal)),
+            ExpressionKind::Text(_) => Ok(Type::String),
             ExpressionKind::Read(variable) => self
                 .variable_type(*variable)
                 .ok_or_else(|| Diagnostic::new("E114", "type is not known yet", expression.span)),
@@ -879,6 +900,12 @@ impl Analysis<'_> {
                     let value = self.value(ty.clone());
                     self.emit(Operation::Constant(value, literal.clone()), span);
                     Ok((value, ty))
+                }
+                ExpressionKind::Text(text) => {
+                    let text = self.name(*text, span)?;
+                    let value = self.value(Type::String);
+                    self.emit(Operation::Text(value, text), span);
+                    Ok((value, Type::String))
                 }
                 ExpressionKind::Read(variable) => {
                     let ty = self.typed(*variable, span)?;
@@ -1192,7 +1219,10 @@ impl Analysis<'_> {
                 .0
                 .checked_sub(self.parameters.len())
                 .and_then(|local| body.locals.get(local))
-                .map_or("", |local| &local.name);
+                .map_or("", |local| match local.name {
+                    LocalName::Source(id) => self.text(id),
+                    LocalName::Hidden(text) => text,
+                });
             return Err(Diagnostic::new(
                 "E114",
                 format!(
@@ -1485,7 +1515,7 @@ impl Analysis<'_> {
 /// Whether `expression` reads any of `variables`.
 fn mentions(expression: &Expression, variables: &[Variable]) -> bool {
     match &expression.kind {
-        ExpressionKind::Literal(_) => false,
+        ExpressionKind::Literal(_) | ExpressionKind::Text(_) => false,
         ExpressionKind::Read(variable)
         | ExpressionKind::Deref(variable)
         | ExpressionKind::Reborrow(variable)
