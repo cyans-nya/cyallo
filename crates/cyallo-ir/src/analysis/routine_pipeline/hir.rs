@@ -78,6 +78,8 @@ pub(super) struct Match {
 #[derive(Clone, Debug)]
 pub(super) struct Arm {
     pub(super) pattern: Pattern,
+    /// `if condition`: evaluated with the arm's bindings in scope.
+    pub(super) guard: Option<Expression>,
     pub(super) body: Expression,
     pub(super) span: Span,
 }
@@ -128,7 +130,9 @@ impl Expression {
                     + matched
                         .arms
                         .iter()
-                        .map(|arm| 1 + arm.body.size())
+                        .map(|arm| {
+                            1 + arm.body.size() + arm.guard.as_ref().map_or(0, Expression::size)
+                        })
                         .sum::<usize>()
             }
             ExpressionKind::Binary(_, left, right)
@@ -880,19 +884,25 @@ impl Context<'_> {
                     let result = self.declare(LocalName::Hidden("$match"), expression.span, false);
                     let mut lowered = Vec::new();
                     for arm in ast.get_list(arms)? {
-                        if arm.guard.is_some() {
-                            return decline(|| "match guard".into());
-                        }
                         let MatchBodyNode::Expression(body) = arm.body else {
                             return decline(|| "match arm with a block".into());
                         };
                         // The arm's bindings are visible in its body only.
                         self.scopes.push(Vec::new());
                         let pattern = self.pattern(arm.pattern);
+                        let guard = match (pattern.as_ref(), arm.guard) {
+                            (Some(_), Some(guard)) => Some(self.value(guard, true)),
+                            _ => None,
+                        };
                         let body = pattern.as_ref().and_then(|_| self.value(body, true));
                         self.scopes.pop();
+                        let guard = match guard {
+                            Some(guard) => Some(guard?),
+                            None => None,
+                        };
                         lowered.push(Arm {
                             pattern: pattern?,
+                            guard,
                             body: body?,
                             span: arm.span,
                         });

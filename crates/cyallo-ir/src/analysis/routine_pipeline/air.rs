@@ -415,6 +415,7 @@ pub(super) fn analyze(
         local_types: vec![None; body.locals.len()],
         blocks: Vec::with_capacity(total),
         operations: Vec::new(),
+        guard_aliases: Vec::new(),
     };
     // The existing route fixes every local's type before it lowers any statement.
     analysis.infer_locals(body)?;
@@ -559,7 +560,10 @@ fn extra_blocks(block: &mir::Block) -> usize {
                     + matched
                         .arms
                         .iter()
-                        .map(|arm| count(&arm.body))
+                        .map(|arm| {
+                            count(&arm.body)
+                                + arm.guard.as_ref().map_or(0, |guard| 1 + count(guard))
+                        })
                         .sum::<usize>()
             }
             ExpressionKind::Call(_, arguments) => arguments.iter().map(count).sum(),
@@ -605,6 +609,8 @@ struct Analysis<'a> {
     local_types: Vec<Option<Type>>,
     blocks: Vec<Block>,
     operations: Vec<Located<Operation>>,
+    /// Bindings a guard is reading before its arm is chosen: they alias the payload.
+    guard_aliases: Vec<Variable>,
 }
 
 impl Analysis<'_> {
@@ -972,6 +978,12 @@ impl Analysis<'_> {
                 ExpressionKind::Read(variable) => {
                     let ty = self.typed(*variable, span)?;
                     if usage == Use::Move && !crate::ownership::copy(&ty) {
+                        if self.guard_aliases.iter().any(|alias| alias.0 == variable.0) {
+                            return Err(patterns::invalid_pattern(
+                                patterns::PatternError::GuardMove,
+                                span,
+                            ));
+                        }
                         let value = self.value(ty.clone());
                         self.emit(Operation::TakeVariable(value, *variable), span);
                         Ok((value, ty))
@@ -1212,13 +1224,15 @@ impl Analysis<'_> {
         for arm in &matched.arms {
             let test_block = match &arm.pattern {
                 hir::Pattern::Wildcard => {
-                    wildcard = true;
+                    wildcard |= arm.guard.is_none();
                     self.close(Exit::Next, arm.span)
                 }
                 hir::Pattern::Variant { name, .. } => {
                     let (contract, index) = self.variant_of(&held, *name, arm.span)?;
                     total = contract.variants.len();
-                    covered.push(index);
+                    if arm.guard.is_none() {
+                        covered.push(index);
+                    }
                     let operation = contract.variants[index].operation();
                     let found = self.value(Type::Boolean);
                     self.emit(
@@ -1236,24 +1250,74 @@ impl Analysis<'_> {
                     )
                 }
             };
-            if let hir::Pattern::Variant {
-                name,
-                payload: hir::Payload::Binding(slot),
-            } = &arm.pattern
-            {
-                let (contract, index) = self.variant_of(&held, *name, arm.span)?;
-                let variant = &contract.variants[index];
-                let ty = self.typed(*slot, arm.span)?;
-                let value = self.value(ty.clone());
-                if crate::ownership::copy(&ty) {
+            let mut fails = Vec::new();
+            if matches!(self.blocks[test_block].exit.kind, Exit::Branch { .. }) {
+                fails.push(test_block);
+            }
+            let binding = match &arm.pattern {
+                hir::Pattern::Variant {
+                    name,
+                    payload: hir::Payload::Binding(slot),
+                } => {
+                    let (contract, index) = self.variant_of(&held, *name, arm.span)?;
+                    let operation = contract.variants[index].operation();
+                    Some((*slot, self.typed(*slot, arm.span)?, operation))
+                }
+                _ => None,
+            };
+            if let Some(guard) = &arm.guard {
+                // The guard reads the payload where it lies; a payload that is not `Copy`
+                // is only moved into its binding once the guard has chosen the arm.
+                let mut owned = false;
+                if let Some((slot, ty, operation)) = &binding {
+                    let value = self.value(ty.clone());
                     self.emit(
-                        Operation::EnumPayload(value, matched.held, variant.operation(), ty),
+                        Operation::EnumPayload(value, matched.held, *operation, ty.clone()),
+                        arm.span,
+                    );
+                    self.store(*slot, value, arm.span);
+                    if !crate::ownership::copy(ty) {
+                        owned = true;
+                        self.guard_aliases.push(*slot);
+                    }
+                }
+                let (condition, ty) = self.expected(guard, &Type::Boolean)?;
+                self.guard_aliases.clear();
+                if ty != Type::Boolean {
+                    return Err(patterns::invalid_pattern(
+                        patterns::PatternError::GuardType { actual: ty },
+                        guard.span,
+                    ));
+                }
+                let next = self.blocks.len() + 1;
+                fails.push(self.close(
+                    Exit::Branch {
+                        condition,
+                        yes: next,
+                        no: usize::MAX,
+                    },
+                    guard.span,
+                ));
+                if owned && let Some((slot, ty, operation)) = &binding {
+                    let value = self.value(ty.clone());
+                    self.emit(
+                        Operation::EnumTake(value, matched.held, *operation, ty.clone()),
+                        arm.span,
+                    );
+                    self.emit(Operation::Consume(matched.held), arm.span);
+                    self.store(*slot, value, arm.span);
+                }
+            } else if let Some((slot, ty, operation)) = &binding {
+                let value = self.value(ty.clone());
+                if crate::ownership::copy(ty) {
+                    self.emit(
+                        Operation::EnumPayload(value, matched.held, *operation, ty.clone()),
                         arm.span,
                     );
                 } else {
                     // The binding owns the payload, so the matched value is spent on this path.
                     self.emit(
-                        Operation::EnumTake(value, matched.held, variant.operation(), ty),
+                        Operation::EnumTake(value, matched.held, *operation, ty.clone()),
                         arm.span,
                     );
                     self.emit(Operation::Consume(matched.held), arm.span);
@@ -1274,21 +1338,20 @@ impl Analysis<'_> {
             let jump = self.close(Exit::Jump(usize::MAX), arm.span);
             tests.push(test_block);
             jumps.push(jump);
-            if matches!(self.blocks[test_block].exit.kind, Exit::Branch { .. }) {
-                self.blocks[test_block].exit.kind = match self.blocks[test_block].exit.kind {
-                    Exit::Branch { condition, yes, .. } => Exit::Branch {
+            for fail in fails {
+                if let Exit::Branch { condition, yes, .. } = self.blocks[fail].exit.kind {
+                    self.blocks[fail].exit.kind = Exit::Branch {
                         condition,
                         yes,
                         no: jump + 1,
-                    },
-                    _ => unreachable!(),
-                };
+                    };
+                }
             }
         }
         if !wildcard {
             covered.sort_unstable();
             covered.dedup();
-            if covered.len() != total {
+            if covered.len() != total || total == 0 {
                 let missing = match self.view(&held) {
                     Type::Enum(contract) => contract
                         .variants
@@ -1997,10 +2060,13 @@ fn mentions(expression: &Expression, variables: &[Variable]) -> bool {
         }
         ExpressionKind::Match(matched) => {
             mentions(&matched.scrutinee, variables)
-                || matched
-                    .arms
-                    .iter()
-                    .any(|arm| mentions(&arm.body, variables))
+                || matched.arms.iter().any(|arm| {
+                    mentions(&arm.body, variables)
+                        || arm
+                            .guard
+                            .as_ref()
+                            .is_some_and(|guard| mentions(guard, variables))
+                })
         }
         ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => {
             mentions(inner, variables)
@@ -2026,6 +2092,9 @@ fn gather_in<'e>(expression: &'e Expression, out: &mut Vec<(&'e hir::Match, Span
             out.push((matched, expression.span));
             gather_matches(&matched.scrutinee, out);
             for arm in &matched.arms {
+                if let Some(guard) = &arm.guard {
+                    gather_matches(guard, out);
+                }
                 gather_matches(&arm.body, out);
             }
         }

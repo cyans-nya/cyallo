@@ -230,3 +230,65 @@ std::io::print(dig(Wrap(One(\"deep\"))))\nstd::io::print(dig(Wrap(Two)))\nstd::i
     assert_eq!(run(source), "deep\ntwo\nbare\n");
     assert_lowered_by_the_pipeline(source);
 }
+
+#[test]
+fn the_guard_example_runs_and_is_lowered_by_the_pipeline() {
+    let source = include_str!("../examples/enums/guards.yas");
+    assert_eq!(run(source), "-1\n0\n9\n100\n1\n-2\napple\nother\nnone\n");
+    assert_lowered_by_the_pipeline(source);
+}
+
+#[test]
+fn a_failed_guard_falls_through_to_a_later_arm_for_the_same_variant() {
+    let source = program(
+        "fn f(s: Shape) -> i64 { return match s { Circle(r) if r > 5 => 1, Circle(_) => 2, _ => 3 } }\n\
+         std::io::print(f(Circle(9)))\nstd::io::print(f(Circle(1)))\nstd::io::print(f(Empty))",
+    );
+    assert_eq!(run(&source), "1\n2\n3\n");
+    assert_lowered_by_the_pipeline(&source);
+}
+
+#[test]
+fn a_guard_may_short_circuit_and_use_other_locals() {
+    let source = program(
+        "fn f(s: Shape, limit: i64) -> i64 { return match s { Circle(r) if r > 0 && r < limit => r, _ => -1 } }\n\
+         std::io::print(f(Circle(3), 10))\nstd::io::print(f(Circle(30), 10))\nstd::io::print(f(Empty, 10))",
+    );
+    assert_eq!(run(&source), "3\n-1\n-1\n");
+    assert_lowered_by_the_pipeline(&source);
+}
+
+#[test]
+fn guarded_arms_do_not_make_a_match_exhaustive() {
+    let error = failure(&program(
+        "fn f(s: Shape) -> i64 { return match s { Circle(r) if r > 0 => r, Square(r) => r, Empty => 0 } }\nstd::io::print(f(Empty))",
+    ));
+    assert_eq!(error.code, "E185");
+    assert!(error.message.contains("Circle"), "{}", error.message);
+    let error = failure(&program(
+        "fn f(s: Shape) -> i64 { return match s { _ if true => 1 } }\nstd::io::print(f(Empty))",
+    ));
+    assert_eq!(error.code, "E185");
+}
+
+#[test]
+fn a_guard_must_be_boolean() {
+    let error = failure(&program(
+        "fn f(s: Shape) -> i64 { return match s { Circle(r) if r => 1, _ => 0 } }\nstd::io::print(f(Empty))",
+    ));
+    assert!(
+        error.code == "E185" || error.code == "E109",
+        "{}",
+        error.code
+    );
+}
+
+#[test]
+fn a_guard_cannot_move_a_payload_before_its_arm_is_chosen() {
+    let error = failure(&messages(
+        "fn eat(t: string) -> bool { return true }\n\
+         fn f(m: Message) -> i64 { return match m { Text(t) if eat(t) => 1, _ => 0 } }\nstd::io::print(f(Quiet))",
+    ));
+    assert_eq!(error.code, "E185");
+    assert!(error.message.contains("guard"), "{}", error.message);
+}
