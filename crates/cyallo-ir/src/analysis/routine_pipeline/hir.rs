@@ -1,7 +1,7 @@
 use super::{LocalName, ReferenceSite, SiteId, Variable};
 use cyallo_ast::indexed::{
-    ExprNode, ExprSyntax, FunctionNode, Id, IndexedAst, List, LiteralNode, MatchBodyNode, NameId,
-    PatternNode, PatternSyntax, StmtNode, StmtSyntax, TypeNode,
+    ExprNode, ExprSyntax, FunctionNode, Id, IndexedAst, List, LiteralNode, MatchArmNode,
+    MatchBodyNode, NameId, PatternNode, PatternSyntax, StmtNode, StmtSyntax, TypeNode,
 };
 use std::sync::OnceLock;
 
@@ -198,6 +198,25 @@ pub(super) enum StatementKind {
     ReturnVoid,
     /// A call to a procedure, as a statement. The expression is a `Call`.
     CallStatement(Expression),
+    /// `match` whose arms are statements. An arm that yields a value assigns it to a
+    /// hidden local, which the statement after this one reads.
+    Match(Box<MatchStatement>),
+}
+
+pub(super) struct MatchStatement {
+    pub(super) scrutinee: Expression,
+    /// The local that holds the value matched: the scrutinee itself when it is a local
+    /// (matched in place), otherwise a hidden local the scrutinee is assigned to.
+    pub(super) held: Variable,
+    pub(super) in_place: bool,
+    pub(super) arms: Vec<StatementArm>,
+}
+
+pub(super) struct StatementArm {
+    pub(super) pattern: Pattern,
+    pub(super) guard: Option<Expression>,
+    pub(super) body: Vec<Statement>,
+    pub(super) span: Span,
 }
 
 /// `for variable in start..finish` over `i64`, without `rev`. `end` and `bound`
@@ -244,6 +263,17 @@ impl Routine {
                         | StatementKind::AssignProject { value, .. }
                         | StatementKind::CompoundProject { value, .. } => value.size(),
                         StatementKind::CallStatement(call) => call.size(),
+                        StatementKind::Match(matched) => {
+                            matched.scrutinee.size()
+                                + matched
+                                    .arms
+                                    .iter()
+                                    .map(|arm| {
+                                        1 + arm.guard.as_ref().map_or(0, Expression::size)
+                                            + block(&arm.body)
+                                    })
+                                    .sum::<usize>()
+                        }
                         StatementKind::Break
                         | StatementKind::Continue
                         | StatementKind::ReturnVoid => 0,
@@ -260,6 +290,7 @@ impl Routine {
             statements.iter().any(|statement| match &statement.kind {
                 StatementKind::While(..) | StatementKind::ForRange(_) => true,
                 StatementKind::If(_, yes, no) => block(yes) || block(no),
+                StatementKind::Match(matched) => matched.arms.iter().any(|arm| block(&arm.body)),
                 _ => false,
             })
         }
@@ -296,6 +327,8 @@ struct Context<'a> {
     loops: usize,
     /// The routine returns no value.
     procedure: bool,
+    /// Statements to run before the one being lowered (a `match` hoisted out of its value).
+    pending: Vec<Statement>,
 }
 
 /// Lower eligible routine bodies directly from the file's indexed tables. `None`
@@ -363,6 +396,7 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
         sites: Vec::new(),
         loops: 0,
         procedure,
+        pending: Vec::new(),
         scopes: vec![
             names
                 .iter()
@@ -551,7 +585,8 @@ impl Context<'_> {
     fn statements(&mut self, list: List<Id<StmtNode>>) -> Option<Vec<Statement>> {
         cyallo_ast::with_stack(|| {
             let ast = self.ast;
-            ast.get_list(list)?
+            let lowered: Vec<Vec<Statement>> = ast
+                .get_list(list)?
                 .iter()
                 .map(|&id| {
                     let statement = ast.get(id)?;
@@ -563,9 +598,21 @@ impl Context<'_> {
                         ),
                         // The existing route reports a value returned from a procedure.
                         StmtSyntax::Return(value) if !self.procedure => {
-                            StatementKind::Return(self.expression(value)?)
+                            let value = match self.hoisted(value, statement.span)? {
+                                Some(read) => read,
+                                None => self.expression(value)?,
+                            };
+                            StatementKind::Return(value)
                         }
                         StmtSyntax::ReturnVoid if self.procedure => StatementKind::ReturnVoid,
+                        StmtSyntax::Evaluate(value)
+                            if matches!(ast.get(value)?.kind, ExprSyntax::Match(..)) =>
+                        {
+                            let ExprSyntax::Match(scrutinee, arms) = ast.get(value)?.kind else {
+                                return None;
+                            };
+                            self.match_statement(scrutinee, arms, statement.span, None)?
+                        }
                         StmtSyntax::Evaluate(value) => {
                             let call = self.value(value, false)?;
                             // The linker checks that the callee has a contract this subset knows.
@@ -590,7 +637,10 @@ impl Context<'_> {
                                 },
                             };
                             // The initializer cannot see the name it declares.
-                            let value = self.expression(value)?;
+                            let value = match self.hoisted(value, statement.span)? {
+                                Some(read) => read,
+                                None => self.expression(value)?,
+                            };
                             let slot =
                                 self.declare(LocalName::Source(name), statement.span, !mutable);
                             self.scopes.last_mut()?.push(Visible {
@@ -618,10 +668,12 @@ impl Context<'_> {
                                     value: self.expression(value)?,
                                 }
                             } else {
-                                StatementKind::Assign {
-                                    slot: self.assignable(target)?,
-                                    value: self.expression(value)?,
-                                }
+                                let slot = self.assignable(target)?;
+                                let value = match self.hoisted(value, statement.span)? {
+                                    Some(read) => read,
+                                    None => self.expression(value)?,
+                                };
+                                StatementKind::Assign { slot, value }
                             }
                         }
                         StmtSyntax::Compound(target, operator, value)
@@ -663,13 +715,152 @@ impl Context<'_> {
                         }
                         ref other => return decline(|| format!("statement {}", variant(other))),
                     };
-                    Some(Statement {
+                    // A hoisted `match` runs first.
+                    let mut produced = std::mem::take(&mut self.pending);
+                    produced.push(Statement {
                         span: statement.span,
                         kind,
-                    })
+                    });
+                    Some(produced)
                 })
-                .collect()
+                .collect::<Option<_>>()?;
+            Some(lowered.into_iter().flatten().collect())
         })
+    }
+
+    /// A `match` in a value position whose arms include a block: it becomes a statement
+    /// that assigns the arm's value to a hidden local, and the value is a read of it.
+    fn hoisted(&mut self, id: Id<ExprNode>, span: Span) -> Option<Option<Expression>> {
+        let ast = self.ast;
+        let ExprSyntax::Match(scrutinee, arms) = ast.get(id)?.kind else {
+            return Some(None);
+        };
+        if !ast
+            .get_list(arms)?
+            .iter()
+            .any(|arm| matches!(arm.body, MatchBodyNode::Block(..)))
+        {
+            return Some(None);
+        }
+        let result = self.declare(LocalName::Hidden("$match"), span, false);
+        let kind = self.match_statement(scrutinee, arms, span, Some(result))?;
+        self.pending.push(Statement { span, kind });
+        Some(Some(Expression::new(span, ExpressionKind::Read(result))))
+    }
+
+    /// `match` as a statement, with `result` set when its value is wanted.
+    fn match_statement(
+        &mut self,
+        scrutinee: Id<ExprNode>,
+        arms: List<MatchArmNode>,
+        span: Span,
+        result: Option<Variable>,
+    ) -> Option<StatementKind> {
+        let ast = self.ast;
+        let scrutinee = self.value(scrutinee, false)?;
+        let (held, in_place) = match &scrutinee.kind {
+            ExpressionKind::Read(variable) => (*variable, true),
+            ExpressionKind::Call(..) => (
+                self.declare(LocalName::Hidden("$scrutinee"), span, false),
+                false,
+            ),
+            _ => return decline(|| "match on something other than a local or call".into()),
+        };
+        let nodes = ast.get_list(arms)?;
+        if nodes.is_empty() {
+            return decline(|| "match without arms".into());
+        }
+        let mut lowered = Vec::new();
+        for arm in nodes {
+            // The arm's bindings are visible in its guard and body only.
+            self.scopes.push(Vec::new());
+            let arm = self.statement_arm(arm, result);
+            self.scopes.pop();
+            lowered.push(arm?);
+        }
+        Some(StatementKind::Match(Box::new(MatchStatement {
+            scrutinee,
+            held,
+            in_place,
+            arms: lowered,
+        })))
+    }
+
+    fn statement_arm(
+        &mut self,
+        arm: &MatchArmNode,
+        result: Option<Variable>,
+    ) -> Option<StatementArm> {
+        let pattern = self.pattern(arm.pattern)?;
+        let guard = match arm.guard {
+            Some(guard) => Some(self.value(guard, true)?),
+            None => None,
+        };
+        let body = match arm.body {
+            MatchBodyNode::Expression(value) => self.arm_value(value, result, arm.span)?,
+            MatchBodyNode::Block(list, tail) => {
+                // The tail sees the block's own locals.
+                self.scopes.push(Vec::new());
+                let lowered = self.statements(list);
+                let tail = match (&lowered, tail) {
+                    (Some(_), Some(tail)) => Some(self.arm_value(tail, result, arm.span)),
+                    _ => None,
+                };
+                self.scopes.pop();
+                let mut statements = lowered?;
+                match tail {
+                    Some(tail) => statements.extend(tail?),
+                    None => {
+                        // A block that yields no value must not be asked for one, unless it
+                        // never finishes.
+                        let ends = matches!(
+                            statements.last().map(|last| &last.kind),
+                            Some(
+                                StatementKind::Return(_)
+                                    | StatementKind::ReturnVoid
+                                    | StatementKind::Break
+                                    | StatementKind::Continue
+                            )
+                        );
+                        if result.is_some() && !ends {
+                            return decline(|| "match arm block without a value".into());
+                        }
+                    }
+                }
+                statements
+            }
+        };
+        Some(StatementArm {
+            pattern,
+            guard,
+            body,
+            span: arm.span,
+        })
+    }
+
+    /// An arm's value as statements: assigned to the match's result, or, when the match is
+    /// a statement, a call made for its effects.
+    fn arm_value(
+        &mut self,
+        value: Id<ExprNode>,
+        result: Option<Variable>,
+        span: Span,
+    ) -> Option<Vec<Statement>> {
+        let kind = match result {
+            Some(slot) => StatementKind::Assign {
+                slot,
+                value: self.expression(value)?,
+            },
+            None => {
+                let call = self.value(value, false)?;
+                let ExpressionKind::Call(site, _) = &call.kind else {
+                    return decline(|| "match arm statement that is not a call".into());
+                };
+                self.sites[site.0].discard = true;
+                StatementKind::CallStatement(call)
+            }
+        };
+        Some(vec![Statement { span, kind }])
     }
 
     /// The slot of a mutable local named by `target`. Parameters, immutable names,

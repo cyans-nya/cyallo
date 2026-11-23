@@ -582,12 +582,18 @@ fn extra_blocks(block: &mir::Block) -> usize {
             | Statement::CompoundProject { value, .. } => count(value),
             Statement::CallStatement(call) => count(call),
             Statement::RangeStart { start, finish, .. } => count(start) + count(finish),
-            Statement::Marker | Statement::RangeBound { .. } | Statement::RangeStep { .. } => 0,
+            Statement::Marker
+            | Statement::RangeBound { .. }
+            | Statement::RangeStep { .. }
+            | Statement::MatchCover { .. }
+            | Statement::MatchBind { .. } => 0,
         })
         .sum();
     statements
         + match &block.exit.kind {
-            mir::Exit::Branch { condition, .. } => count(condition),
+            mir::Exit::Branch { condition, .. } | mir::Exit::Guard { condition, .. } => {
+                count(condition)
+            }
             mir::Exit::Return(value) => count(value),
             _ => 0,
         }
@@ -1631,6 +1637,7 @@ impl Analysis<'_> {
         let mut ranges = Vec::new();
         let mut bounds = Vec::new();
         let mut matches: Vec<(&hir::Match, Span)> = Vec::new();
+        let mut binds: Vec<(Variable, NameId, Variable, Span)> = Vec::new();
         for block in &body.blocks {
             match &block.exit.kind {
                 mir::Exit::Branch { condition, .. } => gather_matches(condition, &mut matches),
@@ -1667,6 +1674,9 @@ impl Analysis<'_> {
                             span,
                         });
                     }
+                    Statement::MatchBind {
+                        held, name, slot, ..
+                    } => binds.push((*held, *name, *slot, span)),
                     Statement::RangeStart {
                         variable,
                         end,
@@ -1707,6 +1717,18 @@ impl Analysis<'_> {
             }
             for (matched, span) in &matches {
                 changed |= self.declare_match(matched, *span)?;
+            }
+            for (held, name, slot, span) in &binds {
+                if self.variable_type(*slot).is_none()
+                    && let Some(held) = self.variable_type(*held)
+                {
+                    let (contract, index) = self.variant_of(&held, *name, *span)?;
+                    if let Some(payload) = &contract.variants[index].payload {
+                        let ty = self.view(payload);
+                        self.declare(*slot, ty, *span)?;
+                        changed = true;
+                    }
+                }
             }
             if !changed {
                 break;
@@ -1763,6 +1785,70 @@ impl Analysis<'_> {
         let span = statement.span;
         match &statement.kind {
             Statement::Marker => self.emit(Operation::Statement, span),
+            Statement::MatchCover { held, arms } => {
+                let held_type = self.typed(*held, span)?;
+                let (mut covered, mut total, mut wildcard) = (Vec::new(), 0, false);
+                for arm in arms {
+                    let Some(name) = arm.name else {
+                        wildcard |= !arm.guarded;
+                        continue;
+                    };
+                    let (contract, index) = self.variant_of(&held_type, name, arm.span)?;
+                    total = contract.variants.len();
+                    let declared = contract.variants[index].payload.is_some();
+                    if declared != !matches!(arm.payload, hir::Payload::Absent) {
+                        return Err(patterns::invalid_pattern(
+                            patterns::PatternError::PayloadArity,
+                            arm.span,
+                        ));
+                    }
+                    if !arm.guarded {
+                        covered.push(index);
+                    }
+                }
+                covered.sort_unstable();
+                covered.dedup();
+                if !wildcard && (covered.len() != total || total == 0) {
+                    let missing = match self.view(&held_type) {
+                        Type::Enum(contract) => contract
+                            .variants
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| !covered.contains(index))
+                            .map(|(_, variant)| variant.name.clone())
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    return Err(patterns::invalid_pattern(
+                        patterns::PatternError::NonExhaustive { missing },
+                        span,
+                    ));
+                }
+            }
+            Statement::MatchBind {
+                held,
+                name,
+                slot,
+                stage,
+            } => {
+                let held_type = self.typed(*held, span)?;
+                let (contract, index) = self.variant_of(&held_type, *name, span)?;
+                let operation = contract.variants[index].operation();
+                let ty = self.typed(*slot, span)?;
+                let copy = crate::ownership::copy(&ty);
+                if *stage == mir::Stage::Take && copy {
+                    return Ok(());
+                }
+                let value = self.value(ty.clone());
+                if copy || *stage == mir::Stage::Alias {
+                    self.emit(Operation::EnumPayload(value, *held, operation, ty), span);
+                } else {
+                    // The binding owns the payload: the matched value is spent on this path.
+                    self.emit(Operation::EnumTake(value, *held, operation, ty), span);
+                    self.emit(Operation::Consume(*held), span);
+                }
+                self.store(*slot, value, span);
+            }
             Statement::Define {
                 slot,
                 value,
@@ -1974,6 +2060,50 @@ impl Analysis<'_> {
                     no: target(self, *no)?,
                 }
             }
+            mir::Exit::MatchTest {
+                held,
+                name,
+                yes,
+                no,
+            } => {
+                let held_type = self.typed(*held, span)?;
+                let (contract, index) = self.variant_of(&held_type, *name, span)?;
+                let found = self.value(Type::Boolean);
+                let operation = contract.variants[index].operation();
+                self.emit(Operation::EnumTest(found, *held, operation), span);
+                Exit::Branch {
+                    condition: found,
+                    yes: target(self, *yes)?,
+                    no: target(self, *no)?,
+                }
+            }
+            mir::Exit::Guard {
+                condition,
+                alias,
+                yes,
+                no,
+            } => {
+                if let Some(slot) = alias
+                    && !crate::ownership::copy(&self.typed(*slot, span)?)
+                {
+                    self.guard_aliases.push(*slot);
+                }
+                let result = self.expected(condition, &Type::Boolean);
+                self.guard_aliases.clear();
+                let (value, ty) = result?;
+                if ty != Type::Boolean {
+                    return Err(patterns::invalid_pattern(
+                        patterns::PatternError::GuardType { actual: ty },
+                        condition.span,
+                    ));
+                }
+                Exit::Branch {
+                    condition: value,
+                    yes: target(self, *yes)?,
+                    no: target(self, *no)?,
+                }
+            }
+            mir::Exit::Unreachable => Exit::Unreachable,
             mir::Exit::Jump(block) => Exit::Jump(target(self, *block)?),
             mir::Exit::Next(block) => {
                 if target(self, *block)? != self.blocks.len() + 1 {

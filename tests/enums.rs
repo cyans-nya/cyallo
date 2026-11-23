@@ -292,3 +292,56 @@ fn a_guard_cannot_move_a_payload_before_its_arm_is_chosen() {
     assert_eq!(error.code, "E185");
     assert!(error.message.contains("guard"), "{}", error.message);
 }
+
+#[test]
+fn the_block_example_runs_and_is_lowered_by_the_pipeline() {
+    let source = include_str!("../examples/enums/blocks.yas");
+    assert_eq!(run(source), "click 8\nkey a\nlong key ab\n31\n6\n-1\n");
+    assert_lowered_by_the_pipeline(source);
+}
+
+#[test]
+fn a_statement_match_with_block_arms_runs_one_arm() {
+    let source = program(
+        "proc show(s: Shape) {\n    match s {\n        Circle(r) => {\n            std::io::print(\"circle\")\n            std::io::print(r)\n        }\n        Square(_) => std::io::print(\"square\"),\n        Empty => {}\n    }\n}\n\
+         show(Circle(3))\nshow(Square(1))\nshow(Empty)",
+    );
+    assert_eq!(run(&source), "circle\n3\nsquare\n");
+    assert_lowered_by_the_pipeline(&source);
+}
+
+#[test]
+fn break_and_continue_in_an_arm_leave_the_enclosing_loop() {
+    let source = program(
+        "proc scan(limit: i64) {\n    let mut i = 0\n    while i < limit {\n        i += 1\n        match Circle(i) {\n            Circle(n) if n == 2 => { continue }\n            Circle(n) if n == 4 => { break }\n            Circle(n) => { std::io::print(n) }\n            _ => {}\n        }\n    }\n}\nscan(9)",
+    );
+    assert_eq!(run(&source), "1\n3\n");
+    assert_lowered_by_the_pipeline(&source);
+}
+
+#[test]
+fn a_value_match_block_may_end_in_a_return() {
+    let source = program(
+        "fn f(s: Shape) -> i64 {\n    let n = match s {\n        Circle(r) => { r + 1 }\n        Square(_) => { return 99 }\n        Empty => 0\n    }\n    return n * 2\n}\n\
+         std::io::print(f(Circle(4)))\nstd::io::print(f(Square(1)))\nstd::io::print(f(Empty))",
+    );
+    assert_eq!(run(&source), "10\n99\n0\n");
+    assert_lowered_by_the_pipeline(&source);
+}
+
+#[test]
+fn a_statement_match_must_be_exhaustive_and_bind_in_its_arm_only() {
+    let error = failure(&program(
+        "proc f(s: Shape) {\n    match s {\n        Circle(_) => {}\n        Square(_) => {}\n    }\n}\nf(Empty)",
+    ));
+    assert_eq!(error.code, "E185");
+    assert!(error.message.contains("Empty"), "{}", error.message);
+}
+
+#[test]
+fn a_block_arm_moves_its_payload_and_spends_the_value() {
+    let source = messages(
+        "fn len(m: Message) -> i64 {\n    let n = match m {\n        Text(t) => { std::string::len(t) }\n        _ => 0\n    }\n    let k = match m { Quiet => 1, _ => 2 }\n    return n + k\n}\nstd::io::print(len(Quiet))",
+    );
+    assert_eq!(failure(&source).code, "E118");
+}

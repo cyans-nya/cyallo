@@ -98,6 +98,40 @@ pub(super) enum Statement {
     RangeStep {
         variable: Variable,
     },
+    /// What a `match` statement's arms are: checked once, before any test, for unknown
+    /// variants, payload shapes and exhaustiveness.
+    MatchCover {
+        held: Variable,
+        arms: Vec<Cover>,
+    },
+    /// Bind the payload of variant `name` held in `held` to `slot`.
+    MatchBind {
+        held: Variable,
+        name: cyallo_ast::indexed::NameId,
+        slot: Variable,
+        stage: Stage,
+    },
+}
+
+/// One arm of a `match` statement, for the coverage check.
+#[derive(Debug)]
+pub(super) struct Cover {
+    /// The variant the arm tests, or `None` for a wildcard.
+    pub(super) name: Option<cyallo_ast::indexed::NameId>,
+    pub(super) payload: hir::Payload,
+    pub(super) guarded: bool,
+    pub(super) span: Span,
+}
+
+/// When a binding is made, relative to the arm's guard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Stage {
+    /// No guard: bind, moving a payload that is not `Copy`.
+    Direct,
+    /// Before a guard: read the payload where it lies.
+    Alias,
+    /// After a guard chose the arm: move a payload that is not `Copy` into the binding.
+    Take,
 }
 
 #[derive(Debug)]
@@ -120,6 +154,22 @@ pub(super) enum Exit {
         yes: BlockId,
         no: BlockId,
     },
+    /// Whether `held` is variant `name`.
+    MatchTest {
+        held: Variable,
+        name: cyallo_ast::indexed::NameId,
+        yes: BlockId,
+        no: BlockId,
+    },
+    /// A guard: like a branch, but the alias binding of the arm is read, not moved.
+    Guard {
+        condition: Expression,
+        alias: Option<Variable>,
+        yes: BlockId,
+        no: BlockId,
+    },
+    /// No arm applied.
+    Unreachable,
     /// The counter reached the last value to visit.
     RangeDone {
         variable: Variable,
@@ -319,6 +369,7 @@ impl Builder {
                         back.finish(self, Exit::Jump(header), back_span);
                     }
                     hir::StatementKind::ForRange(range) => self.range(*range, span),
+                    hir::StatementKind::Match(matched) => self.matching(*matched, span),
                     hir::StatementKind::Break => {
                         let open = self.take_block();
                         if let Some(frame) = self.loops.last_mut() {
@@ -334,6 +385,143 @@ impl Builder {
                 }
             }
         });
+    }
+
+    /// A `match` statement: for each arm a test block, an optional guard block, and the
+    /// body, which ends by jumping past the last arm. A test or guard that fails goes to
+    /// the next arm, and falling off the last one is unreachable.
+    fn matching(&mut self, matched: hir::MatchStatement, span: Span) {
+        let covers = matched
+            .arms
+            .iter()
+            .map(|arm| match &arm.pattern {
+                hir::Pattern::Wildcard => Cover {
+                    name: None,
+                    payload: hir::Payload::Absent,
+                    guarded: arm.guard.is_some(),
+                    span: arm.span,
+                },
+                hir::Pattern::Variant { name, payload } => Cover {
+                    name: Some(*name),
+                    payload: payload.clone(),
+                    guarded: arm.guard.is_some(),
+                    span: arm.span,
+                },
+            })
+            .collect();
+        if !matched.in_place {
+            self.emit(
+                Statement::Assign {
+                    slot: matched.held,
+                    value: matched.scrutinee,
+                },
+                span,
+            );
+        }
+        self.emit(
+            Statement::MatchCover {
+                held: matched.held,
+                arms: covers,
+            },
+            span,
+        );
+        let held = matched.held;
+        let mut fails: Vec<(OpenBlock, Exit, Span)> = Vec::new();
+        let mut ends: Vec<(OpenBlock, Span)> = Vec::new();
+        let mut pending_no: Vec<usize> = Vec::new();
+        for arm in matched.arms {
+            let (name, payload) = match &arm.pattern {
+                hir::Pattern::Variant { name, payload } => (Some(*name), payload.clone()),
+                hir::Pattern::Wildcard => (None, hir::Payload::Absent),
+            };
+            if let Some(name) = name {
+                let test = self.take_block();
+                let yes = self.next_block();
+                pending_no.push(fails.len());
+                fails.push((
+                    test,
+                    Exit::MatchTest {
+                        held,
+                        name,
+                        yes,
+                        no: yes,
+                    },
+                    arm.span,
+                ));
+            }
+            let binding = match (name, &payload) {
+                (Some(name), hir::Payload::Binding(slot)) => Some((name, *slot)),
+                _ => None,
+            };
+            if let Some(guard) = arm.guard {
+                if let Some((name, slot)) = binding {
+                    self.emit(
+                        Statement::MatchBind {
+                            held,
+                            name,
+                            slot,
+                            stage: Stage::Alias,
+                        },
+                        arm.span,
+                    );
+                }
+                let guard_span = guard.span;
+                let block = self.take_block();
+                let yes = self.next_block();
+                pending_no.push(fails.len());
+                fails.push((
+                    block,
+                    Exit::Guard {
+                        condition: guard,
+                        alias: binding.map(|(_, slot)| slot),
+                        yes,
+                        no: yes,
+                    },
+                    guard_span,
+                ));
+                if let Some((name, slot)) = binding {
+                    self.emit(
+                        Statement::MatchBind {
+                            held,
+                            name,
+                            slot,
+                            stage: Stage::Take,
+                        },
+                        arm.span,
+                    );
+                }
+            } else if let Some((name, slot)) = binding {
+                self.emit(
+                    Statement::MatchBind {
+                        held,
+                        name,
+                        slot,
+                        stage: Stage::Direct,
+                    },
+                    arm.span,
+                );
+            }
+            self.statements(arm.body);
+            let end_span = self.last_span;
+            ends.push((self.take_block(), end_span));
+            // Everything that failed in this arm continues with the next one.
+            let next = self.next_block();
+            for index in pending_no.drain(..) {
+                match &mut fails[index].1 {
+                    Exit::MatchTest { no, .. } | Exit::Guard { no, .. } => *no = next,
+                    _ => unreachable!("only tests and guards are pending"),
+                }
+            }
+        }
+        let fall_off = self.take_block();
+        let end = self.next_block();
+        fall_off.finish(self, Exit::Unreachable, span);
+        for (block, exit, span) in fails {
+            block.finish(self, exit, span);
+        }
+        for (block, end_span) in ends {
+            block.finish(self, Exit::Jump(end), end_span);
+        }
     }
 
     /// An empty range skips the body. An exclusive bound becomes inclusive by
