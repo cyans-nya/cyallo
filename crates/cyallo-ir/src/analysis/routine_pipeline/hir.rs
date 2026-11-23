@@ -1,19 +1,23 @@
-use super::{Scalar, ScalarType, Variable};
+use super::{ReferenceSite, SiteId, Variable};
 use cyallo_ast::indexed::{
     ExprNode, ExprSyntax, FunctionNode, Id, IndexedAst, List, LiteralNode, NameId, StmtNode,
     StmtSyntax, TypeNode,
 };
 use cyallo_ast::{
-    FunctionBodyKind, NumberKind, Operator, ParameterArity, ParameterPassing, RoutineKind, Span,
+    FunctionBodyKind, Literal, Operator, ParameterArity, ParameterPassing, RoutineKind, Span, Type,
 };
 
+#[derive(Clone, Debug, Hash)]
 pub(super) struct Expression {
     pub(super) span: Span,
     pub(super) kind: ExpressionKind,
 }
 
+#[derive(Clone, Debug, Hash)]
 pub(super) enum ExpressionKind {
-    Constant(Scalar),
+    /// A literal as written: a plain integer or real literal takes the type its
+    /// context asks for, a suffixed one has its own.
+    Literal(Literal),
     Read(Variable),
     Group(Box<Expression>),
     Binary(Operator, Box<Expression>, Box<Expression>),
@@ -26,8 +30,21 @@ pub(super) enum ExpressionKind {
         right: Box<Expression>,
         slot: Variable,
     },
-    /// A call whose callee path is bound later, by the module graph.
-    Call(Box<str>, Vec<Expression>),
+    /// A call; the site holds the callee path that the module graph binds later.
+    Call(SiteId, Vec<Expression>),
+}
+
+impl Expression {
+    /// Number of expression nodes, for the admission estimate.
+    pub(super) fn size(&self) -> usize {
+        1 + match &self.kind {
+            ExpressionKind::Literal(_) | ExpressionKind::Read(_) => 0,
+            ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => inner.size(),
+            ExpressionKind::Binary(_, left, right)
+            | ExpressionKind::ShortCircuit { left, right, .. } => left.size() + right.size(),
+            ExpressionKind::Call(_, arguments) => arguments.iter().map(Expression::size).sum(),
+        }
+    }
 }
 
 pub(super) struct Statement {
@@ -42,7 +59,7 @@ pub(super) enum StatementKind {
     Let {
         slot: Variable,
         value: Expression,
-        annotation: Option<ScalarType>,
+        annotation: Option<Type>,
     },
     Assign {
         slot: Variable,
@@ -84,6 +101,7 @@ pub(super) struct Local {
 }
 
 pub(super) struct Routine {
+    pub(super) sites: Vec<ReferenceSite>,
     pub(super) statements: Vec<Statement>,
     /// Declared and hidden locals, after the parameters, in slot order.
     pub(super) locals: Vec<Local>,
@@ -103,6 +121,7 @@ struct Context<'a> {
     /// names is a local callable, which this subset leaves to the existing route.
     every_name: Vec<NameId>,
     locals: Vec<Local>,
+    sites: Vec<ReferenceSite>,
     scopes: Vec<Vec<Visible>>,
     /// Loops enclosing the statement being lowered.
     loops: usize,
@@ -125,7 +144,7 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
     }
     // A function returns `i64` or `bool`; a procedure returns nothing.
     let procedure = match (function.kind, ast.get(function.result)?) {
-        (RoutineKind::Function, TypeNode::Integer | TypeNode::Boolean) => false,
+        (RoutineKind::Function, node) if scalar_type(node).is_some() => false,
         (RoutineKind::Procedure, TypeNode::Void) => true,
         _ => return None,
     };
@@ -135,10 +154,7 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
             || parameter.passing != ParameterPassing::Value
             || parameter.by_ref
             || parameter.receiver
-            || !matches!(
-                ast.get(parameter.ty),
-                Some(TypeNode::Integer | TypeNode::Boolean)
-            )
+            || ast.get(parameter.ty).and_then(scalar_type).is_none()
     }) {
         return None;
     }
@@ -159,6 +175,7 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
         parameters: names.len(),
         every_name,
         locals: Vec::new(),
+        sites: Vec::new(),
         loops: 0,
         procedure,
         scopes: vec![
@@ -175,6 +192,7 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
     };
     let statements = context.block(function.body)?;
     Some(Routine {
+        sites: context.sites,
         statements,
         locals: context.locals,
     })
@@ -236,6 +254,16 @@ impl Context<'_> {
         slot
     }
 
+    fn site(&mut self, path: &str, span: Span, arguments: usize, discard: bool) -> SiteId {
+        self.sites.push(ReferenceSite {
+            path: path.into(),
+            span,
+            arguments,
+            discard,
+        });
+        SiteId(self.sites.len() - 1)
+    }
+
     fn name(&self, name: NameId) -> Option<Box<str>> {
         self.ast.name(name).map(Box::from)
     }
@@ -268,9 +296,10 @@ impl Context<'_> {
                         StmtSyntax::Evaluate(value) => {
                             let call = self.value(value, false)?;
                             // Only a call to a procedure; the linker checks which.
-                            if !matches!(call.kind, ExpressionKind::Call(..)) {
+                            let ExpressionKind::Call(site, _) = &call.kind else {
                                 return None;
-                            }
+                            };
+                            self.sites[site.0].discard = true;
                             StatementKind::CallStatement(call)
                         }
                         StmtSyntax::Binding(name, annotation, constant, mutable, value) => {
@@ -279,11 +308,7 @@ impl Context<'_> {
                             }
                             let annotation = match annotation {
                                 None => None,
-                                Some(ty) => Some(match ast.get(ty)? {
-                                    TypeNode::Integer => ScalarType::Integer,
-                                    TypeNode::Boolean => ScalarType::Boolean,
-                                    _ => return None,
-                                }),
+                                Some(ty) => Some(scalar_type(ast.get(ty)?)?),
                             };
                             // The initializer cannot see the name it declares.
                             let value = self.expression(value)?;
@@ -309,7 +334,7 @@ impl Context<'_> {
                             StatementKind::Compound {
                                 slot: self.assignable(target)?,
                                 operator,
-                                value: self.expression(value)?,
+                                value: self.value(value, false)?,
                             }
                         }
                         StmtSyntax::While(condition, body) => {
@@ -390,8 +415,8 @@ impl Context<'_> {
             ExprSyntax::Parenthesized(inner) => self.bounds(inner),
             ExprSyntax::Binary(operator @ (Operator::Range | Operator::RangeInclusive), a, b) => {
                 Some((
-                    self.expression(a)?,
-                    self.expression(b)?,
+                    self.value(a, false)?,
+                    self.value(b, false)?,
                     operator == Operator::RangeInclusive,
                     node.span,
                 ))
@@ -411,12 +436,11 @@ impl Context<'_> {
             let ast = self.ast;
             let expression = ast.get(id)?;
             let kind = match expression.kind {
-                ExprSyntax::Literal(value) => ExpressionKind::Constant(match ast.get(value)? {
-                    LiteralNode::Number(number) if number.kind == NumberKind::I64 => {
-                        Scalar::Integer(number.int() as i64)
-                    }
-                    LiteralNode::Integer(value) => Scalar::Integer(*value),
-                    LiteralNode::Boolean(value) => Scalar::Boolean(*value),
+                ExprSyntax::Literal(value) => ExpressionKind::Literal(match ast.get(value)? {
+                    LiteralNode::Number(number) => Literal::Number(*number),
+                    LiteralNode::Integer(value) => Literal::Integer(*value),
+                    LiteralNode::Real(value) => Literal::Real(*value),
+                    LiteralNode::Boolean(value) => Literal::Boolean(*value),
                     _ => return None,
                 }),
                 ExprSyntax::Name(name) => ExpressionKind::Read(self.lookup(name)?.slot),
@@ -451,13 +475,13 @@ impl Context<'_> {
                     if self.every_name.contains(&name) {
                         return None;
                     }
-                    ExpressionKind::Call(
-                        ast.name(name)?.into(),
-                        ast.get_list(arguments)?
-                            .iter()
-                            .map(|&argument| self.value(argument, false))
-                            .collect::<Option<_>>()?,
-                    )
+                    let arguments: Vec<Expression> = ast
+                        .get_list(arguments)?
+                        .iter()
+                        .map(|&argument| self.value(argument, false))
+                        .collect::<Option<_>>()?;
+                    let site = self.site(ast.name(name)?, expression.span, arguments.len(), false);
+                    ExpressionKind::Call(site, arguments)
                 }
                 _ => return None,
             };
@@ -471,4 +495,15 @@ impl Context<'_> {
 
 fn scalar_operator(operator: Operator) -> bool {
     (operator.is_arithmetic() && operator != Operator::RealDivide) || operator.is_comparison()
+}
+
+/// The scalar types the subset accepts: `i64`, `bool`, `f64` and the sized numbers.
+fn scalar_type(node: &TypeNode) -> Option<Type> {
+    Some(match node {
+        TypeNode::Integer => Type::Integer,
+        TypeNode::Boolean => Type::Boolean,
+        TypeNode::Real => Type::Real,
+        TypeNode::Numeric(kind) => Type::numeric(*kind),
+        _ => return None,
+    })
 }

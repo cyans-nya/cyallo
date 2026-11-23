@@ -1,7 +1,25 @@
-use super::{Scalar, Variable, mir};
-use cyallo_ast::{Diagnostic, Operator, Param, Span, Type};
-use mir::{Exit, Located, Value};
-use std::fmt;
+//! Typed analysis. AIR walks the expression trees that MIR kept and types them the way
+//! the existing route does: it infers a type upward from the operands, and pushes an
+//! expected type downward into the literals of an arithmetic tree (`contextualize`)
+//! before the operation is typed. The order of those two passes decides which
+//! diagnostic a mixed-type expression gets, so it is kept. While walking, AIR flattens
+//! each statement to typed operations and builds the blocks, because `&&` and `||`
+//! end a block in the middle of an expression.
+use super::{SiteId, Variable, hir, mir};
+use cyallo_ast::{Diagnostic, Literal, Number, NumberKind, Operator, Param, Span, Type};
+use hir::{Expression, ExpressionKind};
+use mir::{Located, Statement};
+use std::{borrow::Cow, fmt};
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Value(pub(super) usize);
+
+/// Half-open range into `Body::operands`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Operands {
+    pub(super) start: usize,
+    pub(super) len: usize,
+}
 
 pub(super) struct Body {
     pub(super) blocks: Vec<Block>,
@@ -26,14 +44,29 @@ pub(super) struct Block {
 
 pub(super) enum Operation {
     Statement,
-    Constant(Value, Scalar),
+    Constant(Value, Literal),
     ReadVariable(Value, Variable),
     /// Store into a declared local (its first store is its definition).
     Store(Variable, Value),
     Binary(Value, Operator, Value, Value),
     Unary(Value, Operator, Value),
-    Call(Value, usize, mir::Operands),
-    CallStatement(usize, mir::Operands),
+    Call(Value, usize, Operands),
+    CallStatement(usize, Operands),
+}
+
+/// Targets are indexes into `Body::blocks`.
+pub(super) enum Exit {
+    Branch {
+        condition: Value,
+        yes: usize,
+        no: usize,
+    },
+    Jump(usize),
+    /// Fall into the next block: no instruction.
+    Next,
+    Return(Value),
+    ReturnVoid,
+    End,
 }
 
 #[derive(Debug)]
@@ -55,7 +88,7 @@ impl fmt::Display for CheckError {
             Self::MissingReturn => {
                 f.write_str("non-void routine must return a value on every path")
             }
-            Self::InvalidMir => f.write_str("invalid scalar routine MIR"),
+            Self::InvalidMir => f.write_str("invalid routine MIR"),
         }
     }
 }
@@ -71,8 +104,163 @@ fn routine_diagnostic(error: CheckError, span: Span) -> Diagnostic {
     Diagnostic::new(code, error.to_string(), span)
 }
 
-/// Check every source operation in source order and propagate reachability
-/// separately to decide whether control can fall off the end of the routine.
+fn invalid(span: Span) -> Diagnostic {
+    routine_diagnostic(CheckError::InvalidMir, span)
+}
+
+fn require(expected: &Type, actual: &Type, span: Span) -> Result<(), Diagnostic> {
+    if expected == actual {
+        return Ok(());
+    }
+    let mut diagnostic = routine_diagnostic(
+        CheckError::TypeMismatch {
+            expected: expected.clone(),
+            actual: actual.clone(),
+        },
+        span,
+    );
+    // The existing route explains the one conversion people expect to be implicit.
+    if expected.number_kind().is_some_and(|kind| kind.float())
+        && actual.number_kind().is_some_and(|kind| !kind.float())
+    {
+        diagnostic.message.push_str(
+            "; integers never convert to floats implicitly: write a float literal such as `2.0` or cast with `as`",
+        );
+    }
+    Err(diagnostic)
+}
+
+fn numeric(ty: &Type) -> bool {
+    ty.number_kind().is_some()
+}
+
+/// A literal, or arithmetic over literals only: its type comes from its context.
+fn contextual_number(expression: &Expression) -> bool {
+    match &expression.kind {
+        ExpressionKind::Literal(Literal::Integer(_) | Literal::Real(_)) => true,
+        ExpressionKind::Group(inner) => contextual_number(inner),
+        ExpressionKind::Unary(Operator::Add | Operator::Subtract, inner) => {
+            contextual_number(inner)
+        }
+        ExpressionKind::Binary(operator, left, right) if operator.is_arithmetic() => {
+            contextual_number(left) && contextual_number(right)
+        }
+        _ => false,
+    }
+}
+
+/// The type both operands of a binary operation are read in.
+fn numeric_context(a: &Expression, ta: &Type, b: &Expression, tb: &Type) -> Type {
+    match (contextual_number(a), contextual_number(b)) {
+        (true, false) => tb.clone(),
+        (false, _) => ta.clone(),
+        (true, true) => {
+            if *ta == Type::Real || *tb == Type::Real {
+                Type::Real
+            } else {
+                ta.clone()
+            }
+        }
+    }
+}
+
+/// Push a wanted numeric type into the literals of an arithmetic tree. The expression
+/// is borrowed back unchanged when no literal changes, which is the usual case (an
+/// `i64` literal in an `i64` context), so typing allocates nothing there.
+fn contextualize<'e>(
+    expression: &'e Expression,
+    wanted: &Type,
+) -> Result<Cow<'e, Expression>, Diagnostic> {
+    let Some(kind) = wanted.number_kind() else {
+        return Ok(Cow::Borrowed(expression));
+    };
+    let span = expression.span;
+    match &expression.kind {
+        ExpressionKind::Literal(literal @ (Literal::Integer(_) | Literal::Real(_))) => {
+            let number = match literal {
+                Literal::Integer(value) => Number {
+                    kind: NumberKind::I64,
+                    bits: *value as u64,
+                },
+                Literal::Real(value) => Number {
+                    kind: NumberKind::F64,
+                    bits: value.to_bits(),
+                },
+                _ => unreachable!("matched an integer or real literal"),
+            };
+            if number.kind.float() && !kind.float() {
+                return Err(Diagnostic::new(
+                    "E109",
+                    "floating literal requires a floating type or an explicit cast",
+                    span,
+                ));
+            }
+            // An integer literal never becomes a float implicitly; it fails later.
+            if kind.float() && !number.kind.float() {
+                return Ok(Cow::Borrowed(expression));
+            }
+            let typed =
+                Literal::number(number.cast(kind).map_err(|error| {
+                    cyallo_ast::diagnostic::numeric_conversion_failed(error, span)
+                })?);
+            if typed == *literal {
+                return Ok(Cow::Borrowed(expression));
+            }
+            Ok(Cow::Owned(Expression {
+                span,
+                kind: ExpressionKind::Literal(typed),
+            }))
+        }
+        ExpressionKind::Binary(
+            operator @ (Operator::Add
+            | Operator::Subtract
+            | Operator::Multiply
+            | Operator::Divide
+            | Operator::RealDivide
+            | Operator::IntegerDivide
+            | Operator::Remainder),
+            left,
+            right,
+        ) => {
+            let (new_left, new_right) =
+                (contextualize(left, wanted)?, contextualize(right, wanted)?);
+            if matches!(
+                (&new_left, &new_right),
+                (Cow::Borrowed(_), Cow::Borrowed(_))
+            ) {
+                return Ok(Cow::Borrowed(expression));
+            }
+            Ok(Cow::Owned(Expression {
+                span,
+                kind: ExpressionKind::Binary(
+                    *operator,
+                    Box::new(new_left.into_owned()),
+                    Box::new(new_right.into_owned()),
+                ),
+            }))
+        }
+        ExpressionKind::Group(inner) => Ok(match contextualize(inner, wanted)? {
+            Cow::Borrowed(_) => Cow::Borrowed(expression),
+            Cow::Owned(inner) => Cow::Owned(Expression {
+                span,
+                kind: ExpressionKind::Group(Box::new(inner)),
+            }),
+        }),
+        ExpressionKind::Unary(operator @ (Operator::Add | Operator::Subtract), inner) => {
+            Ok(match contextualize(inner, wanted)? {
+                Cow::Borrowed(_) => Cow::Borrowed(expression),
+                Cow::Owned(inner) => Cow::Owned(Expression {
+                    span,
+                    kind: ExpressionKind::Unary(*operator, Box::new(inner)),
+                }),
+            })
+        }
+        _ => Ok(Cow::Borrowed(expression)),
+    }
+}
+
+/// Check the routine's statements in source order, then decide from reachability
+/// whether control can fall off the end of a routine that returns a value.
 pub(super) fn analyze(
     body: &mir::Body,
     parameters: &[Param],
@@ -80,273 +268,669 @@ pub(super) fn analyze(
     callees: &[Callee],
     routine_span: Span,
 ) -> Result<Body, Diagnostic> {
-    let mut types = Vec::with_capacity(body.value_count);
-    let mut local_types: Vec<Option<Type>> = vec![None; body.locals.len()];
-    let mut reachable = vec![false; body.blocks.len()];
-    *reachable
-        .first_mut()
-        .ok_or_else(|| routine_diagnostic(CheckError::InvalidMir, routine_span))? = true;
-    let mut blocks = Vec::with_capacity(body.blocks.len());
+    // A short-circuit operator ends a block in the middle of an expression, so a
+    // MIR block may become several. The count is syntactic, so targets are known
+    // before any block is built.
+    let mut start = Vec::with_capacity(body.blocks.len());
+    let mut total = 0;
+    for block in &body.blocks {
+        start.push(total);
+        total += 1 + 2 * short_circuits(block);
+    }
+    let mut analysis = Analysis {
+        parameters,
+        result,
+        callees,
+        start,
+        types: Vec::new(),
+        operands: Vec::new(),
+        local_types: vec![None; body.locals.len()],
+        blocks: Vec::with_capacity(total),
+        operations: Vec::new(),
+    };
+    // The existing route fixes every local's type before it lowers any statement.
+    analysis.infer_locals(body)?;
     for (index, block) in body.blocks.iter().enumerate() {
-        let block_reachable = reachable[index];
-        let mut operations = Vec::with_capacity(block.operations.len());
-        let local_start = types.len();
-        for &Located { kind, span } in &block.operations {
-            let checked = match kind {
-                mir::Operation::Statement => Operation::Statement,
-                mir::Operation::Constant(value, scalar) => {
-                    let ty = match scalar {
-                        Scalar::Integer(_) => Type::Integer,
-                        Scalar::Boolean(_) => Type::Boolean,
-                    };
-                    define(&mut types, value, ty, span)?;
-                    Operation::Constant(value, scalar)
-                }
-                mir::Operation::Read(value, variable) => {
-                    let ty = match variable.0.checked_sub(parameters.len()) {
-                        None => parameters[variable.0].ty.clone(),
-                        Some(local) => local_types
-                            .get(local)
-                            .cloned()
-                            .flatten()
-                            .ok_or_else(|| routine_diagnostic(CheckError::InvalidMir, span))?,
-                    };
-                    define(&mut types, value, ty, span)?;
-                    Operation::ReadVariable(value, variable)
-                }
-                mir::Operation::CallStatement(site, range) => {
-                    let callee = callees
-                        .get(site.0)
-                        .ok_or_else(|| routine_diagnostic(CheckError::InvalidMir, span))?;
-                    let arguments = body
-                        .operands
-                        .get(range.start..range.start + range.len)
-                        .filter(|arguments| arguments.len() == callee.parameters.len())
-                        .ok_or_else(|| routine_diagnostic(CheckError::InvalidMir, span))?;
-                    let spans = &body.operand_spans[range.start..range.start + range.len];
-                    for ((&argument, expected), &argument_span) in
-                        arguments.iter().zip(&callee.parameters).zip(spans)
-                    {
-                        require(
-                            expected,
-                            operand(&types, local_start, argument, span)?,
-                            argument_span,
-                        )?;
-                    }
-                    Operation::CallStatement(callee.id, range)
-                }
-                mir::Operation::Unary(value, operator, operand_value) => {
-                    let ty = operand(&types, local_start, operand_value, span)?.clone();
-                    let valid = if operator == Operator::Not {
-                        ty == Type::Boolean
-                    } else {
-                        ty.number_kind().is_some()
-                    };
-                    if !valid {
-                        return Err(Diagnostic::new("E105", "invalid unary operand", span));
-                    }
-                    define(&mut types, value, ty, span)?;
-                    Operation::Unary(value, operator, operand_value)
-                }
-                mir::Operation::Condition(value) => {
-                    // `&&` and `||` take booleans. The existing route never checked this
-                    // (it moved the operand into a boolean register); this is its
-                    // intended `mismatched types` error.
-                    require(
-                        &Type::Boolean,
-                        operand(&types, local_start, value, span)?,
-                        span,
-                    )?;
-                    continue;
-                }
-                mir::Operation::Define(variable, value, value_span, annotation) => {
-                    let actual = operand(&types, local_start, value, span)?.clone();
-                    let slot = local_slot(&mut local_types, parameters.len(), variable, span)?;
-                    if slot.is_some() {
-                        return Err(routine_diagnostic(CheckError::InvalidMir, span));
-                    }
-                    let ty = match annotation {
-                        Some(annotation) => {
-                            let expected = annotation.ty();
-                            require(&expected, &actual, value_span)?;
-                            expected
-                        }
-                        None => actual,
-                    };
-                    *slot = Some(ty);
-                    Operation::Store(variable, value)
-                }
-                mir::Operation::Assign(variable, value, value_span) => {
-                    let actual = operand(&types, local_start, value, span)?.clone();
-                    let slot = local_slot(&mut local_types, parameters.len(), variable, span)?;
-                    let expected = slot
-                        .as_ref()
-                        .ok_or_else(|| routine_diagnostic(CheckError::InvalidMir, span))?;
-                    require(expected, &actual, value_span)?;
-                    Operation::Store(variable, value)
-                }
-                mir::Operation::RangeBounds(start, end, iterable_span, end_span) => {
-                    let start_type = operand(&types, local_start, start, span)?;
-                    let end_type = operand(&types, local_start, end, span)?;
-                    require(start_type, end_type, end_span)?;
-                    if *start_type != Type::Integer {
-                        return Err(Diagnostic::new(
-                            "E109",
-                            "for-in ranges require integer bounds",
-                            iterable_span,
-                        ));
-                    }
-                    // A pure check: nothing is emitted for it.
-                    continue;
-                }
-                mir::Operation::Binary(value, operator, left, right) => {
-                    let left_type = operand(&types, local_start, left, span)?;
-                    let right_type = operand(&types, local_start, right, span)?;
-                    let ty = super::super::binary_type(operator, left_type, right_type, span)?;
-                    let operator = super::super::specialized_operator(operator, &ty);
-                    define(&mut types, value, ty, span)?;
-                    Operation::Binary(value, operator, left, right)
-                }
-                mir::Operation::Call(value, site, range) => {
-                    let callee = callees
-                        .get(site.0)
-                        .ok_or_else(|| routine_diagnostic(CheckError::InvalidMir, span))?;
-                    let arguments = body
-                        .operands
-                        .get(range.start..range.start + range.len)
-                        .filter(|arguments| arguments.len() == callee.parameters.len())
-                        .ok_or_else(|| routine_diagnostic(CheckError::InvalidMir, span))?;
-                    let spans = &body.operand_spans[range.start..range.start + range.len];
-                    for ((&argument, expected), &argument_span) in
-                        arguments.iter().zip(&callee.parameters).zip(spans)
-                    {
-                        require(
-                            expected,
-                            operand(&types, local_start, argument, span)?,
-                            argument_span,
-                        )?;
-                    }
-                    define(&mut types, value, callee.result.clone(), span)?;
-                    Operation::Call(value, callee.id, range)
-                }
-            };
-            operations.push(Located {
-                kind: checked,
-                span,
-            });
+        debug_assert_eq!(analysis.blocks.len(), analysis.start[index]);
+        for statement in &block.statements {
+            analysis.statement(statement)?;
         }
-        let exit = block.exit;
-        let mut edge = |target: mir::BlockId, back: bool| {
-            if target.0 <= index {
-                // A loop's back edge returns to a block already reached.
-                return if back {
-                    Ok(())
-                } else {
-                    Err(routine_diagnostic(CheckError::InvalidMir, exit.span))
-                };
+        analysis.exit(&block.exit, index)?;
+    }
+    // Reachability over the finished blocks. Forward and back edges alike only
+    // mark their targets; a loop header is reached by its forward edge first.
+    let mut reachable = vec![false; analysis.blocks.len()];
+    *reachable.first_mut().ok_or_else(|| invalid(routine_span))? = true;
+    for index in 0..analysis.blocks.len() {
+        if !reachable[index] {
+            continue;
+        }
+        match analysis.blocks[index].exit.kind {
+            Exit::Branch { yes, no, .. } => {
+                reachable[yes] = true;
+                reachable[no] = true;
             }
-            let target = reachable
-                .get_mut(target.0)
-                .ok_or_else(|| routine_diagnostic(CheckError::InvalidMir, exit.span))?;
-            *target |= block_reachable;
-            Ok(())
-        };
-        match exit.kind {
-            Exit::Branch {
-                condition,
-                condition_span,
-                yes,
-                no,
-            } => {
-                require(
-                    &Type::Boolean,
-                    operand(&types, local_start, condition, condition_span)?,
-                    condition_span,
-                )?;
-                edge(yes, false)?;
-                edge(no, false)?;
-            }
-            Exit::Jump(target) => edge(target, true)?,
-            Exit::Next(target) => {
-                if target.0 != index + 1 {
-                    return Err(routine_diagnostic(CheckError::InvalidMir, exit.span));
-                }
-                edge(target, false)?;
-            }
-            Exit::Return { value, value_span } => {
-                require(
-                    result,
-                    operand(&types, local_start, value, value_span)?,
-                    value_span,
-                )?;
-            }
-            Exit::ReturnVoid => {
-                if *result != Type::Void {
-                    return Err(routine_diagnostic(CheckError::InvalidMir, exit.span));
-                }
-            }
-            Exit::End if block_reachable && *result != Type::Void => {
+            Exit::Jump(target) => reachable[target] = true,
+            Exit::Next => reachable[index + 1] = true,
+            Exit::End if *result != Type::Void => {
                 return Err(routine_diagnostic(CheckError::MissingReturn, routine_span));
             }
-            Exit::End => {}
+            Exit::Return(_) | Exit::ReturnVoid | Exit::End => {}
         }
-        blocks.push(Block { operations, exit });
     }
-    let locals = local_types
+    let locals = analysis
+        .local_types
         .into_iter()
-        .map(|ty| ty.ok_or_else(|| routine_diagnostic(CheckError::InvalidMir, routine_span)))
+        .map(|ty| ty.ok_or_else(|| invalid(routine_span)))
         .collect::<Result<_, _>>()?;
     Ok(Body {
-        blocks,
-        types,
-        operands: body.operands.clone(),
+        blocks: analysis.blocks,
+        types: analysis.types,
+        operands: analysis.operands,
         locals,
     })
 }
 
-fn local_slot<'a>(
-    locals: &'a mut [Option<Type>],
-    parameters: usize,
-    variable: Variable,
-    span: Span,
-) -> Result<&'a mut Option<Type>, Diagnostic> {
-    variable
-        .0
-        .checked_sub(parameters)
-        .and_then(|local| locals.get_mut(local))
-        .ok_or_else(|| routine_diagnostic(CheckError::InvalidMir, span))
-}
-
-fn define(types: &mut Vec<Type>, value: Value, ty: Type, span: Span) -> Result<(), Diagnostic> {
-    if value.0 != types.len() {
-        return Err(routine_diagnostic(CheckError::InvalidMir, span));
+fn short_circuits(block: &mir::Block) -> usize {
+    fn count(expression: &Expression) -> usize {
+        match &expression.kind {
+            ExpressionKind::Literal(_) | ExpressionKind::Read(_) => 0,
+            ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => count(inner),
+            ExpressionKind::Binary(_, left, right) => count(left) + count(right),
+            ExpressionKind::ShortCircuit { left, right, .. } => 1 + count(left) + count(right),
+            ExpressionKind::Call(_, arguments) => arguments.iter().map(count).sum(),
+        }
     }
-    types.push(ty);
-    Ok(())
+    let statements: usize = block
+        .statements
+        .iter()
+        .map(|statement| match &statement.kind {
+            Statement::Define { value, .. }
+            | Statement::Assign { value, .. }
+            | Statement::Compound { value, .. } => count(value),
+            Statement::CallStatement(call) => count(call),
+            Statement::RangeStart { start, finish, .. } => count(start) + count(finish),
+            Statement::Marker | Statement::RangeBound { .. } | Statement::RangeStep { .. } => 0,
+        })
+        .sum();
+    statements
+        + match &block.exit.kind {
+            mir::Exit::Branch { condition, .. } => count(condition),
+            mir::Exit::Return(value) => count(value),
+            _ => 0,
+        }
 }
 
-fn operand(
-    types: &[Type],
-    local_start: usize,
-    value: Value,
-    span: Span,
-) -> Result<&Type, Diagnostic> {
-    value
-        .0
-        .checked_sub(local_start)
-        .and_then(|index| types[local_start..].get(index))
-        .ok_or_else(|| routine_diagnostic(CheckError::InvalidMir, span))
+struct Analysis<'a> {
+    parameters: &'a [Param],
+    result: &'a Type,
+    callees: &'a [Callee],
+    /// The first block built for each MIR block.
+    start: Vec<usize>,
+    types: Vec<Type>,
+    operands: Vec<Value>,
+    local_types: Vec<Option<Type>>,
+    blocks: Vec<Block>,
+    operations: Vec<Located<Operation>>,
 }
 
-fn require(expected: &Type, actual: &Type, span: Span) -> Result<(), Diagnostic> {
-    if expected == actual {
-        return Ok(());
+impl Analysis<'_> {
+    fn emit(&mut self, kind: Operation, span: Span) {
+        self.operations.push(Located { kind, span });
     }
-    Err(routine_diagnostic(
-        CheckError::TypeMismatch {
-            expected: expected.clone(),
-            actual: actual.clone(),
-        },
-        span,
-    ))
+
+    fn value(&mut self, ty: Type) -> Value {
+        self.types.push(ty);
+        Value(self.types.len() - 1)
+    }
+
+    /// Close the block being built and return its index.
+    fn close(&mut self, exit: Exit, span: Span) -> usize {
+        let operations = std::mem::take(&mut self.operations);
+        self.blocks.push(Block {
+            operations,
+            exit: Located { kind: exit, span },
+        });
+        self.blocks.len() - 1
+    }
+
+    fn variable_type(&self, variable: Variable) -> Option<Type> {
+        match variable.0.checked_sub(self.parameters.len()) {
+            None => Some(self.parameters[variable.0].ty.clone()),
+            Some(local) => self.local_types.get(local).cloned().flatten(),
+        }
+    }
+
+    /// Give a local its type, or check that it already has this one.
+    fn declare(&mut self, variable: Variable, ty: Type, span: Span) -> Result<(), Diagnostic> {
+        let local = variable
+            .0
+            .checked_sub(self.parameters.len())
+            .ok_or_else(|| invalid(span))?;
+        match self.local_types.get_mut(local) {
+            Some(slot @ None) => {
+                *slot = Some(ty);
+                Ok(())
+            }
+            Some(Some(existing)) if *existing == ty => Ok(()),
+            _ => Err(invalid(span)),
+        }
+    }
+
+    fn typed(&self, variable: Variable, span: Span) -> Result<Type, Diagnostic> {
+        self.variable_type(variable).ok_or_else(|| invalid(span))
+    }
+
+    fn read(&mut self, variable: Variable, span: Span) -> Result<(Value, Type), Diagnostic> {
+        let ty = self.typed(variable, span)?;
+        let value = self.value(ty.clone());
+        self.emit(Operation::ReadVariable(value, variable), span);
+        Ok((value, ty))
+    }
+
+    fn store(&mut self, variable: Variable, value: Value, span: Span) {
+        self.emit(Operation::Store(variable, value), span);
+    }
+
+    /// The type of an expression without lowering it. Errors are the existing
+    /// route's `expression_type` errors; lowering ignores them where it does.
+    fn infer(&self, expression: &Expression) -> Result<Type, Diagnostic> {
+        cyallo_ast::with_stack(|| match &expression.kind {
+            ExpressionKind::Literal(literal) => Ok(super::super::literal_type(literal)),
+            ExpressionKind::Read(variable) => self
+                .variable_type(*variable)
+                .ok_or_else(|| Diagnostic::new("E114", "type is not known yet", expression.span)),
+            ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => self.infer(inner),
+            ExpressionKind::Binary(operator, a, b) => {
+                let ta = self.infer(a)?;
+                let tb = self.infer(b)?;
+                if numeric(&ta) && numeric(&tb) {
+                    let context = numeric_context(a, &ta, b, &tb);
+                    let a = contextualize(a, &context)?;
+                    let b = contextualize(b, &context)?;
+                    super::super::binary_type(
+                        *operator,
+                        &self.infer(&a)?,
+                        &self.infer(&b)?,
+                        expression.span,
+                    )
+                } else {
+                    super::super::binary_type(*operator, &ta, &tb, expression.span)
+                }
+            }
+            ExpressionKind::ShortCircuit { .. } => Ok(Type::Boolean),
+            ExpressionKind::Call(site, _) => {
+                Ok(self.callee(*site, expression.span)?.result.clone())
+            }
+        })
+    }
+
+    fn callee(&self, site: SiteId, span: Span) -> Result<&Callee, Diagnostic> {
+        self.callees.get(site.0).ok_or_else(|| invalid(span))
+    }
+
+    /// `expr_expected`: contextualize to the wanted type, then lower.
+    fn expected(
+        &mut self,
+        expression: &Expression,
+        wanted: &Type,
+    ) -> Result<(Value, Type), Diagnostic> {
+        let expression = contextualize(expression, wanted)?;
+        self.expression(&expression)
+    }
+
+    fn expression(&mut self, expression: &Expression) -> Result<(Value, Type), Diagnostic> {
+        cyallo_ast::with_stack(|| {
+            let span = expression.span;
+            match &expression.kind {
+                ExpressionKind::Literal(literal) => {
+                    let ty = super::super::literal_type(literal);
+                    let value = self.value(ty.clone());
+                    self.emit(Operation::Constant(value, literal.clone()), span);
+                    Ok((value, ty))
+                }
+                ExpressionKind::Read(variable) => self.read(*variable, span),
+                ExpressionKind::Group(inner) => self.expression(inner),
+                ExpressionKind::Unary(operator, operand) => {
+                    let (operand, ty) = self.expression(operand)?;
+                    let valid = if *operator == Operator::Not {
+                        ty == Type::Boolean
+                    } else {
+                        numeric(&ty)
+                    };
+                    if !valid {
+                        return Err(Diagnostic::new("E105", "invalid unary operand", span));
+                    }
+                    let value = self.value(ty.clone());
+                    self.emit(Operation::Unary(value, *operator, operand), span);
+                    Ok((value, ty))
+                }
+                ExpressionKind::Binary(operator, a, b) => {
+                    // Both operands are read in one numeric context, which is chosen
+                    // from their inferred types before either is lowered.
+                    // The existing route types both operands first (to find out whether
+                    // either is dynamic), and a typing error in either stops it here.
+                    let ta = self.infer(a)?;
+                    let tb = self.infer(b)?;
+                    let context =
+                        (numeric(&ta) && numeric(&tb)).then(|| numeric_context(a, &ta, b, &tb));
+                    let (a, b) = match &context {
+                        Some(context) => (contextualize(a, context)?, contextualize(b, context)?),
+                        None => (Cow::Borrowed(&**a), Cow::Borrowed(&**b)),
+                    };
+                    let (left, ta) = self.expression(&a)?;
+                    let (right, tb) = self.expression(&b)?;
+                    if numeric(&ta) && numeric(&tb) && ta != tb {
+                        return Err(Diagnostic::new(
+                            "E109",
+                            "numeric operands require identical types; use a checked cast",
+                            span,
+                        ));
+                    }
+                    let ty = super::super::binary_type(*operator, &ta, &tb, span)?;
+                    let value = self.value(ty.clone());
+                    let operator = super::super::specialized_operator(*operator, &ty);
+                    self.emit(Operation::Binary(value, operator, left, right), span);
+                    Ok((value, ty))
+                }
+                ExpressionKind::ShortCircuit {
+                    and,
+                    left,
+                    right,
+                    slot,
+                } => self.short_circuit(*and, left, right, *slot, span),
+                ExpressionKind::Call(site, arguments) => {
+                    let (target, result, operands) = self.arguments(*site, arguments, span)?;
+                    let value = self.value(result.clone());
+                    self.emit(Operation::Call(value, target, operands), span);
+                    Ok((value, result))
+                }
+            }
+        })
+    }
+
+    /// Lower call arguments against the callee's parameter types, in order.
+    fn arguments(
+        &mut self,
+        site: SiteId,
+        arguments: &[Expression],
+        span: Span,
+    ) -> Result<(usize, Type, Operands), Diagnostic> {
+        let callee = self.callee(site, span)?;
+        let (target, result, parameters) =
+            (callee.id, callee.result.clone(), callee.parameters.clone());
+        if arguments.len() != parameters.len() {
+            return Err(invalid(span));
+        }
+        let mut values = Vec::with_capacity(arguments.len());
+        for (argument, parameter) in arguments.iter().zip(&parameters) {
+            let (value, ty) = self.expected(argument, parameter)?;
+            require(parameter, &ty, argument.span)?;
+            values.push(value);
+        }
+        let operands = Operands {
+            start: self.operands.len(),
+            len: values.len(),
+        };
+        self.operands.extend(values);
+        Ok((target, result, operands))
+    }
+
+    /// `left && right` / `left || right`. The result lives in a hidden local,
+    /// because the right side runs in its own block and values do not cross blocks.
+    fn short_circuit(
+        &mut self,
+        and: bool,
+        left: &Expression,
+        right: &Expression,
+        slot: Variable,
+        span: Span,
+    ) -> Result<(Value, Type), Diagnostic> {
+        // The existing route never checked these operands (it moved them into a
+        // boolean register); this is the check its unreachable second path intended.
+        let (decided, ty) = self.expression(left)?;
+        require(&Type::Boolean, &ty, span)?;
+        self.declare(slot, Type::Boolean, span)?;
+        self.store(slot, decided, span);
+        let test = self.close(Exit::Next, span);
+        let rhs = test + 1;
+        let (other, ty) = self.expression(right)?;
+        require(&Type::Boolean, &ty, span)?;
+        self.store(slot, other, span);
+        let rhs_end = self.close(Exit::Next, span);
+        let end = rhs_end + 1;
+        let (yes, no) = if and { (rhs, end) } else { (end, rhs) };
+        self.blocks[test].exit.kind = Exit::Branch {
+            condition: decided,
+            yes,
+            no,
+        };
+        self.read(slot, span)
+    }
+
+    /// The existing route fixes every local's type before it lowers anything. An
+    /// annotated local has its annotation. An unannotated one takes the first type that
+    /// any of its initializer or later assignments can be given, and a loop counter the
+    /// type of its range. The passes repeat until nothing more is known, then the first
+    /// local still unknown reports why, so a typing error here comes before any
+    /// lowering error. Lowering reads these types and never changes them.
+    fn infer_locals(&mut self, body: &mir::Body) -> Result<(), Diagnostic> {
+        struct Candidate<'b> {
+            slot: Variable,
+            value: &'b Expression,
+            span: Span,
+        }
+        let mut candidates = Vec::new();
+        let mut ranges = Vec::new();
+        let mut bounds = Vec::new();
+        for block in &body.blocks {
+            for statement in &block.statements {
+                let span = statement.span;
+                match &statement.kind {
+                    Statement::Define {
+                        slot,
+                        annotation: Some(ty),
+                        ..
+                    } => self.declare(*slot, ty.clone(), span)?,
+                    Statement::Define { slot, value, .. } | Statement::Assign { slot, value } => {
+                        candidates.push(Candidate {
+                            slot: *slot,
+                            value,
+                            span,
+                        });
+                    }
+                    Statement::RangeStart {
+                        variable,
+                        end,
+                        start,
+                        ..
+                    } => ranges.push((*variable, *end, start)),
+                    Statement::RangeBound { end, bound, .. } => bounds.push((*end, *bound)),
+                    _ => {}
+                }
+            }
+        }
+        loop {
+            let mut changed = false;
+            for (variable, end, start) in &ranges {
+                if self.variable_type(*variable).is_none()
+                    && let Ok(ty) = self.infer(start)
+                {
+                    self.declare(*variable, ty.clone(), start.span)?;
+                    self.declare(*end, ty, start.span)?;
+                    changed = true;
+                }
+            }
+            for (end, bound) in &bounds {
+                if self.variable_type(*bound).is_none()
+                    && let Some(ty) = self.variable_type(*end)
+                {
+                    self.declare(*bound, ty, Span::default())?;
+                    changed = true;
+                }
+            }
+            for candidate in &candidates {
+                if self.variable_type(candidate.slot).is_none()
+                    && let Ok(ty) = self.infer(candidate.value)
+                {
+                    self.declare(candidate.slot, ty, candidate.span)?;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let unresolved: Vec<Variable> = candidates
+            .iter()
+            .map(|candidate| candidate.slot)
+            .filter(|slot| self.variable_type(*slot).is_none())
+            .collect();
+        for candidate in &candidates {
+            if self.variable_type(candidate.slot).is_some() {
+                continue;
+            }
+            // An initializer that does not wait on another unknown local failed on its own:
+            // report that error rather than hiding it.
+            if !mentions(candidate.value, &unresolved)
+                && let Err(error) = self.infer(candidate.value)
+            {
+                return Err(error);
+            }
+            let name = candidate
+                .slot
+                .0
+                .checked_sub(self.parameters.len())
+                .and_then(|local| body.locals.get(local))
+                .map_or("", |local| &local.name);
+            return Err(Diagnostic::new(
+                "E114",
+                format!(
+                    "cannot infer the type of `{}`; initialize it with a known value or declare its type",
+                    cyallo_ast::source_name(name)
+                ),
+                candidate.span,
+            ));
+        }
+        Ok(())
+    }
+
+    fn statement(&mut self, statement: &Located<Statement>) -> Result<(), Diagnostic> {
+        let span = statement.span;
+        match &statement.kind {
+            Statement::Marker => self.emit(Operation::Statement, span),
+            Statement::Define {
+                slot,
+                value,
+                annotation,
+            } => {
+                // The local's type was fixed before lowering began.
+                let ty = self.typed(*slot, span)?;
+                debug_assert!(
+                    annotation
+                        .as_ref()
+                        .is_none_or(|annotation| *annotation == ty)
+                );
+                let (stored, actual) = self.expected(value, &ty)?;
+                require(&ty, &actual, value.span)?;
+                self.store(*slot, stored, span);
+            }
+            Statement::Assign { slot, value } => {
+                let ty = self.typed(*slot, span)?;
+                let (stored, actual) = self.expected(value, &ty)?;
+                require(&ty, &actual, value.span)?;
+                self.store(*slot, stored, span);
+            }
+            Statement::Compound {
+                slot,
+                operator,
+                value,
+            } => {
+                let ty = self.typed(*slot, span)?;
+                let (old, _) = self.read(*slot, span)?;
+                let contextual = contextualize(value, &ty)?;
+                let (operand, operand_type) = self.expression(&contextual)?;
+                let result = super::super::binary_type(*operator, &ty, &operand_type, span)?;
+                require(&ty, &result, span)?;
+                let combined = self.value(result.clone());
+                let operator = super::super::specialized_operator(*operator, &result);
+                self.emit(Operation::Binary(combined, operator, old, operand), span);
+                self.store(*slot, combined, span);
+            }
+            Statement::CallStatement(call) => {
+                let ExpressionKind::Call(site, arguments) = &call.kind else {
+                    return Err(invalid(span));
+                };
+                let (target, _, operands) = self.arguments(*site, arguments, call.span)?;
+                self.emit(Operation::CallStatement(target, operands), call.span);
+            }
+            Statement::RangeStart {
+                variable,
+                end,
+                start,
+                finish,
+                iterable_span,
+            } => {
+                let (first, ty) = self.expression(start)?;
+                let (last, end_type) = self.expression(finish)?;
+                require(&ty, &end_type, finish.span)?;
+                if ty.number_kind().is_none_or(|kind| kind.float()) {
+                    return Err(Diagnostic::new(
+                        "E109",
+                        "for-in ranges require integer bounds",
+                        *iterable_span,
+                    ));
+                }
+                let counter = self.typed(*variable, span)?;
+                require(&ty, &counter, span)?;
+                self.declare(*end, ty, span)?;
+                self.store(*variable, first, span);
+                self.store(*end, last, span);
+            }
+            Statement::RangeBound {
+                end,
+                bound,
+                inclusive,
+            } => {
+                let (last, ty) = self.read(*end, span)?;
+                let value = if *inclusive {
+                    last
+                } else {
+                    let one = self.one(&ty, span)?;
+                    let value = self.value(ty.clone());
+                    self.emit(
+                        Operation::Binary(value, Operator::Subtract, last, one),
+                        span,
+                    );
+                    value
+                };
+                self.declare(*bound, ty, span)?;
+                self.store(*bound, value, span);
+            }
+            Statement::RangeStep { variable } => {
+                let (current, ty) = self.read(*variable, span)?;
+                let one = self.one(&ty, span)?;
+                let next = self.value(ty);
+                self.emit(Operation::Binary(next, Operator::Add, current, one), span);
+                self.store(*variable, next, span);
+            }
+        }
+        Ok(())
+    }
+
+    /// The literal `1` of the counter's integer type.
+    fn one(&mut self, ty: &Type, span: Span) -> Result<Value, Diagnostic> {
+        let kind = ty.number_kind().ok_or_else(|| invalid(span))?;
+        let unit = Number::integer(kind, 1)
+            .map_err(|error| cyallo_ast::diagnostic::invalid_numeric_literal(error, span))?;
+        let value = self.value(ty.clone());
+        self.emit(Operation::Constant(value, Literal::number(unit)), span);
+        Ok(value)
+    }
+
+    fn exit(&mut self, exit: &Located<mir::Exit>, index: usize) -> Result<(), Diagnostic> {
+        let span = exit.span;
+        let target = |analysis: &Self, block: mir::BlockId| -> Result<usize, Diagnostic> {
+            analysis
+                .start
+                .get(block.0)
+                .copied()
+                .ok_or_else(|| invalid(span))
+        };
+        let kind = match &exit.kind {
+            mir::Exit::Branch { condition, yes, no } => {
+                let (value, ty) = self.expected(condition, &Type::Boolean)?;
+                require(&Type::Boolean, &ty, condition.span)?;
+                Exit::Branch {
+                    condition: value,
+                    yes: target(self, *yes)?,
+                    no: target(self, *no)?,
+                }
+            }
+            mir::Exit::Jump(block) => Exit::Jump(target(self, *block)?),
+            mir::Exit::Next(block) => {
+                if target(self, *block)? != self.blocks.len() + 1 {
+                    return Err(invalid(span));
+                }
+                Exit::Next
+            }
+            mir::Exit::Return(value) => {
+                if *self.result == Type::Void {
+                    return Err(invalid(span));
+                }
+                let (stored, ty) = self.expected(value, self.result)?;
+                require(self.result, &ty, value.span)?;
+                Exit::Return(stored)
+            }
+            mir::Exit::ReturnVoid => {
+                if *self.result != Type::Void {
+                    return Err(invalid(span));
+                }
+                Exit::ReturnVoid
+            }
+            mir::Exit::End => Exit::End,
+            mir::Exit::RangeEmpty {
+                variable,
+                end,
+                inclusive,
+                yes,
+                no,
+            } => {
+                let (first, _) = self.read(*variable, span)?;
+                let (last, _) = self.read(*end, span)?;
+                let test = if *inclusive {
+                    Operator::Greater
+                } else {
+                    Operator::GreaterEqual
+                };
+                let empty = self.value(Type::Boolean);
+                self.emit(Operation::Binary(empty, test, first, last), span);
+                Exit::Branch {
+                    condition: empty,
+                    yes: target(self, *yes)?,
+                    no: target(self, *no)?,
+                }
+            }
+            mir::Exit::RangeDone {
+                variable,
+                bound,
+                yes,
+                no,
+            } => {
+                let (current, _) = self.read(*variable, span)?;
+                let (last, _) = self.read(*bound, span)?;
+                let finished = self.value(Type::Boolean);
+                self.emit(
+                    Operation::Binary(finished, Operator::Equal, current, last),
+                    span,
+                );
+                Exit::Branch {
+                    condition: finished,
+                    yes: target(self, *yes)?,
+                    no: target(self, *no)?,
+                }
+            }
+        };
+        let _ = index;
+        self.close(kind, span);
+        Ok(())
+    }
+}
+
+/// Whether `expression` reads any of `variables`.
+fn mentions(expression: &Expression, variables: &[Variable]) -> bool {
+    match &expression.kind {
+        ExpressionKind::Literal(_) => false,
+        ExpressionKind::Read(variable) => variables.iter().any(|other| other.0 == variable.0),
+        ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => {
+            mentions(inner, variables)
+        }
+        ExpressionKind::Binary(_, left, right)
+        | ExpressionKind::ShortCircuit { left, right, .. } => {
+            mentions(left, variables) || mentions(right, variables)
+        }
+        ExpressionKind::Call(_, arguments) => arguments
+            .iter()
+            .any(|argument| mentions(argument, variables)),
+    }
 }

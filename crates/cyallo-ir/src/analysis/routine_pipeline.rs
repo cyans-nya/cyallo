@@ -5,8 +5,8 @@ mod mir;
 
 use super::{Result, Signature, collect, ir, key, routine_function};
 use cyallo_ast::{
-    Expr, ExprKind, Function, Literal, ParameterArity, ParameterPassing, RoutineKind, Span, Stmt,
-    StmtKind, Type,
+    Expr, ExprKind, Function, ParameterArity, ParameterPassing, RoutineKind, Span, Stmt, StmtKind,
+    Type,
 };
 use cyallo_parser::BodyHandle;
 use ir::{Op, Reg, Slot};
@@ -19,27 +19,19 @@ use std::{
 #[derive(Clone, Copy, Debug, Hash)]
 struct Variable(usize);
 
-/// The scalar types a local may be annotated with in the migrated subset.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-enum ScalarType {
-    Integer,
-    Boolean,
-}
-
-impl ScalarType {
-    fn ty(self) -> Type {
-        match self {
-            Self::Integer => Type::Integer,
-            Self::Boolean => Type::Boolean,
-        }
-    }
+/// A use of a name whose meaning depends on declarations outside this body.
+#[derive(Clone, Debug, Hash)]
+struct ReferenceSite {
+    path: Box<str>,
+    span: Span,
+    /// Number of ordered arguments written at the site.
+    arguments: usize,
+    /// The call is a statement: the callee is a procedure and no value is used.
+    discard: bool,
 }
 
 #[derive(Clone, Copy, Debug, Hash)]
-enum Scalar {
-    Integer(i64),
-    Boolean(bool),
-}
+struct SiteId(usize);
 
 /// File-relative control flow retained by the module graph in place of an
 /// owned AST body. Archive placement is applied when producing diagnostics or IR.
@@ -63,7 +55,7 @@ impl IndexedRoutineBody {
         let Some(hir) = hir::from_indexed(handle.unit().syntax(), function) else {
             return Ok(None);
         };
-        let mir = mir::lower(&hir, function.span);
+        let mir = mir::lower(hir, function.span);
         Ok(Some(Self {
             digest: crate::module_cache::fingerprint(&mir),
             mir: Arc::new(mir),
@@ -119,7 +111,14 @@ impl IndexedRoutineBody {
                 .mir
                 .blocks
                 .iter()
-                .map(|block| block.operations.len())
+                .map(|block| {
+                    block.statements.len()
+                        + block
+                            .statements
+                            .iter()
+                            .map(|statement| statement_size(&statement.kind))
+                            .sum::<usize>()
+                })
                 .sum(),
             // Direct-call edges come from the overlay, as they do from an owned body.
             calls: self
@@ -208,14 +207,20 @@ pub(crate) fn plain_contract(
     result: &Type,
     arguments: usize,
 ) -> bool {
+    let scalar = |ty: &Type| {
+        matches!(
+            ty,
+            Type::Integer | Type::Boolean | Type::Real | Type::Numeric(_)
+        )
+    };
     let returns = match kind {
-        RoutineKind::Function => matches!(result, Type::Integer | Type::Boolean),
+        RoutineKind::Function => scalar(result),
         RoutineKind::Procedure => *result == Type::Void,
     };
     returns
         && parameters.len() == arguments
         && parameters.iter().all(|parameter| {
-            matches!(parameter.ty, Type::Integer | Type::Boolean)
+            scalar(&parameter.ty)
                 && parameter.arity == ParameterArity::One
                 && parameter.passing == ParameterPassing::Value
                 && !parameter.by_ref
@@ -315,23 +320,19 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                 _ => 1,
             })
             .sum::<usize>();
-        if !matches!(block.exit.kind, mir::Exit::Next(_)) {
+        if !matches!(block.exit.kind, air::Exit::Next) {
             pc += 1;
         }
     }
     function.code.reserve(pc);
-    let mut registers = Vec::with_capacity(checked.types.len());
+    let mut registers = vec![0; checked.types.len()];
     for block in checked.blocks {
         for mir::Located { kind, span } in block.operations {
             let operation = match kind {
                 air::Operation::Statement => Op::Statement,
-                air::Operation::Constant(value, scalar) => {
-                    let literal = match scalar {
-                        Scalar::Integer(value) => Literal::Integer(value),
-                        Scalar::Boolean(value) => Literal::Boolean(value),
-                    };
+                air::Operation::Constant(value, literal) => {
                     let dst = register(&mut function, &checked.types[value.0]);
-                    registers.push(dst);
+                    registers[value.0] = dst;
                     Op::Literal(dst, literal)
                 }
                 air::Operation::Store(variable, value) => {
@@ -365,7 +366,7 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                         span,
                     );
                     let dst = register(&mut function, ty);
-                    registers.push(dst);
+                    registers[value.0] = dst;
                     Op::Load(dst, address)
                 }
                 air::Operation::Call(value, target, range) => {
@@ -374,7 +375,7 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                         .map(|argument| registers[argument.0])
                         .collect();
                     let dst = register(&mut function, &checked.types[value.0]);
-                    registers.push(dst);
+                    registers[value.0] = dst;
                     Op::Call(Some(dst), target, arguments)
                 }
                 air::Operation::CallStatement(target, range) => {
@@ -386,30 +387,44 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                 }
                 air::Operation::Unary(value, operator, operand) => {
                     let dst = register(&mut function, &checked.types[value.0]);
-                    registers.push(dst);
+                    registers[value.0] = dst;
                     Op::Unary(dst, operator, registers[operand.0])
                 }
                 air::Operation::Binary(value, operator, left, right) => {
                     let dst = register(&mut function, &checked.types[value.0]);
-                    registers.push(dst);
+                    registers[value.0] = dst;
                     Op::Binary(dst, operator, registers[left.0], registers[right.0])
                 }
             };
             push(&mut function, operation, span);
         }
         let operation = match block.exit.kind {
-            mir::Exit::Branch {
-                condition, yes, no, ..
-            } => Op::Branch(registers[condition.0], starts[yes.0], starts[no.0]),
-            mir::Exit::Jump(target) => Op::Jump(starts[target.0]),
-            mir::Exit::Next(_) => continue,
-            mir::Exit::Return { value, .. } => Op::Return(Some(registers[value.0])),
-            mir::Exit::End | mir::Exit::ReturnVoid => Op::Return(None),
+            air::Exit::Branch { condition, yes, no } => {
+                Op::Branch(registers[condition.0], starts[yes], starts[no])
+            }
+            air::Exit::Jump(target) => Op::Jump(starts[target]),
+            air::Exit::Next => continue,
+            air::Exit::Return(value) => Op::Return(Some(registers[value.0])),
+            air::Exit::End | air::Exit::ReturnVoid => Op::Return(None),
         };
         push(&mut function, operation, block.exit.span);
     }
     debug_assert_eq!(function.code.len(), pc);
     function
+}
+
+/// Expression nodes a statement holds, for the admission estimate.
+fn statement_size(statement: &mir::Statement) -> usize {
+    match statement {
+        mir::Statement::Define { value, .. }
+        | mir::Statement::Assign { value, .. }
+        | mir::Statement::Compound { value, .. } => value.size(),
+        mir::Statement::CallStatement(call) => call.size(),
+        mir::Statement::RangeStart { start, finish, .. } => start.size() + finish.size(),
+        mir::Statement::Marker
+        | mir::Statement::RangeBound { .. }
+        | mir::Statement::RangeStep { .. } => 0,
+    }
 }
 
 fn register(function: &mut ir::Function, ty: &Type) -> Reg {

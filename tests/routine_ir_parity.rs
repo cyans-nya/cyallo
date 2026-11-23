@@ -284,3 +284,258 @@ fn procedures_outside_the_subset_keep_the_existing_route() {
     assert!(run_ok("fn g() -> i64 { return 1 }\nproc p() { g() }").is_ok());
     assert!(run_ok("proc h() { }\nfn f() -> i64 { return h() }").is_err());
 }
+
+#[test]
+fn sized_integers_and_floats_match() {
+    parity(
+        "fn f(a: i32, b: i32) -> i32 {PAD\n    return a * 2 + b - 1\n}\n\
+         fn g(x: u8) -> u8 {PAD\n    return x + 1\n}\n\
+         fn area(r: f64) -> f64 {PAD\n    return 3.5 * r * r\n}\n\
+         fn bump(n: usize) -> usize {PAD\n    return n + 1\n}\n\
+         std::io::print(f(3, 4), \" \", g(5), \" \", area(2.0), \" \", bump(9))\n",
+        "9 6 14 10\n",
+    );
+    // Locals, annotations, compound assignment, comparisons and calls in sized types.
+    parity(
+        "fn step(a: i32) -> i32 {PAD\n    return a + 1\n}\n\
+         fn run(n: i32) -> i32 {PAD\n    let y: i32 = n + 1\n    let z = n * 3\n    let mut t: i32 = 0\n    t += 2\n    t -= 1\n    \
+         if y > 3 && z < 100 { t += step(y) + step(2) }\n    return t\n}\n\
+         fn fl(x: f64) -> f64 {PAD\n    let mut a = x\n    a += 1.5\n    a *= 2.0\n    if a > 4.0 { return a / 2.0 }\n    return a\n}\n\
+         std::io::print(run(5), \" \", run(1), \" \", fl(1.0), \" \", fl(3.0))\n",
+        "11 1 2.5 4.5\n",
+    );
+    // Division is integer division for integers, and sized literals on either side.
+    parity(
+        "fn d(a: i32) -> i32 {PAD\n    return a / 2 + 10 / a\n}\n\
+         fn neg(a: i32) -> i32 {PAD\n    let m: i8 = -5\n    return -a + (0 - 1)\n}\n\
+         fn big(a: u64) -> u64 {PAD\n    return a * 1000\n}\n\
+         std::io::print(d(5), \" \", neg(3), \" \", big(7))\n",
+        "4 -4 7000\n",
+    );
+}
+
+#[test]
+fn numeric_typing_reports_the_same_diagnostics() {
+    for (source, code) in [
+        // A wider value into a narrower local or result.
+        (
+            "fn f(n: i64) -> i32 {PAD\n    let x: i32 = n\n    return x\n}\n",
+            "E109",
+        ),
+        ("fn f(a: i32) -> i64 {PAD\n    return a\n}\n", "E109"),
+        // Literals that do not fit, or that are the wrong kind for the context.
+        ("fn f(a: u8) -> u8 {PAD\n    return 300\n}\n", "E10"),
+        ("fn f(a: u8) -> u8 {PAD\n    return a + 300\n}\n", "E10"),
+        (
+            "fn f(a: i32) -> i32 {PAD\n    let x: i32 = 2.5\n    return a\n}\n",
+            "E109",
+        ),
+        ("fn f(a: i32) -> i32 {PAD\n    return a + 2.5\n}\n", "E109"),
+        ("fn f(r: f64) -> f64 {PAD\n    return r * 2\n}\n", "E109"),
+        (
+            "fn f(r: f64) -> f64 {PAD\n    let x: f64 = 2\n    return r\n}\n",
+            "E109",
+        ),
+        ("fn f(n: i64) -> bool {PAD\n    return n < 2.0\n}\n", "E109"),
+        // Mixed operand types.
+        (
+            "fn f(a: i32, b: i64) -> i64 {PAD\n    return a + b\n}\n",
+            "E109",
+        ),
+        (
+            "fn f(a: i32, b: u8) -> bool {PAD\n    return a == b\n}\n",
+            "E109",
+        ),
+        (
+            "fn f(a: i32) -> i32 {PAD\n    let mut t: i32 = 0\n    t += a * 2.0\n    return t\n}\n",
+            "E109",
+        ),
+        // A range whose bounds differ in type, and a float range.
+        (
+            "fn f(n: i32) -> i32 {PAD\n    for i in 0..n { }\n    return n\n}\n",
+            "E109",
+        ),
+        (
+            "fn f(n: f64) -> f64 {PAD\n    for i in 0.0..n { }\n    return n\n}\n",
+            "E109",
+        ),
+        // An argument of the wrong numeric type.
+        (
+            "fn g(a: i32) -> i32 {PAD\n    return a\n}\nfn f(n: i64) -> i32 {PAD\n    return g(n)\n}\n",
+            "E109",
+        ),
+        (
+            "fn g(a: u8) -> u8 {PAD\n    return a\n}\nfn f(n: u8) -> u8 {PAD\n    return g(999)\n}\n",
+            "E10",
+        ),
+    ] {
+        same_diagnostic_prefix(source, code);
+    }
+}
+
+/// Like `same_diagnostic`, with the code compared by prefix, so one case can cover the
+/// conversion errors that share a leading digit group.
+fn same_diagnostic_prefix(source: &str, code: &str) {
+    let (migrated, fallback) = variants(source);
+    assert_migrated(&migrated);
+    let a = compile(&migrated).expect_err(&migrated);
+    let b = compile(&fallback).expect_err(&fallback);
+    assert!(a.code.starts_with(code), "{} for\n{migrated}", a.code);
+    let a = failure(&a, a.span.source_text(&migrated));
+    let b = failure(&b, b.span.source_text(&fallback));
+    assert_eq!(a, b, "migrated:\n{migrated}\nfallback:\n{fallback}");
+}
+
+/// A small deterministic generator (no dependency), so a failure reproduces from its seed.
+struct Random(u64);
+
+impl Random {
+    fn next(&mut self, bound: usize) -> usize {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.0 >> 33) as usize) % bound
+    }
+}
+
+const TYPES: [&str; 6] = ["i64", "i32", "u8", "i8", "f64", "usize"];
+
+fn expression(random: &mut Random, names: &[String], depth: usize) -> String {
+    let leaf = depth == 0 || random.next(3) == 0;
+    if leaf {
+        return match random.next(5) {
+            0 | 1 => names[random.next(names.len())].clone(),
+            2 => format!("{}", random.next(300)),
+            3 => format!("-{}", random.next(130)),
+            _ => format!("{}.5", random.next(20)),
+        };
+    }
+    match random.next(8) {
+        0 => format!("({})", expression(random, names, depth - 1)),
+        1 => format!("-{}", expression(random, names, depth - 1)),
+        _ => {
+            let operator = ["+", "-", "*", "/", "%", "<", ">=", "=="][random.next(8)];
+            format!(
+                "({} {operator} {})",
+                expression(random, names, depth - 1),
+                expression(random, names, depth - 1)
+            )
+        }
+    }
+}
+
+fn generated_function(random: &mut Random, index: usize) -> String {
+    let parameters = 1 + random.next(2);
+    let mut names = Vec::new();
+    let mut signature = Vec::new();
+    let mut arguments = Vec::new();
+    for position in 0..parameters {
+        let name = format!("p{position}");
+        let ty = TYPES[random.next(TYPES.len())];
+        signature.push(format!("{name}: {ty}"));
+        arguments.push(if ty == "f64" { "2.5" } else { "3" });
+        names.push(name);
+    }
+    let mut body = String::new();
+    for local in 0..random.next(3) {
+        let name = format!("v{local}");
+        let annotation = if random.next(2) == 0 {
+            format!(": {}", TYPES[random.next(TYPES.len())])
+        } else {
+            String::new()
+        };
+        body += &format!(
+            "    let mut {name}{annotation} = {}\n",
+            expression(random, &names, 2)
+        );
+        names.push(name.clone());
+        if random.next(2) == 0 {
+            let operator = ["=", "+=", "-=", "*="][random.next(4)];
+            body += &format!("    {name} {operator} {}\n", expression(random, &names, 2));
+        }
+    }
+    body += &format!("    return {}\n", expression(random, &names, 3));
+    format!(
+        "fn f{index}({}) -> {} {{PAD\n{body}}}\nstd::io::print(f{index}({}))\n",
+        signature.join(", "),
+        TYPES[random.next(TYPES.len())],
+        arguments.join(", ")
+    )
+}
+
+/// How a program ends and what it printed, for programs that compile.
+fn outcome(source: &str) -> (String, String) {
+    let program = compile(source).unwrap();
+    let mut session = Session::new(Arc::new(program)).unwrap();
+    for _ in 0..64 {
+        if !matches!(session.run(1 << 16), Status::Paused) {
+            break;
+        }
+    }
+    // The padding shifts source positions, so a runtime failure is compared without its span.
+    let status = format!("{:?}", session.status());
+    let status = match status.find(", span: Span {") {
+        Some(at) => status[..at].to_owned(),
+        None => status,
+    };
+    (status, session.context.output.clone())
+}
+
+#[test]
+fn generated_numeric_programs_agree_with_the_existing_route() {
+    // `ROUTINE_FUZZ_CASES` and `ROUTINE_FUZZ_SEED` widen the search from the command line.
+    let variable = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let cases = variable("ROUTINE_FUZZ_CASES", 400) as usize;
+    let mut random = Random(variable("ROUTINE_FUZZ_SEED", 0x5eed));
+    let (mut compiled, mut rejected, mut migrated_bodies) = (0, 0, 0);
+    for index in 0..cases {
+        let source = generated_function(&mut random, index);
+        let (migrated, fallback) = variants(&source);
+        let file =
+            cyallo_parser::parse_modern_snapshot(migrated.as_str().into(), false, cyallo::Jobs(1))
+                .unwrap();
+        for handle in file.units().iter().flat_map(|unit| unit.bodies()) {
+            if IndexedRoutineBody::prepare(&handle, 0).unwrap().is_some() {
+                migrated_bodies += 1;
+            }
+        }
+        let a = compile(&migrated);
+        let b = compile(&fallback);
+        match (a, b) {
+            (Ok(_), Ok(_)) => {
+                compiled += 1;
+                assert_eq!(
+                    outcome(&migrated),
+                    outcome(&fallback),
+                    "case {index} runs differently\n{migrated}"
+                );
+            }
+            (Err(a), Err(b)) => {
+                rejected += 1;
+                assert_eq!(
+                    failure(&a, a.span.source_text(&migrated)),
+                    failure(&b, b.span.source_text(&fallback)),
+                    "case {index}\n{migrated}"
+                );
+            }
+            (a, b) => panic!(
+                "case {index}: migrated {:?}, fallback {:?}\n{migrated}",
+                a.map(|_| "ok"),
+                b.map(|_| "ok")
+            ),
+        }
+    }
+    // The corpus must exercise both outcomes and the migrated route.
+    assert!(compiled > 20, "only {compiled} programs compile");
+    assert!(rejected > 20, "only {rejected} programs are rejected");
+    assert!(
+        migrated_bodies > 200,
+        "only {migrated_bodies} bodies migrated"
+    );
+}
