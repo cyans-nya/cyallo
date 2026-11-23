@@ -129,8 +129,13 @@ pub(crate) fn specialize_calls(
         ));
         {
             let native = linked.native.clone();
-            linked.with_sources(|asts| {
-                cyallo_ir::generics::specialize_modules(asts, &native, plan.options)
+            linked.with_sources_and_bodies(|asts, bodies| {
+                cyallo_ir::generics::specialize_modules_with_bodies(
+                    asts,
+                    &native,
+                    plan.options,
+                    bodies,
+                )
             })
         }
         .map_err(E::CallCheck)?;

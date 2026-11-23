@@ -5,7 +5,7 @@ mod mir;
 
 use super::{Result, Signature, collect, ir, key, routine_function};
 use cyallo_ast::indexed::{IndexedAst, NameId};
-use cyallo_ast::{Expr, ExprKind, Function, Span, Stmt, StmtKind, Type};
+use cyallo_ast::{Diagnostic, Expr, ExprKind, Function, Param, Span, Stmt, StmtKind, Type};
 use cyallo_parser::BodyHandle;
 use ir::{Op, Reg, Slot};
 use std::{
@@ -91,6 +91,20 @@ pub struct IndexedRoutineBody {
     overlay: Option<Arc<[Box<str>]>>,
     /// The body's syntax, kept so the linker can materialize it as a fallback.
     handle: BodyHandle,
+    /// For a generic routine: its linked parameters and result, with the type parameters
+    /// as names. The template is checked against them once, with the parameters opaque.
+    generic: Option<Arc<GenericHeader>>,
+}
+
+struct GenericHeader {
+    params: Vec<Param>,
+    result: Type,
+}
+
+impl fmt::Debug for GenericHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GenericHeader").finish_non_exhaustive()
+    }
 }
 
 /// HIR waits here until something needs the control-flow graph (typed analysis),
@@ -99,6 +113,8 @@ struct Lowering {
     hir: Mutex<Option<hir::Routine>>,
     mir: OnceLock<mir::Body>,
     span: Span,
+    /// The outcome of checking a generic template with its parameters opaque.
+    generic_check: OnceLock<std::result::Result<(), Diagnostic>>,
 }
 
 impl fmt::Debug for Lowering {
@@ -153,12 +169,14 @@ impl IndexedRoutineBody {
                 hir: Mutex::new(Some(hir)),
                 mir: OnceLock::new(),
                 span: function.span,
+                generic_check: OnceLock::new(),
             }),
             file_span: function.span,
             archived_span: shift(function.span, offset)?,
             offset,
             overlay: None,
             handle: handle.clone(),
+            generic: None,
         }))
     }
 
@@ -187,6 +205,65 @@ impl IndexedRoutineBody {
         self.digest = crate::module_cache::fingerprint(&(self.digest, &targets));
         self.overlay = Some(targets.into());
         self
+    }
+
+    /// Record a generic routine's linked signature, whose type parameters are names.
+    pub(crate) fn set_generic_header(&mut self, params: &[Param], result: &Type) {
+        self.generic = Some(Arc::new(GenericHeader {
+            params: params.to_vec(),
+            result: result.clone(),
+        }));
+    }
+
+    /// Whether this body is a generic template or an instance of one.
+    pub fn is_generic(&self) -> bool {
+        self.generic.is_some()
+    }
+
+    /// The archive-placed span of the routine, to order diagnostics.
+    pub fn placed_span(&self) -> Span {
+        self.archived_span
+    }
+
+    /// Check a generic template once, with its type parameters opaque: a value of such a
+    /// type can be moved and returned and nothing else, whatever the instance turns out to
+    /// be. The outcome is shared by the template and all its instances.
+    pub fn check_generic(
+        &self,
+        signatures: &HashMap<String, Signature>,
+        source_names: &BTreeMap<Box<str>, Box<str>>,
+        definitions: &HashMap<String, Type>,
+    ) -> Result<()> {
+        let Some(header) = &self.generic else {
+            return Ok(());
+        };
+        self.lowering
+            .generic_check
+            .get_or_init(|| {
+                let Some(callees) = self
+                    .bind_callees(None, signatures, source_names)
+                    .map_err(|error| error)?
+                else {
+                    return Ok(());
+                };
+                air::analyze(
+                    self.mir(),
+                    &header.params,
+                    &header.result,
+                    &callees,
+                    definitions,
+                    self.handle.unit().syntax(),
+                    self.file_span,
+                )
+                .map(|_| ())
+                .map_err(|mut error| {
+                    match cyallo_ast::spans::shift_diagnostic(&mut error, self.offset) {
+                        Ok(()) => error,
+                        Err(shift_error) => shift_error,
+                    }
+                })
+            })
+            .clone()
     }
 
     /// The owned statements with archive-placed spans, for a routine the indexed
@@ -235,7 +312,7 @@ impl IndexedRoutineBody {
         signatures: &HashMap<String, Signature>,
         definitions: &HashMap<String, Type>,
     ) -> Result<Option<ir::Function>> {
-        let Some(callees) = self.bind_callees(function, signatures, source_names)? else {
+        let Some(callees) = self.bind_callees(Some(function), signatures, source_names)? else {
             return Ok(None);
         };
         lower_mir(
@@ -255,7 +332,7 @@ impl IndexedRoutineBody {
     /// The MIR itself stays independent of every imported declaration.
     fn bind_callees(
         &self,
-        function: &Function,
+        function: Option<&Function>,
         signatures: &HashMap<String, Signature>,
         source_names: &BTreeMap<Box<str>, Box<str>>,
     ) -> Result<Option<Vec<air::Site>>> {
@@ -263,7 +340,9 @@ impl IndexedRoutineBody {
             return Ok(Some(Vec::new()));
         }
         let mut targets = HashMap::new();
-        if self.overlay.is_none() {
+        if self.overlay.is_none()
+            && let Some(function) = function
+        {
             call_targets(&function.body, &mut targets);
         }
         let mut callees = Vec::with_capacity(self.sites.len());

@@ -1,112 +1,202 @@
-# Strings: library types over slices and vectors
+# Strings: `string` for most code, `Utf8` for byte-level work
 
-Status: design decided in outline, nothing implemented. The runtime today represents a
-string as `Value::String(Arc<str>)`, a literal as `Op::LiteralString(Reg, Arc<str>)`, and
-the native backends reach strings only through bridge calls that resolve handles in a host
-text heap (`BridgeCall::TextConcat`, `TextCompare`, `TextConstant`).
+Status: design. Nothing here is implemented. Today a string is `Value::String(Arc<str>)`, a
+literal is `Op::LiteralString(Reg, Arc<str>)`, and the native backends reach strings only
+through bridge calls that resolve handles in a host text heap (`BridgeCall::TextConcat`,
+`TextCompare`, `TextConstant`).
 
-## Problem
+## Why
 
-- A string is reference counted without the program saying so. A clone is a refcount bump
-  and the free happens at an unpredictable point, although the language treats `string` as an
-  owned, move-only value.
-- Native code never holds string bytes. Every string operation, even a comparison, leaves
-  native code through a bridge call. Concatenation formats into a temporary and copies it
-  into a new string, so each `+` costs two allocations and two copies.
-- Strings are compiler intrinsics, unlike records and slices, so the optimizer cannot see
-  their length or bytes.
+- The `Arc` is a hidden reference count, although the language treats `string` as owned and
+  move-only.
+- Native code never holds string bytes: every operation, even a comparison, is a bridge call,
+  and each `+` formats into a temporary and copies it into a new string.
+- Strings are compiler intrinsics, so the optimizer cannot see their length or bytes.
+- Most string use is "build some text, pass it around, print it", for which an immutable
+  shared value with cheap concatenation is the right default. Byte-level work (parsing,
+  buffers, I/O) wants an owned, growable, validated buffer. One type cannot be both.
 
-## Decisions
+## Overview
 
-1. `&str` and `string` are ordinary types, close to records, not compiler intrinsics.
-2. `&str` is `&[u8]` with the guarantee that the bytes are valid UTF-8.
-3. `string` is `Vec<u8>` with the same guarantee.
-4. Slice and `Vec` are the native primitives that carry everything else:
-   - a slice is `(ptr, len)`;
-   - a `Vec` is `(ptr, cap, len)`;
-   - both live in registers or on the stack, not in a heap object, unless the program asks
-     for `gc` or `rc`.
+Two tiers, both UTF-8 only.
 
-The encoding is fixed to UTF-8 as an invariant of the type, not a parameter. A `u16` form
-(Windows, JavaScript) is a separate type or a conversion, added later without changing
-`string`.
+| Type | Role | Shape | Memory |
+|---|---|---|---|
+| `string` | The default. Immutable. Concatenation makes a new value. | A handle to a heap string object (flat, cons, or sliced) | GC-managed, `Copy` |
+| `Utf8` | Owned, growable, validated UTF-8 buffer (Rust's `String`). | `Vec<u8>`: `(ptr, cap, len)` | Owned and moved; destructor frees the buffer |
+| `utf8` | Unsized validated UTF-8 text (Rust's `str`). | `[]u8` that is valid UTF-8, unsized | Never held by value |
+| `&utf8` | Borrowed flat view. | `&[]u8`: `(ptr, len)` | In registers or on the stack |
 
-| Type | Shape | Meaning |
+`Utf8` and `utf8` are ordinary library types over `Vec<u8>` and `[]u8`, not compiler
+intrinsics. `string` is the one built-in managed type, because its representation
+(cons and sliced nodes, lazy flattening) has to be known to the compiler, the GC, and the
+backends.
+
+The encoding is UTF-8 as an invariant of the types. V8's one-byte/two-byte split is not
+adopted: it would double every layout and every operation. A `u16` form for Windows or
+JavaScript interop is a conversion or a separate type added later.
+
+## `Utf8` and `utf8` (the Rust-style tier)
+
+- `utf8` is `[]u8` with the guarantee that its bytes are valid UTF-8. It is unsized, so it
+  appears only behind a reference: `&utf8` is `&[]u8`, a `(ptr, len)` pair in registers, and
+  `&mut utf8` is its mutable form.
+- `Utf8` is `Vec<u8>` with the same guarantee, `(ptr, cap, len)` in registers or on the
+  stack. It moves, `.clone()` is an explicit copy, and its destructor frees the buffer.
+  `gc Utf8` and `rc Utf8` are available through the existing managed kinds.
+- The guarantee is held by the wrapper: the only ways to make a `Utf8` or `&utf8` are
+  validation (`from_utf8`), an `unchecked` constructor whose caller vouches for the bytes, or
+  operations that preserve validity (push a valid `&utf8`, slice at a character boundary).
+  `find`, `split`, `chars`, `trim` and the rest are library code over the bytes and may
+  assume validity. `.bytes()` returns the raw `&[]u8` when raw access is wanted.
+- `push_str` appends in place with amortized growth. This is the tool for loops that build
+  text.
+
+## `string` (the default tier)
+
+`string` is immutable. `a + b` produces a new value and leaves both operands unchanged, so a
+`string` is shared freely and copying one is copying a handle. It follows V8's cons-string
+model, with one encoding.
+
+### Object layout
+
+Every `string` is a handle to a heap object whose first word is a header. The layout is
+declared here so the interpreter, the verifier, the GC and both native backends agree on it.
+
+| Kind | Fields | Meaning |
 |---|---|---|
-| `&[u8]` | `(ptr, len)` | Raw borrowed bytes. |
-| `Vec<u8>` | `(ptr, cap, len)` | Raw owned bytes, growable. |
-| `&str` | wraps `&[u8]` | Borrowed, valid UTF-8. A literal is a static `&str`. |
-| `string` | wraps `Vec<u8>` | Owned, valid UTF-8. Moves; `.clone()` is an explicit copy. |
-| `rc string`, `gc string` | as for any `rc`/`gc` value | Cheap shared clone, chosen explicitly. |
+| Flat | `header, bytes…` | Valid UTF-8 stored inline. |
+| Cons | `header, left, right` | The concatenation of two strings, not yet copied. |
+| Sliced | `header, parent, offset` | A view into a flat parent. |
 
-## Consequences
+The header holds the kind tag, the byte length, and for a cons the depth. A hash cache may be
+added without changing the layout of the kinds above. An external kind (bytes owned by the
+host) is deliberately left out until something needs it.
 
-### Native code sees the bytes
+### Rules
 
-A string value is plain data in registers: length is a register read, slicing is pointer
-arithmetic with a bounds check, equality compares lengths and then `memcmp` (inline for short
-strings), and a concat is one allocation of `len(a) + len(b)` followed by two copies. The
-host text heap, `intern`, and the `TextConcat`/`TextCompare`/`TextConstant` bridge calls go
-away, and the optimizer sees the same slice and vector operations it sees everywhere else.
-Operations that stay calls into the runtime are the ones that should: formatting, validation,
-Unicode case mapping.
+- **Short concatenation copies.** If the combined length is below a threshold (V8 uses 13
+  bytes; the value here is to be measured), the result is a flat string. Cons nodes are only
+  worth their header for longer text.
+- **Longer concatenation allocates a cons node** in O(1) and copies nothing.
+- **Flattening.** Any operation that needs the bytes (view, compare, hash, character
+  iteration, passing to a `&utf8` parameter) first flattens the string. Flattening a cons
+  allocates one flat string of the full length, copies the leaves into it, and rewrites the
+  node into a one-word forwarding indirection to the flat result, so later accesses on any
+  handle to it are fast. The string's contents never change, so the rewrite is invisible to
+  the program.
+- **Depth limit.** A cons whose depth passes a limit is flattened when it is created, so a
+  loop of `s = s + x` cannot build an unboundedly deep rope or overflow the stack of the
+  flattening routine (which is iterative regardless).
+- **Slicing.** `s.slice(a, b)` on a flat string above a size threshold is a `Sliced` node
+  sharing its parent. Below the threshold it copies, so a small slice does not keep a large
+  parent alive. A character boundary is required (see the error model below).
+- **Equality.** Compare lengths first; if equal, flatten both and compare the bytes. The
+  compiler's interned names (`NameId`) are a separate mechanism and are not affected.
 
-### The UTF-8 guarantee is an invariant of the wrapper
+### Memory
 
-`&str` and `string` have no public way to hold invalid bytes: they are built only by
-validation (`from_utf8`), by an explicit `unchecked` constructor that the caller vouches for,
-or by operations that preserve validity (concatenation of two valid strings, slicing at a
-character boundary). Everything else (find, split, chars, trim) is library code over the
-bytes and can assume validity. Byte-level access is `.bytes()` and the underlying `[]u8`, so
-ordinary code is never forced down to that level.
+A `string` is GC-managed and `Copy`: a plain `string` value is a handle to a collected object,
+and copying it copies the handle. It is not an implicit `rc`. The language already has a
+collected kind (`gc`), and `string` is the one type that uses it implicitly because
+immutability and sharing make an owner meaningless. A `string` therefore has no destructor
+and never needs a drop scope, and it is not moved, so holding one never produces the "use of a
+moved value" error (E118). The collector traces `Cons` (both children), `Sliced` (the parent),
+and forwarding nodes, and treats `Flat` as a leaf.
 
-### Ownership is explicit
+Literals are static `Flat` objects placed in a read-only region, not allocated on the
+collected heap, and are not traced.
 
-An owned `string` is a `Vec` and has the destructor a `Vec` has, so its free point is known
-to the compiler. This replaces the hidden `Arc`. It also means `needs_drop(string)` becomes
-true, and routines that hold strings (or records and enums that hold them) need the drop
-scopes the HIR/MIR/AIR pipeline does not have yet.
+## Conversions
 
-### Concatenation and building
+| From | To | Cost |
+|---|---|---|
+| `string` | `&utf8` | `view()`: flattens if needed, then `(ptr, len)`. The view borrows the string, which keeps the object alive for the borrow. |
+| `&utf8` | `string` | `to_string()`: copies into a flat string. If the view came from `string.slice`, the slice node is returned directly. |
+| `Utf8` | `string` | `into_string()`: copies into a flat string. Adopting the buffer without a copy is a later optimization (needs the buffer on the collected heap). |
+| `string` | `Utf8` | `to_utf8()`: copies into a new buffer. |
+| `&utf8` | `Utf8` | `to_owned()`: copies. |
 
-`+` on strings is defined in the library, not the compiler: owned plus borrowed produces an
-owned string, appending to an owned `string` reuses its capacity, and a chain `a + b + c`
-should become one allocation. A loop that builds a string uses `push_str` on a `string`
-(amortized growth), not repeated `+`.
+A string literal has type `string` and coerces to `&utf8` where one is expected, since a
+literal is always flat and the view needs no flattening.
 
-## Open questions
+## Operations
 
-- **Where the buffer lives.** The header `(ptr, cap, len)` is in registers or on the stack,
-  but the bytes of a `Vec` need storage. The working assumption is the allocator, owned by
-  the `Vec` and freed by its destructor. This needs stating, along with what `gc` and `rc`
-  wrap (the header, the buffer, or both) and how the GC finds a buffer that a header on the
-  stack points to.
-- **Literals.** A literal is a static `&str`, so `let s: string = "x"` needs either a
-  conversion (`.to_string()`) or an allowed coercion. Which one?
-- **Index unit.** Byte offsets on `str`, with characters iterated separately, is the
-  suggestion. There is no `s[i]` by character because it is O(n).
-- **Slicing validity.** Slicing a `&str` at a non-boundary offset either fails (a checked
-  result or a panic-style error with a typed status) or is a distinct unchecked form. The
-  error model must follow the compiler rules on typed errors and statuses.
-- **Interning.** Whether static `&str` literals share the `NameId`-style interned text the
-  compiler already keeps, or each literal is its own static buffer.
-- **Prerequisites.** `Slice` types exist in the type system, but `Vec<u8>` with `(ptr, cap,
-  len)` in registers and a destructor does not; strings cannot move until `Vec` and drop
-  scopes do.
+- `+` on `string` creates a cons (or a flat string below the threshold). `+` on `&utf8` is
+  not defined: use `Utf8` and `push_str`, or convert.
+- Length, `==`, `<`, hashing and iteration are defined once, on `&utf8`, and `string` gets them by
+  taking its view. Length alone is read from the header without flattening.
+- Formatting, validation, and Unicode case mapping are runtime calls. Everything else
+  compiles to the inline sequences below.
+- Byte offsets index `utf8`. Character iteration is separate (`.chars()`); there is no `s[i]`
+  by character because it is O(n).
+
+## Native code
+
+The layout is declared, so native code reads it. The common case is inline and the rare case
+is a call:
+
+- **Length** of a `string`: load the header and mask. No branch on kind.
+- **View** of a `string` as `&utf8`: test the tag; Flat yields `(handle + header, len)`,
+  Sliced yields the parent's bytes plus the offset, and a Cons or forwarding node calls the
+  runtime `flatten`. Flat strings are the overwhelmingly common case.
+- **Equality**: compare header lengths, then `memcmp` (inline for short strings).
+- **Concat**: short result: allocate flat and copy; otherwise allocate a three-word cons.
+- A `Utf8` or `&utf8` is plain `Vec`/slice code: length is a register, slicing is pointer
+  arithmetic with a bounds check, and a copy is `memcpy`.
+
+The host text heap, `intern`, and the `Text*` bridge calls are removed.
+
+## Errors
+
+Operations that can fail on input (`from_utf8`, slicing at a non-boundary offset, an
+out-of-range index) return a typed status or result, following the compiler's rules on typed
+errors and statuses, not a panic. Whether a checked and an unchecked form of slicing are both
+offered is left to the library.
+
+## Effect on the compiler
+
+- **Verified bytecode.** New value kinds for slice `(ptr, len)`, `Vec` `(ptr, cap, len)`,
+  and `string` handles, replacing `FrameValue::Text`. New instructions or intrinsics for
+  string length, view, concat, and equality. The verifier checks register kinds as it does
+  for text today.
+- **Pipeline.** A `string` is `Copy`, so the strings slice's move tracking applies only to
+  `Utf8` and `Vec`. Reading a `string` after passing it on becomes legal, and
+  `tests/strings.rs`, which states the current move-only rule, must change with it. Enums and
+  records that hold only scalars and `string` have no destructor, so the non-`Copy` payload
+  slice is unaffected for `string`, and a `Utf8` payload needs drop scopes.
+- **Drop scopes.** `Utf8` and `Vec` have destructors, so routines holding them need drop
+  scopes driven by the may-moved dataflow (`check_moves`). Routines that hold only `string`
+  do not.
+- **Old route.** It must either change with the runtime or keep an `Arc<str>` adapter during
+  migration; see the order below.
 
 ## Migration order
 
 1. Slice `(ptr, len)` and `Vec` `(ptr, cap, len)` as register-resident values in the verified
-   bytecode, with the interpreter and both native backends handling them.
-2. Drop scopes in HIR/MIR/AIR, driven by the same may-moved dataflow (`check_moves`) that
-   already tracks where a value is empty.
-3. `&str` and `string` as library types over them, with literals as static `&str`.
-4. Remove `Value::String(Arc<str>)`, `LiteralString`, the host text heap and the `Text*`
-   bridge calls.
+   bytecode, handled by the interpreter and both native backends.
+2. Drop scopes in HIR/MIR/AIR.
+3. `utf8`, `&utf8` and `Utf8` as library types over them, with `from_utf8` and `push_str`.
+4. The `string` heap object (Flat, Cons, Sliced, forwarding), GC tracing, flatten, and the
+   inline native sequences. Literals become static Flat objects.
+5. Switch `string` operations and literals to the new representation. Remove
+   `Value::String(Arc<str>)`, `LiteralString`, the host text heap, and the `Text*` bridge
+   calls. Update `tests/strings.rs` for `Copy` semantics.
 
-## Relation to the pipeline
+## Open questions
 
-The slices already implemented (strings, records, enums with non-`Copy` payloads) treat
-`string` as an owned, move-only value with no destructor. They remain correct until step 3,
-and only for payload types without a destructor. Once `string` is a `Vec`, a routine that
-holds one must either stay on the existing route or wait for step 2.
+- **Buffer storage.** The `Vec` header is in registers or on the stack, but its bytes need
+  storage. The working assumption is the allocator, freed by the `Vec` destructor. What `gc`
+  and `rc` wrap (header, buffer, or both) and how the collector finds a buffer pointed to from
+  the stack still need to be stated.
+- **Thresholds.** The short-concat copy limit, the slice-sharing limit, and the maximum cons
+  depth are to be measured, not copied from V8.
+- **Flatten and threads.** Rewriting a cons into a forwarding node is a write to shared
+  data. It must be idempotent and published safely if strings cross threads (see
+  `docs/concurrency.md`), or strings must stay thread-local.
+- **Adopting a buffer.** Moving a `Utf8` into a `string` without a copy needs the buffer on
+  the collected heap; whether that is worth a separate allocation path is open.
+- **Literal coercion.** A literal coerces from `string` to `&utf8`; whether it also coerces to
+  `Utf8` (a copy) is not decided and is currently an explicit `to_owned()`.
+- **Hash cache and interning.** Whether `string` caches its hash in the header, and whether
+  equal strings are deduplicated, are optimizations to decide after measurement.

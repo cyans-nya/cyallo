@@ -211,6 +211,23 @@ fn analyze_modules_with(
                 services: services.clone(),
                 headers,
             });
+            // Each generic template is checked once, with its type parameters opaque, before
+            // any instance: a parameter's type tells the body nothing about the instance.
+            {
+                let mut templates: Vec<&IndexedRoutineBody> = identity
+                    .indexed_bodies
+                    .values()
+                    .filter(|body| body.is_generic())
+                    .collect();
+                templates.sort_by_key(|body| body.placed_span().start);
+                for body in templates {
+                    body.check_generic(
+                        &context.signatures,
+                        &context.source_names,
+                        &context.routine_types,
+                    )?;
+                }
+            }
             let layout = std::sync::Arc::new(crate::module_cache::LinkLayout {
                 routines: std::iter::once("<main>".into())
                     .chain(context.headers.iter().map(|h| h.symbol.clone()))

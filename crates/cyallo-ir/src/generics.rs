@@ -153,6 +153,9 @@ struct Specializer {
     generated_functions: Vec<Function>,
     function_instances: HashMap<String, Box<str>>,
     instances: usize,
+    /// Indexed bodies of the routines that kept one. An instance of a generic routine over
+    /// scalar types is lowered from its template's body instead of a cloned tree.
+    bodies: HashMap<Box<str>, crate::analysis::IndexedRoutineBody>,
 }
 impl Specializer {
     fn reserve(&mut self, span: Span) -> Result<()> {
@@ -228,6 +231,20 @@ impl Specializer {
         }
         f.type_params.clear();
         f.name = id.clone().into();
+        // The template was bound for the routine pipeline. An instance whose type arguments
+        // are all scalars is typed from that body, so it needs no tree of its own.
+        if let Some(template) = self.bodies.get(name).cloned()
+            && f.constraints.is_empty()
+            && args.iter().all(|arg| {
+                matches!(
+                    arg,
+                    Type::Integer | Type::Boolean | Type::Real | Type::Numeric(_) | Type::String
+                )
+            })
+        {
+            f.body.clear();
+            self.bodies.insert(id.clone().into(), template);
+        }
         substitute_function(&mut f, &bindings)?;
         self.generated_functions.push(f);
         Ok(id.into())
@@ -604,6 +621,17 @@ pub fn specialize_modules(
     native: &NativeDeclarations,
     options: crate::CompileOptions,
 ) -> Result<()> {
+    specialize_modules_with_bodies(asts, native, options, &mut HashMap::new())
+}
+
+/// Like `specialize_modules`, and registers in `bodies` the instances of generic routines
+/// that the routine pipeline lowers from their template's indexed body.
+pub fn specialize_modules_with_bodies(
+    asts: &mut [Ast],
+    native: &NativeDeclarations,
+    options: crate::CompileOptions,
+    bodies: &mut HashMap<Box<str>, crate::analysis::IndexedRoutineBody>,
+) -> Result<()> {
     crate::enums::validate_templates(asts)?;
     if !asts.iter().any(|a| {
         a.enums.iter().any(|e| !e.type_params.is_empty())
@@ -623,6 +651,7 @@ pub fn specialize_modules(
         generated_functions: vec![],
         function_instances: HashMap::new(),
         instances: 0,
+        bodies: std::mem::take(bodies),
     };
     let mut owners = HashMap::new();
     for (owner, ast) in asts.iter_mut().enumerate() {
@@ -763,6 +792,7 @@ pub fn specialize_modules(
             }
         }
         if !changed && s.generated_functions.is_empty() {
+            *bodies = s.bodies;
             return Ok(());
         }
     }

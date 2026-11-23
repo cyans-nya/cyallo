@@ -354,8 +354,19 @@ impl Resolver {
 
     /// A type as the module graph resolves it, or `None` if it does not resolve.
     fn resolved(&self, module: usize, ty: &Type, span: Span) -> Option<Type> {
+        self.resolved_with(module, ty, span, &[])
+    }
+
+    /// As `resolved`, with the names of a routine's type parameters left as they are.
+    fn resolved_with(
+        &self,
+        module: usize,
+        ty: &Type,
+        span: Span,
+        params: &[Box<str>],
+    ) -> Option<Type> {
         let mut resolved = ty.clone();
-        self.ty(module, &mut resolved, &[], span).ok()?;
+        self.ty(module, &mut resolved, params, span).ok()?;
         Some(resolved)
     }
 
@@ -397,18 +408,24 @@ impl Resolver {
     /// Whether a routine's parameters and result are all types the pipeline lowers, with
     /// every parameter passed by value and no reference as a result.
     fn pipeline_signature(&self, module: usize, f: &Function) -> bool {
+        // A type parameter stands for a scalar here: each instance is checked when made.
+        let probe: Vec<Type> = f.type_params.iter().map(|_| Type::Integer).collect();
+        let resolved = |ty: &Type, span: Span| {
+            let mut ty = self.resolved_with(module, ty, span, &f.type_params)?;
+            substitute_named(&mut ty, &f.type_params, &probe);
+            Some(ty)
+        };
         let parameters = f.params.iter().all(|parameter| {
             parameter.arity == ParameterArity::One
                 && parameter.passing == ParameterPassing::Value
                 && !parameter.by_ref
                 && !parameter.receiver
-                && self
-                    .resolved(module, &parameter.ty, parameter.span)
+                && resolved(&parameter.ty, parameter.span)
                     .is_some_and(|ty| self.pipeline_type(&ty, 0))
         });
         let result = match f.kind {
             RoutineKind::Procedure if f.result == Type::Void => true,
-            _ => self.resolved(module, &f.result, f.span).is_some_and(|ty| {
+            _ => resolved(&f.result, f.span).is_some_and(|ty| {
                 !matches!(ty, Type::Reference { .. }) && self.pipeline_type(&ty, 0)
             }),
         };
@@ -3063,6 +3080,11 @@ impl Resolver {
                 {
                     match self.bind_indexed(index, f, body)? {
                         Ok(bound) => {
+                            // A generic routine keeps an owned body too: instances the
+                            // pipeline does not take are cloned from it by the specializer.
+                            if !f.type_params.is_empty() {
+                                f.body = bound.materialize_owned()?;
+                            }
                             self.bound.insert(f.name.clone(), bound);
                         }
                         // The indexed pipeline cannot take this routine: link its
@@ -3071,6 +3093,13 @@ impl Resolver {
                     }
                 }
                 self.function(index, f, &[], &[])?;
+                // The template is checked once with its type parameters opaque, against the
+                // signature as linked.
+                if !f.type_params.is_empty()
+                    && let Some(bound) = self.bound.get_mut(&f.name)
+                {
+                    bound.set_generic_header(&f.params, &f.result);
+                }
             }
             for t in &mut ast.traits {
                 let symbol = self.path(index, &t.name, Some(Kind::Type)).unwrap();

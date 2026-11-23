@@ -286,6 +286,18 @@ impl ResolvedProgram {
 }
 
 impl ResolvedProgram {
+    /// Like `with_sources`, also lending the indexed bodies, which the specializer may extend
+    /// with a body for each instance of a generic routine.
+    pub fn with_sources_and_bodies<T>(
+        &mut self,
+        f: impl FnOnce(&mut [Ast], &mut HashMap<Box<str>, crate::analysis::IndexedRoutineBody>) -> T,
+    ) -> T {
+        let mut bodies = std::mem::take(&mut self.indexed_bodies);
+        let result = self.with_sources(|asts| f(asts, &mut bodies));
+        self.indexed_bodies = bodies;
+        result
+    }
+
     pub fn with_sources<T>(&mut self, f: impl FnOnce(&mut [Ast]) -> T) -> T {
         let mut sources: Vec<_> = self
             .modules

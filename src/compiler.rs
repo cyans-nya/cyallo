@@ -262,8 +262,9 @@ pub(crate) fn compile_resolved_with_cache(
     let native = graph.native.clone();
     {
         let _specialize = cyallo_startup_profile::stage(cyallo_startup_profile::Stage::Specialize);
-        graph
-            .with_sources(|asts| cyallo_ir::generics::specialize_modules(asts, &native, options))?;
+        graph.with_sources_and_bodies(|asts, bodies| {
+            cyallo_ir::generics::specialize_modules_with_bodies(asts, &native, options, bodies)
+        })?;
     }
     {
         let _constants = cyallo_startup_profile::stage(cyallo_startup_profile::Stage::ConstEval);
