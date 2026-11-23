@@ -203,6 +203,30 @@ proc show_shout() {
 }
 ```
 
+### Sources built in memory or packed
+
+A component can have many files, and its source needs no filesystem. `helper.ya` is
+module `helper` because every file is a module, and `lib.ya` is the entry only
+because this host named it. `pack` and `unpack` round-trip the same tree through a
+`.yamod`.
+
+```cyallo
+proc load_inline() -> Result<std::module::Instance, std::module::LoadError> {
+    let source = std::module::Source::new()
+        .path("lib.ya", "use crate::helper::double\npub fn quad(n: i64) -> i64 { return double(double(n)) }\n")
+        .path("helper.ya", "pub fn double(n: i64) -> i64 { return n * 2 }\n")
+    let packed = std::module::Source::unpack(source.pack())?   // pure and bounded: no std::fs
+    return std::module::load(packed.entry("lib.ya"), std::module::Bindings::none())
+}
+
+proc show_inline() {
+    match load_inline() {
+        Ok(plugin) => std::io::print(plugin.namespace().quad(5)),   // 20
+        Err(error) => std::io::print(error.message()),
+    }
+}
+```
+
 ## C. Least privilege and uniform not-found (target)
 
 ```cyallo
@@ -273,7 +297,7 @@ proc show_exists(api: dynamic) {
 ```
 
 Expected output of the whole `main`, with `proc main()` calling `show_twice()`,
-`show_shout()`, `show_snoop()` and `show_probes()` after the part A lines:
+`show_shout()`, `show_inline()`, `show_snoop()` and `show_probes()` after the part A lines:
 
 ```text
 DEMO
@@ -281,6 +305,7 @@ DEMO
 100
 84
 HELLO
+20
 snoop rejected
 true
 false
@@ -313,5 +338,5 @@ Must be rejected:
 - **Assumed std additions.** `Source::read` (best implemented over the caller's
   bound `std::fs` members, so wrappers apply), `Source::manifest`,
   `Manifest.imports` and `.version`, `Range::satisfies` and `Range::text`,
-  `std::fs::Error::not_found`, and a `LoadError::Manifest` case for `?` to use.
-  None exist yet.
+  `std::fs::Error::not_found`, `Source::new().path(...)`, `Source::pack` and `unpack`,
+  and a `LoadError::Manifest` case for `?` to use. None exist yet.

@@ -155,7 +155,6 @@ impl IndexedRoutineBody {
             source_names,
             &callees,
         )
-        .map(Some)
     }
 
     /// Bind each reference site to a callee contract. The overlay is read from
@@ -209,10 +208,10 @@ pub(crate) fn plain_contract(
     arguments: usize,
 ) -> bool {
     kind == RoutineKind::Function
-        && *result == Type::Integer
+        && matches!(result, Type::Integer | Type::Boolean)
         && parameters.len() == arguments
         && parameters.iter().all(|parameter| {
-            parameter.ty == Type::Integer
+            matches!(parameter.ty, Type::Integer | Type::Boolean)
                 && parameter.arity == ParameterArity::One
                 && parameter.passing == ParameterPassing::Value
                 && !parameter.by_ref
@@ -263,7 +262,7 @@ fn lower_mir(
     function: &Function,
     source_names: &BTreeMap<Box<str>, Box<str>>,
     callees: &[air::Callee],
-) -> Result<ir::Function> {
+) -> Result<Option<ir::Function>> {
     let mut locals = collect(&[], &function.params)?;
     for local in &mut locals {
         if let Some(name) = source_names.get(&local.name) {
@@ -294,7 +293,7 @@ fn lower_mir(
         }
     }
     cyallo_startup_profile::count(cyallo_startup_profile::Counter::BodiesEmittedFromAir, 1);
-    Ok(emitted)
+    Ok(Some(emitted))
 }
 
 fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
@@ -373,6 +372,11 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                     let dst = register(&mut function, &checked.types[value.0]);
                     registers.push(dst);
                     Op::Call(Some(dst), target, arguments)
+                }
+                air::Operation::Unary(value, operator, operand) => {
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers.push(dst);
+                    Op::Unary(dst, operator, registers[operand.0])
                 }
                 air::Operation::Binary(value, operator, left, right) => {
                     let dst = register(&mut function, &checked.types[value.0]);
@@ -561,6 +565,31 @@ mod tests {
             1,
         );
         assert_eq!(first.digest(), second.digest());
+    }
+
+    #[test]
+    fn short_circuit_operands_must_be_boolean() {
+        for source in [
+            "fn f(n: i64) -> bool { return n && true }",
+            "fn f(n: i64) -> bool { return true || n }",
+        ] {
+            let (function, body) = prepare(source);
+            let error = body
+                .emit(&function, &BTreeMap::new(), &HashMap::new())
+                .unwrap_err();
+            assert_eq!(error.code, "E109", "{source}");
+            // The error is on the whole `&&` or `||` expression.
+            assert!(
+                error.span.source_text(source).contains("&&")
+                    || error.span.source_text(source).contains("||")
+            );
+        }
+        let (function, body) = prepare("fn f(n: i64) -> bool { return n > 0 && n < 9 }");
+        assert!(
+            body.emit(&function, &BTreeMap::new(), &HashMap::new())
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

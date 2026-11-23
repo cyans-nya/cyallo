@@ -64,6 +64,9 @@ pub(super) enum Operation {
     Read(Value, Variable),
     Binary(Value, Operator, Value, Value),
     Call(Value, SiteId, Operands),
+    Unary(Value, Operator, Value),
+    /// Check that an operand of `&&` or `||` is boolean. Produces no value.
+    Condition(Value),
     /// Declare a local with its initial value; checks an annotation.
     Define(Variable, Value, Span, Option<ScalarType>),
     /// Store into a declared local; the span is the stored expression's.
@@ -92,6 +95,7 @@ pub(super) enum Exit {
 pub(super) fn lower(routine: &hir::Routine, span: Span) -> Body {
     let statements = &routine.statements;
     let mut builder = Builder {
+        loops: Vec::new(),
         blocks: Vec::new(),
         operations: Vec::new(),
         value_count: 0,
@@ -125,7 +129,15 @@ pub(super) fn lower(routine: &hir::Routine, span: Span) -> Body {
     }
 }
 
+/// Jumps out of the loop being lowered, finished once its blocks are known.
+#[derive(Default)]
+struct LoopFrame {
+    breaks: Vec<(OpenBlock, Span)>,
+    continues: Vec<(OpenBlock, Span)>,
+}
+
 struct Builder {
+    loops: Vec<LoopFrame>,
     blocks: Vec<Option<Block>>,
     operations: Vec<Located<Operation>>,
     value_count: usize,
@@ -183,6 +195,16 @@ impl Builder {
                     let right = self.expression(right);
                     Operation::Binary(self.new_value(), *operator, left, right)
                 }
+                hir::ExpressionKind::Unary(operator, operand) => {
+                    let operand = self.expression(operand);
+                    Operation::Unary(self.new_value(), *operator, operand)
+                }
+                hir::ExpressionKind::ShortCircuit {
+                    and,
+                    left,
+                    right,
+                    slot,
+                } => return self.short_circuit(*and, left, right, *slot, expression.span),
                 hir::ExpressionKind::Call(path, arguments) => {
                     // Arguments run left to right before the call.
                     let values: Vec<Value> = arguments
@@ -208,6 +230,7 @@ impl Builder {
                 Operation::Constant(value, _)
                 | Operation::Read(value, _)
                 | Operation::Binary(value, ..)
+                | Operation::Unary(value, ..)
                 | Operation::Call(value, ..) => value,
                 _ => unreachable!("expressions produce values"),
             };
@@ -250,7 +273,13 @@ impl Builder {
         self.emit(Operation::Define(range.bound, bound, span, None), span);
         let enter = self.take_block();
         let head = self.next_block();
+        self.loops.push(LoopFrame::default());
         self.statements(&range.body);
+        // A `continue` lands on the test, which therefore starts its own block.
+        let body_end_span = self.last_span;
+        let body_end = self.take_block();
+        let test_start = self.next_block();
+        body_end.finish(self, Exit::Next(test_start), body_end_span);
         // The test after the body: stop on the last value, else step and repeat.
         let current = self.new_value();
         self.emit(Operation::Read(current, range.variable), span);
@@ -273,6 +302,7 @@ impl Builder {
         let jump_span = self.last_span;
         let back = self.take_block();
         let exit = self.next_block();
+        self.finish_loop(test_start, exit);
         skip.finish(
             self,
             Exit::Branch {
@@ -295,6 +325,56 @@ impl Builder {
             test_span,
         );
         back.finish(self, Exit::Jump(head), jump_span);
+    }
+
+    /// Finish the pending `break` and `continue` jumps of the innermost loop.
+    fn finish_loop(&mut self, next: BlockId, exit: BlockId) {
+        let frame = self.loops.pop().expect("a loop frame is open");
+        for (open, span) in frame.continues {
+            open.finish(self, Exit::Jump(next), span);
+        }
+        for (open, span) in frame.breaks {
+            open.finish(self, Exit::Jump(exit), span);
+        }
+    }
+
+    /// `left && right` / `left || right`. The result lives in a hidden local,
+    /// because the right side runs in its own block and values do not cross blocks.
+    fn short_circuit(
+        &mut self,
+        and: bool,
+        left: &hir::Expression,
+        right: &hir::Expression,
+        slot: Variable,
+        span: Span,
+    ) -> Value {
+        let decided = self.expression(left);
+        self.emit(Operation::Condition(decided), span);
+        self.emit(Operation::Define(slot, decided, left.span, None), span);
+        let branch_span = self.last_span;
+        let test = self.take_block();
+        let rhs = self.next_block();
+        let other = self.expression(right);
+        self.emit(Operation::Condition(other), span);
+        self.emit(Operation::Assign(slot, other, right.span), span);
+        let rhs_span = self.last_span;
+        let rhs_end = self.take_block();
+        let end = self.next_block();
+        let (yes, no) = if and { (rhs, end) } else { (end, rhs) };
+        test.finish(
+            self,
+            Exit::Branch {
+                condition: decided,
+                condition_span: left.span,
+                yes,
+                no,
+            },
+            branch_span,
+        );
+        rhs_end.finish(self, Exit::Next(end), rhs_span);
+        let result = self.new_value();
+        self.emit(Operation::Read(result, slot), span);
+        result
     }
 
     fn constant_one(&mut self, span: Span) -> Value {
@@ -359,10 +439,12 @@ impl Builder {
                         let branch_span = self.last_span;
                         let test = self.take_block();
                         let yes = self.next_block();
+                        self.loops.push(LoopFrame::default());
                         self.statements(body);
                         let back_span = self.last_span;
                         let back = self.take_block();
                         let no = self.next_block();
+                        self.finish_loop(header, no);
                         test.finish(
                             self,
                             Exit::Branch {
@@ -376,6 +458,20 @@ impl Builder {
                         back.finish(self, Exit::Jump(header), back_span);
                     }
                     hir::StatementKind::ForRange(range) => self.range(range, statement.span),
+                    hir::StatementKind::Break => {
+                        let open = self.take_block();
+                        let span = self.last_span;
+                        if let Some(frame) = self.loops.last_mut() {
+                            frame.breaks.push((open, span));
+                        }
+                    }
+                    hir::StatementKind::Continue => {
+                        let open = self.take_block();
+                        let span = self.last_span;
+                        if let Some(frame) = self.loops.last_mut() {
+                            frame.continues.push((open, span));
+                        }
+                    }
                     hir::StatementKind::Return(expression) => {
                         let value = self.expression(expression);
                         let span = self.last_span;

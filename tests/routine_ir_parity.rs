@@ -187,8 +187,51 @@ fn programs_outside_the_subset_keep_the_existing_route() {
         "fn f(n: i64) -> i64 { for i in 0..n { }\n return i }",
         // A call to a local name, and `break`/`continue`.
         "fn f(n: i64) -> i64 { let g = 1\n return g(n) }",
-        "fn f(n: i64) -> i64 { while true { break }\n return n }",
     ] {
         assert_fallback(source);
+    }
+}
+
+#[test]
+fn break_continue_short_circuit_unary_and_bool_match() {
+    // `break` and `continue` in while and for, including nested loops.
+    parity(
+        "fn f(n: i64) -> i64 {PAD\n    let mut t = 0\n    for i in 0..n {\n        if i % 2 == 0 { continue }\n        if i > 7 { break }\n        t += i\n    }\n    return t\n}\n\
+         fn g(n: i64) -> i64 {PAD\n    let mut a = 0\n    let mut i = 0\n    while true {\n        i += 1\n        if i > n { break }\n        if i % 3 == 0 { continue }\n        a += i\n    }\n    return a\n}\n\
+         fn h(n: i64) -> i64 {PAD\n    let mut t = 0\n    for i in 0..n { for j in 0..n { if j > i { break }\n        t += 1 } }\n    return t\n}\n\
+         std::io::print(f(20), \" \", g(10), \" \", h(4))\n",
+        "16 37 10\n",
+    );
+    // `&&` and `||` run the right side only when needed; a side effect is a call that traps.
+    parity(
+        "fn safe(n: i64) -> bool {PAD\n    return n != 0 && 100 / n > 3\n}\n\
+         fn either(a: i64, b: i64) -> bool {PAD\n    return a > 5 || b > 5 && a != b\n}\n\
+         fn pick(n: i64) -> i64 {PAD\n    let ok = safe(n) || n == 0\n    if ok && !(n > 50) { return 1 }\n    return 0\n}\n\
+         std::io::print(safe(0), \" \", safe(10), \" \", safe(50), \" \", either(1, 9), \" \", either(1, 1), \" \", pick(0), pick(4), pick(60))\n",
+        "false true false true false 110\n",
+    );
+    // Unary minus and not, and bool parameters and results.
+    parity(
+        "fn neg(n: i64) -> i64 {PAD\n    return -n + -(n * 2)\n}\n\
+         fn flip(b: bool, n: i64) -> bool {PAD\n    if !b { return n > 0 }\n    return !(n > 0)\n}\n\
+         std::io::print(neg(5), \" \", flip(true, 3), \" \", flip(false, 3), \" \", flip(false, -1))\n",
+        "-15 false true false\n",
+    );
+}
+
+#[test]
+fn new_forms_report_the_same_diagnostics() {
+    for (source, code) in [
+        ("fn f(n: i64) -> i64 {PAD\n    return -true\n}\n", "E105"),
+        ("fn f(n: i64) -> bool {PAD\n    return !n\n}\n", "E105"),
+        ("fn f(n: i64) -> bool {PAD\n    return n\n}\n", "E109"),
+        ("fn f(b: bool) -> i64 {PAD\n    return b\n}\n", "E109"),
+        ("fn f(b: bool) -> i64 {PAD\n    return b + 1\n}\n", "E105"),
+        (
+            "fn f(n: i64) -> i64 {PAD\n    for i in 0..n { break }\n}\n",
+            "E103",
+        ),
+    ] {
+        same_diagnostic(source, code);
     }
 }

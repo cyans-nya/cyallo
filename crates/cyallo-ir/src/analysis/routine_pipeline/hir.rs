@@ -17,6 +17,15 @@ pub(super) enum ExpressionKind {
     Read(Variable),
     Group(Box<Expression>),
     Binary(Operator, Box<Expression>, Box<Expression>),
+    Unary(Operator, Box<Expression>),
+    /// `left && right` or `left || right`: the right side runs only when the left
+    /// does not decide. `slot` is a hidden local that carries the result across blocks.
+    ShortCircuit {
+        and: bool,
+        left: Box<Expression>,
+        right: Box<Expression>,
+        slot: Variable,
+    },
     /// A call whose callee path is bound later, by the module graph.
     Call(Box<str>, Vec<Expression>),
 }
@@ -47,6 +56,8 @@ pub(super) enum StatementKind {
     },
     While(Expression, Vec<Statement>),
     ForRange(Box<ForRange>),
+    Break,
+    Continue,
 }
 
 /// `for variable in start..finish` over `i64`, without `rev`. `end` and `bound`
@@ -89,6 +100,8 @@ struct Context<'a> {
     every_name: Vec<NameId>,
     locals: Vec<Local>,
     scopes: Vec<Vec<Visible>>,
+    /// Loops enclosing the statement being lowered.
+    loops: usize,
 }
 
 /// Lower eligible routine bodies directly from the file's indexed tables. `None`
@@ -102,7 +115,10 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
         || !ast.get_list(function.annotations)?.is_empty()
         || !ast.get_list(function.type_params)?.is_empty()
         || !ast.get_list(function.type_packs)?.is_empty()
-        || !matches!(ast.get(function.result)?, TypeNode::Integer)
+        || !matches!(
+            ast.get(function.result)?,
+            TypeNode::Integer | TypeNode::Boolean
+        )
     {
         return None;
     }
@@ -112,7 +128,10 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
             || parameter.passing != ParameterPassing::Value
             || parameter.by_ref
             || parameter.receiver
-            || !matches!(ast.get(parameter.ty), Some(TypeNode::Integer))
+            || !matches!(
+                ast.get(parameter.ty),
+                Some(TypeNode::Integer | TypeNode::Boolean)
+            )
     }) {
         return None;
     }
@@ -133,6 +152,7 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
         parameters: names.len(),
         every_name,
         locals: Vec::new(),
+        loops: 0,
         scopes: vec![
             names
                 .iter()
@@ -175,7 +195,11 @@ fn declared_names(
                     declared_names(ast, no, out, counters)?;
                 }
                 StmtSyntax::While(_, body) => declared_names(ast, body, out, counters)?,
-                StmtSyntax::Return(_) | StmtSyntax::Assign(..) | StmtSyntax::Compound(..) => {}
+                StmtSyntax::Return(_)
+                | StmtSyntax::Assign(..)
+                | StmtSyntax::Compound(..)
+                | StmtSyntax::Break
+                | StmtSyntax::Continue => {}
                 _ => return None,
             }
         }
@@ -267,8 +291,15 @@ impl Context<'_> {
                             }
                         }
                         StmtSyntax::While(condition, body) => {
-                            StatementKind::While(self.expression(condition)?, self.block(body)?)
+                            let condition = self.expression(condition)?;
+                            self.loops += 1;
+                            let body = self.block(body);
+                            self.loops -= 1;
+                            StatementKind::While(condition, body?)
                         }
+                        // Outside a loop the existing route reports E115.
+                        StmtSyntax::Break if self.loops > 0 => StatementKind::Break,
+                        StmtSyntax::Continue if self.loops > 0 => StatementKind::Continue,
                         StmtSyntax::ForIn(name, iterable, body) => {
                             self.range(name, iterable, body, statement.span)?
                         }
@@ -315,7 +346,9 @@ impl Context<'_> {
             slot: variable,
             mutable: false,
         }]);
+        self.loops += 1;
         let body = self.block(body);
+        self.loops -= 1;
         self.scopes.pop();
         Some(StatementKind::ForRange(Box::new(ForRange {
             variable,
@@ -346,6 +379,12 @@ impl Context<'_> {
     }
 
     fn expression(&mut self, id: Id<ExprNode>) -> Option<Expression> {
+        self.value(id, true)
+    }
+
+    /// `split` is true where a short-circuit operator may start new blocks: no
+    /// earlier sibling value is waiting, because a value cannot cross a block.
+    fn value(&mut self, id: Id<ExprNode>, split: bool) -> Option<Expression> {
         cyallo_ast::with_stack(|| {
             let ast = self.ast;
             let expression = ast.get(id)?;
@@ -360,14 +399,30 @@ impl Context<'_> {
                 }),
                 ExprSyntax::Name(name) => ExpressionKind::Read(self.lookup(name)?.slot),
                 ExprSyntax::Parenthesized(inner) => {
-                    ExpressionKind::Group(Box::new(self.expression(inner)?))
+                    ExpressionKind::Group(Box::new(self.value(inner, split)?))
+                }
+                ExprSyntax::Binary(operator @ (Operator::And | Operator::Or), left, right)
+                    if split =>
+                {
+                    let left = Box::new(self.value(left, true)?);
+                    let right = Box::new(self.value(right, true)?);
+                    let slot = self.declare("$short_circuit".into(), expression.span, false);
+                    ExpressionKind::ShortCircuit {
+                        and: operator == Operator::And,
+                        left,
+                        right,
+                        slot,
+                    }
                 }
                 ExprSyntax::Binary(operator, left, right) if scalar_operator(operator) => {
                     ExpressionKind::Binary(
                         operator,
-                        Box::new(self.expression(left)?),
-                        Box::new(self.expression(right)?),
+                        Box::new(self.value(left, false)?),
+                        Box::new(self.value(right, false)?),
                     )
+                }
+                ExprSyntax::Unary(operator @ (Operator::Not | Operator::Subtract), operand) => {
+                    ExpressionKind::Unary(operator, Box::new(self.value(operand, split)?))
                 }
                 ExprSyntax::Call(name, arguments) => {
                     // A local of the same name shadows the declaration.
@@ -378,7 +433,7 @@ impl Context<'_> {
                         ast.name(name)?.into(),
                         ast.get_list(arguments)?
                             .iter()
-                            .map(|&argument| self.expression(argument))
+                            .map(|&argument| self.value(argument, false))
                             .collect::<Option<_>>()?,
                     )
                 }

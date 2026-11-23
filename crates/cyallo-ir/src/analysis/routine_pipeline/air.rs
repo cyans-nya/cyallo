@@ -31,6 +31,7 @@ pub(super) enum Operation {
     /// Store into a declared local (its first store is its definition).
     Store(Variable, Value),
     Binary(Value, Operator, Value, Value),
+    Unary(Value, Operator, Value),
     Call(Value, usize, mir::Operands),
 }
 
@@ -111,6 +112,30 @@ pub(super) fn analyze(
                     };
                     define(&mut types, value, ty, span)?;
                     Operation::ReadVariable(value, variable)
+                }
+                mir::Operation::Unary(value, operator, operand_value) => {
+                    let ty = operand(&types, local_start, operand_value, span)?.clone();
+                    let valid = if operator == Operator::Not {
+                        ty == Type::Boolean
+                    } else {
+                        ty.number_kind().is_some()
+                    };
+                    if !valid {
+                        return Err(Diagnostic::new("E105", "invalid unary operand", span));
+                    }
+                    define(&mut types, value, ty, span)?;
+                    Operation::Unary(value, operator, operand_value)
+                }
+                mir::Operation::Condition(value) => {
+                    // `&&` and `||` take booleans. The existing route never checked this
+                    // (it moved the operand into a boolean register); this is its
+                    // intended `mismatched types` error.
+                    require(
+                        &Type::Boolean,
+                        operand(&types, local_start, value, span)?,
+                        span,
+                    )?;
+                    continue;
                 }
                 mir::Operation::Define(variable, value, value_span, annotation) => {
                     let actual = operand(&types, local_start, value, span)?.clone();
