@@ -311,10 +311,8 @@ impl Resolver {
                     })
                 }) || self.enums.get(target).is_some_and(|variants| {
                     variants.iter().all(|(_, payload)| {
-                        // A payload is bound by copy, so only copyable values are carried.
                         payload.as_ref().is_none_or(|payload| {
-                            crate::ownership::copy(payload)
-                                && !matches!(payload, Type::Reference { .. })
+                            !matches!(payload, Type::Reference { .. })
                                 && self.pipeline_type(payload, depth + 1)
                         })
                     })

@@ -97,6 +97,10 @@ pub(super) enum Operation {
     EnumTest(Value, Variable, cyallo_ast::EnumVariant),
     /// The payload of the variant the local holds, read as a value.
     EnumPayload(Value, Variable, cyallo_ast::EnumVariant, Type),
+    /// The payload of a non-`Copy` variant, moved out of the local that holds it.
+    EnumTake(Value, Variable, cyallo_ast::EnumVariant, Type),
+    /// The local's value has been (partly) moved out: it is empty on this path.
+    Consume(Variable),
 }
 
 /// Targets are indexes into `Body::blocks`.
@@ -462,6 +466,7 @@ fn check_moves(blocks: &[Block], variables: usize) -> Result<(), Diagnostic> {
                 | Operation::FieldRead(_, variable, _)
                 | Operation::EnumTest(_, variable, _)
                 | Operation::EnumPayload(_, variable, _, _)
+                | Operation::EnumTake(_, variable, _, _)
                 | Operation::FieldWrite(variable, _, _)
                 | Operation::TakeVariable(_, variable) => {
                     if report && let Some(moved) = state[variable.0] {
@@ -472,6 +477,7 @@ fn check_moves(blocks: &[Block], variables: usize) -> Result<(), Diagnostic> {
                         state[variable.0] = Some(span);
                     }
                 }
+                Operation::Consume(variable) => state[variable.0] = Some(span),
                 Operation::Store(variable, _) => state[variable.0] = None,
                 _ => {}
             }
@@ -479,10 +485,12 @@ fn check_moves(blocks: &[Block], variables: usize) -> Result<(), Diagnostic> {
         Ok(())
     }
     if !blocks.iter().any(|block| {
-        block
-            .operations
-            .iter()
-            .any(|operation| matches!(operation.kind, Operation::TakeVariable(..)))
+        block.operations.iter().any(|operation| {
+            matches!(
+                operation.kind,
+                Operation::TakeVariable(..) | Operation::Consume(..)
+            )
+        })
     }) {
         return Ok(());
     }
@@ -1218,10 +1226,19 @@ impl Analysis<'_> {
                 let variant = &contract.variants[index];
                 let ty = self.typed(*slot, arm.span)?;
                 let value = self.value(ty.clone());
-                self.emit(
-                    Operation::EnumPayload(value, matched.held, variant.operation(), ty),
-                    arm.span,
-                );
+                if crate::ownership::copy(&ty) {
+                    self.emit(
+                        Operation::EnumPayload(value, matched.held, variant.operation(), ty),
+                        arm.span,
+                    );
+                } else {
+                    // The binding owns the payload, so the matched value is spent on this path.
+                    self.emit(
+                        Operation::EnumTake(value, matched.held, variant.operation(), ty),
+                        arm.span,
+                    );
+                    self.emit(Operation::Consume(matched.held), arm.span);
+                }
                 self.store(*slot, value, arm.span);
             }
             let (value, ty) = self.expected_as(&arm.body, &result, Use::Move)?;

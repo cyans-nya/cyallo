@@ -415,6 +415,8 @@ fn lower_mir(
 /// How many instructions an operation expands to.
 fn instruction_count(operation: &air::Operation) -> usize {
     match operation {
+        air::Operation::Consume(..) => 0,
+        air::Operation::EnumTake(..) => 3,
         air::Operation::ReadVariable(..)
         | air::Operation::EnumTest(..)
         | air::Operation::EnumPayload(..)
@@ -620,6 +622,25 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                     let dst = register(&mut function, &checked.types[value.0]);
                     registers[value.0] = dst;
                     Op::EnumTest(dst, address, variant)
+                }
+                air::Operation::Consume(_) => continue,
+                air::Operation::EnumTake(value, variable, variant, ty) => {
+                    let address = enum_address(&mut function, variable, span);
+                    let payload = register(&mut function, &ty);
+                    push(
+                        &mut function,
+                        Op::EnumPayload(
+                            payload,
+                            address,
+                            variant,
+                            crate::enums::Projection::Address,
+                            Box::new(ty.clone()),
+                        ),
+                        span,
+                    );
+                    let dst = register(&mut function, &ty);
+                    registers[value.0] = dst;
+                    Op::Take(dst, payload)
                 }
                 air::Operation::EnumPayload(value, variable, variant, ty) => {
                     let address = enum_address(&mut function, variable, span);

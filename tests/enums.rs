@@ -167,3 +167,66 @@ fn a_moved_enum_is_reported_at_the_match() {
     ));
     assert_eq!(error.code, "E118");
 }
+
+const MESSAGE: &str = "record Point {\n    x: i64,\n    y: i64,\n}\nenum Message {\n    Text: string,\n    At: Point,\n    Quiet,\n}\nuse Message::*\n";
+
+fn messages(rest: &str) -> String {
+    format!("{MESSAGE}{rest}")
+}
+
+#[test]
+fn a_string_payload_is_moved_into_its_binding() {
+    let source = messages(
+        "fn text(m: Message) -> string { return match m { Text(t) => t, _ => \"none\" } }\n\
+         std::io::print(text(Text(\"hello\")))\nstd::io::print(text(Quiet))",
+    );
+    assert_eq!(run(&source), "hello\nnone\n");
+    assert_lowered_by_the_pipeline(&source);
+}
+
+#[test]
+fn a_record_payload_is_moved_and_read_through_its_binding() {
+    let source = messages(
+        "fn total(m: Message) -> i64 { return match m { At(p) => p.x + p.y, _ => 0 } }\n\
+         std::io::print(total(At(Point { x: 3, y: 4 })))\nstd::io::print(total(Quiet))",
+    );
+    assert_eq!(run(&source), "7\n0\n");
+    assert_lowered_by_the_pipeline(&source);
+}
+
+#[test]
+fn a_payload_ignored_with_a_wildcard_leaves_the_value_intact() {
+    let source = messages(
+        "fn twice(m: Message) -> i64 {\n    let a = match m { Text(_) => 1, _ => 0 }\n    let b = match m { Text(_) => 10, _ => 0 }\n    return a + b\n}\n\
+         std::io::print(twice(Text(\"x\")))",
+    );
+    assert_eq!(run(&source), "11\n");
+    assert_lowered_by_the_pipeline(&source);
+}
+
+#[test]
+fn matching_a_moved_payload_again_is_a_use_of_a_moved_value() {
+    let error = failure(&messages(
+        "fn f(m: Message) -> string {\n    let a = match m { Text(t) => t, _ => \"none\" }\n    let b = match m { Text(t) => t, _ => \"none\" }\n    return a\n}\nstd::io::print(f(Quiet))",
+    ));
+    assert_eq!(error.code, "E118");
+}
+
+#[test]
+fn only_the_arm_that_binds_spends_the_value() {
+    // The wildcard arm does not move `m`, but the binding arm does, so a later use is
+    // reported: a move on any path counts.
+    let error = failure(&messages(
+        "fn f(m: Message) -> i64 {\n    let n = match m { Text(t) => 1, _ => 0 }\n    let k = match m { Quiet => 1, _ => 2 }\n    return n + k\n}\nstd::io::print(f(Quiet))",
+    ));
+    assert_eq!(error.code, "E118");
+}
+
+#[test]
+fn an_enum_may_carry_another_enum() {
+    let source = "enum Inner {\n    One: string,\n    Two,\n}\nenum Outer {\n    Wrap: Inner,\n    Bare,\n}\nuse Inner::*\nuse Outer::*\n\
+fn dig(o: Outer) -> string {\n    return match o { Wrap(i) => match i { One(s) => s, Two => \"two\" }, Bare => \"bare\" }\n}\n\
+std::io::print(dig(Wrap(One(\"deep\"))))\nstd::io::print(dig(Wrap(Two)))\nstd::io::print(dig(Bare))";
+    assert_eq!(run(source), "deep\ntwo\nbare\n");
+    assert_lowered_by_the_pipeline(source);
+}
