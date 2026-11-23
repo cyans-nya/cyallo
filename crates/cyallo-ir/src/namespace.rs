@@ -449,6 +449,13 @@ impl Resolver {
                 targets.push("$print".into());
                 continue;
             }
+            if let Some(id) = symbol.intrinsic
+                && crate::builtins::pipeline_utility(id)
+            {
+                // A utility is typed from its operands and emitted as one operation.
+                targets.push(format!("$builtin:{}", id as u16).into());
+                continue;
+            }
             if symbol.intrinsic.is_some()
                 || self.unit_variants.contains(&symbol.id)
                 || !(constructor

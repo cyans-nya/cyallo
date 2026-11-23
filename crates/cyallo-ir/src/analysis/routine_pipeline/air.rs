@@ -38,6 +38,8 @@ pub(super) enum Site {
     Record(Box<str>),
     /// The built-in `print`, which writes its arguments to the output.
     Print,
+    /// A utility resolved from its operand types: string and numeric helpers.
+    Builtin(crate::intrinsic::Intrinsic),
     /// A variant constructor, built in place rather than by calling a function.
     Variant {
         variant: cyallo_ast::EnumVariant,
@@ -81,6 +83,7 @@ pub(super) enum Operation {
     CallStatement(usize, Operands),
     /// Write the values to the output.
     Print(Operands),
+    Builtin(Value, crate::intrinsic::Intrinsic, Operands),
     /// Build a record from its fields, in declaration order.
     Aggregate(Value, Vec<Value>),
     /// Read a field of a local or of the record a reference parameter refers to.
@@ -902,7 +905,11 @@ impl Analysis<'_> {
                 Some(arm) => self.infer(&arm.body),
                 None => Err(invalid(expression.span)),
             },
-            ExpressionKind::Call(site, _) => match self.callees.get(site.0) {
+            ExpressionKind::Call(site, arguments) => match self.callees.get(site.0) {
+                Some(Site::Builtin(id)) => {
+                    let (_, types) = self.builtin_arguments(*id, arguments)?;
+                    self.builtin_result(*id, &types, expression.span)
+                }
                 Some(Site::Variant { result, .. }) => Ok(self.view(result)),
                 _ => Ok(self.callee(*site, expression.span)?.result.clone()),
             },
@@ -1076,6 +1083,14 @@ impl Analysis<'_> {
                     slot,
                 } => self.short_circuit(*and, left, right, *slot, span),
                 ExpressionKind::Match(matched) => self.matched(matched, span),
+                ExpressionKind::Call(site, arguments)
+                    if matches!(self.callees.get(site.0), Some(Site::Builtin(_))) =>
+                {
+                    let Some(Site::Builtin(id)) = self.callees.get(site.0) else {
+                        return Err(invalid(span));
+                    };
+                    self.builtin(*id, arguments, span)
+                }
                 ExpressionKind::Call(site, arguments)
                     if matches!(self.callees.get(site.0), Some(Site::Variant { .. })) =>
                 {
@@ -1296,6 +1311,83 @@ impl Analysis<'_> {
         }
         let _ = tests;
         self.read(matched.result, span)
+    }
+
+    /// The arguments of a utility and their types, with literals taking the type the other
+    /// numeric arguments share, as the existing route contextualizes them.
+    fn builtin_arguments<'e>(
+        &self,
+        id: crate::intrinsic::Intrinsic,
+        arguments: &'e [Expression],
+    ) -> Result<(Vec<Cow<'e, Expression>>, Vec<Type>), Diagnostic> {
+        let context = if crate::builtins::shares_numeric_type(id) {
+            arguments
+                .iter()
+                .find(|argument| !contextual_number(argument))
+                .or_else(|| {
+                    arguments.iter().find(|argument| {
+                        matches!(argument.kind, ExpressionKind::Literal(Literal::Real(_)))
+                    })
+                })
+                .or(arguments.first())
+                .map(|argument| self.infer(argument))
+                .transpose()?
+        } else {
+            None
+        };
+        let mut retyped = Vec::with_capacity(arguments.len());
+        let mut types = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            let argument = match &context {
+                Some(context) => contextualize(argument, context)?,
+                None => Cow::Borrowed(argument),
+            };
+            types.push(self.infer(&argument)?);
+            retyped.push(argument);
+        }
+        Ok((retyped, types))
+    }
+
+    fn builtin_result(
+        &self,
+        id: crate::intrinsic::Intrinsic,
+        types: &[Type],
+        span: Span,
+    ) -> Result<Type, Diagnostic> {
+        crate::builtins::result_type(id, types).ok_or_else(|| {
+            let found = types
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            Diagnostic::new("E112", format!("`{id}` does not accept ({found})"), span)
+        })
+    }
+
+    /// A utility call: arguments are read, and the result is one operation.
+    fn builtin(
+        &mut self,
+        id: crate::intrinsic::Intrinsic,
+        arguments: &[Expression],
+        span: Span,
+    ) -> Result<(Value, Type), Diagnostic> {
+        let (arguments, _) = self.builtin_arguments(id, arguments)?;
+        let mut values = Vec::with_capacity(arguments.len());
+        let mut types = Vec::with_capacity(arguments.len());
+        for argument in &arguments {
+            let (value, ty) = self.expression(argument)?;
+            values.push(value);
+            types.push(ty);
+        }
+        let result = self.builtin_result(id, &types, span)?;
+        let operands = Operands {
+            start: self.operands.len(),
+            len: values.len(),
+        };
+        self.operands.extend(values);
+        let value = self.value(result.clone());
+        self.emit(Operation::Builtin(value, id, operands), span);
+        Ok((value, result))
     }
 
     /// `print(a, b, ...)`: every argument is evaluated, then all must be printable.
@@ -1721,6 +1813,11 @@ impl Analysis<'_> {
                 };
                 if matches!(self.callees.get(site.0), Some(Site::Print)) {
                     return self.print(arguments, call.span);
+                }
+                if matches!(self.callees.get(site.0), Some(Site::Builtin(_))) {
+                    // The result is computed and dropped, as for any call statement.
+                    self.expression(call)?;
+                    return Ok(());
                 }
                 let (target, result, operands) = self.arguments(*site, arguments, call.span)?;
                 if result == Type::Void {

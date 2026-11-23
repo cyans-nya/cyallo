@@ -283,6 +283,16 @@ impl IndexedRoutineBody {
                 callees.push(air::Site::Print);
                 continue;
             }
+            if let Some(id) = target
+                .and_then(|target| target.strip_prefix("$builtin:"))
+                .and_then(|number| number.parse::<u16>().ok())
+                .and_then(|number| {
+                    crate::intrinsic::Intrinsic::from_id(cyallo_ast::IntrinsicId(number, None))
+                })
+            {
+                callees.push(air::Site::Builtin(id));
+                continue;
+            }
             let Some(signature) = target.and_then(|target| signatures.get(&key(target))) else {
                 return Ok(None);
             };
@@ -631,6 +641,15 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                     Op::EnumTest(dst, address, variant)
                 }
                 air::Operation::Consume(_) => continue,
+                air::Operation::Builtin(value, id, range) => {
+                    let arguments = checked.operands[range.start..range.start + range.len]
+                        .iter()
+                        .map(|argument| registers[argument.0])
+                        .collect();
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::Builtin(dst, id, arguments)
+                }
                 air::Operation::Print(range) => Op::Output(
                     checked.operands[range.start..range.start + range.len]
                         .iter()
