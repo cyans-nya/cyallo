@@ -652,3 +652,38 @@ loops, type errors in `let`, assignment, `+=`, range bounds and conditions, and 
 a loop. Anything else declines the subset: assignment to a parameter, an immutable local or a loop
 counter, names used out of scope or declared twice (a counter name may repeat across loops that do not
 nest), calls to local names, and `break`/`continue`. The existing route then runs and reports it.
+
+## Demand-driven metadata discovery
+
+Verified lowering used to read every checked body to find module variables and boxed trait
+implementations, which forced analysis of every routine before the worklist emitted a single image
+(4,098 bodies checked at n=4,096 although one image was emitted). It now computes the set of routines
+that can run first (`demanded_routines` in `src/bytecode/verified/lower.rs`): the entry, the extra
+roots, and everything reached through direct calls, function values, allocator callbacks and the
+methods of implementations that a reached body boxes. Globals and implementations are collected over
+that set only. If lowering ever reaches a routine outside it, a reference kind was missed, and lowering
+runs again over every routine as before, so the result is never narrower than the old scan.
+
+Effect (profile, `--jobs 1`): bodies checked before first output went from N+2 to 0 for the unused
+workloads, and the verified module lowering stage fell from about 31 ms to under 1 ms at n=4,096.
+Call-all still checks and lowers every routine, as it must. Raw data:
+[bench](measurements/startup-demand-bench.json), [profile](measurements/startup-demand-profile.json).
+
+Paired medians of 15 rounds, `--jobs 1`, first output, against the older release binary (two
+alternating passes):
+
+| Workload | Old | New | Change |
+| --- | ---: | ---: | ---: |
+| unused 256 | 36.3 ms | 11.1 ms | −69% |
+| unused 1,024 | 128.6 ms | 26.4 ms | −79% |
+| unused 4,096 | 505 ms | 87.7 ms | −83% |
+| unused 16,384 | 2,075 ms | 339 ms | −84% |
+| call all 1,024 | 162.6 ms | 59.0 ms | −64% |
+| call all 4,096 | 650 ms | 223.5 ms | −66% |
+
+What remains at n=4,096 unused is front-end work: lex, parse and freeze (~40 ms), building MIR for each
+body during materialize (~35 ms), and smaller passes. Caveats as before: the old binary predates
+`9ac74ed` and the host is shared.
+
+Test status: the `constants`, `effects` and `native_contract` failures fail identically on a pristine
+`9ac74ed` checkout, so they are not caused by this branch.
