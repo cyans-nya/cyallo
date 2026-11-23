@@ -3,17 +3,24 @@ use cyallo_ast::indexed::{
     ExprNode, ExprSyntax, FunctionNode, Id, IndexedAst, List, LiteralNode, NameId, StmtNode,
     StmtSyntax, TypeNode,
 };
+use std::sync::OnceLock;
+
 use cyallo_ast::{
     FunctionBodyKind, Literal, Operator, ParameterArity, ParameterPassing, RoutineKind, Span, Type,
 };
 
-#[derive(Clone, Debug, Hash)]
+#[derive(Clone, Debug)]
 pub(super) struct Expression {
     pub(super) span: Span,
     pub(super) kind: ExpressionKind,
+    /// The inferred type of a binary node, remembered once known so no node is typed
+    /// twice (leaves are cheaper to type than to look up). It depends
+    /// only on the node and on the routine's fixed local and callee types, and a
+    /// retyped copy is a new node with nothing remembered.
+    pub(super) inferred: OnceLock<Box<Type>>,
 }
 
-#[derive(Clone, Debug, Hash)]
+#[derive(Clone, Debug)]
 pub(super) enum ExpressionKind {
     /// A literal as written: a plain integer or real literal takes the type its
     /// context asks for, a suffixed one has its own.
@@ -32,13 +39,34 @@ pub(super) enum ExpressionKind {
     },
     /// A call; the site holds the callee path that the module graph binds later.
     Call(SiteId, Vec<Expression>),
+    /// `p.*`: the value a reference parameter refers to.
+    Deref(Variable),
+    /// `&x` or `&mut x`, as a call argument: a reference to a local or a by-value parameter.
+    Borrow {
+        variable: Variable,
+        mutable: bool,
+    },
+    /// A reference parameter passed on, as a call argument.
+    Reborrow(Variable),
 }
 
 impl Expression {
+    pub(super) fn new(span: Span, kind: ExpressionKind) -> Self {
+        Self {
+            span,
+            kind,
+            inferred: OnceLock::new(),
+        }
+    }
+
     /// Number of expression nodes, for the admission estimate.
     pub(super) fn size(&self) -> usize {
         1 + match &self.kind {
-            ExpressionKind::Literal(_) | ExpressionKind::Read(_) => 0,
+            ExpressionKind::Literal(_)
+            | ExpressionKind::Read(_)
+            | ExpressionKind::Deref(_)
+            | ExpressionKind::Borrow { .. }
+            | ExpressionKind::Reborrow(_) => 0,
             ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => inner.size(),
             ExpressionKind::Binary(_, left, right)
             | ExpressionKind::ShortCircuit { left, right, .. } => left.size() + right.size(),
@@ -75,6 +103,17 @@ pub(super) enum StatementKind {
     ForRange(Box<ForRange>),
     Break,
     Continue,
+    /// `p.* = value`.
+    AssignDeref {
+        variable: Variable,
+        value: Expression,
+    },
+    /// `p.* op= value`.
+    CompoundDeref {
+        variable: Variable,
+        operator: Operator,
+        value: Expression,
+    },
     /// `return` in a procedure.
     ReturnVoid,
     /// A call to a procedure, as a statement. The expression is a `Call`.
@@ -100,6 +139,52 @@ pub(super) struct Local {
     pub(super) constant: bool,
 }
 
+impl Routine {
+    /// Statement and expression nodes, for the admission estimate.
+    pub(super) fn size(&self) -> usize {
+        fn block(statements: &[Statement]) -> usize {
+            statements
+                .iter()
+                .map(|statement| {
+                    // Each statement is also a logical marker.
+                    2 + match &statement.kind {
+                        StatementKind::If(condition, yes, no) => {
+                            condition.size() + block(yes) + block(no)
+                        }
+                        StatementKind::While(condition, body) => condition.size() + block(body),
+                        StatementKind::ForRange(range) => {
+                            range.start.size() + range.finish.size() + block(&range.body)
+                        }
+                        StatementKind::Return(value) => value.size(),
+                        StatementKind::Let { value, .. }
+                        | StatementKind::Assign { value, .. }
+                        | StatementKind::Compound { value, .. }
+                        | StatementKind::AssignDeref { value, .. }
+                        | StatementKind::CompoundDeref { value, .. } => value.size(),
+                        StatementKind::CallStatement(call) => call.size(),
+                        StatementKind::Break
+                        | StatementKind::Continue
+                        | StatementKind::ReturnVoid => 0,
+                    }
+                })
+                .sum()
+        }
+        block(&self.statements)
+    }
+
+    /// Whether any statement is a loop.
+    pub(super) fn has_loops(&self) -> bool {
+        fn block(statements: &[Statement]) -> bool {
+            statements.iter().any(|statement| match &statement.kind {
+                StatementKind::While(..) | StatementKind::ForRange(_) => true,
+                StatementKind::If(_, yes, no) => block(yes) || block(no),
+                _ => false,
+            })
+        }
+        block(&self.statements)
+    }
+}
+
 pub(super) struct Routine {
     pub(super) sites: Vec<ReferenceSite>,
     pub(super) statements: Vec<Statement>,
@@ -112,6 +197,8 @@ struct Visible {
     name: NameId,
     slot: Variable,
     mutable: bool,
+    /// A reference parameter, and whether it is `&mut`.
+    reference: Option<bool>,
 }
 
 struct Context<'a> {
@@ -125,7 +212,7 @@ struct Context<'a> {
     scopes: Vec<Vec<Visible>>,
     /// Loops enclosing the statement being lowered.
     loops: usize,
-    /// The routine is a procedure: it returns no value.
+    /// The routine returns no value.
     procedure: bool,
 }
 
@@ -134,29 +221,45 @@ struct Context<'a> {
 /// for anything this subset does not accept (duplicate names, assignment to an
 /// immutable name, a name used out of scope, and so on).
 pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<Routine> {
-    if function.body_kind != FunctionBodyKind::Source
-        || function.generator
-        || !ast.get_list(function.annotations)?.is_empty()
-        || !ast.get_list(function.type_params)?.is_empty()
+    REASON.with(|reason| *reason.borrow_mut() = None);
+    if function.body_kind != FunctionBodyKind::Source {
+        return decline(|| "declared without a body".into());
+    }
+    if function.generator {
+        return decline(|| "generator".into());
+    }
+    if !ast.get_list(function.annotations)?.is_empty() {
+        return decline(|| "annotated routine".into());
+    }
+    if !ast.get_list(function.type_params)?.is_empty()
         || !ast.get_list(function.type_packs)?.is_empty()
     {
-        return None;
+        return decline(|| "generic routine".into());
     }
-    // A function returns `i64` or `bool`; a procedure returns nothing.
+    // A routine returns a scalar, or a procedure returns nothing.
     let procedure = match (function.kind, ast.get(function.result)?) {
-        (RoutineKind::Function, node) if scalar_type(node).is_some() => false,
+        (_, node) if scalar_type(node).is_some() => false,
         (RoutineKind::Procedure, TypeNode::Void) => true,
-        _ => return None,
+        (_, node) => return decline(|| format!("result type {}", variant(node))),
     };
     let parameters = ast.get_list(function.params)?;
-    if parameters.iter().any(|parameter| {
-        parameter.arity != ParameterArity::One
-            || parameter.passing != ParameterPassing::Value
-            || parameter.by_ref
-            || parameter.receiver
-            || ast.get(parameter.ty).and_then(scalar_type).is_none()
-    }) {
-        return None;
+    for parameter in parameters {
+        if parameter.arity != ParameterArity::One {
+            return decline(|| "variadic parameter".into());
+        }
+        if parameter.passing != ParameterPassing::Value || parameter.by_ref {
+            return decline(|| "parameter passed by reference".into());
+        }
+        if parameter.receiver {
+            return decline(|| "method receiver".into());
+        }
+        match ast.get(parameter.ty) {
+            Some(node) if scalar_type(node).is_some() => {}
+            Some(node) if reference_type(ast, node).is_some() => {}
+            node => {
+                return decline(|| format!("parameter type {}", node.map_or("?".into(), variant)));
+            }
+        }
     }
     let names: Vec<_> = parameters.iter().map(|parameter| parameter.name).collect();
     let mut every_name = names.clone();
@@ -166,7 +269,7 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
     // error. Only loop counters may share a name, across loops that do not nest.
     for (index, name) in every_name.iter().enumerate() {
         if every_name[..index].contains(name) || counters.contains(name) {
-            return None;
+            return decline(|| "a name is declared twice".into());
         }
     }
     every_name.extend(counters.iter().copied());
@@ -186,6 +289,11 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
                     name,
                     slot: Variable(index),
                     mutable: false,
+                    reference: parameters
+                        .get(index)
+                        .and_then(|parameter| ast.get(parameter.ty))
+                        .and_then(|node| reference_type(ast, node))
+                        .map(|(mutable, _)| mutable),
                 })
                 .collect(),
         ],
@@ -228,7 +336,7 @@ fn declared_names(
                 | StmtSyntax::Compound(..)
                 | StmtSyntax::Break
                 | StmtSyntax::Continue => {}
-                _ => return None,
+                ref other => return decline(|| format!("statement {}", variant(other))),
             }
         }
         Some(())
@@ -252,6 +360,34 @@ impl Context<'_> {
             constant,
         });
         slot
+    }
+
+    /// A call argument: a plain value, or the one place a borrow may appear.
+    fn argument(&mut self, id: Id<ExprNode>) -> Option<Expression> {
+        let ast = self.ast;
+        let node = ast.get(id)?;
+        let kind = match node.kind {
+            ExprSyntax::Unary(operator @ (Operator::Borrow | Operator::BorrowMut), inner) => {
+                let ExprSyntax::Name(name) = ast.get(inner)?.kind else {
+                    return decline(|| "borrow of something other than a name".into());
+                };
+                match self.lookup(name) {
+                    Some(visible) if visible.reference.is_none() => ExpressionKind::Borrow {
+                        variable: visible.slot,
+                        mutable: operator == Operator::BorrowMut,
+                    },
+                    _ => return decline(|| "borrow of a reference or an unknown name".into()),
+                }
+            }
+            ExprSyntax::Name(name) => match self.lookup(name) {
+                Some(visible) if visible.reference.is_some() => {
+                    ExpressionKind::Reborrow(visible.slot)
+                }
+                _ => return self.value(id, false),
+            },
+            _ => return self.value(id, false),
+        };
+        Some(Expression::new(node.span, kind))
     }
 
     fn site(&mut self, path: &str, span: Span, arguments: usize, discard: bool) -> SiteId {
@@ -295,16 +431,16 @@ impl Context<'_> {
                         StmtSyntax::ReturnVoid if self.procedure => StatementKind::ReturnVoid,
                         StmtSyntax::Evaluate(value) => {
                             let call = self.value(value, false)?;
-                            // Only a call to a procedure; the linker checks which.
+                            // The linker checks that the callee has a contract this subset knows.
                             let ExpressionKind::Call(site, _) = &call.kind else {
-                                return None;
+                                return decline(|| "statement that is not a call".into());
                             };
                             self.sites[site.0].discard = true;
                             StatementKind::CallStatement(call)
                         }
                         StmtSyntax::Binding(name, annotation, constant, mutable, value) => {
                             if constant {
-                                return None;
+                                return decline(|| "constant binding".into());
                             }
                             let annotation = match annotation {
                                 None => None,
@@ -317,6 +453,7 @@ impl Context<'_> {
                                 name,
                                 slot,
                                 mutable,
+                                reference: None,
                             });
                             StatementKind::Let {
                                 slot,
@@ -324,17 +461,34 @@ impl Context<'_> {
                                 annotation,
                             }
                         }
-                        StmtSyntax::Assign(target, value) => StatementKind::Assign {
-                            slot: self.assignable(target)?,
-                            value: self.expression(value)?,
-                        },
+                        StmtSyntax::Assign(target, value) => {
+                            if let Some(variable) = self.dereferenced(target) {
+                                StatementKind::AssignDeref {
+                                    variable,
+                                    value: self.expression(value)?,
+                                }
+                            } else {
+                                StatementKind::Assign {
+                                    slot: self.assignable(target)?,
+                                    value: self.expression(value)?,
+                                }
+                            }
+                        }
                         StmtSyntax::Compound(target, operator, value)
                             if operator.is_arithmetic() && operator != Operator::RealDivide =>
                         {
-                            StatementKind::Compound {
-                                slot: self.assignable(target)?,
-                                operator,
-                                value: self.value(value, false)?,
+                            if let Some(variable) = self.dereferenced(target) {
+                                StatementKind::CompoundDeref {
+                                    variable,
+                                    operator,
+                                    value: self.value(value, false)?,
+                                }
+                            } else {
+                                StatementKind::Compound {
+                                    slot: self.assignable(target)?,
+                                    operator,
+                                    value: self.value(value, false)?,
+                                }
                             }
                         }
                         StmtSyntax::While(condition, body) => {
@@ -350,7 +504,7 @@ impl Context<'_> {
                         StmtSyntax::ForIn(name, iterable, body) => {
                             self.range(name, iterable, body, statement.span)?
                         }
-                        _ => return None,
+                        ref other => return decline(|| format!("statement {}", variant(other))),
                     };
                     Some(Statement {
                         span: statement.span,
@@ -364,12 +518,29 @@ impl Context<'_> {
     /// The slot of a mutable local named by `target`. Parameters, immutable names,
     /// loop counters and anything else stay with the existing route, which owns
     /// those diagnostics.
-    fn assignable(&self, target: Id<ExprNode>) -> Option<Variable> {
-        let ExprSyntax::Name(name) = self.ast.get(target)?.kind else {
+    /// The reference parameter `p` when `target` is `p.*`.
+    fn dereferenced(&self, target: Id<ExprNode>) -> Option<Variable> {
+        let ExprSyntax::Unary(Operator::Dereference, inner) = self.ast.get(target)?.kind else {
             return None;
         };
+        let ExprSyntax::Name(name) = self.ast.get(inner)?.kind else {
+            return decline(|| "dereference of something other than a reference parameter".into());
+        };
         let visible = self.lookup(name)?;
-        visible.mutable.then_some(visible.slot)
+        visible.reference.is_some().then_some(visible.slot)
+    }
+
+    fn assignable(&self, target: Id<ExprNode>) -> Option<Variable> {
+        let ExprSyntax::Name(name) = self.ast.get(target)?.kind else {
+            return decline(|| "assignment to a field, index or dereference".into());
+        };
+        let Some(visible) = self.lookup(name) else {
+            return decline(|| "assignment to a name that is not a local".into());
+        };
+        if !visible.mutable {
+            return decline(|| "assignment to a parameter, an immutable name or a counter".into());
+        }
+        Some(visible.slot)
     }
 
     fn range(
@@ -392,6 +563,7 @@ impl Context<'_> {
             name,
             slot: variable,
             mutable: false,
+            reference: None,
         }]);
         self.loops += 1;
         let body = self.block(body);
@@ -441,9 +613,17 @@ impl Context<'_> {
                     LiteralNode::Integer(value) => Literal::Integer(*value),
                     LiteralNode::Real(value) => Literal::Real(*value),
                     LiteralNode::Boolean(value) => Literal::Boolean(*value),
-                    _ => return None,
+                    LiteralNode::String(text) => Literal::String(ast.name(*text)?.into()),
+                    other => return decline(|| format!("literal {}", variant(other))),
                 }),
-                ExprSyntax::Name(name) => ExpressionKind::Read(self.lookup(name)?.slot),
+                ExprSyntax::Name(name) => match self.lookup(name) {
+                    Some(visible) if visible.reference.is_some() => {
+                        return decline(|| "reference parameter used as a value".into());
+                    }
+                    Some(visible) => ExpressionKind::Read(visible.slot),
+                    // A module variable, a constant, a function value, or a name out of scope.
+                    None => return decline(|| "name that is not a local".into()),
+                },
                 ExprSyntax::Parenthesized(inner) => {
                     ExpressionKind::Group(Box::new(self.value(inner, split)?))
                 }
@@ -470,25 +650,39 @@ impl Context<'_> {
                 ExprSyntax::Unary(operator @ (Operator::Not | Operator::Subtract), operand) => {
                     ExpressionKind::Unary(operator, Box::new(self.value(operand, split)?))
                 }
+                ExprSyntax::Unary(Operator::Dereference, inner) => {
+                    let ExprSyntax::Name(name) = ast.get(inner)?.kind else {
+                        return decline(|| {
+                            "dereference of something other than a reference parameter".into()
+                        });
+                    };
+                    match self.lookup(name) {
+                        Some(visible) if visible.reference.is_some() => {
+                            ExpressionKind::Deref(visible.slot)
+                        }
+                        _ => {
+                            return decline(|| {
+                                "dereference of a name that is not a reference parameter".into()
+                            });
+                        }
+                    }
+                }
                 ExprSyntax::Call(name, arguments) => {
                     // A local of the same name shadows the declaration.
                     if self.every_name.contains(&name) {
-                        return None;
+                        return decline(|| "call of a local name".into());
                     }
                     let arguments: Vec<Expression> = ast
                         .get_list(arguments)?
                         .iter()
-                        .map(|&argument| self.value(argument, false))
+                        .map(|&argument| self.argument(argument))
                         .collect::<Option<_>>()?;
                     let site = self.site(ast.name(name)?, expression.span, arguments.len(), false);
                     ExpressionKind::Call(site, arguments)
                 }
-                _ => return None,
+                ref other => return decline(|| format!("expression {}", variant(other))),
             };
-            Some(Expression {
-                span: expression.span,
-                kind,
-            })
+            Some(Expression::new(expression.span, kind))
         })
     }
 }
@@ -497,12 +691,64 @@ fn scalar_operator(operator: Operator) -> bool {
     (operator.is_arithmetic() && operator != Operator::RealDivide) || operator.is_comparison()
 }
 
+thread_local! {
+    /// Why the routine last handed to `from_indexed` was declined, for coverage reports.
+    static REASON: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Decline the routine, remembering the first (innermost) reason.
+fn decline<T>(reason: impl FnOnce() -> String) -> Option<T> {
+    REASON.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(reason());
+        }
+    });
+    None
+}
+
+/// The name of an enum value's variant, without its fields.
+fn variant(value: &impl std::fmt::Debug) -> String {
+    let text = format!("{value:?}");
+    text.split(['(', ' ', '{'])
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The reason `from_indexed` last declined on this thread.
+pub(super) fn last_decline() -> Option<String> {
+    REASON.with(|slot| slot.borrow_mut().take())
+}
+
+/// `&T` or `&mut T` over a scalar `T`, without a named lifetime: whether it is `&mut`, and the type.
+fn reference_type(ast: &IndexedAst, node: &TypeNode) -> Option<(bool, Type)> {
+    let TypeNode::Reference {
+        mutable,
+        lifetime: None,
+        pointee,
+    } = node
+    else {
+        return None;
+    };
+    let pointee = scalar_type(ast.get(*pointee)?)?;
+    Some((
+        *mutable,
+        Type::Reference {
+            mutable: *mutable,
+            lifetime: None,
+            pointee: Box::new(pointee),
+        },
+    ))
+}
+
 /// The scalar types the subset accepts: `i64`, `bool`, `f64` and the sized numbers.
 fn scalar_type(node: &TypeNode) -> Option<Type> {
     Some(match node {
         TypeNode::Integer => Type::Integer,
         TypeNode::Boolean => Type::Boolean,
         TypeNode::Real => Type::Real,
+        TypeNode::String => Type::String,
         TypeNode::Numeric(kind) => Type::numeric(*kind),
         _ => return None,
     })

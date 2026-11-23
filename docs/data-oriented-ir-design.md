@@ -232,6 +232,48 @@ Clone removal: MIR takes ownership of HIR, because HIR is transient, so expressi
 
 Cost: walking trees and typing twice (infer, then lower) makes AIR heavier. Unused routines are unaffected because AIR runs only on demand; the call-all workload at 4,096 routines went from about 223 ms to about 249 ms to first output.
 
+### Slice 7 status: lazy control-flow graph and a text digest
+
+Profiling a prepared body at 4,096 routines showed the cost was not where the plan assumed. Building HIR took about 5.5 ms, lowering it to MIR about 2.4 ms, and the SHA-256 digest of the MIR tree about 18 ms, because hashing a tree feeds the hash thousands of tiny pieces. Two changes follow. The body's digest is now one hash of its own source text, which is still independent of every imported declaration, so an unchanged importer keeps its key when an import changes (a comment edit now changes the key, which is a harmless over-invalidation). And HIR waits in the retained body until typed analysis first needs the control-flow graph, which a routine that is never run never does. What stays eager is what the linker and admission need: the reference sites, an eligibility decision (HIR construction), and node and loop counts taken from HIR.
+
+Paired against the build before this change (15 rounds, two passes each), first output for unused routines went from about 82.6 ms to 66.2 ms at 4,096 and from about 318 ms to 253 ms at 16,384, and call-all at 4,096 from about 236 ms to 221 ms. The remaining time at 4,096 unused is front-end work (lex, parse, freeze, header materialization) and HIR construction.
+
+### Slice 8 status: each binary node is typed once
+
+The existing route's `expression_type` types both operands of a binary operation, and then types them again after the numeric context has been applied, and every ancestor does the same to its subtree. For a left-nested chain such as `a + b + c + ...` that is exponential in the number of terms, so the existing route does not finish a 40-term sum. AIR now remembers the inferred type on each binary node, which is safe because it depends only on the node and on the routine's fixed local and callee types, and it reuses an operand's type when the context left that operand unchanged. A retyped literal path is a new node with nothing remembered. Only binary nodes are remembered, and the stored type is boxed, because typing a leaf is cheaper than looking it up and an unused slot should stay small; remembering every node cost about 1.5% on the shallow expressions of the benchmark. A 300-term chain now compiles in about 0.1 s on the migrated route, and the parity tests compare the two routes at a depth the existing route survives.
+
+### Slice 9 status: value-returning procedures, and a coverage report
+
+A `proc` may return a scalar, and a call statement may discard the result of any routine that has one: the call is lowered with a destination that is never read, as the existing route does. The linker's contract check now requires a value call to name a callee that returns something, and lets a statement call name any plain callee.
+
+`tests/pipeline_coverage.rs` reports how much real code the pipeline accepts and why it declines the rest (`COVERAGE_VERBOSE=1` lists each decline; the test asserts a floor, so a change that makes the pipeline decline more is noticed). On the 58 routines in the examples and std sources, 9 are accepted. The reasons for the rest, by count: reference parameters (12), generic routines (8, which are specialized to concrete copies before lowering and never reach this pipeline as indexed bodies), collection, option and result types (8), `gc` and `rc` types (8), record types (3), module variables and function values (4), and one each of string, array, closure and index expressions. Every one of these needs more than typing: a reference or an owned aggregate brings the ownership and loan checks (`ownership.rs` walks the owned AST body, which the pipeline no longer has), drop scopes, and the place and lookup operations. Extending the subset further is therefore a series of ownership-aware slices, each to be verified against the existing route by the differential generator, not more scalar forms.
+
+### Slice 10 status: scalar references
+
+A routine may take `&T` or `&mut T` parameters over `i64`, `bool`, `f64` and the sized numbers, and a call may borrow a local. This slice is verified by its own tests (`tests/scalar_references.rs`, with the Cyallo program `examples/references/scalar.yas`), which state what the language does and do not compare with the existing route. The rules are small and are checked in AIR:
+
+- `p.*` reads and `p.* = v`, `p.* op= v` write through a reference parameter. Writing through `&T` is E107 ("cannot write through a read-only reference").
+- `&x` and `&mut x` may appear only as direct call arguments, and `x` must be a local or a by-value parameter, not a reference. `&mut x` of a local declared without `mut` is E107 ("cannot modify a constant"). A reference to a reference is rejected.
+- A reference parameter may be passed on as an argument; a `&mut` may be passed where `&` is expected, and not the reverse (E109).
+- Within one call, two loans of the same place conflict unless both are shared (E118, "call arguments overlap and include a mutable reference"). Loans exist only for the arguments of a call, so no loan outlives it and nothing needs lifetimes.
+- A reference is never a value: it cannot be stored in a local, returned, compared or used in arithmetic, and a result of reference type, a named lifetime, or a reference to anything but a scalar leaves the routine to the existing route.
+
+The emitted IR has the shape the rest of the compiler already reads: a borrow is the local's address moved into a reference-typed register, a dereference loads or stores through that register, and storage placement then keeps a borrowed local in a cell. Purity needs no new code, because the effect analysis sees the store through the reference. `tests/pipeline_coverage.rs` now reports 16 of 64 routines accepted.
+
+This slice also makes one earlier claim true: calls now read the callee's parameter list through the callee table instead of copying it. An earlier edit that was meant to do this had silently not applied, so the change recorded as clone removal was only the ownership move and the borrowing `contextualize`.
+
+### Slice 11 status: strings
+
+`string` parameters, results, locals and literals, concatenation (`+`, `+=`), comparison, and `&string` and `&mut string` references now lower through the pipeline. Verified by `tests/strings.rs` and `examples/strings/basic.yas`.
+
+A `string` is an owned value that is not `Copy`, and that is what this slice adds. Handing a string on moves it out of its variable: the root of a `let` initializer, an assignment, a return value, or a by-value call argument. Reading it does not: the operands of `+` and of a comparison, and a shared reference's `p.*`. A moved variable may not be used until it is written again. AIR emits a moving read as `Address` and `Take`, which empties the local (the legacy interpreter really does), and everything else as `Load`. A forward dataflow over the typed blocks (`check_moves` in `air.rs`) tracks which locals may have been moved at the start of each block, merging across branches and back edges, and reports the first use of one (E118, "use of a moved value", with a related note at the move). Because it works on blocks it needs no special case for `if` or loops: a loop that moves an outer string reports the move at the next pass's use. Moving out of a reference (`return s.*` for `s: &string`) is E118 ("cannot move an owned value out of borrowed or shared storage; clone it explicitly").
+
+Strings have no destructor, so there are no drop scopes yet; the move check is the whole of the ownership model for this slice. Records and anything with a destructor will need drops, which the same dataflow can drive. Printing and string methods are intrinsic calls and are the next big source of declined routines (`print` is how most procedures end). `tests/pipeline_coverage.rs` now reports 24 of 70 routines accepted.
+
+### Hashing: BLAKE3
+
+Every digest in the compiler (the module-cache key, body digests and SDK interface digests) is BLAKE3; `sha2` is no longer a dependency of `cyallo-ir`, and a `Digest` now displays as `blake3:...`. Paired against the build before the change, first output for unused routines improved by about 3.5% (68.4 ms to 66.0 ms at 4,096, 263 ms to 254 ms at 16,384). The `xtask` provenance check for the vendored Winch sources still uses SHA-256, because it verifies the checksum of an upstream tarball published as SHA-256 and the manifest would have to be re-pinned from that tarball.
+
 ### Performance work during migration
 
 The [verified-interpreter baseline](startup-baseline.md#verified-interpreter-baseline) gives the comparison point for demand and metadata costs. Reuse the harness for the zero-routine, 4,096-unused-routine and call-all cases. Keep the default deferred CLI separate from explicit eager `--engine ng`. Scope the standalone worklist optimization as an independent execution scheduling change if it lands before the pipeline migration. It can reduce forced body checks while the compiler still uses a linked AST as its analysis input. [Benchmark harness](../scripts/startup_baseline.py) · [CLI dispatch](../src/main.rs)

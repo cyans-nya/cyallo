@@ -228,7 +228,7 @@ fn a_digest_from_an_older_sdk_is_rejected_precisely() {
     assert!(
         errors[0]
             .to_string()
-            .contains("implemented against sha256:")
+            .contains("implemented against blake3:")
     );
 }
 #[test]

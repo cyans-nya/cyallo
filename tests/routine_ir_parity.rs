@@ -457,7 +457,9 @@ fn generated_function(random: &mut Random, index: usize) -> String {
     }
     body += &format!("    return {}\n", expression(random, &names, 3));
     format!(
-        "fn f{index}({}) -> {} {{PAD\n{body}}}\nstd::io::print(f{index}({}))\n",
+        "{} f{index}({}) -> {} {{PAD\n{body}}}\nstd::io::print(f{index}({}))\n",
+        // A procedure may return a value too.
+        ["fn", "fn", "proc"][random.next(3)],
         signature.join(", "),
         TYPES[random.next(TYPES.len())],
         arguments.join(", ")
@@ -537,5 +539,50 @@ fn generated_numeric_programs_agree_with_the_existing_route() {
     assert!(
         migrated_bodies > 200,
         "only {migrated_bodies} bodies migrated"
+    );
+}
+
+#[test]
+fn a_long_left_nested_chain_is_typed_in_linear_time() {
+    // `a + a + ...` nests to the left. Typing each subtree at every ancestor, and again
+    // after the context is applied, is exponential in the depth, which the existing route
+    // still is, so it is compared only at a depth it survives. The migrated route types
+    // each node once and takes the long chain in stride.
+    let chain = |terms: usize, join: &str| vec!["p0"; terms].join(join);
+    parity(
+        &format!(
+            "fn f(p0: i64) -> i64 {{PAD\n    return {}\n}}\nstd::io::print(f(2))\n",
+            chain(10, " + ")
+        ),
+        "20\n",
+    );
+    let started = std::time::Instant::now();
+    let source = format!(
+        "fn f(p0: i64) -> i64 {{\n    return {}\n}}\nfn g(p0: f64) -> f64 {{\n    return {}\n}}\nstd::io::print(f(2))\n",
+        chain(300, " + "),
+        chain(300, " * 1.0 + ")
+    );
+    assert_eq!(run(&source), "600\n");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "typing a long chain took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn procedures_that_return_values_match() {
+    // A value-returning procedure, a call whose result is discarded, and a value used.
+    parity(
+        "proc work(n: i64) -> i64 {PAD\n    let mut t = 0\n    for i in 0..n { t += i }\n    return t\n}\n\
+         proc caller(n: i64) -> i64 {PAD\n    work(n)\n    work(n + 1)\n    return work(n) + 1\n}\n\
+         fn pure_one(n: i64) -> i64 {PAD\n    return n + 1\n}\n\
+         proc discard(n: i64) {PAD\n    pure_one(n)\n    work(n)\n}\n\
+         discard(3)\nstd::io::print(caller(4))\n",
+        "7\n",
+    );
+    same_diagnostic(
+        "proc work(n: i64) -> i64 {PAD\n    let mut t = 0\n    while t < n { t += 1 }\n}\n",
+        "E103",
     );
 }

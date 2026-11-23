@@ -1,42 +1,40 @@
 //! File-local control flow: blocks of statements joined by explicit exits. Expressions
 //! stay trees, so typed analysis can infer upward and push expected types downward
 //! exactly as the existing route does. Nothing here depends on an imported declaration.
-use super::{ReferenceSite, Variable, hir};
+use super::{Variable, hir};
 use cyallo_ast::Span;
 use hir::Expression;
 
-#[derive(Clone, Copy, Debug, Hash)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct BlockId(pub(super) usize);
 
-#[derive(Clone, Debug, Hash)]
+#[derive(Clone, Debug)]
 pub(super) struct Located<T> {
     pub(super) span: Span,
     pub(super) kind: T,
 }
 
-#[derive(Clone, Debug, Hash)]
+#[derive(Clone, Debug)]
 pub(super) struct LocalInfo {
     pub(super) name: Box<str>,
     pub(super) span: Span,
     pub(super) constant: bool,
 }
 
-#[derive(Debug, Hash)]
+#[derive(Debug)]
 pub(super) struct Body {
     pub(super) blocks: Vec<Block>,
     /// Locals after the parameters, with hidden loop locals, in slot order.
     pub(super) locals: Vec<LocalInfo>,
-    /// Reference sites in source order. MIR never stores a resolved target.
-    pub(super) sites: Vec<ReferenceSite>,
 }
 
-#[derive(Debug, Hash)]
+#[derive(Debug)]
 pub(super) struct Block {
     pub(super) statements: Vec<Located<Statement>>,
     pub(super) exit: Located<Exit>,
 }
 
-#[derive(Debug, Hash)]
+#[derive(Debug)]
 pub(super) enum Statement {
     /// A source statement boundary: a logical instruction of its own.
     Marker,
@@ -53,6 +51,17 @@ pub(super) enum Statement {
     /// `slot op= value`.
     Compound {
         slot: Variable,
+        operator: cyallo_ast::Operator,
+        value: Expression,
+    },
+    /// `p.* = value`, through a reference parameter.
+    AssignDeref {
+        variable: Variable,
+        value: Expression,
+    },
+    /// `p.* op= value`.
+    CompoundDeref {
+        variable: Variable,
         operator: cyallo_ast::Operator,
         value: Expression,
     },
@@ -78,7 +87,7 @@ pub(super) enum Statement {
     },
 }
 
-#[derive(Debug, Hash)]
+#[derive(Debug)]
 pub(super) enum Exit {
     Branch {
         condition: Expression,
@@ -135,7 +144,6 @@ pub(super) fn lower(routine: hir::Routine, span: Span) -> Body {
                 constant: local.constant,
             })
             .collect(),
-        sites: routine.sites,
     }
 }
 
@@ -217,6 +225,21 @@ impl Builder {
                     } => self.emit(
                         Statement::Compound {
                             slot,
+                            operator,
+                            value,
+                        },
+                        span,
+                    ),
+                    hir::StatementKind::AssignDeref { variable, value } => {
+                        self.emit(Statement::AssignDeref { variable, value }, span)
+                    }
+                    hir::StatementKind::CompoundDeref {
+                        variable,
+                        operator,
+                        value,
+                    } => self.emit(
+                        Statement::CompoundDeref {
+                            variable,
                             operator,
                             value,
                         },

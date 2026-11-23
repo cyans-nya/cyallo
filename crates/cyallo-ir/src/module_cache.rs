@@ -16,22 +16,26 @@ pub struct ModuleKey {
     native: crate::sdk::Digest,
     permissions: crate::sdk::Digest,
 }
-/// Streams a value's structure into SHA-256. Identity comes from `Hash` on the
+/// Streams a value's structure into BLAKE3. Identity comes from `Hash` on the
 /// declarations themselves, never from their debug text, whose format is not a contract.
-struct Fingerprint(sha2::Sha256);
+struct Fingerprint(blake3::Hasher);
 impl std::hash::Hasher for Fingerprint {
     fn write(&mut self, bytes: &[u8]) {
-        sha2::Digest::update(&mut self.0, bytes);
+        self.0.update(bytes);
     }
     fn finish(&self) -> u64 {
-        let digest = sha2::Digest::finalize(self.0.clone());
-        u64::from_le_bytes(digest[..8].try_into().expect("a digest has 32 bytes"))
+        let digest = self.0.finalize();
+        u64::from_le_bytes(
+            digest.as_bytes()[..8]
+                .try_into()
+                .expect("a digest has 32 bytes"),
+        )
     }
 }
 pub(crate) fn fingerprint(value: &impl std::hash::Hash) -> crate::sdk::Digest {
-    let mut state = Fingerprint(<sha2::Sha256 as sha2::Digest>::new());
+    let mut state = Fingerprint(blake3::Hasher::new());
     value.hash(&mut state);
-    crate::sdk::Digest(sha2::Digest::finalize(state.0).into())
+    crate::sdk::Digest(*state.0.finalize().as_bytes())
 }
 #[derive(Debug, Clone)]
 pub struct LinkLayout {

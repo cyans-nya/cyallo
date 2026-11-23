@@ -5,14 +5,15 @@ mod mir;
 
 use super::{Result, Signature, collect, ir, key, routine_function};
 use cyallo_ast::{
-    Expr, ExprKind, Function, ParameterArity, ParameterPassing, RoutineKind, Span, Stmt, StmtKind,
-    Type,
+    Expr, ExprKind, Function, Literal, ParameterArity, ParameterPassing, RoutineKind, Span, Stmt,
+    StmtKind, Type,
 };
 use cyallo_parser::BodyHandle;
 use ir::{Op, Reg, Slot};
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::Arc,
+    fmt,
+    sync::{Arc, Mutex, OnceLock},
 };
 
 /// A parameter or local slot: parameters first, then locals in declaration order.
@@ -37,7 +38,13 @@ struct SiteId(usize);
 /// owned AST body. Archive placement is applied when producing diagnostics or IR.
 #[derive(Clone, Debug)]
 pub struct IndexedRoutineBody {
-    mir: Arc<mir::Body>,
+    /// Reference sites in source order, known as soon as the body is prepared: the
+    /// linker binds them. The control-flow graph itself is built on first use.
+    sites: Arc<[ReferenceSite]>,
+    lowering: Arc<Lowering>,
+    /// Admission facts, computed from the syntax so they do not force the graph.
+    size: usize,
+    loops: bool,
     file_span: Span,
     archived_span: Span,
     offset: u32,
@@ -49,16 +56,67 @@ pub struct IndexedRoutineBody {
     handle: BodyHandle,
 }
 
+/// HIR waits here until something needs the control-flow graph (typed analysis),
+/// so a routine that is never run never pays for it.
+struct Lowering {
+    hir: Mutex<Option<hir::Routine>>,
+    mir: OnceLock<mir::Body>,
+    span: Span,
+}
+
+impl fmt::Debug for Lowering {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Lowering")
+            .field("built", &self.mir.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl IndexedRoutineBody {
+    fn mir(&self) -> &mir::Body {
+        self.lowering.mir.get_or_init(|| {
+            let hir = self
+                .lowering
+                .hir
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("the HIR is taken once, by the thread that builds the graph");
+            mir::lower(hir, self.lowering.span)
+        })
+    }
+
+    /// Why `prepare` would decline this body, or `None` when it is accepted. For coverage
+    /// reports: the reason is the first unsupported form found.
+    pub fn decline_reason(handle: &BodyHandle) -> Option<String> {
+        match hir::from_indexed(handle.unit().syntax(), handle.function()) {
+            Some(_) => None,
+            None => Some(hir::last_decline().unwrap_or_else(|| "unrecognized form".into())),
+        }
+    }
+
     pub fn prepare(handle: &BodyHandle, offset: u32) -> Result<Option<Self>> {
         let function = handle.function();
         let Some(hir) = hir::from_indexed(handle.unit().syntax(), function) else {
             return Ok(None);
         };
-        let mir = mir::lower(hir, function.span);
+        // The digest is of the body's own text: one call into the hash, and independent
+        // of every imported declaration, as the cache key requires.
+        let text = handle.unit().source().text();
+        let Some(body_text) = text.get(function.span.start as usize..function.span.end as usize)
+        else {
+            return Ok(None);
+        };
         Ok(Some(Self {
-            digest: crate::module_cache::fingerprint(&mir),
-            mir: Arc::new(mir),
+            digest: crate::module_cache::fingerprint(&body_text),
+            sites: Arc::from(hir.sites.clone()),
+            size: hir.size(),
+            loops: hir.has_loops(),
+            lowering: Arc::new(Lowering {
+                hir: Mutex::new(Some(hir)),
+                mir: OnceLock::new(),
+                span: function.span,
+            }),
             file_span: function.span,
             archived_span: shift(function.span, offset)?,
             offset,
@@ -69,7 +127,7 @@ impl IndexedRoutineBody {
 
     /// Reference sites in source order as `(path, argument count, is a statement, archived span)`.
     pub(crate) fn reference_sites(&self) -> impl Iterator<Item = (&str, usize, bool, Span)> {
-        self.mir.sites.iter().map(|site| {
+        self.sites.iter().map(|site| {
             let span = shift(site.span, self.offset).unwrap_or(site.span);
             (&*site.path, site.arguments, site.discard, span)
         })
@@ -78,7 +136,7 @@ impl IndexedRoutineBody {
     /// Attach the linker's resolved callee symbol for each site, in site order.
     /// The overlay is part of the digest, so a retargeted call changes cache keys.
     pub(crate) fn with_targets(mut self, targets: Vec<Box<str>>) -> Self {
-        debug_assert_eq!(targets.len(), self.mir.sites.len());
+        debug_assert_eq!(targets.len(), self.sites.len());
         self.digest = crate::module_cache::fingerprint(&(self.digest, &targets));
         self.overlay = Some(targets.into());
         self
@@ -107,19 +165,7 @@ impl IndexedRoutineBody {
 
     pub(super) fn estimate(&self) -> crate::admission::Estimate {
         crate::admission::Estimate {
-            nodes: self
-                .mir
-                .blocks
-                .iter()
-                .map(|block| {
-                    block.statements.len()
-                        + block
-                            .statements
-                            .iter()
-                            .map(|statement| statement_size(&statement.kind))
-                            .sum::<usize>()
-                })
-                .sum(),
+            nodes: self.size,
             // Direct-call edges come from the overlay, as they do from an owned body.
             calls: self
                 .overlay
@@ -127,10 +173,8 @@ impl IndexedRoutineBody {
                 .flat_map(|o| o.iter().cloned())
                 .collect(),
             shape: ir::RoutineShape {
-                calls: !self.mir.sites.is_empty(),
-                loops: self.mir.blocks.iter().enumerate().any(|(index, block)| {
-                    matches!(block.exit.kind, mir::Exit::Jump(target) if target.0 <= index)
-                }),
+                calls: !self.sites.is_empty(),
+                loops: self.loops,
             },
         }
     }
@@ -147,7 +191,7 @@ impl IndexedRoutineBody {
             return Ok(None);
         };
         lower_mir(
-            &self.mir,
+            self.mir(),
             self.file_span,
             self.offset,
             function,
@@ -164,15 +208,15 @@ impl IndexedRoutineBody {
         function: &Function,
         signatures: &HashMap<String, Signature>,
     ) -> Result<Option<Vec<air::Callee>>> {
-        if self.mir.sites.is_empty() {
+        if self.sites.is_empty() {
             return Ok(Some(Vec::new()));
         }
         let mut targets = HashMap::new();
         if self.overlay.is_none() {
             call_targets(&function.body, &mut targets);
         }
-        let mut callees = Vec::with_capacity(self.mir.sites.len());
-        for (index, site) in self.mir.sites.iter().enumerate() {
+        let mut callees = Vec::with_capacity(self.sites.len());
+        for (index, site) in self.sites.iter().enumerate() {
             let target = match &self.overlay {
                 Some(overlay) => overlay.get(index).map(|target| &**target),
                 None => targets.get(&shift(site.span, self.offset)?).copied(),
@@ -180,12 +224,13 @@ impl IndexedRoutineBody {
             let Some(signature) = target.and_then(|target| signatures.get(&key(target))) else {
                 return Ok(None);
             };
+            // A statement may discard any result; a value must come from a callee that has one.
             if !plain_contract(
                 signature.kind,
                 &signature.params,
                 &signature.result,
                 site.arguments,
-            ) || (signature.result == Type::Void) != site.discard
+            ) || (signature.result == Type::Void && !site.discard)
             {
                 return Ok(None);
             }
@@ -207,24 +252,32 @@ pub(crate) fn plain_contract(
     result: &Type,
     arguments: usize,
 ) -> bool {
+    let scalar_reference = |ty: &Type| {
+        matches!(
+            ty,
+            Type::Reference { lifetime: None, pointee, .. }
+                if matches!(
+                    **pointee,
+                    Type::Integer | Type::Boolean | Type::Real | Type::Numeric(_) | Type::String
+                )
+        )
+    };
     let scalar = |ty: &Type| {
         matches!(
             ty,
-            Type::Integer | Type::Boolean | Type::Real | Type::Numeric(_)
+            Type::Integer | Type::Boolean | Type::Real | Type::Numeric(_) | Type::String
         )
     };
-    let returns = match kind {
-        RoutineKind::Function => scalar(result),
-        RoutineKind::Procedure => *result == Type::Void,
-    };
+    let returns = scalar(result) || (kind == RoutineKind::Procedure && *result == Type::Void);
     returns
         && parameters.len() == arguments
         && parameters.iter().all(|parameter| {
             scalar(&parameter.ty)
-                && parameter.arity == ParameterArity::One
-                && parameter.passing == ParameterPassing::Value
-                && !parameter.by_ref
-                && !parameter.receiver
+                || scalar_reference(&parameter.ty)
+                    && parameter.arity == ParameterArity::One
+                    && parameter.passing == ParameterPassing::Value
+                    && !parameter.by_ref
+                    && !parameter.receiver
         })
 }
 
@@ -316,7 +369,10 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
             .operations
             .iter()
             .map(|operation| match operation.kind {
-                air::Operation::ReadVariable(..) | air::Operation::Store(..) => 2,
+                air::Operation::ReadVariable(..)
+                | air::Operation::TakeVariable(..)
+                | air::Operation::Store(..)
+                | air::Operation::Borrow(..) => 2,
                 _ => 1,
             })
             .sum::<usize>();
@@ -333,7 +389,29 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                 air::Operation::Constant(value, literal) => {
                     let dst = register(&mut function, &checked.types[value.0]);
                     registers[value.0] = dst;
-                    Op::Literal(dst, literal)
+                    match literal {
+                        Literal::String(text) => Op::LiteralString(dst, Arc::from(&*text)),
+                        literal => Op::Literal(dst, literal),
+                    }
+                }
+                air::Operation::TakeVariable(value, variable) => {
+                    // Moving a value out empties the local it came from.
+                    let ty = &checked.types[value.0];
+                    let address = register(&mut function, ty);
+                    push(
+                        &mut function,
+                        Op::Address(
+                            address,
+                            Slot {
+                                global: false,
+                                index: variable.0,
+                            },
+                        ),
+                        span,
+                    );
+                    let dst = register(&mut function, ty);
+                    registers[value.0] = dst;
+                    Op::Take(dst, address)
                 }
                 air::Operation::Store(variable, value) => {
                     let ty = &checked.types[value.0];
@@ -378,6 +456,35 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                     registers[value.0] = dst;
                     Op::Call(Some(dst), target, arguments)
                 }
+                air::Operation::Load(value, reference) => {
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::Load(dst, registers[reference.0])
+                }
+                air::Operation::StoreIndirect(reference, value) => {
+                    Op::Store(registers[reference.0], registers[value.0])
+                }
+                air::Operation::Borrow(value, variable) => {
+                    // The address of the local, then a reference value that holds it.
+                    let Type::Reference { pointee, .. } = &checked.types[value.0] else {
+                        unreachable!("a borrow produces a reference");
+                    };
+                    let address = register(&mut function, pointee);
+                    push(
+                        &mut function,
+                        Op::Address(
+                            address,
+                            Slot {
+                                global: false,
+                                index: variable.0,
+                            },
+                        ),
+                        span,
+                    );
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::Move(dst, address)
+                }
                 air::Operation::CallStatement(target, range) => {
                     let arguments = checked.operands[range.start..range.start + range.len]
                         .iter()
@@ -411,20 +518,6 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
     }
     debug_assert_eq!(function.code.len(), pc);
     function
-}
-
-/// Expression nodes a statement holds, for the admission estimate.
-fn statement_size(statement: &mir::Statement) -> usize {
-    match statement {
-        mir::Statement::Define { value, .. }
-        | mir::Statement::Assign { value, .. }
-        | mir::Statement::Compound { value, .. } => value.size(),
-        mir::Statement::CallStatement(call) => call.size(),
-        mir::Statement::RangeStart { start, finish, .. } => start.size() + finish.size(),
-        mir::Statement::Marker
-        | mir::Statement::RangeBound { .. }
-        | mir::Statement::RangeStep { .. } => 0,
-    }
 }
 
 fn register(function: &mut ir::Function, ty: &Type) -> Reg {
@@ -464,7 +557,7 @@ mod tests {
     fn indexed_routine_produces_explicit_blocks_and_checked_values() {
         let source = include_str!("../../../../examples/routine-ir.yas");
         let (function, prepared) = prepare(source);
-        let mir = &prepared.mir;
+        let mir = prepared.mir();
         let mir::Exit::Branch { yes, no, .. } = mir.blocks[0].exit.kind else {
             panic!("the condition terminates the entry block");
         };
@@ -540,8 +633,8 @@ mod tests {
         let source = "fn bump(n: i64) -> i64 { return n + 1 }\nfn twice(n: i64) -> i64 { return bump(bump(n)) }";
         let (functions, body) = prepare_nth(source, 1);
         // Two sites in source order; MIR holds no resolved target.
-        assert_eq!(body.mir.sites.len(), 2);
-        assert!(body.mir.sites.iter().all(|site| &*site.path == "bump"));
+        assert_eq!(body.sites.len(), 2);
+        assert!(body.sites.iter().all(|site| &*site.path == "bump"));
         let signatures = HashMap::from([("bump".to_owned(), signature(&functions[0], 7))]);
         let emitted = body
             .emit(&functions[1], &BTreeMap::new(), &signatures)

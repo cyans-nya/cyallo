@@ -52,6 +52,14 @@ pub(super) enum Operation {
     Unary(Value, Operator, Value),
     Call(Value, usize, Operands),
     CallStatement(usize, Operands),
+    /// Move a value out of a local, which is then empty until it is written again.
+    TakeVariable(Value, Variable),
+    /// Read through a reference value.
+    Load(Value, Value),
+    /// Write through a reference value.
+    StoreIndirect(Value, Value),
+    /// A reference to a local: its address, moved into a reference value.
+    Borrow(Value, Variable),
 }
 
 /// Targets are indexes into `Body::blocks`.
@@ -130,6 +138,63 @@ fn require(expected: &Type, actual: &Type, span: Span) -> Result<(), Diagnostic>
     Err(diagnostic)
 }
 
+/// How the value of an expression is used.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Use {
+    /// Looked at: the source keeps it.
+    Read,
+    /// Handed on: a value that is not `Copy` leaves its source.
+    Move,
+}
+
+/// The type a reference refers to.
+fn pointee(ty: &Type, span: Span) -> Result<Type, Diagnostic> {
+    match ty {
+        Type::Reference { pointee, .. } => Ok((**pointee).clone()),
+        _ => Err(Diagnostic::new(
+            "E109",
+            "dereference requires a reference or managed owner",
+            span,
+        )),
+    }
+}
+
+/// The type behind a reference that may be written through.
+fn writable(ty: &Type, span: Span) -> Result<Type, Diagnostic> {
+    let target = pointee(ty, span)?;
+    match ty {
+        Type::Reference { mutable: true, .. } => Ok(target),
+        _ => Err(Diagnostic::new(
+            "E107",
+            "cannot write through a read-only reference",
+            span,
+        )),
+    }
+}
+
+/// An argument matches its parameter, and a mutable reference may be passed where a
+/// shared one of the same pointee is wanted.
+fn require_argument(parameter: &Type, actual: &Type, span: Span) -> Result<(), Diagnostic> {
+    if let (
+        Type::Reference {
+            mutable: wanted,
+            pointee: wanted_pointee,
+            ..
+        },
+        Type::Reference {
+            mutable: given,
+            pointee: given_pointee,
+            ..
+        },
+    ) = (parameter, actual)
+        && (!*wanted || *given)
+        && wanted_pointee == given_pointee
+    {
+        return Ok(());
+    }
+    require(parameter, actual, span)
+}
+
 fn numeric(ty: &Type) -> bool {
     ty.number_kind().is_some()
 }
@@ -206,10 +271,10 @@ fn contextualize<'e>(
             if typed == *literal {
                 return Ok(Cow::Borrowed(expression));
             }
-            Ok(Cow::Owned(Expression {
+            Ok(Cow::Owned(Expression::new(
                 span,
-                kind: ExpressionKind::Literal(typed),
-            }))
+                ExpressionKind::Literal(typed),
+            )))
         }
         ExpressionKind::Binary(
             operator @ (Operator::Add
@@ -230,29 +295,29 @@ fn contextualize<'e>(
             ) {
                 return Ok(Cow::Borrowed(expression));
             }
-            Ok(Cow::Owned(Expression {
+            Ok(Cow::Owned(Expression::new(
                 span,
-                kind: ExpressionKind::Binary(
+                ExpressionKind::Binary(
                     *operator,
                     Box::new(new_left.into_owned()),
                     Box::new(new_right.into_owned()),
                 ),
-            }))
+            )))
         }
         ExpressionKind::Group(inner) => Ok(match contextualize(inner, wanted)? {
             Cow::Borrowed(_) => Cow::Borrowed(expression),
-            Cow::Owned(inner) => Cow::Owned(Expression {
+            Cow::Owned(inner) => Cow::Owned(Expression::new(
                 span,
-                kind: ExpressionKind::Group(Box::new(inner)),
-            }),
+                ExpressionKind::Group(Box::new(inner)),
+            )),
         }),
         ExpressionKind::Unary(operator @ (Operator::Add | Operator::Subtract), inner) => {
             Ok(match contextualize(inner, wanted)? {
                 Cow::Borrowed(_) => Cow::Borrowed(expression),
-                Cow::Owned(inner) => Cow::Owned(Expression {
+                Cow::Owned(inner) => Cow::Owned(Expression::new(
                     span,
-                    kind: ExpressionKind::Unary(*operator, Box::new(inner)),
-                }),
+                    ExpressionKind::Unary(*operator, Box::new(inner)),
+                )),
             })
         }
         _ => Ok(Cow::Borrowed(expression)),
@@ -279,6 +344,7 @@ pub(super) fn analyze(
     }
     let mut analysis = Analysis {
         parameters,
+        locals: &body.locals,
         result,
         callees,
         start,
@@ -297,6 +363,7 @@ pub(super) fn analyze(
         }
         analysis.exit(&block.exit, index)?;
     }
+    check_moves(&analysis.blocks, parameters.len() + body.locals.len())?;
     // Reachability over the finished blocks. Forward and back edges alike only
     // mark their targets; a loop header is reached by its forward edge first.
     let mut reachable = vec![false; analysis.blocks.len()];
@@ -331,10 +398,79 @@ pub(super) fn analyze(
     })
 }
 
+/// A value moved out of a local may not be used again until the local is written. A move
+/// on any path into a block counts, so a branch or a loop that moves a local and then
+/// reaches a later use is reported at that use.
+fn check_moves(blocks: &[Block], variables: usize) -> Result<(), Diagnostic> {
+    fn walk(block: &Block, state: &mut [Option<Span>], report: bool) -> Result<(), Diagnostic> {
+        for operation in &block.operations {
+            let span = operation.span;
+            match operation.kind {
+                Operation::ReadVariable(_, variable)
+                | Operation::Borrow(_, variable)
+                | Operation::TakeVariable(_, variable) => {
+                    if report && let Some(moved) = state[variable.0] {
+                        return Err(Diagnostic::new("E118", "use of a moved value", span)
+                            .with_related(moved, "ownership transferred here"));
+                    }
+                    if matches!(operation.kind, Operation::TakeVariable(..)) {
+                        state[variable.0] = Some(span);
+                    }
+                }
+                Operation::Store(variable, _) => state[variable.0] = None,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    if !blocks.iter().any(|block| {
+        block
+            .operations
+            .iter()
+            .any(|operation| matches!(operation.kind, Operation::TakeVariable(..)))
+    }) {
+        return Ok(());
+    }
+    let successors = |index: usize| -> Vec<usize> {
+        match blocks[index].exit.kind {
+            Exit::Branch { yes, no, .. } => vec![yes, no],
+            Exit::Jump(target) => vec![target],
+            Exit::Next => vec![index + 1],
+            Exit::Return(_) | Exit::ReturnVoid | Exit::End => vec![],
+        }
+    };
+    let mut entry: Vec<Vec<Option<Span>>> = vec![vec![None; variables]; blocks.len()];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for index in 0..blocks.len() {
+            let mut state = entry[index].clone();
+            walk(&blocks[index], &mut state, false)?;
+            for target in successors(index) {
+                for (slot, moved) in state.iter().enumerate() {
+                    if moved.is_some() && entry[target][slot].is_none() {
+                        entry[target][slot] = *moved;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    for (index, block) in blocks.iter().enumerate() {
+        let mut state = entry[index].clone();
+        walk(block, &mut state, true)?;
+    }
+    Ok(())
+}
+
 fn short_circuits(block: &mir::Block) -> usize {
     fn count(expression: &Expression) -> usize {
         match &expression.kind {
-            ExpressionKind::Literal(_) | ExpressionKind::Read(_) => 0,
+            ExpressionKind::Literal(_)
+            | ExpressionKind::Read(_)
+            | ExpressionKind::Deref(_)
+            | ExpressionKind::Borrow { .. }
+            | ExpressionKind::Reborrow(_) => 0,
             ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => count(inner),
             ExpressionKind::Binary(_, left, right) => count(left) + count(right),
             ExpressionKind::ShortCircuit { left, right, .. } => 1 + count(left) + count(right),
@@ -347,7 +483,9 @@ fn short_circuits(block: &mir::Block) -> usize {
         .map(|statement| match &statement.kind {
             Statement::Define { value, .. }
             | Statement::Assign { value, .. }
-            | Statement::Compound { value, .. } => count(value),
+            | Statement::Compound { value, .. }
+            | Statement::AssignDeref { value, .. }
+            | Statement::CompoundDeref { value, .. } => count(value),
             Statement::CallStatement(call) => count(call),
             Statement::RangeStart { start, finish, .. } => count(start) + count(finish),
             Statement::Marker | Statement::RangeBound { .. } | Statement::RangeStep { .. } => 0,
@@ -363,6 +501,7 @@ fn short_circuits(block: &mir::Block) -> usize {
 
 struct Analysis<'a> {
     parameters: &'a [Param],
+    locals: &'a [mir::LocalInfo],
     result: &'a Type,
     callees: &'a [Callee],
     /// The first block built for each MIR block.
@@ -392,6 +531,15 @@ impl Analysis<'_> {
             exit: Located { kind: exit, span },
         });
         self.blocks.len() - 1
+    }
+
+    /// Whether a local was declared without `mut` (parameters were not).
+    fn constant(&self, variable: Variable) -> bool {
+        variable
+            .0
+            .checked_sub(self.parameters.len())
+            .and_then(|local| self.locals.get(local))
+            .is_some_and(|local| local.constant)
     }
 
     fn variable_type(&self, variable: Variable) -> Option<Type> {
@@ -435,25 +583,63 @@ impl Analysis<'_> {
     /// The type of an expression without lowering it. Errors are the existing
     /// route's `expression_type` errors; lowering ignores them where it does.
     fn infer(&self, expression: &Expression) -> Result<Type, Diagnostic> {
+        // Only a binary operation recurses into operands that are typed again by its
+        // ancestors, so only it is remembered.
+        if !matches!(expression.kind, ExpressionKind::Binary(..)) {
+            return self.infer_uncached(expression);
+        }
+        if let Some(known) = expression.inferred.get() {
+            return Ok((**known).clone());
+        }
+        let ty = self.infer_uncached(expression)?;
+        // Only a success is remembered: a failure may be fixed by a later local.
+        let _ = expression.inferred.set(Box::new(ty.clone()));
+        Ok(ty)
+    }
+
+    fn infer_uncached(&self, expression: &Expression) -> Result<Type, Diagnostic> {
         cyallo_ast::with_stack(|| match &expression.kind {
             ExpressionKind::Literal(literal) => Ok(super::super::literal_type(literal)),
             ExpressionKind::Read(variable) => self
                 .variable_type(*variable)
                 .ok_or_else(|| Diagnostic::new("E114", "type is not known yet", expression.span)),
             ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => self.infer(inner),
+            ExpressionKind::Deref(variable) => {
+                let ty = self.variable_type(*variable).ok_or_else(|| {
+                    Diagnostic::new("E114", "type is not known yet", expression.span)
+                })?;
+                pointee(&ty, expression.span)
+            }
+            ExpressionKind::Reborrow(variable) => self
+                .variable_type(*variable)
+                .ok_or_else(|| Diagnostic::new("E114", "type is not known yet", expression.span)),
+            ExpressionKind::Borrow { variable, mutable } => {
+                let ty = self.variable_type(*variable).ok_or_else(|| {
+                    Diagnostic::new("E114", "type is not known yet", expression.span)
+                })?;
+                Ok(Type::Reference {
+                    mutable: *mutable,
+                    lifetime: None,
+                    pointee: Box::new(ty),
+                })
+            }
             ExpressionKind::Binary(operator, a, b) => {
                 let ta = self.infer(a)?;
                 let tb = self.infer(b)?;
                 if numeric(&ta) && numeric(&tb) {
                     let context = numeric_context(a, &ta, b, &tb);
+                    // An operand the context left alone has the type it was just given.
                     let a = contextualize(a, &context)?;
                     let b = contextualize(b, &context)?;
-                    super::super::binary_type(
-                        *operator,
-                        &self.infer(&a)?,
-                        &self.infer(&b)?,
-                        expression.span,
-                    )
+                    let ta = match a {
+                        Cow::Borrowed(_) => ta,
+                        Cow::Owned(ref retyped) => self.infer(retyped)?,
+                    };
+                    let tb = match b {
+                        Cow::Borrowed(_) => tb,
+                        Cow::Owned(ref retyped) => self.infer(retyped)?,
+                    };
+                    super::super::binary_type(*operator, &ta, &tb, expression.span)
                 } else {
                     super::super::binary_type(*operator, &ta, &tb, expression.span)
                 }
@@ -475,11 +661,31 @@ impl Analysis<'_> {
         expression: &Expression,
         wanted: &Type,
     ) -> Result<(Value, Type), Diagnostic> {
+        self.expected_as(expression, wanted, Use::Read)
+    }
+
+    fn expected_as(
+        &mut self,
+        expression: &Expression,
+        wanted: &Type,
+        usage: Use,
+    ) -> Result<(Value, Type), Diagnostic> {
         let expression = contextualize(expression, wanted)?;
-        self.expression(&expression)
+        self.expression_as(&expression, usage)
     }
 
     fn expression(&mut self, expression: &Expression) -> Result<(Value, Type), Diagnostic> {
+        self.expression_as(expression, Use::Read)
+    }
+
+    /// Lower an expression. A value that is moved out of a local (`Use::Move`) empties the
+    /// local when its type is not `Copy`; only the root of a moved expression is moved, so
+    /// operands of an operation are always read.
+    fn expression_as(
+        &mut self,
+        expression: &Expression,
+        usage: Use,
+    ) -> Result<(Value, Type), Diagnostic> {
         cyallo_ast::with_stack(|| {
             let span = expression.span;
             match &expression.kind {
@@ -489,8 +695,53 @@ impl Analysis<'_> {
                     self.emit(Operation::Constant(value, literal.clone()), span);
                     Ok((value, ty))
                 }
-                ExpressionKind::Read(variable) => self.read(*variable, span),
-                ExpressionKind::Group(inner) => self.expression(inner),
+                ExpressionKind::Read(variable) => {
+                    let ty = self.typed(*variable, span)?;
+                    if usage == Use::Move && !crate::ownership::copy(&ty) {
+                        let value = self.value(ty.clone());
+                        self.emit(Operation::TakeVariable(value, *variable), span);
+                        Ok((value, ty))
+                    } else {
+                        self.read(*variable, span)
+                    }
+                }
+                ExpressionKind::Reborrow(variable) => self.read(*variable, span),
+                ExpressionKind::Deref(variable) => {
+                    let (reference, ty) = self.read(*variable, span)?;
+                    let target = pointee(&ty, span)?;
+                    if usage == Use::Move && !crate::ownership::copy(&target) {
+                        return Err(Diagnostic::new(
+                            "E118",
+                            "cannot move an owned value out of borrowed or shared storage; clone it explicitly",
+                            span,
+                        ));
+                    }
+                    let value = self.value(target.clone());
+                    self.emit(Operation::Load(value, reference), span);
+                    Ok((value, target))
+                }
+                ExpressionKind::Borrow { variable, mutable } => {
+                    let ty = self.typed(*variable, span)?;
+                    if matches!(ty, Type::Reference { .. }) {
+                        return Err(Diagnostic::new(
+                            "E109",
+                            "a reference to a reference is not supported",
+                            span,
+                        ));
+                    }
+                    if *mutable && self.constant(*variable) {
+                        return Err(Diagnostic::new("E107", "cannot modify a constant", span));
+                    }
+                    let reference = Type::Reference {
+                        mutable: *mutable,
+                        lifetime: None,
+                        pointee: Box::new(ty),
+                    };
+                    let value = self.value(reference.clone());
+                    self.emit(Operation::Borrow(value, *variable), span);
+                    Ok((value, reference))
+                }
+                ExpressionKind::Group(inner) => self.expression_as(inner, usage),
                 ExpressionKind::Unary(operator, operand) => {
                     let (operand, ty) = self.expression(operand)?;
                     let valid = if *operator == Operator::Not {
@@ -556,17 +807,45 @@ impl Analysis<'_> {
         arguments: &[Expression],
         span: Span,
     ) -> Result<(usize, Type, Operands), Diagnostic> {
-        let callee = self.callee(site, span)?;
-        let (target, result, parameters) =
-            (callee.id, callee.result.clone(), callee.parameters.clone());
+        // The callee table outlives the analysis, so its parameters need no copy.
+        let callees = self.callees;
+        let callee = callees.get(site.0).ok_or_else(|| invalid(span))?;
+        let (target, result, parameters) = (callee.id, callee.result.clone(), &callee.parameters);
         if arguments.len() != parameters.len() {
             return Err(invalid(span));
         }
         let mut values = Vec::with_capacity(arguments.len());
-        for (argument, parameter) in arguments.iter().zip(&parameters) {
-            let (value, ty) = self.expected(argument, parameter)?;
-            require(parameter, &ty, argument.span)?;
+        let mut loans: Vec<(Variable, bool)> = Vec::new();
+        for (argument, parameter) in arguments.iter().zip(parameters) {
+            let usage = if matches!(parameter, Type::Reference { .. }) {
+                Use::Read
+            } else {
+                Use::Move
+            };
+            let (value, ty) = self.expected_as(argument, parameter, usage)?;
+            require_argument(parameter, &ty, argument.span)?;
+            match &argument.kind {
+                ExpressionKind::Borrow { variable, mutable } => loans.push((*variable, *mutable)),
+                ExpressionKind::Reborrow(variable) => {
+                    let mutable = matches!(ty, Type::Reference { mutable: true, .. });
+                    loans.push((*variable, mutable));
+                }
+                _ => {}
+            }
             values.push(value);
+        }
+        // Two loans of one place in one call may not include a mutable one.
+        for (index, (place, mutable)) in loans.iter().enumerate() {
+            if loans[index + 1..]
+                .iter()
+                .any(|(other, other_mutable)| other.0 == place.0 && (*mutable || *other_mutable))
+            {
+                return Err(Diagnostic::new(
+                    "E118",
+                    "call arguments overlap and include a mutable reference",
+                    span,
+                ));
+            }
         }
         let operands = Operands {
             start: self.operands.len(),
@@ -731,13 +1010,13 @@ impl Analysis<'_> {
                         .as_ref()
                         .is_none_or(|annotation| *annotation == ty)
                 );
-                let (stored, actual) = self.expected(value, &ty)?;
+                let (stored, actual) = self.expected_as(value, &ty, Use::Move)?;
                 require(&ty, &actual, value.span)?;
                 self.store(*slot, stored, span);
             }
             Statement::Assign { slot, value } => {
                 let ty = self.typed(*slot, span)?;
-                let (stored, actual) = self.expected(value, &ty)?;
+                let (stored, actual) = self.expected_as(value, &ty, Use::Move)?;
                 require(&ty, &actual, value.span)?;
                 self.store(*slot, stored, span);
             }
@@ -757,12 +1036,45 @@ impl Analysis<'_> {
                 self.emit(Operation::Binary(combined, operator, old, operand), span);
                 self.store(*slot, combined, span);
             }
+            Statement::AssignDeref { variable, value } => {
+                let reference = self.typed(*variable, span)?;
+                let target = writable(&reference, span)?;
+                let (stored, actual) = self.expected_as(value, &target, Use::Move)?;
+                require(&target, &actual, value.span)?;
+                let (pointer, _) = self.read(*variable, span)?;
+                self.emit(Operation::StoreIndirect(pointer, stored), span);
+            }
+            Statement::CompoundDeref {
+                variable,
+                operator,
+                value,
+            } => {
+                let reference = self.typed(*variable, span)?;
+                let target = writable(&reference, span)?;
+                let (pointer, _) = self.read(*variable, span)?;
+                let old = self.value(target.clone());
+                self.emit(Operation::Load(old, pointer), span);
+                let contextual = contextualize(value, &target)?;
+                let (operand, operand_type) = self.expression(&contextual)?;
+                let result = super::super::binary_type(*operator, &target, &operand_type, span)?;
+                require(&target, &result, span)?;
+                let combined = self.value(result.clone());
+                let operator = super::super::specialized_operator(*operator, &result);
+                self.emit(Operation::Binary(combined, operator, old, operand), span);
+                self.emit(Operation::StoreIndirect(pointer, combined), span);
+            }
             Statement::CallStatement(call) => {
                 let ExpressionKind::Call(site, arguments) = &call.kind else {
                     return Err(invalid(span));
                 };
-                let (target, _, operands) = self.arguments(*site, arguments, call.span)?;
-                self.emit(Operation::CallStatement(target, operands), call.span);
+                let (target, result, operands) = self.arguments(*site, arguments, call.span)?;
+                if result == Type::Void {
+                    self.emit(Operation::CallStatement(target, operands), call.span);
+                } else {
+                    // The result is computed and dropped, as the existing route does.
+                    let value = self.value(result);
+                    self.emit(Operation::Call(value, target, operands), call.span);
+                }
             }
             Statement::RangeStart {
                 variable,
@@ -858,7 +1170,7 @@ impl Analysis<'_> {
                 if *self.result == Type::Void {
                     return Err(invalid(span));
                 }
-                let (stored, ty) = self.expected(value, self.result)?;
+                let (stored, ty) = self.expected_as(value, self.result, Use::Move)?;
                 require(self.result, &ty, value.span)?;
                 Exit::Return(stored)
             }
@@ -921,7 +1233,12 @@ impl Analysis<'_> {
 fn mentions(expression: &Expression, variables: &[Variable]) -> bool {
     match &expression.kind {
         ExpressionKind::Literal(_) => false,
-        ExpressionKind::Read(variable) => variables.iter().any(|other| other.0 == variable.0),
+        ExpressionKind::Read(variable)
+        | ExpressionKind::Deref(variable)
+        | ExpressionKind::Reborrow(variable)
+        | ExpressionKind::Borrow { variable, .. } => {
+            variables.iter().any(|other| other.0 == variable.0)
+        }
         ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => {
             mentions(inner, variables)
         }

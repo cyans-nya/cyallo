@@ -7,5 +7,5 @@ edition = "2024"
 cyallo-ast = { path = "../cyallo-ast" }
 cyallo-parser = { path = "../cyallo-parser" }
 cyallo-compile-jobs = { path = "../cyallo-compile-jobs" }
-sha2 = "0.10.9"
 cyallo-startup-profile = { path = "../cyallo-startup-profile" }
+blake3 = "1.8.7"

@@ -76,7 +76,7 @@ struct Resolver {
     /// Indexed bodies bound by the linker: MIR plus resolved call targets.
     bound: HashMap<Box<str>, crate::analysis::IndexedRoutineBody>,
     /// Linked symbols of plain `i64` functions a migrated body may call.
-    /// Parameter count and whether the callee is a procedure.
+    /// Parameter count and whether the callee returns nothing.
     plain: HashMap<Box<str>, (usize, bool)>,
     /// Source-file mode: the entry runs `proc main()` and no top level may hold statements.
     entry_mode: crate::EntryMode,
@@ -237,7 +237,7 @@ impl Resolver {
                     && crate::analysis::plain_contract(f.kind, &f.params, &f.result, f.params.len())
                     && let Ok(target) = self.symbol(index, &f.name, Kind::Value, f.span)
                 {
-                    plain.insert(target, (f.params.len(), f.kind == RoutineKind::Procedure));
+                    plain.insert(target, (f.params.len(), f.result == Type::Void));
                 }
             }
         }
@@ -276,7 +276,12 @@ impl Resolver {
             self.check_import(module, &symbol, span)?;
             if symbol.intrinsic.is_some()
                 || self.unit_variants.contains(&symbol.id)
-                || self.plain.get(&symbol.target) != Some(&(arguments, discard))
+                || !self
+                    .plain
+                    .get(&symbol.target)
+                    .is_some_and(|&(parameters, void)| {
+                        parameters == arguments && (discard || !void)
+                    })
             {
                 return Ok(Err(body));
             }
