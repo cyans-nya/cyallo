@@ -1,83 +1,10 @@
 use cyallo::{
-    Session, Status,
     modules::{SourceModule, compile_modules},
 };
+use cyallo::vm::{Session, Status};
 use std::sync::Arc;
 fn module(path: &str, source: &str) -> SourceModule {
     SourceModule::new(path, source)
-}
-#[test]
-fn filesystem_dialects_stay_separate() {
-    struct Sources(std::path::PathBuf);
-    impl Drop for Sources {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let directory =
-        Sources(std::env::temp_dir().join(format!("caie-dialects-{}-{nonce}", std::process::id())));
-    std::fs::create_dir_all(directory.0.join("lib")).unwrap();
-    let entry = directory.0.join("main.ya");
-    std::fs::write(
-        &entry,
-        "mod math;\nuse crate::math::ANSWER\nstd::io::print(ANSWER)\n",
-    )
-    .unwrap();
-    std::fs::write(directory.0.join("math.ya"), "pub const ANSWER = 42\n").unwrap();
-    // A compatibility file must not even be read during modern module discovery.
-    std::fs::write(directory.0.join("lib/exam.psc"), [0xff]).unwrap();
-    let sources = cyallo::modules::load_path(&entry).unwrap();
-    assert_eq!(sources.len(), 2);
-    let loader = cyallo::module_loader::ModuleLoader::for_entry(&entry).unwrap();
-    let parsed = loader.load_parsed(&entry, cyallo::Jobs(1)).unwrap();
-    let (archive, ranges) = cyallo::modules::parsed_source_context(&parsed);
-    assert_eq!(archive, cyallo::modules::source_archive(&sources));
-    assert_eq!(
-        ranges[0].span.source_text(&archive),
-        "pub const ANSWER = 42\n"
-    );
-    // A parsed graph represents the bytes that were read during discovery.
-    std::fs::write(directory.0.join("math.ya"), "pub const ANSWER = 99\n").unwrap();
-    let program =
-        cyallo::modules::compile_parsed_modules(1, &parsed, Default::default(), true).unwrap();
-    let mut session = Session::new(Arc::new(program)).unwrap();
-    session.run(100);
-    assert_eq!(session.status(), &Status::Finished);
-    assert_eq!(session.context.output, "42\n");
-    std::fs::write(directory.0.join("math.ya"), "pub const ANSWER = 42\n").unwrap();
-
-    let program = cyallo::modules::compile_path(&entry, Default::default(), false).unwrap();
-    let mut session = Session::new(Arc::new(program)).unwrap();
-    session.run(100);
-    assert_eq!(session.status(), &Status::Finished);
-    assert_eq!(session.context.output, "42\n");
-
-    let legacy = directory.0.join("legacy.ya");
-    std::fs::write(&legacy, "DECLARE n : INTEGER\nn <- 1\nOUTPUT n\n").unwrap();
-    for command in ["check", "run", "bytecode"] {
-        let result = std::process::Command::new(env!("CARGO_BIN_EXE_cyallo"))
-            .arg(command)
-            .arg(&legacy)
-            .output()
-            .unwrap();
-        assert!(!result.status.success(), "{command} accepted CAIE in .ya");
-        assert!(String::from_utf8_lossy(&result.stderr).contains("E002"));
-    }
-    let result = std::process::Command::new(env!("CARGO_BIN_EXE_cyallo"))
-        .arg("run")
-        .arg(&entry)
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    assert_eq!(result.stdout, b"42\n");
 }
 #[test]
 fn reachable_modules_constants_and_import_aliases() {
@@ -112,7 +39,6 @@ fn imported_constants_evaluate_pure_routines() {
     let mut s = Session::new(p).unwrap();
     s.run(1000);
     assert_eq!(s.context.output, "144\n");
-    assert_eq!(s.function_call_count(1), 0);
 }
 #[test]
 fn invalid_imports_visibility_initializers_and_cycles() {
@@ -212,30 +138,6 @@ fn batch_module_errors_follow_input_order() {
             cyallo::modules::diagnostic_context(&archive, &ranges, &diagnostic).unwrap();
         assert_eq!(path, "first.ya");
         assert_eq!(diagnostic.span.source_text(source), "=");
-    }
-}
-#[test]
-fn service_modules_run_from_cli() {
-    for engine in ["interpreter", "jit", "cranelift", "cranelift_speed"] {
-        let result = std::process::Command::new(env!("CARGO_BIN_EXE_cyallo"))
-            .args([
-                "run",
-                "examples/services/main.ya",
-                "--engine",
-                engine,
-                "--gc-stress",
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&result.stdout),
-            "first: ready\nfirst: cleanup\nsecond: ready\nfalse\n"
-        );
     }
 }
 

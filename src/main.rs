@@ -161,15 +161,6 @@ enum Dialect {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Inspect bytecode, verified scalar bytecode, or the Winch Wasm adapter.
-    Bytecode {
-        file: PathBuf,
-        #[arg(long)]
-        wasm: Option<usize>,
-        /// Verify and disassemble the linked routine and its direct callees.
-        #[arg(long, value_name = "ROUTINE_ID", conflicts_with = "wasm")]
-        verified: Option<usize>,
-    },
     /// Start a persistent interactive session (modern syntax by default).
     Repl {
         /// Engine to run on. Defaults to ng, the next-generation interpreter.
@@ -183,6 +174,11 @@ enum Command {
         file: PathBuf,
     },
     Check {
+        file: PathBuf,
+    },
+    /// Print the ng pipeline's typed IR or verified bytecode for a file.
+    Emit {
+        kind: EmitTarget,
         file: PathBuf,
     },
     Run {
@@ -202,9 +198,9 @@ enum Command {
 impl Command {
     fn file(&self) -> Option<&Path> {
         match self {
-            Self::Bytecode { file, .. }
             | Self::Pretty { file }
             | Self::Check { file }
+            | Self::Emit { file, .. }
             | Self::Run { file, .. }
             | Self::Debug { file }
             | Self::Trace { file } => Some(file),
@@ -238,6 +234,13 @@ enum ColorMode {
     Auto,
     Always,
     Never,
+}
+#[derive(Clone, Copy, ValueEnum)]
+enum EmitTarget {
+    /// The typed IR that the verified lowering consumes.
+    Ir,
+    /// The verified (ng) register bytecode.
+    Bytecode,
 }
 #[derive(Clone, Copy, ValueEnum)]
 enum EmitKind {
@@ -450,9 +453,6 @@ fn main() -> color_eyre::Result<()> {
         Command::Run {
             engine: None | Some(Engine::LegacyJit | Engine::LegacyInterpreter),
             ..
-        } | Command::Bytecode {
-            verified: Some(_),
-            ..
         }
     );
     let frontend_result = if options.dialect == cyallo::Dialect::Modern {
@@ -512,44 +512,51 @@ fn main() -> color_eyre::Result<()> {
         check_emission(&program)?;
     }
     match cli.command {
-        Command::Bytecode { wasm, verified, .. } => {
-            if let Some(routine) = verified {
-                let bytecode =
-                    cyallo::bytecode::verified::VerifiedModule::lower(&program, routine)?;
-                print!("{}", bytecode.disassemble());
-            } else if let Some(function) = wasm {
-                let bytecode = program
-                    .bytecode()
-                    .functions
-                    .get(function)
-                    .ok_or_else(|| color_eyre::eyre::eyre!("unknown function"))?;
-                print!(
-                    "{}",
-                    bytecode.wasm_text(function, &program.functions()[function].registers)
-                );
-            } else {
-                print!("{}", program.bytecode().disassemble());
-            }
+        Command::Check { .. } => {
+            // Validate every analyzed body through the verified engine, so the
+            // check fails for anything the ng engine cannot run.
+            lower_analyzed_or_exit(&program, &source_name, diagnostic_color, options.dialect);
+            println!(
+                "OK: {}",
+                match dialect {
+                    Dialect::Modern => "modern",
+                    Dialect::Compatibility => "CAIE 9618 compatibility (2027–2029)",
+                    Dialect::Strict => "CAIE compatibility (strict alias)",
+                    Dialect::Simplified => "simplified (fixed inferred types)",
+                }
+            )
         }
-        Command::Check { .. } => println!(
-            "OK: {}",
-            match dialect {
-                Dialect::Modern => "modern",
-                Dialect::Compatibility => "CAIE 9618 compatibility (2027–2029)",
-                Dialect::Strict => "CAIE compatibility (strict alias)",
-                Dialect::Simplified => "simplified (fixed inferred types)",
+        Command::Emit { kind, .. } => match kind {
+            EmitTarget::Bytecode => {
+                let module = lower_analyzed_or_exit(
+                    &program,
+                    &source_name,
+                    diagnostic_color,
+                    options.dialect,
+                );
+                print!("{}", module.disassemble());
             }
-        ),
+            EmitTarget::Ir => {
+                for (fi, routine) in program.functions().iter().enumerate() {
+                    if let Ok(body) = routine.checked() {
+                        print!("{}", cyallo::inspection::routine_ir_text(fi, routine, body));
+                    }
+                }
+            }
+        },
         Command::Run { engine, .. } => {
             if matches!(engine, None | Some(Engine::Ng | Engine::NgJit)) {
-                // JIT reports and inspection are produced by the legacy engines.
+                // JIT reports and unfulfilled-attribute warnings are legacy-only;
+                // --emit dumps the verified pipeline on this engine.
                 if runtime.jit_report
                     || runtime.jit_notices
                     || runtime.jit_no_inline
-                    || runtime.inspection.is_some()
+                    || runtime.inspection.as_ref().is_some_and(|o| o.options.warn_unfulfilled)
                 {
                     legacy_option_error();
                 }
+                program.emit_inspection();
+                check_emission(&program)?;
                 let render = |diagnostic: &Diagnostic| {
                     cyallo::diagnostics::render_program(
                         &source_name,
@@ -564,8 +571,10 @@ fn main() -> color_eyre::Result<()> {
                     cyallo::vm::start_jit(program.clone(), &context)
                         .map(|tiered| run_ng_jit(tiered, &render))
                 } else {
-                    cyallo::vm::Session::with_context(program.clone(), context)
-                        .map(|session| run_verified(session, &render))
+                    let result = cyallo::vm::Session::with_context(program.clone(), context)
+                        .map(|session| run_verified(session, &render));
+                    cyallo_startup_profile::finish();
+                    result
                 };
                 match run {
                     Ok(result) => {
@@ -621,10 +630,37 @@ fn main() -> color_eyre::Result<()> {
 
     Ok(())
 }
+/// Lower every analyzed routine on the verified engine, or print the refusal
+/// as a located diagnostic and exit.
+fn lower_analyzed_or_exit(
+    program: &cyallo::ir::Program,
+    source_name: &str,
+    diagnostic_color: bool,
+    dialect: cyallo::Dialect,
+) -> cyallo::bytecode::verified::VerifiedModule {
+    match cyallo::bytecode::verified::VerifiedModule::lower_analyzed(program) {
+        Ok(module) => module,
+        Err(error) => {
+            let diagnostic = Diagnostic::new("R900", error.to_string(), cyallo::Span::default());
+            eprintln!(
+                "{}",
+                cyallo::diagnostics::render_program(
+                    source_name,
+                    program,
+                    &diagnostic,
+                    diagnostic_color,
+                    dialect,
+                )
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 /// JIT reports, notices and inspection come from the legacy engines only.
 fn legacy_option_error() -> ! {
     eprintln!(
-        "error: --jit-* reports and inspection need a legacy engine; pass --engine with legacy_jit, legacy_interpreter, legacy_cranelift, or legacy_cranelift_speed"
+        "error: --jit-* reports and --warn-unfulfilled-attributes need a legacy engine; pass --engine with legacy_jit, legacy_interpreter, legacy_cranelift, or legacy_cranelift_speed"
     );
     std::process::exit(2);
 }
@@ -641,11 +677,15 @@ fn run_verified(
     let mut written = 0;
     loop {
         session.run(VERIFIED_SLICE);
-        if session.context.output.len() > written {
+        let output_pending = session.context.output.len() > written;
+        if output_pending {
             print!("{}", &session.context.output[written..]);
             written = session.context.output.len();
         }
         io::stdout().flush()?;
+        if output_pending {
+            cyallo_startup_profile::mark_first_output();
+        }
         match session.status() {
             Status::Paused | Status::Waiting => {}
             Status::WaitingForInput => match read_input_line()? {

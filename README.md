@@ -21,8 +21,8 @@ cargo run -- repl
 cargo run -- pretty examples/modern.ya --color always
 cargo run -- debug examples/modern.ya
 cargo run -- check examples/loops.psc
-cargo run -- bytecode examples/modern.ya
-cargo run -- bytecode examples/modern.ya --wasm 1
+cargo run -- emit bytecode examples/modern.ya
+cargo run -- emit ir examples/modern.ya
 ```
 
 Start with the [example guide](examples/README.md) for a reading order, run commands,
@@ -169,7 +169,7 @@ Source → AST → declarations → per-body checking/inference → typed contro
        → register bytecode → interpreter / native Winch / Cranelift
 ```
 
-Scalar/control instructions are 16-byte words with explicit register IDs, branch PCs, and type tags. Source spans and variable-sized operations live separately. `bytecode <file>` disassembles them; `bytecode <file> --wasm <function-id>` displays the optional legacy Wasm adapter. The native baseline consumes bytecode directly. The adapter requires matching runtime metadata and imports; it is not a standalone WASI application or a stable persisted package format.
+Scalar/control instructions are 16-byte words with explicit register IDs, branch PCs, and type tags. Source spans and variable-sized operations live separately. `emit bytecode <file>` disassembles the verified (ng) bytecode of every analyzed routine; `emit ir <file>` prints the checked typed IR that both lowerings consume. The native baseline consumes bytecode directly. The adapter requires matching runtime metadata and imports; it is not a standalone WASI application or a stable persisted package format.
 
 **Current engines (2026-11-20).** The **next-generation verified pipeline** lowers typed IR to verified register bytecode (`src/bytecode/verified`). `run`, `repl` and `debug` default to its resumable interpreter (`--engine ng` for `run` and `repl`). Both `ng` and `ng_jit` report a diagnostic for programs they cannot lower, including programs that use characters, 32-bit numbers, or the simplified dialect's sparse arrays. See [overhaul stages](docs/overhaul-stages.md), [native tiers: next steps](docs/native-tiers-next-steps.md) and the [legacy removal plan](docs/legacy-removal-plan.md).
 
@@ -179,7 +179,7 @@ The rest of this section describes the **legacy engines** (`--engine legacy_jit|
 
 The automatic JIT can proactively compile likely repeated work in the **[16, 128) bytecode-word window**. It uses syntax-only estimates, direct-call lookahead and recent compilation costs, then checks actual lowered size on a worker. It permits four outstanding eager jobs, 256 estimated speculative words and 2 ms of predicted compilation work. First entries share **one 1 ms wait budget per artifact**; a timeout continues interpretation. `TierPolicy::eager`, `first_call_wait`, and `TieredArtifact::hint_call_soon(function_id)` expose the policy. Set `TierPolicy::eager.enabled = false` to disable prediction for comparison.
 
-`run` with `legacy_jit` or `legacy_interpreter` checks declarations and the entry body up front. Other bodies are checked/lowered once on use or selection by the proactive JIT; unrelated cold bodies retain syntax without detailed analysis. A deferred semantic error is raised at its original span before that body executes. `check`, the `bytecode` command, debugging, explicit eager Cranelift engines, and the REPL fully validate bodies. Library `compile()` remains eager; use `compile_for_execution(source, options)` for deferred analysis. Dump flags do not force cold bodies to be analyzed.
+`run` with `legacy_jit` or `legacy_interpreter` checks declarations and the entry body up front. Other bodies are checked/lowered once on use or selection by the proactive JIT; unrelated cold bodies retain syntax without detailed analysis. A deferred semantic error is raised at its original span before that body executes. `check`, `emit`, debugging, explicit eager Cranelift engines, and the REPL fully validate bodies. Library `compile()` remains eager; use `compile_for_execution(source, options)` for deferred analysis. Dump flags do not force cold bodies to be analyzed.
 
 Modern functions and procedures accept independent routine attributes:
 
@@ -192,7 +192,7 @@ fn inc(n: i64) -> i64 { return n + 1 }
 
 `opt(lazy)` suppresses predictive JIT jobs while allowing normal observed-work tiering and inlining. `opt(always_lazy)` forbids all native compilation and inlining, including explicit eager engines. `always_eager` bypasses the automatic size window, retaining hard limits. `inline(always)` can retain real frames for supported branching functions and procedures; it never bypasses correctness limits. Unfulfilled requests are silent unless `--warn-unfulfilled-attributes` is set. See [policy, limits and measurements](docs/jit-inspection-and-admission.md).
 
-`--emit ir,bytecode,clif --emit-dir ./compiler-output` writes typed IR, register bytecode, and generated Cranelift IR before/after optimization. A manifest identifies deferred routines. `--jit-notices` prints bounded inline, optimization, eager-admission, fallback and invalidation notices at execution safepoints. These options preserve ordinary inlining; `--jit-trace` observes execution without turning inlining off.
+`--emit ir,bytecode,clif --emit-dir ./compiler-output` writes the checked typed IR, the verified (ng) bytecode as `p<N>.verified-bytecode`, and generated Cranelift IR before/after optimization (Cranelift dumps remain legacy-only). A manifest identifies deferred routines. `--jit-notices` prints bounded inline, optimization, eager-admission, fallback and invalidation notices at execution safepoints. These options preserve ordinary inlining; `--jit-trace` observes execution without turning inlining off.
 
 Independent parsing, checking, bytecode lowering and dump formatting use bounded jobs with ordered publication. Eager native compilation uses up to three workers; background compilation also honors the artifact's worker allowance. `--jobs 1` selects serial compilation within an artifact. Execution and code installation preserve source order on the Session thread.
 

@@ -1,58 +1,28 @@
-use cyallo::backend::{
-    CraneliftBackend, CraneliftSpeedBackend, Executable, NativeBackend, Tier, TieredBackend,
-};
-use cyallo::{CompileOptions, Context, Session, Status, compile, compile_for_execution};
+use cyallo::{CompileOptions, compile, vm::{Context, Session, Status}};
+use std::{collections::HashMap, sync::Arc};
 use cyallo_ast::{ExprKind, Locality, MemoryKind, StmtKind, Type};
-use std::{collections::HashMap, sync::Arc, time::Duration};
 
 fn parity(source: &str, expected: &str) {
-    for deferred in [false, true] {
-        let program = Arc::new(
-            if deferred {
-                compile_for_execution(source, CompileOptions::default())
-            } else {
-                compile(source)
+    let program = Arc::new(compile(source).unwrap_or_else(|error| panic!("{error}\n{source}")));
+    for stress in [false, true] {
+        let mut session = Session::with_context(
+            program.clone(),
+            Context {
+                gc: cyallo::runtime::gc::GcConfig { stress, ..Default::default() },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for _ in 0..100_000 {
+            if session.run(1000) != &Status::Paused {
+                break;
             }
-            .unwrap(),
-        );
-        let winch = TieredBackend::default().compile(program.clone()).unwrap();
-        for function in 0..program.functions().len() {
-            winch.precompile(function, Tier::Winch).unwrap();
         }
-        assert!(winch.wait_for_compilation(Duration::from_secs(30)));
-        let engines: Vec<Option<Box<dyn Executable>>> = vec![
-            None,
-            Some(Box::new(winch)),
-            Some(Box::new(CraneliftBackend.compile(program.clone()).unwrap())),
-            Some(Box::new(
-                CraneliftSpeedBackend.compile(program.clone()).unwrap(),
-            )),
-        ];
-        for engine in engines {
-            let mut session = Session::with_context(
-                program.clone(),
-                Context {
-                    gc: cyallo::runtime::gc::GcConfig::stress(),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            for step in 0..10_000 {
-                match &engine {
-                    Some(engine) if step % 3 != 0 => engine.run(&mut session, 1).unwrap(),
-                    _ => {
-                        session.run(1);
-                    }
-                }
-                if session.status() != &Status::Paused {
-                    break;
-                }
-            }
-            assert_eq!(session.status(), &Status::Finished);
-            assert_eq!(session.context.output, expected);
-        }
+        assert_eq!(session.status(), &Status::Finished, "stress={stress}\n{source}");
+        assert_eq!(session.context.output, expected, "stress={stress}\n{source}");
     }
 }
+
 
 #[test]
 fn parser_keeps_storage_and_locality_as_independent_semantic_fields() {
@@ -166,13 +136,6 @@ fn shared_syntax_cannot_silently_allocate_or_promote_local_storage() {
         "let value = gc 42; let same: @shared gc i64 = value",
     ] {
         assert_eq!(compile(source).unwrap_err().code, "E179", "{source}");
-        assert_eq!(
-            compile_for_execution(source, CompileOptions::default())
-                .unwrap_err()
-                .code,
-            "E179",
-            "{source}"
-        );
     }
 }
 

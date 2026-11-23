@@ -224,6 +224,9 @@ impl Inspection {
                 self.emit_routine(program, fi, routine)
             }
         });
+        if self.options.emit_bytecode {
+            self.emit_verified_bytecode(program);
+        }
         let manifest = program
             .functions()
             .iter()
@@ -247,30 +250,40 @@ impl Inspection {
         };
         let prefix = format!("p{}-f{fi}", program.snapshot_id);
         if self.options.emit_ir {
-            let mut text = format!(
-                "function f{fi} {} {:?}\nattributes {:?}\neffects {:?}\nlocals {:?}\nregisters {:?}\n",
-                routine.name,
-                routine.kind,
-                routine.attributes,
-                body.effects,
-                body.locals,
-                body.registers
-            );
-            for (pc, instruction) in body.code.iter().enumerate() {
-                writeln!(
-                    text,
-                    "  {pc:04} {:?} ; {}..{}",
-                    instruction.op, instruction.span.start, instruction.span.end
-                )
-                .unwrap();
-            }
-            self.write(&format!("{prefix}.ir"), &text);
-        }
-        if self.options.emit_bytecode {
-            self.write(
-                &format!("{prefix}.bytecode"),
-                &program.bytecode().disassemble_unit(fi),
-            );
+            self.write(&format!("{prefix}.ir"), &routine_ir_text(fi, routine, body));
         }
     }
+
+    /// Write the verified (ng) bytecode of the entry and every analyzed routine
+    /// as one module dump. A lowering failure is written in its place, so the
+    /// dump says why the module is missing.
+    fn emit_verified_bytecode(&self, program: &crate::ir::Program) {
+        let text = match crate::bytecode::verified::VerifiedModule::lower_analyzed(program) {
+            Ok(module) => module.disassemble(),
+            Err(error) => format!("verified bytecode unavailable: {error}\n"),
+        };
+        self.write(&format!("p{}.verified-bytecode", program.snapshot_id), &text);
+    }
+}
+
+/// The typed IR of one checked routine, one line per instruction with its
+/// source span. Shared by `--emit ir` and the `emit ir` command.
+pub fn routine_ir_text(
+    fi: usize,
+    routine: &crate::ir::Routine,
+    body: &crate::ir::Function,
+) -> String {
+    let mut text = format!(
+        "function f{fi} {} {:?}\nattributes {:?}\neffects {:?}\nlocals {:?}\nregisters {:?}\n",
+        routine.name, routine.kind, routine.attributes, body.effects, body.locals, body.registers
+    );
+    for (pc, instruction) in body.code.iter().enumerate() {
+        writeln!(
+            text,
+            "  {pc:04} {:?} ; {}..{}",
+            instruction.op, instruction.span.start, instruction.span.end
+        )
+        .unwrap();
+    }
+    text
 }

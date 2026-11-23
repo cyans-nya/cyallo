@@ -56,6 +56,8 @@ Modern Cyallo already matches keyword spellings exactly, even though the matcher
 
 Test exact keywords, longer identifiers with keyword prefixes, ASCII case variants in both dialects, and non-ASCII lookalikes. Keep Unicode casing, locale-sensitive mappings and normalization out of keyword recognition. The lexer can decode bytes for literal values and diagnostics independently of how it matches keywords.
 
+### Migration and validation
+
 Test the byte-input API independently of SIMD. Keep a `&str` convenience adapter for text callers if useful. To accept raw files end to end, pass bytes through the CLI and module loaders, source snapshots and archives, and expose decoded token text where the parser needs it. Diagnostic line indexing can count LF in raw bytes. Rendering can replace undecodable bytes for display while retaining a mapping from original byte spans to rendered positions. Add tests for malformed bytes before, within and after comments and literals, including at vector boundaries and EOF. Run scalar and SIMD versions under the same proposed policy and compare both with today's lexer on valid UTF-8 inputs. [Source snapshots](../crates/cyallo-parser/src/units.rs) · [Source positions](architecture.md#source-positions-and-bytecode) · [Typed errors](compiler-and-runtime-rules.md#typed-status-and-error-models)
 
 ## Other approaches

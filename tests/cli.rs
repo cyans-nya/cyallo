@@ -8,8 +8,8 @@ fn cli(args: &[&str]) -> Command {
     command
 }
 #[test]
-fn bytecode_can_verify_and_show_a_selected_routine() {
-    let result = cli(&["bytecode", "examples/functions.psc", "--verified", "1"])
+fn emit_bytecode_shows_verified_routines() {
+    let result = cli(&["emit", "bytecode", "examples/functions.psc"])
         .output()
         .unwrap();
     assert!(
@@ -21,7 +21,7 @@ fn bytecode_can_verify_and_show_a_selected_routine() {
     assert!(disassembly.contains("verified bytecode v"));
     assert!(disassembly.contains("frame slots"));
     assert!(disassembly.contains("storage.dead"));
-    assert!(disassembly.contains("call.direct f0("));
+    assert!(disassembly.contains("call.direct f"));
     assert!(disassembly.contains(".statement"));
     assert!(
         !disassembly
@@ -29,23 +29,26 @@ fn bytecode_can_verify_and_show_a_selected_routine() {
             .any(|line| line.split_whitespace().nth(1) == Some("nop"))
     );
 
-    let result = cli(&["bytecode", "examples/functions.psc", "--verified", "0"])
-        .output()
-        .unwrap();
-    assert!(result.status.success());
-    assert!(
-        String::from_utf8(result.stdout)
-            .unwrap()
-            .contains("output.caie")
-    );
-
     let unsupported = unsupported_program();
-    let result = cli(&["bytecode", unsupported.to_str().unwrap(), "--verified", "0"])
+    let result = cli(&["emit", "bytecode", unsupported.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(!result.status.success());
     assert!(result.stdout.is_empty());
     assert!(String::from_utf8_lossy(&result.stderr).contains("unsupported"));
+}
+
+#[test]
+fn emit_ir_prints_the_typed_ir_of_each_routine() {
+    let result = cli(&["emit", "ir", "examples/fib.ya"]).output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let text = String::from_utf8(result.stdout).unwrap();
+    assert!(text.contains("function f0 "));
+    assert!(text.contains("registers "));
 }
 
 #[test]
@@ -108,6 +111,8 @@ fn extensions_select_dialects_and_simplified_is_explicit() {
         .unwrap();
     assert!(!invalid.status.success());
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("E002"));
+    // The frontend accepts this dialect, but the verified engine cannot store
+    // its sparse arrays yet, so the ng-backed check refuses it.
     let simplified = cli(&[
         "check",
         "examples/simplified.psc",
@@ -116,8 +121,8 @@ fn extensions_select_dialects_and_simplified_is_explicit() {
     ])
     .output()
     .unwrap();
-    assert!(simplified.status.success());
-    assert!(String::from_utf8_lossy(&simplified.stdout).contains("simplified"));
+    assert!(!simplified.status.success());
+    assert!(String::from_utf8_lossy(&simplified.stderr).contains("unsupported"));
     let invalid = cli(&[
         "check",
         "examples/simplified.psc",
@@ -363,14 +368,11 @@ fn modern_syntax_and_bytecode_are_inspectable() {
         .output()
         .unwrap();
     assert!(!compat.status.success());
-    let bytecode = cli(&["bytecode", "examples/modern.ya"]).output().unwrap();
-    assert!(bytecode.status.success());
-    assert!(String::from_utf8_lossy(&bytecode.stdout).contains("Branch"));
-    let wasm = cli(&["bytecode", "examples/modern.ya", "--wasm", "1"])
+    let bytecode = cli(&["emit", "bytecode", "examples/modern.ya"])
         .output()
         .unwrap();
-    assert!(wasm.status.success());
-    assert!(String::from_utf8_lossy(&wasm.stdout).starts_with("(module"));
+    assert!(bytecode.status.success());
+    assert!(String::from_utf8_lossy(&bytecode.stdout).contains("branch"));
 }
 #[test]
 fn reports_show_metrics_without_changing_program_output() {

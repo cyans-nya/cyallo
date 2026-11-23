@@ -1,17 +1,7 @@
-//! Differential checks of name resolution through the compiler entry points.
-//!
-//! Resolution results (bindings, diagnostics and when a diagnostic is raised)
-//! must not depend on whether a routine is ever called, nor on how many
-//! declarations surround it. Each case runs through the eager entry point
-//! (`compile`) and the deferred one (`compile_for_execution`) and requires the
-//! same outcome from both; expected diagnostics were recorded from the
-//! resolver before declaration lookup was indexed by name.
-//!
-//! Two timings are distinguished. Declaration-level errors (duplicates, private
-//! imports) are raised by both entry points. A name that does not resolve in a
-//! routine body is raised when that body is checked: at compile time by the
-//! eager entry point, and only on use by the deferred one.
-use cyallo::{CompileOptions, Session, Status, compile, compile_for_execution};
+//! Name resolution through the compiler entry point: results (bindings,
+//! diagnostics) must not depend on whether a routine is ever called, nor on how
+//! many declarations surround it.
+use cyallo::{compile, vm::{Session, Status}};
 use std::sync::Arc;
 
 /// `(code, message, text under the primary span)` of a compile failure.
@@ -28,34 +18,17 @@ fn describe(source: &str, error: &cyallo::Diagnostic) -> Failure {
 /// A declaration-level failure: both entry points report the same diagnostic.
 fn failure(source: &str) -> Failure {
     let eager = compile(source).expect_err("eager compile should fail");
-    let deferred = compile_for_execution(source, CompileOptions::default())
-        .expect_err("deferred compile should fail");
-    assert_eq!(
-        (eager.code, &eager.message, eager.span),
-        (deferred.code, &deferred.message, deferred.span),
-        "eager and deferred diagnostics differ for:\n{source}"
-    );
     describe(source, &eager)
 }
 
-/// A body-level failure: raised eagerly, and deferred until the routine is used.
+/// A body-level failure: raised at compile time even for unused routines.
 fn body_failure(source: &str) -> Failure {
     let eager = compile(source).expect_err("eager compile should fail");
-    assert!(
-        compile_for_execution(source, CompileOptions::default()).is_ok(),
-        "an unused routine must not fail the deferred compile for:\n{source}"
-    );
     describe(source, &eager)
 }
 
 fn output(source: &str) -> String {
-    let eager = run(compile(source).unwrap());
-    let deferred = run(compile_for_execution(source, CompileOptions::default()).unwrap());
-    assert_eq!(
-        eager, deferred,
-        "eager and deferred output differ for:\n{source}"
-    );
-    eager
+    run(compile(source).unwrap())
 }
 
 fn run(program: cyallo::ir::Program) -> String {

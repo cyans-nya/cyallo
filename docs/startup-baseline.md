@@ -486,3 +486,68 @@ tracing, deferred and key copies sit in `analysis/modules.rs` and `module_cache.
 `DeferredBody` needs a shared `Function.body` representation. Tests: `tests/resolution_bindings.rs`
 (passes on old and new resolver). The workspace has 29 failing tests that fail identically
 without these changes.
+
+## Verified interpreter baseline
+
+The default CLI now runs the verified interpreter. This baseline uses the
+default `run` command with deferred frontend compilation. Explicit
+`--engine ng` uses the same interpreter with eager frontend compilation.
+The measurements above used the historical legacy engine. See
+[CLI dispatch](../src/main.rs) and the
+[raw timings](measurements/startup-verified-bench.json) and
+[stage profiles](measurements/startup-verified-profile.json).
+
+Measured on arm64 macOS 27.3 with 16 CPUs and Rust `1.101.0-nightly (07e526db9)`.
+The binaries were built from `9ac74ed` with the profiler changes and the local
+CLI work in progress. Wall-clock results are medians of 15 randomized fresh-process
+rounds on the uninstrumented release build with a warm filesystem cache. Stage
+figures are medians of five separate runs on the instrumented build with
+`--jobs 1`. All workloads print `ready` and wait for input before continuing.
+
+| Workload | First output, jobs 1 (ms) | p95, jobs 1 (ms) | First output, jobs 0 (ms) | After output, jobs 1 (ms) | Checked before first output | Verified images before first output |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| No user routines | 6.61 | 6.94 | 6.83 | 0.47 | 2 | 1 |
+| 256 unused | 34.86 | 35.51 | 33.80 | 1.21 | 258 | 1 |
+| 1,024 unused | 122.27 | 123.67 | 116.25 | 2.90 | 1,026 | 1 |
+| 4,096 unused | 478.77 | 482.63 | 456.61 | 8.64 | 4,098 | 1 |
+| 16,384 unused | 1,979.76 | 1,987.16 | 1,869.84 | 30.98 | 16,386 | 1 |
+| Call all 4,096 | 619.11 | 622.47 | 595.40 | 19.00 | 4,099 | 4,098 |
+
+For the 4,096-unused case, verified module lowering took **304.2 ms** before
+first output in the profile build. Body analysis accounted for **302.2 ms**,
+and translation to verified function images accounted for **0.03 ms**. These
+are inclusive stage timings. `Globals::collect` and `Implementations::collect`
+both iterate through the routine directory and call `Routine::checked()`
+before the reachable-routine worklist runs. Their metadata scans force checked
+bodies even when the worklist never emits a verified image for them.
+Cache keys took 47.1 ms, and deferred setup took 6.0 ms, including 4,098
+syntax clones. Peak live memory was 182 MB. [Verified lowering](../src/bytecode/verified/lower.rs)
+
+The [IR migration plan](data-oriented-ir-design.md#migration-from-the-current-body-pipeline)
+introduces the routine IR stages first. Use this baseline to verify a later change
+that restricts metadata discovery to routines demanded by verified lowering.
+Preserve globals, dynamic and trait targets, and persistent session state. The
+4,096-unused-routine fixture should approach the control's body check count while
+lowering one verified image. The call-all fixture measures worklist cost when
+every callee is reachable.
+
+The harness now records the selected engine. The verified interpreter records
+its first-output snapshot after the first stdout flush and reports on exit.
+A smoke test confirmed the expected output and found 258 verified images before
+the first output for the 256-routine call-all fixture. The legacy interpreter
+checked zero bodies before output and 257 by exit on that fixture. Malformed
+syntax and the invalid constant-callee case both failed before output across
+the tested engines. An unresolved local in an unused routine was reported by
+the eager path. The default deferred path still printed `ready` because the
+metadata scans ignore failed checks for routines outside the reachable set.
+
+```sh
+cargo build --release
+cargo build --release --features startup-profile --target-dir target-profile
+uv run scripts/startup_baseline.py bench --engine default --reps 15 --jobs 1,0 \
+  --sweep 'unused-routine count' --sweep 'call every' \
+  --out docs/measurements/startup-verified-bench.json
+uv run scripts/startup_baseline.py profile --engine default --reps 5 --jobs 1 \
+  --sweep 'unused-routine count' --sweep 'call every' \
+  --out docs/measurements/startup-verified-profile.json
+```

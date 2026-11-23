@@ -1,83 +1,27 @@
-use cyallo::backend::{
-    CraneliftBackend, CraneliftSpeedBackend, Executable, NativeBackend, Tier, TieredBackend,
-};
-use cyallo::{CompileOptions, Context, Session, Status, compile, compile_for_execution};
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use cyallo::{compile, vm::{Context, Session, Status}};
+use std::sync::Arc;
 
 fn parity(source: &str, expected: &str) {
-    for deferred in [false, true] {
-        let program = Arc::new(
-            if deferred {
-                compile_for_execution(source, CompileOptions::default())
-            } else {
-                compile(source)
-            }
-            .unwrap(),
-        );
-        let winch = TieredBackend::default().compile(program.clone()).unwrap();
-        for function in 0..program.functions().len() {
-            winch.precompile(function, Tier::Winch).unwrap();
-        }
-        assert!(winch.wait_for_compilation(Duration::from_secs(30)));
-        let engines: Vec<Option<Box<dyn Executable>>> = vec![
-            None,
-            Some(Box::new(winch)),
-            Some(Box::new(CraneliftBackend.compile(program.clone()).unwrap())),
-            Some(Box::new(
-                CraneliftSpeedBackend.compile(program.clone()).unwrap(),
-            )),
-        ];
-        for (engine_index, engine) in engines.into_iter().enumerate() {
-            let context = Context {
-                gc: cyallo::runtime::gc::GcConfig::stress(),
-                concurrency: cyallo_scheduler::Config {
-                    processors: 1,
-                    quantum: 7,
-                    blocking_threads: 1,
-                    ..Default::default()
-                },
+    let program = Arc::new(compile(source).unwrap_or_else(|error| panic!("{error}\n{source}")));
+    for stress in [false, true] {
+        let mut session = Session::with_context(
+            program.clone(),
+            Context {
+                gc: cyallo::runtime::gc::GcConfig { stress, ..Default::default() },
                 ..Default::default()
-            };
-            let mut session = Session::with_context(program.clone(), context).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(10);
-            for step in 0..100_000 {
-                match &engine {
-                    Some(engine) if step % 3 != 0 => engine.run(&mut session, 1).unwrap(),
-                    _ => {
-                        session.run(1);
-                    }
-                }
-                if session.status() == &Status::Waiting {
-                    session.wait_for_wakeup(Duration::from_millis(5));
-                } else if session.status() != &Status::Paused {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "timed out: deferred={deferred}, engine={engine_index}, output={:?}",
-                    session.context.output
-                );
-            }
-            assert_eq!(
-                session.status(),
-                &Status::Finished,
-                "deferred={deferred}, engine={engine_index}, output={:?}",
-                session.context.output
-            );
-            assert_eq!(
-                session.context.output, expected,
-                "deferred={deferred}, engine={engine_index}"
-            );
-            if let Some(stats) = session.scheduler_stats() {
-                assert_eq!(stats.processors, 1);
-                assert_eq!(stats.peak_running, 1);
+            },
+        )
+        .unwrap();
+        for _ in 0..100_000 {
+            if session.run(1000) != &Status::Paused {
+                break;
             }
         }
+        assert_eq!(session.status(), &Status::Finished, "stress={stress}\n{source}");
+        assert_eq!(session.context.output, expected, "stress={stress}\n{source}");
     }
 }
+
 #[test]
 fn buffered_channels_keep_typed_errors_and_unsent_values() {
     parity(

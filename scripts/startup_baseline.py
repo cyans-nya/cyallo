@@ -49,6 +49,13 @@ class Kind(str, Enum):
     call_all = "call_all"  # N routines, all called once through a deferred routine
 
 
+class Engine(str, Enum):
+    default = "default"
+    ng = "ng"
+    legacy_interpreter = "legacy_interpreter"
+    legacy_jit = "legacy_jit"
+
+
 @dataclass(frozen=True)
 class Workload:
     kind: Kind
@@ -186,8 +193,12 @@ class Sample:
     total_ms: float
 
 
-def run_once(cyallo: Path, entry: Path, jobs: int, env: dict[str, str] | None = None) -> tuple[Sample, str]:
+def run_once(
+    cyallo: Path, entry: Path, jobs: int, engine: Engine, env: dict[str, str] | None = None
+) -> tuple[Sample, str]:
     cmd = [str(cyallo), "run", str(entry), "--jobs", str(jobs)]
+    if engine != Engine.default:
+        cmd.extend(["--engine", engine.value])
     started = time.perf_counter()
     proc = subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
@@ -216,6 +227,7 @@ def percentile(values: list[float], q: float) -> float:
 @app.command()
 def bench(
     cyallo: Annotated[Path, typer.Option(help="Plain release binary")] = Path("target/release/cyallo"),
+    engine: Annotated[Engine, typer.Option(help="default omits --engine")] = Engine.default,
     reps: Annotated[int, typer.Option(help="Paired rounds; each round runs every cell once")] = 30,
     jobs: Annotated[str, typer.Option(help="Comma list of --jobs values (0: all cores)")] = "1,0",
     sweep: Annotated[list[str] | None, typer.Option(help="Only sweeps whose name contains this")] = None,
@@ -235,11 +247,11 @@ def bench(
     pairs = [(w, j) for w in cells for j in job_values]
     try:
         for _ in range(2):  # warm the binary and the filesystem cache; not recorded
-            run_once(cyallo, entries[control], job_values[0])
+            run_once(cyallo, entries[control], job_values[0], engine)
         for rep in range(reps):
             rng.shuffle(pairs)  # fresh random order each round, control included
             for w, j in pairs:
-                results[w, j].append(run_once(cyallo, entries[w], j)[0])
+                results[w, j].append(run_once(cyallo, entries[w], j, engine)[0])
             console.print(f"round {rep + 1}/{reps}", end="\r")
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -250,6 +262,7 @@ def bench(
         "cpus": os.cpu_count(),
         "revision": git("rev-parse", "HEAD"),
         "binary": str(cyallo),
+        "engine": engine.value,
         "reps": reps,
         "filesystem_cache": "warm (sources written immediately before timing)",
         "compiler_cache": "empty (no persistent cache exists; every sample is a fresh process)",
@@ -292,7 +305,7 @@ def bench(
             console.print(table)
     if out:
         raw = {f"{w.slug}@jobs{j}": [asdict(s) for s in ss] for (w, j), ss in results.items()}
-        out.write_text(json.dumps({"meta": meta, "summary": summary, "samples": raw}, indent=1))
+        out.write_text(json.dumps({"meta": meta, "summary": summary, "samples": raw}, indent=1) + "\n")
         console.print(f"wrote {out}")
 
 
@@ -317,6 +330,7 @@ def profile(
     cyallo: Annotated[Path, typer.Option(help="Binary built with --features startup-profile")] = Path(
         "target-profile/release/cyallo"
     ),
+    engine: Annotated[Engine, typer.Option(help="default omits --engine")] = Engine.default,
     reps: int = 15,
     jobs: Annotated[int, typer.Option(help="Use 1: stage times then equal elapsed time")] = 1,
     sweep: Annotated[list[str] | None, typer.Option(help="Only sweeps whose name contains this")] = None,
@@ -335,15 +349,21 @@ def profile(
                 entry = write(w, root / w.slug)
                 runs = []
                 for _ in range(reps):
-                    _, err = run_once(cyallo, entry, jobs, env)
-                    runs.append(json.loads(err[err.index("{") :]))
-                report[w.slug] = summarize(w, runs)
+                    _, err = run_once(cyallo, entry, jobs, engine, env)
+                    report_start = err.find('{"end":')
+                    if report_start == -1:
+                        raise RuntimeError(f"no startup profile for {w.label} with {engine.value}: {err}")
+                    profile_run, _ = json.JSONDecoder().raw_decode(err[report_start:])
+                    if "first_output" not in profile_run:
+                        raise RuntimeError(f"no first-output snapshot for {w.label} with {engine.value}")
+                    runs.append(profile_run)
+                report[w.slug] = summarize(w, runs) | {"engine": engine.value, "jobs": jobs}
     finally:
         shutil.rmtree(root, ignore_errors=True)
     for name, ws in chosen.items():
         stage_table(name, [(w, report[w.slug]) for w in ws])
     if out:
-        out.write_text(json.dumps(report, indent=1))
+        out.write_text(json.dumps(report, indent=1) + "\n")
 
 
 def med(runs: list[dict], *path: str) -> float:
@@ -362,6 +382,7 @@ def summarize(w: Workload, runs: list[dict]) -> dict:
     return {
         "workload": w.label,
         "stage_ms": {s: med(runs, "stages", s, "ns") / 1e6 for s in stages},
+        "stage_ms_first_output": {s: med(runs, "first_output", "stage_ns", s) / 1e6 for s in stages},
         "stage_calls": {s: med(runs, "stages", s, "calls") for s in stages},
         "stage_alloc_bytes": {s: med(runs, "stages", s, "alloc_bytes") for s in stages},
         "counters_end": {c: med(runs, "end", "counters", c) for c in counters},
@@ -382,10 +403,11 @@ STAGE_ROWS = [  # (stage, indent)
     ("bytecode_module", 0),
     ("body_analysis", 0), ("body_lower", 1), ("header_clone", 1), ("body_effects", 1), ("body_finish", 1),
     ("bytecode_translate", 0),
+    ("verified_module_lower", 0), ("verified_body_lower", 1),
 ]
 SHOWN_COUNTERS = ["bodies_parsed", "bodies_frozen", "bodies_materialized", "bodies_resolved",
                   "bodies_deferred_copied", "bodies_tracing_copied", "bodies_checked", "bodies_translated",
-                  "header_elements_cloned"]
+                  "header_elements_cloned", "verified_bodies_lowered"]
 
 
 def short(label: str) -> str:
@@ -398,7 +420,8 @@ def stage_rows(rows: list[tuple[str, dict]]) -> tuple[list[str], list[list[str]]
     """Header and rows with workloads as columns, so wide sweeps stay readable."""
     head = ["median ms"] + [short(label) for label, _ in rows]
     body = [
-        ["\u00a0" * 2 * depth + stage] + [f"{r['stage_ms'][stage]:.2f}" for _, r in rows]
+        ["\u00a0" * 2 * depth + stage]
+        + [f"{r['stage_ms'][stage]:.2f}" if stage in r["stage_ms"] else "—" for _, r in rows]
         for stage, depth in STAGE_ROWS
     ]
     body.append(["time to first output"] + [f"{r['first_output_ms']:.2f}" for _, r in rows])
@@ -408,7 +431,12 @@ def stage_rows(rows: list[tuple[str, dict]]) -> tuple[list[str], list[list[str]]
     for c in SHOWN_COUNTERS:
         body.append(
             [f"{c} (first out / exit)"]
-            + [f"{r['counters_first_output'][c]:.0f} / {r['counters_end'][c]:.0f}" for _, r in rows]
+            + [
+                f"{r['counters_first_output'][c]:.0f} / {r['counters_end'][c]:.0f}"
+                if c in r["counters_end"]
+                else "—"
+                for _, r in rows
+            ]
         )
     return head, body
 
@@ -437,8 +465,10 @@ def report(
     """Print the measurements as Markdown tables (the source of docs/startup-baseline.md)."""
     profile = json.loads(profile_json.read_text())
     for name, ws in SWEEPS.items():
-        print(f"\n#### Stages: {name}\n")
-        print(markdown(*stage_rows([(w.label, profile[w.slug]) for w in ws])))
+        rows = [(w.label, profile[w.slug]) for w in ws if w.slug in profile]
+        if rows:
+            print(f"\n#### Stages: {name}\n")
+            print(markdown(*stage_rows(rows)))
     if bench_json.exists():
         bench = json.loads(bench_json.read_text())
         print(f"\n#### Time to first output\n\n`{bench['meta']}`\n")

@@ -1,6 +1,6 @@
 # Data-oriented IR design for Cyallo
 
-Cyallo already defers checked IR and bytecode for unused routines in execution mode. The startup opportunity is the work those routines still trigger before the entry can run, including syntax conversion, name resolution, dependency discovery and deferred-body setup. The first experiment shares indexed syntax with the resolver. HIR, MIR and compact AIR are candidate representations with separate adoption decisions.
+Cyallo has indexed source syntax, a mutable linked AST, checked register IR and verified bytecode. The compiler still takes routine bodies directly from the linked AST into semantic checking and register emission. The goal of this plan is to introduce a routine representation with explicit control flow that semantic analysis actually consumes, then give analyzed routines their own checked representation. Startup measurements guide scheduling and storage decisions during that migration. [Routine lowering](../crates/cyallo-ir/src/analysis.rs) · [Checked register IR](../crates/cyallo-ir/src/ir.rs) · [Verified interpreter baseline](startup-baseline.md#verified-interpreter-baseline)
 
 ## Startup goal and current pipeline
 
@@ -8,7 +8,7 @@ Apply the [readability and correctness rules](compiler-and-runtime-rules.md#read
 
 Optimize fresh-process time to first observable output for programs with many unused routines. Every body must still pass grammar validation before the first program effect. Keep verified bytecode and native preparation as the initial execution boundary. Reopening either contract requires an identified limitation, a measured cost where performance is the rationale, and a compatibility plan. The experiments below determine which changes ship.
 
-Preserve the current timing of unresolved-name diagnostics in unused routines. Retain one immutable parsed body per routine in the first prototype. Compare compact checked IR against the existing layout with allocation-free operand traversal before adopting it.
+Preserve each entry point's diagnostic timing. Declaration and import errors stay eager. Full checking reports an unresolved local reference even in an unused routine. Deferred compilation reports it when execution needs the affected routine. Retain one immutable parsed body per routine in the first prototype. Compare compact checked IR against the existing layout with allocation-free operand traversal before adopting it.
 
 ### Existing syntax conversions
 
@@ -16,19 +16,28 @@ Cyallo already indexes token ranges per parse unit. Its modern parser builds an 
 
 ### Where startup work happens today
 
+```text
+Source → tokens → indexed AST → materialized AST → linked AST in ResolvedProgram
+       → generic specialization and constant evaluation on AST
+       → inference, ownership checks and register lowering from AST
+       → checked ir::Function → verified bytecode → interpreter or native preparation
+```
+
+`lower_routine` reads `cyallo_ast::Function` for local collection, type inference, ownership checking and register emission. `ir::Function` contains typed registers, locals, branches in a flat instruction stream, storage placement and VM metadata. It is the current checked execution-side product. Verified lowering builds its own CFG from that stream. The structured HIR, file-local MIR and separate AIR described below are target products. [Compiler entry](../src/compiler.rs) · [Routine lowering](../crates/cyallo-ir/src/analysis.rs) · [Verified CFG](../src/bytecode/verified/cfg.rs)
+
 | Boundary | Current work | Design pressure |
 | --- | --- | --- |
 | Source → syntax | Modern compilation parses units and freezes their syntax. Archived syntax materializes a mutable tree and shifts spans for linking. | Skipping balanced braces cannot preserve diagnostics for malformed expressions. Reusing immutable syntax could remove a copy without parsing twice. [Parser units](../crates/cyallo-parser/src/units.rs) · [Source materialization](../src/dynamic_modules.rs) |
 | Syntax → linked declarations | Name resolution enters body scopes. Generic specialization and constant evaluation run before checked-module construction. | Moving these walks behind first call can change which programs perform effects before reporting errors. Constants and statically reachable constant callees require eager validation. [Namespace resolution](../crates/cyallo-ir/src/namespace.rs) · [Compiler entry](../src/compiler.rs) · [Architecture](architecture.md) |
-| Linked declarations → deferred bodies | Module analysis lifts closures, computes cache dependencies, clones each deferred function and estimates its cost. Deferred analysis later clones the header vector for its local effect check. | Instrument work per declared body and per forced body separately. Cloning all headers once per forced body scales with both counts. Measure this before tuning opcode dispatch. [Module analysis](../crates/cyallo-ir/src/analysis/modules.rs) · [Deferred analysis](../crates/cyallo-ir/src/analysis.rs) · [Cache keys](../crates/cyallo-ir/src/module_cache.rs) |
-| Checked body → execution | Per-routine checked and bytecode cells already defer translation. Liveness builds or clones operand vectors, including for fixed-arity instructions. Verified lowering builds a CFG and validates executable layout. | An unused routine pays no checked-instruction stride cost until forced. A faster instruction representation mainly benefits the entry body, first calls and full checking. [Routine storage](../crates/cyallo-ir/src/ir.rs) · [Bytecode lowering](../src/bytecode.rs) · [Liveness](../crates/cyallo-ir/src/osr.rs) · [Verified CFG](../src/bytecode/verified/cfg.rs) |
+| Linked declarations → deferred bodies | Module analysis lifts closures, computes cache dependencies where a cache is supplied, clones each deferred function and estimates its cost. Deferred analysis now borrows shared headers for local effect checking. The tracing scan also borrows bodies. | Measure the remaining function clone and body walks separately. Attribute work to the number and size of declared bodies and to the number of bodies actually forced. [Module analysis](../crates/cyallo-ir/src/analysis/modules.rs) · [Deferred analysis](../crates/cyallo-ir/src/analysis.rs) · [Cache keys](../crates/cyallo-ir/src/module_cache.rs) |
+| Checked body → execution | Per-routine checked and bytecode cells defer translation. Verified lowering scans all checked bodies for global slots and trait implementations before it emits the reachable subset. | Use the baseline to verify demand and metadata discovery as the new pipeline takes over. A worklist fix changes which bodies the backend forces. [Routine storage](../crates/cyallo-ir/src/ir.rs) · [Verified lowering](../src/bytecode/verified/lower.rs) |
 
 ## Proposed compiler stages
 
 ```text
 Source → lexer → token stream → parser → indexed AST
 AST → desugar to structured HIR → lower control flow to MIR (per routine, file-local)
-AST or MIR references → eager name checks against the module graph
+AST or MIR references → declaration and lexical resolution against the module graph
 MIR + resolved bindings + declaration contracts → typed analysis and compile-time evaluation → AIR
 AIR → type-directed specialization and emission → verified bytecode → interpreter or native preparation
 ```
@@ -73,7 +82,7 @@ For example, an iterator loop lowers to setup, advance, item and exhaustion path
 
 ### 4. Resolve declarations and perform eager checks
 
-Index declarations in deterministic module order, then resolve imports, exports and lexical references against the active module graph. Record bindings in a graph-owned overlay keyed by syntax position or reference-site ID. Preserve the current timing and selection of unresolved-name diagnostics, including names in unused routines. A member whose meaning depends on the receiver type remains available for typed body analysis. Track the import and namespace facts a lookup consulted, including failed lookups whose diagnostics could change after an edit.
+Index declarations in deterministic module order, then resolve imports, exports and lexical references against the active module graph. Record bindings in a graph-owned overlay keyed by syntax position or reference-site ID. Keep references that require the body checker available for that check, including unresolved locals and members whose meaning depends on the receiver type. Preserve the first error selected by each entry point. Track the import and namespace facts a lookup consulted, including failed lookups whose diagnostics could change after an edit.
 
 Freeze declaration facts that body jobs consume, including signatures, passing modes and conservative effect contracts. Keep compile-time constant initializers and their statically reachable callee checks on the eager schedule, under existing resource limits. [Declaration and constant timing](architecture.md#declarations-and-deferred-analysis)
 
@@ -89,7 +98,7 @@ Build the checked body privately. Resolve block fixups, validate the representat
 
 Select operations using AIR's types, layouts, resolved declarations and ownership facts. For speculative specialization, test the guard before effects and preserve the checked fallback. Derive liveness, roots and continuation metadata against the fixed logical instruction order. Translate routine targets through executable linkage and preserve source origins, trapping behavior, polling and logical fuel.
 
-Keep shipping bytecode and the opt-in verified path at their existing coverage. Today the verified module can lower a selected routine and its transitive direct callees as a group. Track the bodies it forces separately from frontend body demand. The verified path validates executable layout before interpretation or native preparation. [Backend design](backend-design.md) · [Specialization rules](compiler-and-runtime-rules.md#specialization-uses-resolved-information)
+The CLI defaults to the verified interpreter. The verified module can lower a selected routine and its transitive direct callees as a group. Track the bodies it forces separately from frontend body demand. The verified path validates executable layout before interpretation or native preparation. [Current engines](../README.md) · [Verified lowering](../src/bytecode/verified/lower.rs) · [Specialization rules](compiler-and-runtime-rules.md#specialization-uses-resolved-information)
 
 ## Data partitions and lifetimes
 
@@ -128,13 +137,30 @@ The startup risk is retaining a full AST and a second full body representation f
 
 | Slice | Implementation work | Evidence to proceed |
 | --- | --- | --- |
-| Measure the baseline | Instrument the modern snapshot parser, linker/materializer, deferred-body setup, body analysis and bytecode translation. Count which bodies each execution path forces. | Attribute startup work to a stage and identify which work scales with unused routine count or size. |
-| Resolve over shared indexed syntax | Keep the grammar and share existing parsed body handles. Move bindings out of the mutable resolver tree into overlays where possible. Keep materialization at remaining compatibility boundaries and count each one. | Compare bindings and diagnostics through the existing compiler entry points, including shadowing and unused bodies. Measure the eliminated copies. |
-| Share deferred analysis inputs | Retain body handles and immutable contracts. Measure and address deferred function and header clones independently. Preserve cached diagnostics and recursive-call behavior. | Compare fresh-process startup and first call. Verify concurrent demand for one body and deterministic full checking. |
-| Compare routine lowering boundaries | Compare indexed AST with eager reference tables against full file-local MIR. If MIR pays for itself, compare eager MIR against eager scope and reference tables with an on-demand operation stream. | Compare peak live bytes, eager checks and first-call time. The selected boundary must support the eager diagnostic contract. |
-| Isolate checked storage costs | Introduce allocation-free operand traversal over the current representation. Compare compact AIR with that baseline, through liveness and bytecode emission. | Require checked and executable parity, then measure the memory and throughput attributable to layout. |
+| 1. Run a routine through new IR | Add structured HIR and explicit-block MIR for a scalar routine. Check that MIR and publish a typed body. Emit the existing `ir::Function` from the typed body through a compatibility adapter. | A normal `cyallo run` call executes a routine processed by the new stages. Tests demonstrate that analysis and emission consume their declared inputs. |
+| 2. Build file-local MIR from indexed syntax | Move the migrated syntax-to-MIR path ahead of the mutable linker. Take an indexed body handle and file-local context. Resolve graph-dependent references through a graph-owned overlay. | The same unchanged importer builds identical MIR across edits to an imported signature or body. The relevant bindings, AIR or constant results are rebuilt. |
+| 3. Migrate semantic consumers | Add direct and indirect calls, captures, generics, constants, and ownership-sensitive operations in slices. Move each check and rewrite to the stage that owns its inputs. | Check diagnostic and behavior parity per feature before removing the previous routine path for that feature. Publish only complete typed bodies. |
+| 4. Route the backend through typed bodies | Make verified lowering consume the checked representation and discover global slots, referenced routines and used implementations from demanded bodies. Preserve extra roots and persistent-session state. | Verify direct, indirect and trait calls, globals and continuations. Rerun the zero-routine, unused and call-all profiles and report bodies checked and verified images emitted. |
+| 5. Remove transition copies and measure layout | Delete the redundant resolved-body copies as their consumers move. Compare allocation-free traversal over the transitional representation with compact storage. | Attribute improvements to the changed stage. Compare first output, first invocation, full checking and resident bytes. |
 
-Direct indexed construction can move ahead of indexed resolution if parser freezing dominates. Re-parsing discarded bodies, persistent caches, and optimizing SSA after native admission are separate experiments with separate cost measurements. [Parser snapshots](../crates/cyallo-parser/src/units.rs) · [Module analysis](../crates/cyallo-ir/src/analysis/modules.rs) · [Backend design](backend-design.md)
+### First executable slice
+
+The `ir-pipeline` worktree holds the implementation. Start at `lower_routine` with modern source functions that use by-value `i64` parameters, arithmetic, a branch and explicit returns. The verified interpreter consumes the adapter's register IR through its normal entry point. [Routine lowering](../crates/cyallo-ir/src/analysis.rs) · [Verified interpreter entry](../src/vm.rs)
+
+| Stage | Input and output for this slice |
+| --- | --- |
+| Structured lowering | A read-only linked AST function is the initial adapter input. HIR records typed operator kinds, parameter and local identities, expression origins, and the structure of the `if` and returns. |
+| Control-flow lowering | HIR produces MIR with routine-local IDs, ordered operations, an entry block, and explicit branch and return terminators. Validate block targets and local references when the builder finishes. |
+| Semantic analysis | MIR and the routine's declaration contract produce typed blocks, typed operation identities and source origins. Check both reachable exits and preserve the current arithmetic and diagnostic behavior. Read expression and control-flow data from MIR. |
+| Register emission | Translate the typed blocks to the current `ir::Function` and its logical instruction locations. Reuse existing storage, liveness, GC and resume finalization. The current verified bytecode emitter consumes the result. |
+
+The linked AST adapter lets the first slice run before indexed name resolution migrates. It still depends on the existing linker. The file-local MIR independence guarantee starts with slice 2. Select the migration path for a whole routine based on supported syntax and contracts before starting analysis. The existing route handles unsupported forms during migration. A semantic diagnostic from the new route is the routine's result. Assertions at the compiler seam must establish that the fixture passed through MIR analysis and emission, so equivalent CLI output alone cannot accidentally validate the existing route.
+
+### Performance work during migration
+
+The [verified-interpreter baseline](startup-baseline.md#verified-interpreter-baseline) gives the comparison point for demand and metadata costs. Reuse the harness for the zero-routine, 4,096-unused-routine and call-all cases. Keep the default deferred CLI separate from explicit eager `--engine ng`. Scope the standalone worklist optimization as an independent execution scheduling change if it lands before the pipeline migration. It can reduce forced body checks while the compiler still uses a linked AST as its analysis input. [Benchmark harness](../scripts/startup_baseline.py) · [CLI dispatch](../src/main.rs)
+
+Cache-key work and the deferred-body clone remain measurable during the transition. Keep warm module reuse separate from fresh-process results. Key binding overlays by typed syntax IDs scoped to the owning unit and body. Use spans for source origins and diagnostics. Compare eager and deferred behavior on malformed syntax, unresolved references and constant callees throughout migration. [Module cache](../crates/cyallo-ir/src/module_cache.rs) · [Name resolution tests](../tests/resolution_bindings.rs) · [Constant dependency tests](../tests/module_units.rs)
 
 ## Candidate checked representation
 
@@ -173,7 +199,7 @@ Expose typed decoded views and an allocation-free operand visitor. Preserve oper
 
 ### Approved experiment order and acceptance criteria
 
-Measure parser freezing and linker materialization separately. Start by resolving names directly against shared indexed bodies and keeping resolved references in per-body tables. Move direct parser construction of indexed syntax ahead of this experiment if the baseline shows freezing dominates.
+Measure parser freezing and linker materialization separately. The historical 4,096-routine case spent 11 ms in freezing and 9 ms in materialization, compared with 61 ms in name resolution before declaration indexing. Recheck those proportions after the current baseline refresh and compare reductions in whole-pipeline allocations as well as time. [Startup baseline](startup-baseline.md)
 
 Use a fresh process with an empty persistent compiler cache for the primary startup measurement. Report warm reuse separately. Measure elapsed time from launch through completion of the first called routine alongside time to first output. A first-call regression beyond measured run-to-run noise requires an explicit tradeoff decision before adoption.
 
