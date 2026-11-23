@@ -594,8 +594,19 @@ impl Context<'_> {
             discard,
             record,
             name_use,
+            contextual: false,
         });
         SiteId(self.sites.len() - 1)
+    }
+
+    /// Note that the expression stands where its type is fixed by the context: a returned
+    /// value or a call argument. Only a generic variant constructor needs to know.
+    fn contextual(&mut self, expression: &Expression) {
+        match &expression.kind {
+            ExpressionKind::Call(site, _) => self.sites[site.0].contextual = true,
+            ExpressionKind::Group(inner) => self.contextual(inner),
+            _ => {}
+        }
     }
 
     fn block(&mut self, list: List<Id<StmtNode>>) -> Option<Vec<Statement>> {
@@ -625,6 +636,7 @@ impl Context<'_> {
                                 Some(read) => read,
                                 None => self.expression(value)?,
                             };
+                            self.contextual(&value);
                             StatementKind::Return(value)
                         }
                         StmtSyntax::ReturnVoid if self.procedure => StatementKind::ReturnVoid,
@@ -1183,6 +1195,9 @@ impl Context<'_> {
                         .iter()
                         .map(|&argument| self.argument(argument))
                         .collect::<Option<_>>()?;
+                    for argument in &arguments {
+                        self.contextual(argument);
+                    }
                     let site =
                         self.site(name, expression.span, arguments.len(), false, false, false);
                     ExpressionKind::Call(site, arguments)
@@ -1254,7 +1269,7 @@ fn reference_type(ast: &IndexedAst, node: &TypeNode) -> Option<(bool, Type)> {
 fn signature_type(_ast: &IndexedAst, node: &TypeNode) -> Option<Type> {
     match node {
         // Only the fact that it is acceptable is used; the type itself is resolved later.
-        TypeNode::Named(_) => Some(Type::Void),
+        TypeNode::Named(_) | TypeNode::Applied(..) => Some(Type::Void),
         other => scalar_type(other),
     }
 }

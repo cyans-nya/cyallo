@@ -45,6 +45,8 @@ pub(crate) struct SiteFacts<'a> {
     pub(crate) record: bool,
     /// A name used as a value that is not a local.
     pub(crate) name_use: bool,
+    /// The value's type is fixed by where it stands: a returned value or a call argument.
+    pub(crate) contextual: bool,
     pub(crate) span: Span,
 }
 
@@ -62,6 +64,8 @@ struct ReferenceSite {
     record: bool,
     /// A name used as a value that is not a local: acceptable only as a unit variant.
     name_use: bool,
+    /// The value's type is fixed by where it stands: a returned value or a call argument.
+    contextual: bool,
 }
 
 #[derive(Clone, Copy, Debug, Hash)]
@@ -171,6 +175,7 @@ impl IndexedRoutineBody {
             discard: site.discard,
             record: site.record,
             name_use: site.name_use,
+            contextual: site.contextual,
             span: shift(site.span, self.offset).unwrap_or(site.span),
         })
     }
@@ -293,9 +298,7 @@ impl IndexedRoutineBody {
                 callees.push(air::Site::Builtin(id));
                 continue;
             }
-            let Some(signature) = target.and_then(|target| signatures.get(&key(target))) else {
-                return Ok(None);
-            };
+            let signature = target.and_then(|target| signatures.get(&key(target)));
             if let Some(target) = target
                 && target.starts_with("$variant")
             {
@@ -303,8 +306,28 @@ impl IndexedRoutineBody {
                 let Some(name) = source_names.get(target) else {
                     return Ok(None);
                 };
-                let Type::Enum(contract) = &signature.result else {
-                    return Ok(None);
+                let concrete = signature.and_then(|signature| match &signature.result {
+                    Type::Enum(contract) => Some((signature, contract)),
+                    _ => None,
+                });
+                let Some((signature, contract)) = concrete else {
+                    // A variant of a generic enum: its instance comes from the expected type.
+                    let owner = target
+                        .strip_prefix("$variant")
+                        .and_then(|rest| rest.split_once('$'))
+                        .and_then(|(id, _)| id.parse::<u32>().ok());
+                    let Some(owner) = owner else {
+                        return Ok(None);
+                    };
+                    if site.arguments > 1 || site.discard {
+                        return Ok(None);
+                    }
+                    callees.push(air::Site::GenericVariant {
+                        owner: cyallo_ast::DeclarationId(owner),
+                        name: name.clone(),
+                        payload: site.arguments == 1,
+                    });
+                    continue;
                 };
                 let Some(variant) = contract.variants.iter().find(|v| *v.name == **name) else {
                     return Ok(None);
@@ -319,6 +342,9 @@ impl IndexedRoutineBody {
                 });
                 continue;
             }
+            let Some(signature) = signature else {
+                return Ok(None);
+            };
             // A statement may discard any result; a value must come from a callee that has one.
             // The linker has already checked the callee's types.
             if signature.params.len() != site.arguments

@@ -84,6 +84,9 @@ struct Resolver {
     /// The variants of each enum without type parameters, by the enum's linked name, with
     /// their resolved payload types.
     enums: HashMap<Box<str>, Vec<(Box<str>, Option<Type>)>>,
+    /// Enums with type parameters, by linked name: the parameters and the variants'
+    /// payload types, which mention them.
+    generic_enums: HashMap<Box<str>, (Vec<Box<str>>, Vec<Option<Type>>)>,
     /// The enum each variant belongs to, and whether it carries a payload.
     variants: HashMap<DeclarationId, (Box<str>, bool)>,
     /// Source-file mode: the entry runs `proc main()` and no top level may hold statements.
@@ -286,6 +289,69 @@ impl Resolver {
         table
     }
 
+    /// The payload types of every enum with type parameters, resolved in its own module with
+    /// the parameters left as names.
+    fn generic_enum_table(&self) -> HashMap<Box<str>, (Vec<Box<str>>, Vec<Option<Type>>)> {
+        let mut table = HashMap::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            for declaration in &node.ast.enums {
+                if declaration.type_params.is_empty() || declaration.open {
+                    continue;
+                }
+                let Some(symbol) = self.path(index, &declaration.name, Some(Kind::Type)) else {
+                    continue;
+                };
+                let payloads: Option<Vec<_>> = declaration
+                    .variants
+                    .iter()
+                    .map(|variant| match &variant.payload {
+                        Some(ty) => {
+                            let mut ty = ty.clone();
+                            self.ty(index, &mut ty, &declaration.type_params, variant.span)
+                                .ok()?;
+                            Some(Some(ty))
+                        }
+                        None => Some(None),
+                    })
+                    .collect();
+                if let Some(payloads) = payloads {
+                    table.insert(symbol.target, (declaration.type_params.to_vec(), payloads));
+                }
+            }
+        }
+        table
+    }
+
+    /// Whether every instance of a generic enum with scalar type arguments is a type the
+    /// pipeline lowers, which decides whether its constructors may be built in place.
+    fn generic_enum_supported(&self, owner: &str) -> bool {
+        let Some((params, payloads)) = self.generic_enums.get(owner) else {
+            return false;
+        };
+        let probe: Vec<Type> = params.iter().map(|_| Type::Integer).collect();
+        self.applied_supported(params, payloads, &probe, 0)
+    }
+
+    fn applied_supported(
+        &self,
+        params: &[Box<str>],
+        payloads: &[Option<Type>],
+        arguments: &[Type],
+        depth: usize,
+    ) -> bool {
+        params.len() == arguments.len()
+            && arguments.iter().all(|argument| {
+                !matches!(argument, Type::Reference { .. })
+                    && self.pipeline_type(argument, depth + 1)
+            })
+            && payloads.iter().flatten().all(|payload| {
+                let mut payload = payload.clone();
+                substitute_named(&mut payload, params, arguments);
+                !matches!(payload, Type::Reference { .. })
+                    && self.pipeline_type(&payload, depth + 1)
+            })
+    }
+
     /// A type as the module graph resolves it, or `None` if it does not resolve.
     fn resolved(&self, module: usize, ty: &Type, span: Span) -> Option<Type> {
         let mut resolved = ty.clone();
@@ -303,6 +369,12 @@ impl Resolver {
                 pointee,
                 ..
             } => !matches!(**pointee, Type::Reference { .. }) && self.pipeline_type(pointee, depth),
+            Type::Applied(target, arguments) if depth < 8 => self
+                .generic_enums
+                .get(target)
+                .is_some_and(|(params, payloads)| {
+                    self.applied_supported(params, payloads, arguments, depth)
+                }),
             Type::Named(target) if depth < 8 => {
                 self.records.get(target).is_some_and(|fields| {
                     fields.iter().all(|(_, field)| {
@@ -391,12 +463,13 @@ impl Resolver {
                     site.discard,
                     site.record,
                     site.name_use,
+                    site.contextual,
                     site.span,
                 )
             })
             .collect();
         let mut targets = Vec::with_capacity(sites.len());
-        for (path, arguments, discard, record, name_use, span) in sites {
+        for (path, arguments, discard, record, name_use, contextual, span) in sites {
             if record {
                 // A record literal names a record type whose fields the pipeline lowers.
                 let Some(symbol) = self.path(module, &path, Some(Kind::Type)) else {
@@ -422,7 +495,9 @@ impl Resolver {
                     .variants
                     .get(&symbol.id)
                     .is_some_and(|(owner, payload)| {
-                        !payload && self.pipeline_type(&Type::Named(owner.clone()), 0)
+                        !payload
+                            && (self.pipeline_type(&Type::Named(owner.clone()), 0)
+                                || (contextual && self.generic_enum_supported(owner)))
                     });
                 if !supported {
                     return Ok(Err(body));
@@ -442,7 +517,8 @@ impl Resolver {
                     *payload
                         && arguments == 1
                         && !discard
-                        && self.pipeline_type(&Type::Named(owner.clone()), 0)
+                        && (self.pipeline_type(&Type::Named(owner.clone()), 0)
+                            || (contextual && self.generic_enum_supported(owner)))
                 });
             if symbol.intrinsic == Some(crate::intrinsic::Intrinsic::Print) && discard {
                 // `print` is built in: the pipeline lowers it to an output, with no callee.
@@ -2959,6 +3035,7 @@ impl Resolver {
         }
         self.records = self.record_table();
         self.enums = self.enum_table();
+        self.generic_enums = self.generic_enum_table();
         self.plain = self.plain_functions();
         for index in 0..self.nodes.len() {
             self.next_binding = 0;
@@ -3471,6 +3548,7 @@ pub fn link_program(
         plain: HashMap::new(),
         records: HashMap::new(),
         enums: HashMap::new(),
+        generic_enums: HashMap::new(),
         variants: HashMap::new(),
         aliases: HashMap::new(),
         source_names: Default::default(),
@@ -3548,4 +3626,22 @@ pub fn link_program(
 }
 pub fn single(ast: Ast) -> Result<ResolvedProgram> {
     link(vec![ast], &["main.ya".into()], 0)
+}
+
+/// Replace type parameters named in `params` by the matching `arguments`.
+fn substitute_named(ty: &mut Type, params: &[Box<str>], arguments: &[Type]) {
+    match ty {
+        Type::Named(name) => {
+            if let Some(index) = params.iter().position(|param| param == name) {
+                *ty = arguments[index].clone();
+            }
+        }
+        Type::Applied(_, inner) => {
+            for argument in inner {
+                substitute_named(argument, params, arguments);
+            }
+        }
+        Type::Reference { pointee, .. } => substitute_named(pointee, params, arguments),
+        _ => {}
+    }
 }

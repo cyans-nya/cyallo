@@ -40,6 +40,12 @@ pub(super) enum Site {
     Print,
     /// A utility resolved from its operand types: string and numeric helpers.
     Builtin(crate::intrinsic::Intrinsic),
+    /// A variant of a generic enum, whose instance is the type expected where it stands.
+    GenericVariant {
+        owner: cyallo_ast::DeclarationId,
+        name: Box<str>,
+        payload: bool,
+    },
     /// A variant constructor, built in place rather than by calling a function.
     Variant {
         variant: cyallo_ast::EnumVariant,
@@ -923,6 +929,11 @@ impl Analysis<'_> {
                     self.builtin_result(*id, &types, expression.span)
                 }
                 Some(Site::Variant { result, .. }) => Ok(self.view(result)),
+                Some(Site::GenericVariant { .. }) => Err(Diagnostic::new(
+                    "E114",
+                    "the enum instance of this variant is not known here; annotate the type",
+                    expression.span,
+                )),
                 _ => Ok(self.callee(*site, expression.span)?.result.clone()),
             },
         })
@@ -950,6 +961,11 @@ impl Analysis<'_> {
         wanted: &Type,
         usage: Use,
     ) -> Result<(Value, Type), Diagnostic> {
+        if let ExpressionKind::Call(site, arguments) = &expression.kind
+            && matches!(self.callees.get(site.0), Some(Site::GenericVariant { .. }))
+        {
+            return self.construct_generic(*site, arguments, wanted, expression.span);
+        }
         let expression = contextualize(expression, wanted)?;
         self.expression_as(&expression, usage)
     }
@@ -1492,6 +1508,55 @@ impl Analysis<'_> {
         self.operands.extend(values);
         self.emit(Operation::Print(operands), span);
         Ok(())
+    }
+
+    /// A variant of a generic enum, built as the instance the context asks for: the expected
+    /// type names the instance, and fixes the payload's type.
+    fn construct_generic(
+        &mut self,
+        site: SiteId,
+        arguments: &[Expression],
+        wanted: &Type,
+        span: Span,
+    ) -> Result<(Value, Type), Diagnostic> {
+        let callees = self.callees;
+        let Some(Site::GenericVariant {
+            owner,
+            name,
+            payload,
+        }) = callees.get(site.0)
+        else {
+            return Err(invalid(span));
+        };
+        let result = self.view(wanted);
+        let found = match &result {
+            Type::Enum(contract) if contract.identity.declaration.0 == *owner => contract
+                .variants
+                .iter()
+                .find(|variant| *variant.name == **name),
+            _ => None,
+        };
+        let Some(variant) = found else {
+            return Err(Diagnostic::new(
+                "E109",
+                format!("a variant of another enum cannot be used where `{wanted}` is expected"),
+                span,
+            ));
+        };
+        let operation = variant.operation();
+        let operand = match (&variant.payload, payload, arguments) {
+            (None, false, []) => None,
+            (Some(declared), true, [argument]) => {
+                let declared = self.view(declared);
+                let (value, ty) = self.expected_as(argument, &declared, Use::Move)?;
+                require_argument(&declared, &ty, argument.span)?;
+                Some(value)
+            }
+            _ => return Err(invalid(span)),
+        };
+        let value = self.value(result.clone());
+        self.emit(Operation::EnumConstruct(value, operation, operand), span);
+        Ok((value, result))
     }
 
     /// A variant constructor: the variant's tag and its payload, built in place.
