@@ -444,6 +444,11 @@ impl Resolver {
                         && !discard
                         && self.pipeline_type(&Type::Named(owner.clone()), 0)
                 });
+            if symbol.intrinsic == Some(crate::intrinsic::Intrinsic::Print) && discard {
+                // `print` is built in: the pipeline lowers it to an output, with no callee.
+                targets.push("$print".into());
+                continue;
+            }
             if symbol.intrinsic.is_some()
                 || self.unit_variants.contains(&symbol.id)
                 || !(constructor

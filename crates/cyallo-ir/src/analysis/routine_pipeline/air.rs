@@ -36,6 +36,8 @@ pub(super) enum Site {
     Call(Callee),
     /// The linked name of the record, whose definition the type environment holds.
     Record(Box<str>),
+    /// The built-in `print`, which writes its arguments to the output.
+    Print,
     /// A variant constructor, built in place rather than by calling a function.
     Variant {
         variant: cyallo_ast::EnumVariant,
@@ -77,6 +79,8 @@ pub(super) enum Operation {
     Unary(Value, Operator, Value),
     Call(Value, usize, Operands),
     CallStatement(usize, Operands),
+    /// Write the values to the output.
+    Print(Operands),
     /// Build a record from its fields, in declaration order.
     Aggregate(Value, Vec<Value>),
     /// Read a field of a local or of the record a reference parameter refers to.
@@ -1294,6 +1298,41 @@ impl Analysis<'_> {
         self.read(matched.result, span)
     }
 
+    /// `print(a, b, ...)`: every argument is evaluated, then all must be printable.
+    fn print(&mut self, arguments: &[Expression], span: Span) -> Result<(), Diagnostic> {
+        let mut values = Vec::with_capacity(arguments.len());
+        let mut types = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            let (value, ty) = self.expression(argument)?;
+            values.push(value);
+            types.push(ty);
+        }
+        if let Some(_) = types.iter().find(|ty| {
+            ty.number_kind().is_none() && !matches!(ty, Type::String | Type::Char | Type::Boolean)
+        }) {
+            let found = types
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Diagnostic::new(
+                "E112",
+                format!(
+                    "`{}` does not accept ({found})",
+                    crate::intrinsic::Intrinsic::Print
+                ),
+                span,
+            ));
+        }
+        let operands = Operands {
+            start: self.operands.len(),
+            len: values.len(),
+        };
+        self.operands.extend(values);
+        self.emit(Operation::Print(operands), span);
+        Ok(())
+    }
+
     /// A variant constructor: the variant's tag and its payload, built in place.
     fn construct(
         &mut self,
@@ -1680,6 +1719,9 @@ impl Analysis<'_> {
                 let ExpressionKind::Call(site, arguments) = &call.kind else {
                     return Err(invalid(span));
                 };
+                if matches!(self.callees.get(site.0), Some(Site::Print)) {
+                    return self.print(arguments, call.span);
+                }
                 let (target, result, operands) = self.arguments(*site, arguments, call.span)?;
                 if result == Type::Void {
                     self.emit(Operation::CallStatement(target, operands), call.span);

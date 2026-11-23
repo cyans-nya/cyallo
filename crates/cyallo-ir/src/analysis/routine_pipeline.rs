@@ -276,6 +276,13 @@ impl IndexedRoutineBody {
                 Some(overlay) => overlay.get(index).map(|target| &**target),
                 None => targets.get(&shift(site.span, self.offset)?).copied(),
             };
+            if target == Some("$print") {
+                if !site.discard {
+                    return Ok(None);
+                }
+                callees.push(air::Site::Print);
+                continue;
+            }
             let Some(signature) = target.and_then(|target| signatures.get(&key(target))) else {
                 return Ok(None);
             };
@@ -624,6 +631,13 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                     Op::EnumTest(dst, address, variant)
                 }
                 air::Operation::Consume(_) => continue,
+                air::Operation::Print(range) => Op::Output(
+                    checked.operands[range.start..range.start + range.len]
+                        .iter()
+                        .map(|argument| registers[argument.0])
+                        .collect(),
+                    ir::TextStyle::Plain,
+                ),
                 air::Operation::EnumTake(value, variable, variant, ty) => {
                     let address = enum_address(&mut function, variable, span);
                     let payload = register(&mut function, &ty);
