@@ -33,6 +33,7 @@ pub(super) enum Operation {
     Binary(Value, Operator, Value, Value),
     Unary(Value, Operator, Value),
     Call(Value, usize, mir::Operands),
+    CallStatement(usize, mir::Operands),
 }
 
 #[derive(Debug)]
@@ -112,6 +113,27 @@ pub(super) fn analyze(
                     };
                     define(&mut types, value, ty, span)?;
                     Operation::ReadVariable(value, variable)
+                }
+                mir::Operation::CallStatement(site, range) => {
+                    let callee = callees
+                        .get(site.0)
+                        .ok_or_else(|| routine_diagnostic(CheckError::InvalidMir, span))?;
+                    let arguments = body
+                        .operands
+                        .get(range.start..range.start + range.len)
+                        .filter(|arguments| arguments.len() == callee.parameters.len())
+                        .ok_or_else(|| routine_diagnostic(CheckError::InvalidMir, span))?;
+                    let spans = &body.operand_spans[range.start..range.start + range.len];
+                    for ((&argument, expected), &argument_span) in
+                        arguments.iter().zip(&callee.parameters).zip(spans)
+                    {
+                        require(
+                            expected,
+                            operand(&types, local_start, argument, span)?,
+                            argument_span,
+                        )?;
+                    }
+                    Operation::CallStatement(callee.id, range)
                 }
                 mir::Operation::Unary(value, operator, operand_value) => {
                     let ty = operand(&types, local_start, operand_value, span)?.clone();
@@ -194,11 +216,14 @@ pub(super) fn analyze(
                         .get(range.start..range.start + range.len)
                         .filter(|arguments| arguments.len() == callee.parameters.len())
                         .ok_or_else(|| routine_diagnostic(CheckError::InvalidMir, span))?;
-                    for (&argument, expected) in arguments.iter().zip(&callee.parameters) {
+                    let spans = &body.operand_spans[range.start..range.start + range.len];
+                    for ((&argument, expected), &argument_span) in
+                        arguments.iter().zip(&callee.parameters).zip(spans)
+                    {
                         require(
                             expected,
                             operand(&types, local_start, argument, span)?,
-                            span,
+                            argument_span,
                         )?;
                     }
                     define(&mut types, value, callee.result.clone(), span)?;
@@ -255,7 +280,12 @@ pub(super) fn analyze(
                     value_span,
                 )?;
             }
-            Exit::End if block_reachable => {
+            Exit::ReturnVoid => {
+                if *result != Type::Void {
+                    return Err(routine_diagnostic(CheckError::InvalidMir, exit.span));
+                }
+            }
+            Exit::End if block_reachable && *result != Type::Void => {
                 return Err(routine_diagnostic(CheckError::MissingReturn, routine_span));
             }
             Exit::End => {}

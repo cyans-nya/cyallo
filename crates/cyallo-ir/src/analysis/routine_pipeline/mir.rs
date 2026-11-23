@@ -23,6 +23,8 @@ pub(super) struct Body {
     pub(super) sites: Vec<ReferenceSite>,
     /// Ordered call arguments, addressed by `Operands`.
     pub(super) operands: Vec<Value>,
+    /// The source span of each operand, parallel to `operands`.
+    pub(super) operand_spans: Vec<Span>,
 }
 
 #[derive(Clone, Debug, Hash)]
@@ -39,6 +41,8 @@ pub(super) struct ReferenceSite {
     pub(super) span: Span,
     /// Number of ordered arguments written at the site.
     pub(super) arguments: usize,
+    /// The call is a statement: the callee is a procedure and no value is used.
+    pub(super) discard: bool,
 }
 
 #[derive(Clone, Copy, Debug, Hash)]
@@ -67,6 +71,8 @@ pub(super) enum Operation {
     Unary(Value, Operator, Value),
     /// Check that an operand of `&&` or `||` is boolean. Produces no value.
     Condition(Value),
+    /// A call to a procedure for its effects.
+    CallStatement(SiteId, Operands),
     /// Declare a local with its initial value; checks an annotation.
     Define(Variable, Value, Span, Option<ScalarType>),
     /// Store into a declared local; the span is the stored expression's.
@@ -85,6 +91,7 @@ pub(super) enum Exit {
     },
     Jump(BlockId),
     Next(BlockId),
+    ReturnVoid,
     Return {
         value: Value,
         value_span: Span,
@@ -101,6 +108,7 @@ pub(super) fn lower(routine: &hir::Routine, span: Span) -> Body {
         value_count: 0,
         sites: Vec::new(),
         operands: Vec::new(),
+        operand_spans: Vec::new(),
         last_span: span,
     };
     builder.statements(statements);
@@ -126,6 +134,7 @@ pub(super) fn lower(routine: &hir::Routine, span: Span) -> Body {
             .collect(),
         sites: builder.sites,
         operands: builder.operands,
+        operand_spans: builder.operand_spans,
     }
 }
 
@@ -143,6 +152,7 @@ struct Builder {
     value_count: usize,
     sites: Vec<ReferenceSite>,
     operands: Vec<Value>,
+    operand_spans: Vec<Span>,
     last_span: Span,
 }
 
@@ -217,11 +227,14 @@ impl Builder {
                         len: values.len(),
                     };
                     self.operands.extend(values);
+                    self.operand_spans
+                        .extend(arguments.iter().map(|argument| argument.span));
                     let site = SiteId(self.sites.len());
                     self.sites.push(ReferenceSite {
                         path: path.clone(),
                         span: expression.span,
                         arguments: argument_count,
+                        discard: false,
                     });
                     Operation::Call(self.new_value(), site, operands)
                 }
@@ -458,6 +471,35 @@ impl Builder {
                         back.finish(self, Exit::Jump(header), back_span);
                     }
                     hir::StatementKind::ForRange(range) => self.range(range, statement.span),
+                    hir::StatementKind::ReturnVoid => {
+                        let span = statement.span;
+                        self.take_block().finish(self, Exit::ReturnVoid, span);
+                    }
+                    hir::StatementKind::CallStatement(call) => {
+                        let hir::ExpressionKind::Call(path, arguments) = &call.kind else {
+                            unreachable!("a call statement holds a call");
+                        };
+                        let values: Vec<Value> = arguments
+                            .iter()
+                            .map(|argument| self.expression(argument))
+                            .collect();
+                        let operands = Operands {
+                            start: self.operands.len(),
+                            len: values.len(),
+                        };
+                        let count = values.len();
+                        self.operands.extend(values);
+                        self.operand_spans
+                            .extend(arguments.iter().map(|argument| argument.span));
+                        let site = SiteId(self.sites.len());
+                        self.sites.push(ReferenceSite {
+                            path: path.clone(),
+                            span: call.span,
+                            arguments: count,
+                            discard: true,
+                        });
+                        self.emit(Operation::CallStatement(site, operands), call.span);
+                    }
                     hir::StatementKind::Break => {
                         let open = self.take_block();
                         let span = self.last_span;

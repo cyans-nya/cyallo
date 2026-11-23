@@ -58,6 +58,10 @@ pub(super) enum StatementKind {
     ForRange(Box<ForRange>),
     Break,
     Continue,
+    /// `return` in a procedure.
+    ReturnVoid,
+    /// A call to a procedure, as a statement. The expression is a `Call`.
+    CallStatement(Expression),
 }
 
 /// `for variable in start..finish` over `i64`, without `rev`. `end` and `bound`
@@ -102,6 +106,8 @@ struct Context<'a> {
     scopes: Vec<Vec<Visible>>,
     /// Loops enclosing the statement being lowered.
     loops: usize,
+    /// The routine is a procedure: it returns no value.
+    procedure: bool,
 }
 
 /// Lower eligible routine bodies directly from the file's indexed tables. `None`
@@ -110,18 +116,19 @@ struct Context<'a> {
 /// immutable name, a name used out of scope, and so on).
 pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<Routine> {
     if function.body_kind != FunctionBodyKind::Source
-        || function.kind != RoutineKind::Function
         || function.generator
         || !ast.get_list(function.annotations)?.is_empty()
         || !ast.get_list(function.type_params)?.is_empty()
         || !ast.get_list(function.type_packs)?.is_empty()
-        || !matches!(
-            ast.get(function.result)?,
-            TypeNode::Integer | TypeNode::Boolean
-        )
     {
         return None;
     }
+    // A function returns `i64` or `bool`; a procedure returns nothing.
+    let procedure = match (function.kind, ast.get(function.result)?) {
+        (RoutineKind::Function, TypeNode::Integer | TypeNode::Boolean) => false,
+        (RoutineKind::Procedure, TypeNode::Void) => true,
+        _ => return None,
+    };
     let parameters = ast.get_list(function.params)?;
     if parameters.iter().any(|parameter| {
         parameter.arity != ParameterArity::One
@@ -153,6 +160,7 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
         every_name,
         locals: Vec::new(),
         loops: 0,
+        procedure,
         scopes: vec![
             names
                 .iter()
@@ -196,6 +204,8 @@ fn declared_names(
                 }
                 StmtSyntax::While(_, body) => declared_names(ast, body, out, counters)?,
                 StmtSyntax::Return(_)
+                | StmtSyntax::ReturnVoid
+                | StmtSyntax::Evaluate(_)
                 | StmtSyntax::Assign(..)
                 | StmtSyntax::Compound(..)
                 | StmtSyntax::Break
@@ -250,7 +260,19 @@ impl Context<'_> {
                             self.block(yes)?,
                             self.block(no)?,
                         ),
-                        StmtSyntax::Return(value) => StatementKind::Return(self.expression(value)?),
+                        // The existing route reports a value returned from a procedure.
+                        StmtSyntax::Return(value) if !self.procedure => {
+                            StatementKind::Return(self.expression(value)?)
+                        }
+                        StmtSyntax::ReturnVoid if self.procedure => StatementKind::ReturnVoid,
+                        StmtSyntax::Evaluate(value) => {
+                            let call = self.value(value, false)?;
+                            // Only a call to a procedure; the linker checks which.
+                            if !matches!(call.kind, ExpressionKind::Call(..)) {
+                                return None;
+                            }
+                            StatementKind::CallStatement(call)
+                        }
                         StmtSyntax::Binding(name, annotation, constant, mutable, value) => {
                             if constant {
                                 return None;

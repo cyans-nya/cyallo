@@ -76,7 +76,8 @@ struct Resolver {
     /// Indexed bodies bound by the linker: MIR plus resolved call targets.
     bound: HashMap<Box<str>, crate::analysis::IndexedRoutineBody>,
     /// Linked symbols of plain `i64` functions a migrated body may call.
-    plain: HashMap<Box<str>, usize>,
+    /// Parameter count and whether the callee is a procedure.
+    plain: HashMap<Box<str>, (usize, bool)>,
     /// Source-file mode: the entry runs `proc main()` and no top level may hold statements.
     entry_mode: crate::EntryMode,
     aliases: HashMap<Box<str>, (usize, Type)>,
@@ -224,7 +225,7 @@ impl Resolver {
         Ok(())
     }
     /// Linked symbols of source functions with a plain `i64` contract.
-    fn plain_functions(&self) -> HashMap<Box<str>, usize> {
+    fn plain_functions(&self) -> HashMap<Box<str>, (usize, bool)> {
         let mut plain = HashMap::new();
         for (index, node) in self.nodes.iter().enumerate() {
             for f in &node.ast.functions {
@@ -236,7 +237,7 @@ impl Resolver {
                     && crate::analysis::plain_contract(f.kind, &f.params, &f.result, f.params.len())
                     && let Ok(target) = self.symbol(index, &f.name, Kind::Value, f.span)
                 {
-                    plain.insert(target, f.params.len());
+                    plain.insert(target, (f.params.len(), f.kind == RoutineKind::Procedure));
                 }
             }
         }
@@ -260,10 +261,12 @@ impl Resolver {
     > {
         let sites: Vec<_> = body
             .reference_sites()
-            .map(|(path, arguments, span)| (Box::<str>::from(path), arguments, span))
+            .map(|(path, arguments, discard, span)| {
+                (Box::<str>::from(path), arguments, discard, span)
+            })
             .collect();
         let mut targets = Vec::with_capacity(sites.len());
-        for (path, arguments, span) in sites {
+        for (path, arguments, discard, span) in sites {
             if function.params.iter().any(|param| param.name == path) {
                 return Ok(Err(body));
             }
@@ -273,7 +276,7 @@ impl Resolver {
             self.check_import(module, &symbol, span)?;
             if symbol.intrinsic.is_some()
                 || self.unit_variants.contains(&symbol.id)
-                || self.plain.get(&symbol.target) != Some(&arguments)
+                || self.plain.get(&symbol.target) != Some(&(arguments, discard))
             {
                 return Ok(Err(body));
             }

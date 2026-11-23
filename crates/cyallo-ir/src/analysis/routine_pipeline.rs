@@ -75,11 +75,11 @@ impl IndexedRoutineBody {
         }))
     }
 
-    /// Reference sites in source order as `(path, argument count, archived span)`.
-    pub(crate) fn reference_sites(&self) -> impl Iterator<Item = (&str, usize, Span)> {
+    /// Reference sites in source order as `(path, argument count, is a statement, archived span)`.
+    pub(crate) fn reference_sites(&self) -> impl Iterator<Item = (&str, usize, bool, Span)> {
         self.mir.sites.iter().map(|site| {
             let span = shift(site.span, self.offset).unwrap_or(site.span);
-            (&*site.path, site.arguments, span)
+            (&*site.path, site.arguments, site.discard, span)
         })
     }
 
@@ -186,7 +186,8 @@ impl IndexedRoutineBody {
                 &signature.params,
                 &signature.result,
                 site.arguments,
-            ) {
+            ) || (signature.result == Type::Void) != site.discard
+            {
                 return Ok(None);
             }
             callees.push(air::Callee {
@@ -207,8 +208,11 @@ pub(crate) fn plain_contract(
     result: &Type,
     arguments: usize,
 ) -> bool {
-    kind == RoutineKind::Function
-        && matches!(result, Type::Integer | Type::Boolean)
+    let returns = match kind {
+        RoutineKind::Function => matches!(result, Type::Integer | Type::Boolean),
+        RoutineKind::Procedure => *result == Type::Void,
+    };
+    returns
         && parameters.len() == arguments
         && parameters.iter().all(|parameter| {
             matches!(parameter.ty, Type::Integer | Type::Boolean)
@@ -373,6 +377,13 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                     registers.push(dst);
                     Op::Call(Some(dst), target, arguments)
                 }
+                air::Operation::CallStatement(target, range) => {
+                    let arguments = checked.operands[range.start..range.start + range.len]
+                        .iter()
+                        .map(|argument| registers[argument.0])
+                        .collect();
+                    Op::Call(None, target, arguments)
+                }
                 air::Operation::Unary(value, operator, operand) => {
                     let dst = register(&mut function, &checked.types[value.0]);
                     registers.push(dst);
@@ -393,7 +404,7 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
             mir::Exit::Jump(target) => Op::Jump(starts[target.0]),
             mir::Exit::Next(_) => continue,
             mir::Exit::Return { value, .. } => Op::Return(Some(registers[value.0])),
-            mir::Exit::End => Op::Return(None),
+            mir::Exit::End | mir::Exit::ReturnVoid => Op::Return(None),
         };
         push(&mut function, operation, block.exit.span);
     }

@@ -235,3 +235,52 @@ fn new_forms_report_the_same_diagnostics() {
         same_diagnostic(source, code);
     }
 }
+
+#[test]
+fn procedures_and_call_statements_match() {
+    // A procedure runs for its effects; the calls here are the effects the pipeline
+    // can see, so the check is that both routes accept, link and run the program.
+    parity(
+        "proc work(n: i64) {PAD\n    let mut t = 0\n    for i in 0..n {\n        if i > 5 { return }\n        t += i\n    }\n}\n\
+         proc outer(n: i64) {PAD\n    work(n)\n    work(n + 1)\n    if n > 100 { return }\n    work(2)\n}\n\
+         fn pure_sum(n: i64) -> i64 {PAD\n    let mut t = 0\n    for i in 0..n { t += i }\n    return t\n}\n\
+         outer(3)\nouter(500)\nstd::io::print(pure_sum(10))\n",
+        "45\n",
+    );
+}
+
+#[test]
+fn procedure_diagnostics_match() {
+    for (source, code) in [
+        // An argument of the wrong type in a call statement.
+        (
+            "proc helper(n: i64) {PAD\n}\nproc f(n: i64) {PAD\n    helper(true)\n}\n",
+            "E109",
+        ),
+        // A missing argument.
+        (
+            "proc helper(n: i64) {PAD\n}\nproc f(n: i64) {PAD\n    helper()\n}\n",
+            "E110",
+        ),
+        // The same in an expression call, reported at the argument.
+        (
+            "fn g(n: i64) -> i64 {PAD\n    return n\n}\nfn f(n: i64) -> i64 {PAD\n    return g(true)\n}\n",
+            "E109",
+        ),
+    ] {
+        same_diagnostic(source, code);
+    }
+}
+
+#[test]
+fn procedures_outside_the_subset_keep_the_existing_route() {
+    // Declined by HIR itself.
+    for source in ["proc p() { return 1 }", "fn f() -> i64 { return }"] {
+        assert_fallback(source);
+    }
+    // Declined when the linker checks the callee: a function called as a statement is
+    // accepted by the existing route, a procedure used as a value is its error.
+    let run_ok = |source: &str| compile(&format!("{source}\nstd::io::print(0)\n"));
+    assert!(run_ok("fn g() -> i64 { return 1 }\nproc p() { g() }").is_ok());
+    assert!(run_ok("proc h() { }\nfn f() -> i64 { return h() }").is_err());
+}
