@@ -7,14 +7,14 @@ original `DeclarationId` and defining `ModuleId`; aliases and reexports retain
 those identities. Visibility and extension imports are checked by the resolver.
 See [module syntax and services](services.md) for the language interface.
 
-The [executable example](../examples/modules/static/main.ya) combines imported
+The [executable example](../examples/modules/static/main.yas) combines imported
 records and traits, a private helper, dependent constants, a generic function and
 a returned capturing closure:
 
 ```sh
-cargo run -- check examples/modules/static/main.ya --jobs 4
-cargo run -- run examples/modules/static/main.ya --gc-stress
-cargo run -- run examples/modules/static/main.ya --engine cranelift_speed --gc-stress
+cargo run -- check examples/modules/static/main.yas --jobs 4
+cargo run -- run examples/modules/static/main.yas --gc-stress
+cargo run -- run examples/modules/static/main.yas --engine cranelift_speed --gc-stress
 ```
 
 It prints `42:retained`.

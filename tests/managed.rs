@@ -73,7 +73,7 @@ fn parity(source: &str, expected: &str) {
 #[test]
 fn gc_sharing_example() {
     parity(
-        include_str!("../examples/gc-sharing.ya"),
+        include_str!("../examples/gc-sharing.yas"),
         "snapshot: 10\nshared: 11:11\nretained: 21\n",
     );
 }
@@ -101,14 +101,14 @@ fn explicit_local_rc_supports_custom_allocator_state_and_lifetimes() {
 #[test]
 fn rc_ownership_example() {
     parity(
-        include_str!("../examples/rc-ownership.ya"),
+        include_str!("../examples/rc-ownership.yas"),
         "strong: 2\nsurvivor: 42\nupgraded: 42:2\nexpired: true\n",
     );
 }
 #[test]
 fn combined_gc_rc_example() {
     parity(
-        include_str!("../examples/gc-rc.ya"),
+        include_str!("../examples/gc-rc.yas"),
         "first: 7\nsecond: 7\nfirst expired: true\nsecond survives: 9\ngc survives: 11\n",
     );
 }

@@ -148,11 +148,11 @@ std::io::print(shout(&names[1]), " ", shout(&pair.right), " ", shout(&names[0]))
 #[test]
 fn the_documented_text_and_result_examples_run() {
     for (name, source) in [
-        ("parser", include_str!("../examples/parser.ya")),
-        ("modern", include_str!("../examples/modern.ya")),
-        ("generics", include_str!("../examples/generics.ya")),
-        ("patterns", include_str!("../examples/enums/patterns.ya")),
-        ("result", include_str!("../examples/enums/result.ya")),
+        ("parser", include_str!("../examples/parser.yas")),
+        ("modern", include_str!("../examples/modern.yas")),
+        ("generics", include_str!("../examples/generics.yas")),
+        ("patterns", include_str!("../examples/enums/patterns.yas")),
+        ("result", include_str!("../examples/enums/result.yas")),
     ] {
         let lines = run(source).unwrap_or_else(|error| panic!("{name}: {error}"));
         assert!(!lines.is_empty(), "{name}");

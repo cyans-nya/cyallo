@@ -43,6 +43,8 @@ pub struct ResolvedProgram {
     pub native: NativeDeclarations,
     pub source_names: std::collections::BTreeMap<Box<str>, Box<str>>,
     pub exports: Vec<ResolvedModuleExports>,
+    /// File-relative MIR for routines whose source bodies were kept indexed.
+    pub(crate) indexed_bodies: HashMap<Box<str>, crate::analysis::IndexedRoutineBody>,
 }
 /// A world after name resolution: its flattened imports and exports, each
 /// remembering the world that declared it.
@@ -163,6 +165,11 @@ pub fn module_diagnostic(error: ModuleError) -> Diagnostic {
     Diagnostic::new(code, error.to_string(), span)
 }
 impl ResolvedProgram {
+    /// Whether the routine keeps indexed MIR (and overlay) in place of an AST body.
+    pub fn has_indexed_body(&self, symbol: &str) -> bool {
+        self.indexed_bodies.contains_key(symbol)
+    }
+
     pub fn entry_index(&self) -> usize {
         self.modules
             .iter()

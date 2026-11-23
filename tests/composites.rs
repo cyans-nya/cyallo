@@ -38,7 +38,7 @@ fn output(source: &str, expected: &str) {
 }
 #[test]
 fn composites_example() {
-    output(include_str!("../examples/composites.ya"), "1:7\n2\n");
+    output(include_str!("../examples/composites.yas"), "1:7\n2\n");
 }
 #[test]
 fn named_function_values_and_higher_order_results() {

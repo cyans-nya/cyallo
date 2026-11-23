@@ -89,7 +89,7 @@ fn ordinary_service_library_keeps_paths_during_replacement() {
         ),
         SourceModule::new(
             "main.ya",
-            include_str!("../examples/lookup-services/main.ya"),
+            include_str!("../examples/lookup-services/main.yas"),
         ),
     ];
     let p = Arc::new(compile_modules(3, &sources, Default::default(), false).unwrap());

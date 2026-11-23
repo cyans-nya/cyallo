@@ -22,25 +22,25 @@ fn output(source: &str, expected: &str) {
 #[test]
 fn modern_example() {
     output(
-        include_str!("../examples/modern.ya"),
+        include_str!("../examples/modern.yas"),
         "ADA\n288212784234102776:10:3\n",
     );
 }
 #[test]
 fn algorithm_examples() {
     output(
-        include_str!("../examples/quicksort.ya"),
+        include_str!("../examples/quicksort.yas"),
         "513509887:1072:998045\n",
     );
     output(
-        include_str!("../examples/mergesort.ya"),
+        include_str!("../examples/mergesort.yas"),
         "398403790:1921:999272\n",
     );
-    output(include_str!("../examples/fib.ya"), "17711\n");
-    output(include_str!("../examples/knapsack.ya"), "1054\n3400\n");
-    let dfs = include_str!("../examples/dfs.ya").replace("let n = 300", "let n = 50");
+    output(include_str!("../examples/fib.yas"), "17711\n");
+    output(include_str!("../examples/knapsack.yas"), "1054\n3400\n");
+    let dfs = include_str!("../examples/dfs.yas").replace("let n = 300", "let n = 50");
     output(&dfs, "50:0:50\n");
-    let parser = include_str!("../examples/parser.ya").replace("let reps = 200", "let reps = 2");
+    let parser = include_str!("../examples/parser.yas").replace("let reps = 200", "let reps = 2");
     output(&parser, "416:12:330464\n");
 }
 #[test]

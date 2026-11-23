@@ -1,0 +1,29 @@
+// cargo run -- run examples/modules/dynamic/main.yas --gc-stress
+// Expected: runtime, 42, 42, true (one value per line).
+use std::io::print
+use std::module::load
+
+// A structural view is optional and keeps the complete namespace.
+type Plugin = object {
+    label: string,
+    twice: fn(i64) -> i64,
+    update: proc(gc Cell<i64>) -> i64,
+    ..
+}
+
+// plugin.ya is loaded when load executes; it is not declared with mod.
+let path = "plugin" + ".ya"
+let module = load(path).unwrap()
+print(module.label)
+let export_name = "twice"
+print(module[export_name](21))
+let plugin = std::object::view<Plugin>(module).unwrap()
+
+// An imported procedure executes in this coroutine and uses its local heap.
+let state = @local gc Cell::new(40)
+let changed = plugin.update(state.clone())
+print(state.*.*)
+
+// Loading errors are ordinary Result values.
+let absent = load("missing.ya").unwrap_err()
+print(absent.is_not_found())

@@ -12,7 +12,7 @@ use std::{
 };
 fn main() {
     let program =
-        Arc::new(cyallo::compile(include_str!("../examples/objects/native-ic.ya")).unwrap());
+        Arc::new(cyallo::compile(include_str!("../examples/objects/native-ic.yas")).unwrap());
     let winch = TieredBackend::default().compile(program.clone()).unwrap();
     for function in 0..program.functions().len() {
         winch.precompile(function, Tier::Winch).unwrap();

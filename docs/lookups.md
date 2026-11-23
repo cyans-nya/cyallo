@@ -71,10 +71,10 @@ Native code does not infer an intrinsic from a method's source name.
 
 ## A registry implemented in source
 
-Run [lookup-services/main.ya](../examples/lookup-services/main.ya):
+Run [lookup-services/main.ya](../examples/lookup-services/main.yas):
 
 ```sh
-cargo run -- run examples/lookup-services/main.ya --engine cranelift_speed --gc-stress
+cargo run -- run examples/lookup-services/main.yas --engine cranelift_speed --gc-stress
 ```
 
 The [registry](../examples/lookup-services/registry.ya) has an explicit GC-owned
@@ -86,5 +86,5 @@ A generation check prevents an old lease from disposing a replacement.
 
 The example uses ordinary records, generic routines, trait dispatch and lookup
 operations. It emits no privileged service opcodes. The separate
-[service-context example](../examples/services/main.ya) demonstrates admission,
+[service-context example](../examples/services/main.yas) demonstrates admission,
 isolation and dependent cleanup using `std::service`.

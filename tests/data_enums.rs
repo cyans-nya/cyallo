@@ -290,18 +290,18 @@ std::io::print(match restored { Number::Value(n) => n, Number::Empty => 0 })
 fn documented_enum_examples_execute() {
     for (source, expected) in [
         (
-            include_str!("../examples/enums/result.ya"),
+            include_str!("../examples/enums/result.yas"),
             "4\ncannot divide by 0\n",
         ),
         (
-            include_str!("../examples/enums/patterns.ya"),
+            include_str!("../examples/enums/patterns.yas"),
             "positive: 7\nchanged\n2\n",
         ),
         (
-            include_str!("../examples/enums/ownership.ya"),
+            include_str!("../examples/enums/ownership.yas"),
             "first:1:1:true\n",
         ),
-        (include_str!("../examples/enums/recursive.ya"), "5\n"),
+        (include_str!("../examples/enums/recursive.yas"), "5\n"),
     ] {
         output(source, expected);
     }

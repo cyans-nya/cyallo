@@ -119,13 +119,17 @@ fn compile_modules_cached(
         .map_err(cyallo_ir::core_package::invalid_core_source)?;
     let trees = inputs.archive_syntax(&offsets, cyallo_compile_jobs::Jobs(options.jobs))?;
     let paths: Vec<_> = sources.iter().map(|&(path, _)| path.to_owned()).collect();
-    let mut ast = crate::namespace::link_with_core(
-        trees.materialize(entry)?,
+    let (linker_trees, indexed_bodies) =
+        trees.materialize_with_indexed(entry, options.dialect == crate::Dialect::Modern)?;
+    let mut ast = crate::namespace::link_program(
+        linker_trees,
         &paths,
         entry,
         policy,
         core,
         core_archive.base,
+        options.entry,
+        indexed_bodies,
     )?;
     ast.source_files = sources
         .iter()
@@ -272,7 +276,11 @@ pub fn compile_path(
     let loader = crate::module_loader::ModuleLoader::for_entry(path)
         .map_err(crate::module_loader::module_load_diagnostic)?;
     let sources = loader
-        .load_parsed(path, crate::Jobs(options.jobs))
+        .load_entry(
+            path,
+            crate::Jobs(options.jobs),
+            options.entry == cyallo_ir::EntryMode::Main,
+        )
         .map_err(crate::module_loader::module_load_diagnostic)?;
     Ok(
         compile_parsed_modules(sources.len() - 1, &sources, options, deferred)?

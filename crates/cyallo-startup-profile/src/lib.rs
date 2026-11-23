@@ -66,10 +66,14 @@ pub enum Stage {
     BytecodeModule,
     /// `bytecode::Function::lower`: one checked body to bytecode.
     BytecodeTranslate,
+    /// Verified module construction, including any checks it forces and image verification.
+    VerifiedModuleLower,
+    /// Translation of one checked routine into a verified function image.
+    VerifiedBodyLower,
 }
 
 impl Stage {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 26] = [
         Self::Lex,
         Self::Parse,
         Self::Freeze,
@@ -94,6 +98,8 @@ impl Stage {
         Self::BodyFinish,
         Self::BytecodeModule,
         Self::BytecodeTranslate,
+        Self::VerifiedModuleLower,
+        Self::VerifiedBodyLower,
     ];
     pub const fn name(self) -> &'static str {
         match self {
@@ -121,6 +127,8 @@ impl Stage {
             Self::BodyFinish => "body_finish",
             Self::BytecodeModule => "bytecode_module",
             Self::BytecodeTranslate => "bytecode_translate",
+            Self::VerifiedModuleLower => "verified_module_lower",
+            Self::VerifiedBodyLower => "verified_body_lower",
         }
     }
 }
@@ -157,10 +165,16 @@ pub enum Counter {
     CheckedInstructions,
     /// Bytecode words in translated bodies.
     BytecodeWords,
+    /// Routines translated into verified function images.
+    VerifiedBodiesLowered,
+    /// Scalar routines emitted from the new HIR → MIR → AIR pipeline.
+    BodiesEmittedFromAir,
+    /// Routine bodies lowered from indexed syntax without AST materialization.
+    BodiesPreparedFromIndexedSyntax,
 }
 
 impl Counter {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 19] = [
         Self::SourceBytes,
         Self::Tokens,
         Self::Files,
@@ -177,6 +191,9 @@ impl Counter {
         Self::HeaderElementsCloned,
         Self::CheckedInstructions,
         Self::BytecodeWords,
+        Self::VerifiedBodiesLowered,
+        Self::BodiesEmittedFromAir,
+        Self::BodiesPreparedFromIndexedSyntax,
     ];
     pub const fn name(self) -> &'static str {
         match self {
@@ -196,6 +213,9 @@ impl Counter {
             Self::HeaderElementsCloned => "header_elements_cloned",
             Self::CheckedInstructions => "checked_instructions",
             Self::BytecodeWords => "bytecode_words",
+            Self::VerifiedBodiesLowered => "verified_bodies_lowered",
+            Self::BodiesEmittedFromAir => "bodies_emitted_from_air",
+            Self::BodiesPreparedFromIndexedSyntax => "bodies_prepared_from_indexed_syntax",
         }
     }
 }

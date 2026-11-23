@@ -42,7 +42,7 @@ fn run(source: &str) -> Result<Vec<String>, RunError> {
 
 #[test]
 fn the_documented_example_shares_state_between_object_copies() {
-    let source = include_str!("../examples/traits.ya");
+    let source = include_str!("../examples/traits.yas");
     for stress in [false, true] {
         let (lines, _) = run_with(source, stress).unwrap();
         assert_eq!(lines, ["direct: 5", "shared: 9", "original: 5"]);

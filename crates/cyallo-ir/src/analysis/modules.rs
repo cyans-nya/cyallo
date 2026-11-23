@@ -71,6 +71,7 @@ fn analyze_modules_with(
         native: graph.native.clone(),
         source_names: graph.source_names.clone(),
         exports: graph.exports.clone(),
+        indexed_bodies: graph.indexed_bodies.clone(),
     };
     let entry = graph.entry_index();
     let native = graph.native.clone();
@@ -322,14 +323,24 @@ fn analyze_modules_with(
                     let _setup = stage(Stage::DeferredSetup);
                     let f = &ast.functions[function];
                     let id = routine_ids[module][function];
+                    let indexed = identity.indexed_bodies.get(&f.name);
+                    // A body with reference sites keeps its owned body, whose estimate
+                    // also records its direct-call edges for admission.
+                    let owned_body = indexed.is_none() || !f.body.is_empty();
+                    let estimate = indexed
+                        .filter(|_| !owned_body)
+                        .map(IndexedRoutineBody::estimate)
+                        .unwrap_or_else(|| crate::admission::estimate(f));
                     let body = DeferredBody {
                         function: f.clone(),
+                        indexed: indexed.cloned(),
                         context: context.clone(),
                         index: id,
                     };
-                    let estimate = crate::admission::estimate(f);
                     let routine = if deferred {
-                        count(Counter::BodiesDeferredCopied, 1);
+                        if owned_body {
+                            count(Counter::BodiesDeferredCopied, 1);
+                        }
                         ir::Routine::deferred(
                             body,
                             estimate.eager_candidate(),

@@ -152,8 +152,8 @@ Modern source uses case-sensitive Rust-style module paths: `mod logging;`,
 `use crate::logging::{Logger, LOGGER, logger}`, and `pub use` reexports.
 The executable syntax and visibility rules are maintained in the
 [module/service reference](services.md). Complete module sources are in
-[examples/services](../examples/services/main.ya); the generic registry example
-is in [examples/lookup-services](../examples/lookup-services/main.ya).
+[examples/services](../examples/services/main.yas); the generic registry example
+is in [examples/lookup-services](../examples/lookup-services/main.yas).
 
 Imports expose declarations without activating providers. Provider activation is
 an explicit procedure call returning a registration. Extension getters resolve

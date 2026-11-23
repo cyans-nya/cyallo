@@ -1,0 +1,14 @@
+// Run: cargo run -- run examples/concurrency/channels/rendezvous.yas --engine interpreter
+// Expected: 42, 7 (one result per line).
+use std::channel::bounded
+use std::task::spawn
+use std::io::print
+
+let endpoints = bounded<i64>(0 as usize)
+let sender = endpoints.0.clone()
+let worker = spawn(proc() -> i64 {
+    sender.send(42).unwrap()
+    return 7
+})
+print(endpoints.1.recv().unwrap())
+print(worker.join().completed())

@@ -113,9 +113,9 @@ std::io::print(v[0], v[1], v[2], v[3], v[4], v[5], " ", v.len())
 #[test]
 fn the_documented_sorting_and_knapsack_examples_print_their_results() {
     for (name, source) in [
-        ("mergesort", include_str!("../examples/mergesort.ya")),
-        ("quicksort", include_str!("../examples/quicksort.ya")),
-        ("knapsack", include_str!("../examples/knapsack.ya")),
+        ("mergesort", include_str!("../examples/mergesort.yas")),
+        ("quicksort", include_str!("../examples/quicksort.yas")),
+        ("knapsack", include_str!("../examples/knapsack.yas")),
     ] {
         let lines = run(source).unwrap_or_else(|error| panic!("{name}: {error}"));
         assert!(!lines.is_empty(), "{name}");
@@ -138,7 +138,7 @@ std::io::print(old, " ", c.*)
 
 #[test]
 fn collected_cycles_and_shared_counters_behave_like_the_documented_examples() {
-    let cycles = include_str!("../examples/gc-cycles.ya");
+    let cycles = include_str!("../examples/gc-cycles.yas");
     for stress in [false, true] {
         let (lines, stats) = run_with(cycles, stress).unwrap();
         assert_eq!(lines, ["cycle: 10 -> 20 -> 10", "temporary cycles: 128"]);
@@ -148,7 +148,7 @@ fn collected_cycles_and_shared_counters_behave_like_the_documented_examples() {
     }
     let (_, stressed) = run_with(cycles, true).unwrap();
     assert!(stressed.live <= 16, "{stressed:?}");
-    let sharing = include_str!("../examples/gc-sharing.ya");
+    let sharing = include_str!("../examples/gc-sharing.yas");
     let (lines, _) = run_with(sharing, true).unwrap();
     assert_eq!(lines, ["snapshot: 10", "shared: 11:11", "retained: 21"]);
 }

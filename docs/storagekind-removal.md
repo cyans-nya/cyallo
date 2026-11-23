@@ -245,7 +245,7 @@ and no dedicated `Value`/`Payload` variant.
 - **Self in native impls.** `Self` is substituted with the unresolved impl receiver before the signature is resolved;
   the resolved name cannot be resolved a second time.
 - **Verified.** Full root suite fails the same 15 tests as the baseline (names compared); crate tests unchanged except the
-  known `enum_resolution` failure; `examples/concurrency/status-enums.ya` runs.
+  known `enum_resolution` failure; `examples/concurrency/status-enums.yas` runs.
 - **Next.** `SendError`, `GeneratorStep`, `Option`, `Result` (these carry payloads and generic parameters, so they also need
   the generic layout optimizer), then the error enums, `Range` and `TypeDescriptor`.
 

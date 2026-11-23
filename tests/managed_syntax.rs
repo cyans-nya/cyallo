@@ -106,7 +106,7 @@ fn parser_keeps_storage_and_locality_as_independent_semantic_fields() {
 #[test]
 fn local_managed_language_example_preserves_aliases_rc_and_weak_ownership() {
     parity(
-        include_str!("../examples/concurrency/ownership/local-managed.ya"),
+        include_str!("../examples/concurrency/ownership/local-managed.yas"),
         "42\n2\n7\ntrue\n",
     );
 }

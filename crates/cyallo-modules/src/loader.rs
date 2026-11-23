@@ -24,6 +24,7 @@ pub enum ModuleIoOperation {
     InspectCandidate,
     CanonicalizeSource,
     ReadSource,
+    ReadDirectory,
 }
 impl fmt::Display for ModuleIoOperation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -36,6 +37,7 @@ impl fmt::Display for ModuleIoOperation {
             Self::InspectCandidate => "inspect declared module candidate",
             Self::CanonicalizeSource => "resolve declared module source",
             Self::ReadSource => "read module source",
+            Self::ReadDirectory => "list component directory",
         })
     }
 }
@@ -364,6 +366,7 @@ impl ModuleLoader {
             active: HashSet::new(),
             stack: vec![],
             sources: vec![],
+            loaded: HashSet::new(),
         };
         load.candidate(&path, Span::default())?
             .map(|candidate| candidate.canonical)
@@ -375,8 +378,9 @@ impl ModuleLoader {
             })
     }
 
-    /// Loads declared source files only. All per-load identities and cycle state
-    /// are local to this call; errors do not poison later loads of this instance.
+    /// Loads declared source files only. Runtime imports use this: a plugin
+    /// directory is never swept. All per-load identities and cycle state are
+    /// local to this call; errors do not poison later loads of this instance.
     pub fn load(&self, entry: &Path) -> Result<Vec<SourceModule>, ModuleLoadError> {
         self.load_parsed(entry, Jobs::default()).map(|files| {
             files
@@ -391,6 +395,27 @@ impl ModuleLoader {
         &self,
         entry: &Path,
         jobs: Jobs,
+    ) -> Result<Vec<ParsedModule>, ModuleLoadError> {
+        self.load_entry(entry, jobs, false)
+    }
+
+    /// Load a compiler entry. A `.ya` entry is a component root, so every other
+    /// `.ya` file below its directory is a module too (files are modules). A
+    /// `.yas` script loads declared files only.
+    pub fn load_component(
+        &self,
+        entry: &Path,
+        jobs: Jobs,
+    ) -> Result<Vec<ParsedModule>, ModuleLoadError> {
+        self.load_entry(entry, jobs, true)
+    }
+
+    /// `scan_component` adds every `.ya` file below a `.ya` entry's directory.
+    pub fn load_entry(
+        &self,
+        entry: &Path,
+        jobs: Jobs,
+        scan_component: bool,
     ) -> Result<Vec<ParsedModule>, ModuleLoadError> {
         let canonical = io_at(
             ModuleIoOperation::CanonicalizeEntry,
@@ -418,8 +443,19 @@ impl ModuleLoader {
             active: HashSet::new(),
             stack: vec![],
             sources: vec![],
+            loaded: HashSet::new(),
         };
         load.file(&canonical, &canonical, directory, Span::default())?;
+        if scan_component
+            && canonical
+                .extension()
+                .is_some_and(|extension| extension == "ya")
+        {
+            // The entry stays last: children and scanned files come first.
+            let entry_module = load.sources.pop().expect("the entry was just loaded");
+            load.scan(directory)?;
+            load.sources.push(entry_module);
+        }
         Ok(load.sources)
     }
 }
@@ -434,8 +470,75 @@ struct Load<'a> {
     active: HashSet<PathBuf>,
     stack: Vec<PathBuf>,
     sources: Vec<ParsedModule>,
+    /// Canonical paths of every file already loaded, whether declared or scanned.
+    loaded: HashSet<PathBuf>,
 }
 impl Load<'_> {
+    /// Load every `.ya` file below `root` that is not loaded yet, in sorted path
+    /// order. Hidden entries are skipped, symlinked directories are not followed,
+    /// and a subdirectory holding `cyallo.toml` is a separate package and skipped. A `.ya` leaf symlink is rejected as for declared modules.
+    fn scan(&mut self, root: &Path) -> Result<(), ModuleLoadError> {
+        let mut found = Vec::new();
+        self.collect(root, &mut found)?;
+        for label in found {
+            let Some(candidate) = self.candidate(&label, Span::default())? else {
+                continue;
+            };
+            if self.loaded.contains(&candidate.canonical) {
+                continue;
+            }
+            // `x.ya` owns child directory `x/`; `mod.ya` owns its own directory.
+            let parent = label.parent().unwrap_or(root);
+            let directory = match label.file_stem() {
+                Some(stem) if stem != "mod" => parent.join(stem),
+                _ => parent.to_owned(),
+            };
+            self.file(
+                &candidate.label,
+                &candidate.canonical,
+                &directory,
+                Span::default(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn collect(&self, directory: &Path, found: &mut Vec<PathBuf>) -> Result<(), ModuleLoadError> {
+        let mut entries = io_at(
+            ModuleIoOperation::ReadDirectory,
+            directory,
+            Span::default(),
+            fs::read_dir(directory).and_then(|entries| entries.collect::<io::Result<Vec<_>>>()),
+        )?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let path = directory.join(&name);
+            let kind = io_at(
+                ModuleIoOperation::InspectCandidate,
+                &path,
+                Span::default(),
+                entry.file_type(),
+            )?;
+            let is_source = path.extension().is_some_and(|extension| extension == "ya");
+            if kind.is_dir() {
+                // A subdirectory with its own manifest is a separate package, not
+                // part of this component's tree.
+                if fs::symlink_metadata(path.join("cyallo.toml")).is_ok() {
+                    continue;
+                }
+                self.collect(&path, found)?;
+            } else if is_source {
+                // Symlinked or regular, `candidate` makes the final decision.
+                found.push(path);
+            }
+        }
+        Ok(())
+    }
+
     fn candidate(&self, label: &Path, span: Span) -> Result<Option<Candidate>, ModuleLoadError> {
         let parent = label.parent().unwrap_or(self.grant.root());
         let Some(directory) = self.grant.directory_for(parent, span)? else {
@@ -522,6 +625,11 @@ impl Load<'_> {
                 }
                 (Some(source), None) | (None, Some(source)) => source,
             };
+            if self.loaded.contains(&selected.canonical) {
+                // A scan or an earlier declaration already loaded it; the linker
+                // reports a second claim on the same source.
+                continue;
+            }
             self.file(
                 &selected.label,
                 &selected.canonical,
@@ -566,6 +674,7 @@ impl Load<'_> {
                 let syntax = unit.syntax();
                 self.declarations(directory, syntax, syntax.root())?;
             }
+            self.loaded.insert(canonical.to_owned());
             self.sources.push(ParsedModule {
                 path: label.display().to_string(),
                 file: Arc::new(file),
@@ -626,17 +735,102 @@ mod tests {
     }
 
     #[test]
-    fn reads_only_declared_files_and_returns_children_before_the_entry() {
+    fn declared_children_come_before_the_entry_and_other_extensions_are_not_read() {
         let temp = TempDir::new();
         let entry = temp.write("main.ya", "mod math;\n");
         let child = temp.write("math.ya", "pub const VALUE = 42\n");
-        fs::write(temp.0.join("ignored.ya"), [0xff]).unwrap();
+        fs::write(temp.0.join("ignored.yas"), [0xff]).unwrap();
         fs::write(temp.0.join("ignored.psc"), [0xff]).unwrap();
         let sources = load_path_checked(&entry).unwrap();
         assert_eq!(sources.len(), 2);
         assert_eq!(Path::new(&sources[0].path), child);
         assert_eq!(Path::new(&sources[1].path), entry);
         assert_eq!(sources[0].source, "pub const VALUE = 42\n");
+    }
+
+    fn component(entry: &Path) -> Result<Vec<SourceModule>, ModuleLoadError> {
+        let loader = ModuleLoader::for_entry(entry)?;
+        loader.load_component(entry, Jobs::SEQUENTIAL).map(|files| {
+            files
+                .into_iter()
+                .map(|module| SourceModule::new(module.path, module.file.source().text()))
+                .collect()
+        })
+    }
+
+    #[test]
+    fn a_module_entry_scans_its_component_and_keeps_itself_last() {
+        let temp = TempDir::new();
+        let entry = temp.write("main.ya", "proc main() {}\n");
+        let b = temp.write("b.ya", "pub const B = 2\n");
+        let a = temp.write("a.ya", "pub const A = 1\n");
+        let nested = temp.write("d/c.ya", "pub const C = 3\n");
+        let gate = temp.write("d/mod.ya", "");
+        temp.write(".hidden/skipped.ya", "not a module\n");
+        temp.write("notes.txt", "ignored");
+        let sources = component(&entry).unwrap();
+        let paths: Vec<_> = sources.iter().map(|s| PathBuf::from(&s.path)).collect();
+        // Sorted scan order, with the entry last.
+        assert_eq!(paths, [a, b, nested, gate, entry]);
+    }
+
+    #[test]
+    fn a_subdirectory_with_its_own_manifest_is_a_separate_package() {
+        let temp = TempDir::new();
+        // The root's own manifest does not exclude the root.
+        temp.write("cyallo.toml", "");
+        let entry = temp.write("main.ya", "proc main() {}\n");
+        let own = temp.write("own.ya", "pub const A = 1\n");
+        temp.write("plugins/cyallo.toml", "");
+        temp.write("plugins/main.ya", "this is not valid cyallo\n");
+        temp.write("plugins/deep/x.ya", "also not valid\n");
+        let kept = temp.write("lib/helper.ya", "pub const H = 2\n");
+        let sources = component(&entry).unwrap();
+        let paths: Vec<_> = sources.iter().map(|s| PathBuf::from(&s.path)).collect();
+        assert_eq!(paths, [kept, own, entry]);
+    }
+
+    #[test]
+    fn a_declared_file_is_loaded_once_even_if_the_scan_also_finds_it() {
+        let temp = TempDir::new();
+        let entry = temp.write("main.ya", "mod b;\nproc main() {}\n");
+        temp.write("b.ya", "pub const B = 2\n");
+        let sources = component(&entry).unwrap();
+        let count = sources.iter().filter(|s| s.path.ends_with("/b.ya")).count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn a_script_loads_declared_files_only() {
+        let temp = TempDir::new();
+        let entry = temp.write("main.yas", "mod math;\n");
+        temp.write("math.ya", "pub const VALUE = 1\n");
+        fs::write(temp.0.join("unrelated.ya"), [0xff]).unwrap();
+        let sources = component(&entry).unwrap();
+        assert_eq!(sources.len(), 2);
+        // Runtime imports never sweep a directory, even for a `.ya` entry.
+        let module_entry = temp.write("sub/main.ya", "mod x;\n");
+        temp.write("sub/x.ya", "");
+        fs::write(temp.0.join("sub/other.ya"), [0xff]).unwrap();
+        let loader = ModuleLoader::for_entry(&module_entry).unwrap();
+        assert_eq!(
+            loader
+                .load_parsed(&module_entry, Jobs::SEQUENTIAL)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn an_invalid_file_in_a_module_component_is_a_typed_failure() {
+        let temp = TempDir::new();
+        let entry = temp.write("main.ya", "proc main() {}\n");
+        temp.write("broken.ya", "proc broken( {\n");
+        assert!(matches!(
+            component(&entry),
+            Err(ModuleLoadError::Syntax { .. })
+        ));
     }
 
     #[test]

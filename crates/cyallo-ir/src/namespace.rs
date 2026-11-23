@@ -35,11 +35,24 @@ struct Symbol {
     public: bool,
     intrinsic: Option<Intrinsic>,
 }
+/// Where a module's contents come from, which decides how files beside it
+/// become child modules.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModuleSource {
+    /// A source file (the entry, `x.ya` or `x/mod.ya`). It gates its children:
+    /// an implicit child file is private unless this module re-exports it.
+    File,
+    /// A directory with no `mod.ya`: an open namespace whose children are public.
+    Namespace,
+    /// An inline `mod x { ... }`. Files are never scanned beside it.
+    Inline,
+}
 #[derive(Clone, Copy)]
 struct Placement {
     trust: SourceTrust,
     parent: Option<usize>,
     boundary: ModuleBoundary,
+    source: ModuleSource,
 }
 struct Node {
     interface: bool,
@@ -58,6 +71,14 @@ struct Local {
     writable: bool,
 }
 struct Resolver {
+    /// Indexed routine bodies not yet bound to their linked routine, by archived span.
+    indexed: HashMap<Span, crate::analysis::IndexedRoutineBody>,
+    /// Indexed bodies bound by the linker: MIR plus resolved call targets.
+    bound: HashMap<Box<str>, crate::analysis::IndexedRoutineBody>,
+    /// Linked symbols of plain `i64` functions a migrated body may call.
+    plain: HashMap<Box<str>, usize>,
+    /// Source-file mode: the entry runs `proc main()` and no top level may hold statements.
+    entry_mode: crate::EntryMode,
     aliases: HashMap<Box<str>, (usize, Type)>,
     source_names: std::collections::BTreeMap<Box<str>, Box<str>>,
     nodes: Vec<Node>,
@@ -94,6 +115,176 @@ fn error(message: impl Into<String>, span: Span) -> Diagnostic {
     Diagnostic::new("E140", message, span)
 }
 impl Resolver {
+    /// Files are modules: each unclaimed source below `dir` that no `mod` line
+    /// declared becomes a child. `x.ya` and `x/mod.ya` name module `x`; a
+    /// directory with no `mod.ya` is an empty open namespace. Children of a
+    /// file module are private (its gate); children of a namespace are public.
+    fn implicit_modules(
+        declared: &[ModuleDeclaration],
+        files: &[Option<Ast>],
+        paths: &[String],
+        dir: &Path,
+        gated: bool,
+    ) -> Result<(Vec<ModuleDeclaration>, std::collections::HashSet<Box<str>>)> {
+        // An inline `mod b { .. }` and a file for `b` would define it twice.
+        for declaration in declared.iter().filter(|d| d.body.is_some()) {
+            let name = declaration.name.as_ref();
+            let owns_file = [
+                dir.join(format!("{name}.ya")),
+                dir.join(name).join("mod.ya"),
+            ]
+            .iter()
+            .any(|candidate| {
+                paths
+                    .iter()
+                    .enumerate()
+                    .any(|(index, path)| files[index].is_some() && Path::new(path) == candidate)
+            });
+            if owns_file {
+                return Err(error(
+                    format!("module `{name}` is declared inline and also defined by a source file"),
+                    declaration.span,
+                ));
+            }
+        }
+        let mut children: std::collections::BTreeSet<String> = Default::default();
+        for (index, path) in paths.iter().enumerate() {
+            if files[index].is_none() {
+                continue;
+            }
+            let Ok(relative) = Path::new(path).strip_prefix(dir) else {
+                continue;
+            };
+            let mut parts = relative.components();
+            let (Some(first), rest) = (parts.next(), parts.as_path()) else {
+                continue;
+            };
+            let first = first.as_os_str().to_string_lossy();
+            let name = if rest.as_os_str().is_empty() {
+                match first.strip_suffix(".ya") {
+                    Some("mod") | None => continue,
+                    Some(name) => name,
+                }
+            } else {
+                first.as_ref()
+            };
+            if !declared.iter().any(|d| d.name.as_ref() == name) {
+                children.insert(name.to_owned());
+            }
+        }
+        for name in &children {
+            Self::reject_two_layouts(name, paths, dir, Span::default())?;
+        }
+        let mut namespaces = std::collections::HashSet::new();
+        let modules = children
+            .into_iter()
+            .map(|name| {
+                let child_dir = dir.join(&name);
+                let file_backed = paths.iter().enumerate().any(|(index, path)| {
+                    files[index].is_some()
+                        && (Path::new(path) == dir.join(format!("{name}.ya"))
+                            || Path::new(path) == child_dir.join("mod.ya"))
+                });
+                if !file_backed {
+                    namespaces.insert(Box::<str>::from(name.as_str()));
+                }
+                ModuleDeclaration {
+                    interface: false,
+                    boundary: ModuleBoundary::Lexical,
+                    annotations: Vec::new(),
+                    name: name.into(),
+                    public: !gated,
+                    // A directory without `mod.ya` is a namespace with no items.
+                    body: (!file_backed).then(|| Box::new(Ast::default())),
+                    span: Span::default(),
+                }
+            })
+            .collect();
+        Ok((modules, namespaces))
+    }
+    /// `x.ya` beside a directory `x/` of sources is ambiguous: a module is either
+    /// one file, or a directory with `x/mod.ya`.
+    fn reject_two_layouts(name: &str, paths: &[String], dir: &Path, span: Span) -> Result<()> {
+        let file = dir.join(format!("{name}.ya"));
+        let child_dir = dir.join(name);
+        let has_file = paths.iter().any(|path| Path::new(path) == file);
+        let has_directory = paths.iter().any(|path| {
+            let path = Path::new(path);
+            path.starts_with(&child_dir) && path.extension().is_some_and(|e| e == "ya")
+        });
+        if has_file && has_directory {
+            return Err(error(
+                format!(
+                    "module `{name}` is defined by both `{name}.ya` and the directory `{name}/`; \
+                     use `{name}/mod.ya`"
+                ),
+                span,
+            ));
+        }
+        Ok(())
+    }
+    /// Linked symbols of source functions with a plain `i64` contract.
+    fn plain_functions(&self) -> HashMap<Box<str>, usize> {
+        let mut plain = HashMap::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            for f in &node.ast.functions {
+                if f.origin == RoutineOrigin::Source
+                    && f.body_kind == FunctionBodyKind::Source
+                    && !f.generator
+                    && f.type_params.is_empty()
+                    && f.annotations.is_empty()
+                    && crate::analysis::plain_contract(f.kind, &f.params, &f.result, f.params.len())
+                    && let Ok(target) = self.symbol(index, &f.name, Kind::Value, f.span)
+                {
+                    plain.insert(target, f.params.len());
+                }
+            }
+        }
+        plain
+    }
+
+    /// Resolve an indexed body's call sites against the module namespace, with no
+    /// owned tree. `Err(body)` gives the body back when a site is not a plain call
+    /// (a local, an intrinsic, a unit variant, an unresolved name or another
+    /// contract); the caller then links the body as a tree, and reports its errors.
+    fn bind_indexed(
+        &self,
+        module: usize,
+        function: &Function,
+        body: crate::analysis::IndexedRoutineBody,
+    ) -> Result<
+        std::result::Result<
+            crate::analysis::IndexedRoutineBody,
+            crate::analysis::IndexedRoutineBody,
+        >,
+    > {
+        let sites: Vec<_> = body
+            .reference_sites()
+            .map(|(path, arguments, span)| (Box::<str>::from(path), arguments, span))
+            .collect();
+        let mut targets = Vec::with_capacity(sites.len());
+        for (path, arguments, span) in sites {
+            if function.params.iter().any(|param| param.name == path) {
+                return Ok(Err(body));
+            }
+            let Some(symbol) = self.path(module, &path, Some(Kind::Value)) else {
+                return Ok(Err(body));
+            };
+            self.check_import(module, &symbol, span)?;
+            if symbol.intrinsic.is_some()
+                || self.unit_variants.contains(&symbol.id)
+                || self.plain.get(&symbol.target) != Some(&arguments)
+            {
+                return Ok(Err(body));
+            }
+            targets.push(symbol.target);
+        }
+        Ok(Ok(if targets.is_empty() {
+            body
+        } else {
+            body.with_targets(targets)
+        }))
+    }
     fn declaration_id(&mut self) -> DeclarationId {
         let id = DeclarationId(self.next_declaration);
         self.next_declaration += 1;
@@ -117,7 +308,19 @@ impl Resolver {
         }
         let index = self.nodes.len();
         let id = self.declaration_id();
-        let declarations = std::mem::take(&mut ast.modules);
+        let mut declarations = std::mem::take(&mut ast.modules);
+        let mut namespaces = std::collections::HashSet::new();
+        if trust != SourceTrust::Core && placement.source != ModuleSource::Inline {
+            let (implicit, empty) = Self::implicit_modules(
+                &declarations,
+                files,
+                paths,
+                dir,
+                placement.source == ModuleSource::File,
+            )?;
+            declarations.extend(implicit);
+            namespaces = empty;
+        }
         let package = if placement.boundary == ModuleBoundary::Package {
             index
         } else {
@@ -139,9 +342,17 @@ impl Resolver {
         for declaration in declarations {
             let child_path = format!("{path}::{}", declaration.name);
             let child_dir = dir.join(declaration.name.as_ref());
+            let mut source = ModuleSource::Inline;
             let body = if let Some(body) = declaration.body {
+                if namespaces.contains(&declaration.name) {
+                    source = ModuleSource::Namespace;
+                }
                 *body
             } else {
+                source = ModuleSource::File;
+                if trust != SourceTrust::Core {
+                    Self::reject_two_layouts(&declaration.name, paths, dir, declaration.span)?;
+                }
                 let candidates = [
                     dir.join(format!("{}.ya", declaration.name)),
                     child_dir.join("mod.ya"),
@@ -180,6 +391,7 @@ impl Resolver {
                     trust,
                     parent: Some(index),
                     boundary: declaration.boundary,
+                    source,
                 },
             )?;
             if semantic == Some(InternalSemantic::Prelude) && self.prelude.replace(child).is_some()
@@ -1678,7 +1890,10 @@ impl Resolver {
                     )) {
                         continue;
                     }
-                    if import.public && !symbol.public {
+                    // A module may publish its own child module: the file gate opens
+                    // with `pub use b`, as `pub mod b` would in Rust.
+                    let own_child = symbol.kind == Kind::Module && symbol.owner == *module;
+                    if import.public && !symbol.public && !own_child {
                         return Err(error(
                             "cannot publicly reexport a private declaration",
                             import.span,
@@ -1691,6 +1906,14 @@ impl Resolver {
                         .iter_mut()
                         .find(|existing| existing.kind == symbol.kind)
                     {
+                        if own_child && existing.target == symbol.target {
+                            if import.public && !existing.public {
+                                existing.public = true;
+                                changed = true;
+                            }
+                            previous.push(ordinal);
+                            continue;
+                        }
                         if existing.target != symbol.target
                             || (!import.glob
                                 && (previous.is_empty()
@@ -2541,6 +2764,7 @@ impl Resolver {
                 linked.native.functions.push(declaration);
             }
         }
+        self.plain = self.plain_functions();
         for index in 0..self.nodes.len() {
             self.next_binding = 0;
             let mut ast = std::mem::take(&mut self.nodes[index].ast);
@@ -2562,6 +2786,18 @@ impl Resolver {
             }
             for f in &mut ast.functions {
                 f.name = self.symbol(index, &f.name, Kind::Value, f.span)?;
+                if f.origin == RoutineOrigin::Source
+                    && let Some(body) = self.indexed.remove(&f.span)
+                {
+                    match self.bind_indexed(index, f, body)? {
+                        Ok(bound) => {
+                            self.bound.insert(f.name.clone(), bound);
+                        }
+                        // The indexed pipeline cannot take this routine: link its
+                        // owned body so the existing resolver reports or resolves it.
+                        Err(body) => f.body = body.materialize_owned()?,
+                    }
+                }
                 self.function(index, f, &[], &[])?;
             }
             for t in &mut ast.traits {
@@ -2717,7 +2953,17 @@ impl Resolver {
                 }
                 _ => true,
             });
-            if index != entry
+            let strict = self.entry_mode == crate::EntryMode::Main;
+            if strict {
+                // An immutable `let` at the top level is a compile-time constant.
+                for statement in &mut ast.body {
+                    if let StmtKind::Binding(_, _, constant @ false, false, _) = &mut statement.kind
+                    {
+                        *constant = true;
+                    }
+                }
+            }
+            if (index != entry || strict)
                 && ast.body.iter().any(|s| {
                     !matches!(
                         s.kind,
@@ -2726,9 +2972,39 @@ impl Resolver {
                 })
             {
                 return Err(error(
-                    "module initialization requires constants or an explicit procedure",
+                    if strict {
+                        "top level allows declarations, `const` and immutable `let`; \
+                         put statements in `proc main()`"
+                    } else {
+                        "module initialization requires constants or an explicit procedure"
+                    },
                     ast.body[0].span,
                 ));
+            }
+            if strict && index == entry {
+                // The entry file's program is its `proc main()`.
+                let main_span = ast
+                    .functions
+                    .iter()
+                    .find(|f| {
+                        cyallo_ast::source_name(&f.name) == "main"
+                            && f.kind == RoutineKind::Procedure
+                            && f.params.is_empty()
+                            && f.result == Type::Void
+                    })
+                    .map(|f| f.span);
+                match main_span {
+                    Some(span) => ast.body.push(Stmt {
+                        kind: StmtKind::Call("main".into(), Vec::new()),
+                        span,
+                    }),
+                    None => {
+                        return Err(error(
+                            "the entry file must declare `proc main()`",
+                            ast.body.first().map_or(Span::default(), |s| s.span),
+                        ));
+                    }
+                }
             }
             self.block(index, &mut ast.body, &mut Vec::new(), &[], true)?;
             ast.functions.append(&mut associated[index]);
@@ -2876,6 +3152,14 @@ impl Resolver {
                 requesters: self.requesting_modules,
             });
         }
+        // Every indexed body was left out of the owned tree, so each must be bound
+        // to a linked routine or materialized. An unbound one would lose its body.
+        if !self.indexed.is_empty() {
+            return Err(error(
+                "internal error: an indexed routine body has no linked routine",
+                Span::default(),
+            ));
+        }
         let graph = ResolvedProgram {
             interface,
             interface_declarations,
@@ -2886,6 +3170,7 @@ impl Resolver {
             native: linked.native,
             source_names: linked.source_names,
             exports: linked.resolved_modules,
+            indexed_bodies: std::mem::take(&mut self.bound),
         };
         graph
             .constant_order()
@@ -2912,6 +3197,24 @@ pub fn link(asts: Vec<Ast>, paths: &[String], entry: usize) -> Result<ResolvedPr
         &crate::import_policy::ImportPolicy::default(),
     )
 }
+/// Link a single source set with indexed routine bodies, as the compiler does.
+pub fn link_with_indexed_bodies(
+    asts: Vec<Ast>,
+    paths: &[String],
+    entry: usize,
+    indexed: Vec<crate::analysis::IndexedRoutineBody>,
+) -> Result<ResolvedProgram> {
+    link_program(
+        asts,
+        paths,
+        entry,
+        &crate::import_policy::ImportPolicy::default(),
+        &crate::core_package::CorePackage::embedded(),
+        0,
+        crate::EntryMode::Script,
+        indexed,
+    )
+}
 pub fn link_with_policy(
     asts: Vec<Ast>,
     paths: &[String],
@@ -2935,6 +3238,28 @@ pub fn link_with_core(
     package: &crate::core_package::CorePackage<'_>,
     core_offset: u32,
 ) -> Result<ResolvedProgram> {
+    link_program(
+        asts,
+        paths,
+        entry,
+        policy,
+        package,
+        core_offset,
+        crate::EntryMode::Script,
+        Vec::new(),
+    )
+}
+/// Link with an explicit entry mode. `EntryMode::Main` is for source files.
+pub fn link_program(
+    asts: Vec<Ast>,
+    paths: &[String],
+    entry: usize,
+    policy: &crate::import_policy::ImportPolicy,
+    package: &crate::core_package::CorePackage<'_>,
+    core_offset: u32,
+    mode: crate::EntryMode,
+    indexed: Vec<crate::analysis::IndexedRoutineBody>,
+) -> Result<ResolvedProgram> {
     let _resolve = cyallo_startup_profile::stage(cyallo_startup_profile::Stage::Resolve);
     let mut files: Vec<_> = asts.into_iter().map(Some).collect();
     let root = files[entry]
@@ -2942,6 +3267,13 @@ pub fn link_with_core(
         .ok_or_else(|| error("missing entry module", Span::default()))?;
     let dir = Path::new(&paths[entry]).parent().unwrap_or(Path::new(""));
     let mut resolver = Resolver {
+        entry_mode: mode,
+        indexed: indexed
+            .into_iter()
+            .map(|body| (body.archived_span(), body))
+            .collect(),
+        bound: HashMap::new(),
+        plain: HashMap::new(),
         aliases: HashMap::new(),
         source_names: Default::default(),
         nodes: Vec::new(),
@@ -2988,6 +3320,7 @@ pub fn link_with_core(
             trust: SourceTrust::Core,
             parent: None,
             boundary: ModuleBoundary::Package,
+            source: ModuleSource::File,
         },
     )?;
     resolver.packages.insert(core_name, core);
@@ -3005,6 +3338,7 @@ pub fn link_with_core(
             trust: SourceTrust::User,
             parent: None,
             boundary: ModuleBoundary::Package,
+            source: ModuleSource::File,
         },
     )?;
     resolver.packages.insert("crate".into(), user);

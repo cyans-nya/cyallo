@@ -46,8 +46,8 @@ Cranelift now accesses scalar slots directly through a stable VM view, emits che
 ## Sized algorithm workloads
 
 Recorded 2026-11-10 with `cargo bench --bench engines -- <filter>`. Sources are
-generated from `examples/quicksort.ya`, `examples/mergesort.ya`,
-`examples/fib.ya`, and `examples/knapsack.ya` by replacing their size
+generated from `examples/quicksort.yas`, `examples/mergesort.yas`,
+`examples/fib.yas`, and `examples/knapsack.yas` by replacing their size
 constants. Small/medium/large cases execute 50, 10, and 3 fresh sessions per
 sample with seven samples per cell; the scalar rows above retain 100 sessions
 and 21 samples. The benchmark budget is 100,000,000 bytecode instructions so

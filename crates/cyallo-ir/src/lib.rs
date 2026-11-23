@@ -31,7 +31,7 @@ pub mod standard;
 
 pub use cyallo_compile_jobs::Jobs;
 pub mod options;
-pub use options::{CompileOptions, Dialect};
+pub use options::{CompileOptions, Dialect, EntryMode};
 pub mod admission;
 pub mod analysis;
 pub mod composites;

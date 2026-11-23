@@ -119,7 +119,7 @@ fn end_of_input_and_bad_lines_are_typed_failures() {
 
 #[test]
 fn cyallo_reads_through_a_loan_and_parses() {
-    let program = compile(include_str!("../examples/secret-number.ya")).unwrap();
+    let program = compile(include_str!("../examples/secret-number.yas")).unwrap();
     let (lines, status) = run(&program, &["50", "abc", "10", "42"], 1000);
     assert!(matches!(status, ExecutionStatus::Returned(None)));
     assert_eq!(

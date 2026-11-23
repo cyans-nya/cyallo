@@ -345,6 +345,12 @@ impl IndexedAst {
         Ast::thaw(&self.root, self)
     }
 
+    /// Materialize the declaration headers while letting a consumer retain
+    /// selected root routine bodies in its own representation.
+    pub fn to_source_tree_with_bodies(&self, include_body: &impl Fn(Span) -> bool) -> Ast {
+        declarations::thaw_module(self.root, self, include_body)
+    }
+
     fn node<T: Table>(&self, id: Id<T>) -> &T {
         self.get(id).expect("syntax node belongs to this unit")
     }

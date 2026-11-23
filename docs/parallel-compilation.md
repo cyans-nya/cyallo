@@ -7,8 +7,8 @@ and explicit budgets are capped at 128. Tiny stages execute serially to avoid
 thread startup overhead.
 
 ```sh
-cargo run -- check examples/lookup-services/main.ya --jobs 4
-cargo run -- bytecode examples/lookup-services/main.ya --jobs 1
+cargo run -- check examples/lookup-services/main.yas --jobs 4
+cargo run -- bytecode examples/lookup-services/main.yas --jobs 1
 ```
 
 | Stage | Current scheduling |

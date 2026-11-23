@@ -35,7 +35,7 @@ fn ng_jit_enters_the_hot_loop_in_winch() {
     if NativeTarget::host().is_none() {
         return;
     }
-    let program = Arc::new(compile(include_str!("../examples/hot-loop.ya")).unwrap());
+    let program = Arc::new(compile(include_str!("../examples/hot-loop.yas")).unwrap());
     let sum_to = program
         .functions()
         .iter()
@@ -67,7 +67,7 @@ fn ng_jit_enters_the_hot_loop_in_winch() {
 
 #[test]
 fn ng_jit_falls_back_for_unlinked_recursive_word_code() {
-    let program = Arc::new(compile(include_str!("../examples/fib.ya")).unwrap());
+    let program = Arc::new(compile(include_str!("../examples/fib.yas")).unwrap());
     let mut tiered = cyallo::vm::start_jit(program, &Default::default()).unwrap();
     assert!(matches!(tiered.dispatch(), Dispatch::Interpreter(_)));
 }
@@ -648,8 +648,8 @@ proc entry(n: i64) -> i64 {
 #[test]
 fn managed_roots_counts_and_allocator_finalizers_survive_every_handoff() {
     for source in [
-        include_str!("../examples/managed.ya"),
-        include_str!("../examples/rc-ownership.ya"),
+        include_str!("../examples/managed.yas"),
+        include_str!("../examples/rc-ownership.yas"),
     ] {
         check_module(
             VerifiedModule::lower(&compile(source).unwrap(), 0).unwrap(),
@@ -682,7 +682,7 @@ proc entry(n: i64) -> i64 {
 
 #[test]
 fn trait_dispatched_calls_share_the_heap_with_native_sections() {
-    let program = compile(include_str!("../examples/traits.ya")).unwrap();
+    let program = compile(include_str!("../examples/traits.yas")).unwrap();
     check_module(VerifiedModule::lower(&program, 0).unwrap(), &[vec![]]);
 }
 

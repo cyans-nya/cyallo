@@ -1,0 +1,33 @@
+// Concrete method calls and shared, erased trait objects.
+// Run: cargo run -- run examples/traits.yas
+trait Counter {
+    proc current(self: &Self) -> i64
+    proc add(self: &mut Self, amount: i64)
+}
+
+record Tally {
+    value: i64
+}
+
+impl Counter for Tally {
+    proc current(self: &Self) -> i64 {
+        return self.value
+    }
+
+    proc add(self: &mut Self, amount: i64) {
+        self.value += amount
+    }
+}
+
+// The concrete receiver makes these direct method calls.
+let mut tally = Tally { value: 2 }
+tally.add(3)
+std::io::print("direct: ", tally.current())
+
+// Conversion creates an owned copy of the record. Copies of the resulting
+// trait-object handle share that object's state.
+let mut erased = std::mem::clone(&tally) as dyn Counter
+let alias = std::mem::clone(&erased)
+erased.add(4)
+std::io::print("shared: ", alias.current())
+std::io::print("original: ", tally.current())

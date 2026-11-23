@@ -65,7 +65,7 @@ fn initializer(source: &str) -> Expr {
 #[test]
 fn postfix_dereference_composes_with_references_managed_owners_and_cells() {
     parity(
-        include_str!("../examples/postfix-dereference.ya"),
+        include_str!("../examples/postfix-dereference.yas"),
         "21\n12\n7\n",
     );
 }

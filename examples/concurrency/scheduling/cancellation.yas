@@ -1,0 +1,14 @@
+// Run: cargo run -- run examples/concurrency/scheduling/cancellation.yas
+// Expected: true, true, 99 (one result per line).
+use std::task::spawn
+use std::io::print
+
+let endpoints = std::channel::bounded<i64>(0 as usize)
+let sender = endpoints.0.clone()
+let receiver = endpoints.1.clone()
+std::mem::drop(endpoints)
+let worker = spawn(proc() -> i64 { return receiver.recv().unwrap() })
+worker.cancel()
+print(worker.join().is_cancelled())
+print(sender.is_closed())
+print(sender.send(99).unwrap_err().into_value())

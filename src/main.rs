@@ -379,6 +379,7 @@ fn main() -> color_eyre::Result<()> {
                 _ => Dialect::Modern,
             });
     let options = cyallo::CompileOptions {
+        entry: cyallo::EntryMode::Script,
         convenience_builtins: cli.convenience_builtins,
         jobs: cli.jobs,
         dialect: match dialect {
@@ -459,17 +460,27 @@ fn main() -> color_eyre::Result<()> {
         let loaded = cyallo::module_loader::ModuleLoader::for_entry(file)
             .and_then(|loader| {
                 loader
-                    .load_parsed(file, cyallo::Jobs(options.jobs))
+                    .load_component(file, cyallo::Jobs(options.jobs))
                     .map(|sources| (loader, sources))
             })
             .map_err(cyallo::module_loader::module_load_diagnostic);
         match loaded {
             Ok((loader, sources)) => {
                 (text, source_ranges) = cyallo::modules::parsed_source_context(&sources);
+                // `.yas` is a script and `.ya` is a module file: the extension picks
+                // the mode, and neither falls back to the other.
+                let file_options = cyallo::CompileOptions {
+                    entry: if file.extension().is_some_and(|extension| extension == "yas") {
+                        cyallo::EntryMode::Script
+                    } else {
+                        cyallo::EntryMode::Main
+                    },
+                    ..options
+                };
                 cyallo::modules::compile_parsed_modules(
                     sources.len() - 1,
                     &sources,
-                    options,
+                    file_options,
                     deferred,
                 )
                 .map(|program| program.with_module_loader(loader))
@@ -564,8 +575,10 @@ fn main() -> color_eyre::Result<()> {
                     cyallo::vm::start_jit(program.clone(), &context)
                         .map(|tiered| run_ng_jit(tiered, &render))
                 } else {
-                    cyallo::vm::Session::with_context(program.clone(), context)
-                        .map(|session| run_verified(session, &render))
+                    let result = cyallo::vm::Session::with_context(program.clone(), context)
+                        .map(|session| run_verified(session, &render));
+                    cyallo_startup_profile::finish();
+                    result
                 };
                 match run {
                     Ok(result) => {
@@ -641,11 +654,15 @@ fn run_verified(
     let mut written = 0;
     loop {
         session.run(VERIFIED_SLICE);
-        if session.context.output.len() > written {
+        let output_pending = session.context.output.len() > written;
+        if output_pending {
             print!("{}", &session.context.output[written..]);
             written = session.context.output.len();
         }
         io::stdout().flush()?;
+        if output_pending {
+            cyallo_startup_profile::mark_first_output();
+        }
         match session.status() {
             Status::Paused | Status::Waiting => {}
             Status::WaitingForInput => match read_input_line()? {

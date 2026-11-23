@@ -45,7 +45,7 @@ pub use compiler::{
 };
 pub use cyallo_ast::{Diagnostic, SourceFile, Span, Type};
 pub use cyallo_compile_jobs::Jobs;
-pub use cyallo_ir::{core_package, import_policy};
+pub use cyallo_ir::{EntryMode, core_package, import_policy};
 pub use runtime::{Context, Session, Status, Value};
 pub mod modules;
 pub use cyallo_ir::services;

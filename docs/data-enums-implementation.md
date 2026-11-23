@@ -45,7 +45,7 @@ fixes, verification and the resume point. The target is the
   dispatch, closure captures and dynamic round-trips retain enum identity.
 - Heap-independent enum payload transport through tasks/channels. Local managed
   values and borrows remain rejected, including inside structural payloads. See
-  [the concurrency example](../examples/concurrency/enums.ya).
+  [the concurrency example](../examples/concurrency/enums.yas).
 
 ## Standard Option and Result
 

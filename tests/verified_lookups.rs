@@ -112,7 +112,7 @@ fn a_negative_index_is_a_typed_failure() {
 
 #[test]
 fn the_directory_example_follows_updates() {
-    let (lines, status) = run(include_str!("../examples/lookups.ya"), true);
+    let (lines, status) = run(include_str!("../examples/lookups.yas"), true);
     assert!(
         matches!(status, ExecutionStatus::Returned(None)),
         "{status:?}"

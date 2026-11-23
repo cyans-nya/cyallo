@@ -62,21 +62,21 @@ fn parity(source: &str, expected: &str) {
 #[test]
 fn lazy_capturing_factory_yields_and_completes() {
     parity(
-        include_str!("../examples/concurrency/generators/sequence.ya"),
+        include_str!("../examples/concurrency/generators/sequence.yas"),
         "10\n11\n12\ncomplete: 3\n",
     );
 }
 #[test]
 fn typed_result_resume_input_is_an_ordinary_value() {
     parity(
-        include_str!("../examples/concurrency/generators/resume-result.ya"),
+        include_str!("../examples/concurrency/generators/resume-result.yas"),
         "request\ncomplete: 42\nrequest\nerror: unavailable\ncomplete: -1\n",
     );
 }
 #[test]
 fn pure_factory_and_owned_delegation_forward_input_and_return() {
     parity(
-        include_str!("../examples/concurrency/generators/delegation.ya"),
+        include_str!("../examples/concurrency/generators/delegation.yas"),
         "yielded: 7\ncomplete: 42\n",
     );
 }
@@ -168,7 +168,7 @@ std::io::print(expired.is_none())
 fn a_session_can_migrate_with_parked_generator_and_host_roots() {
     let program = Arc::new(
         compile(include_str!(
-            "../examples/concurrency/generators/sequence.ya"
+            "../examples/concurrency/generators/sequence.yas"
         ))
         .unwrap(),
     );

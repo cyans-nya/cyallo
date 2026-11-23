@@ -28,7 +28,7 @@ impl std::hash::Hasher for Fingerprint {
         u64::from_le_bytes(digest[..8].try_into().expect("a digest has 32 bytes"))
     }
 }
-fn fingerprint(value: &impl std::hash::Hash) -> crate::sdk::Digest {
+pub(crate) fn fingerprint(value: &impl std::hash::Hash) -> crate::sdk::Digest {
     let mut state = Fingerprint(<sha2::Sha256 as sha2::Digest>::new());
     value.hash(&mut state);
     crate::sdk::Digest(sha2::Digest::finalize(state.0).into())
@@ -369,9 +369,21 @@ pub(crate) fn keys(
                     })
                     .collect::<Vec<_>>()
             });
+            let indexed_bodies: Vec<_> = ast
+                .functions
+                .iter()
+                .filter_map(|function| {
+                    graph
+                        .indexed_bodies
+                        .get(&function.name)
+                        .map(|body| (&function.name, body.digest()))
+                })
+                .collect();
+            let indexed_digest = (!indexed_bodies.is_empty()).then(|| fingerprint(&indexed_bodies));
+            let source = normalized(ast, &graph.source_files);
             ModuleKey {
                 path: module.path.clone(),
-                source: normalized(ast, &graph.source_files),
+                source: indexed_digest.map_or(source, |digest| fingerprint(&(source, digest))),
                 dependencies,
                 native,
                 permissions: fingerprint(&permissions),

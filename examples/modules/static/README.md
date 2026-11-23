@@ -3,9 +3,9 @@
 Run from the repository root:
 
 ```sh
-cargo run -- check examples/modules/static/main.ya --jobs 4
-cargo run -- run examples/modules/static/main.ya --gc-stress
-cargo run -- run examples/modules/static/main.ya --engine cranelift_speed --gc-stress
+cargo run -- check examples/modules/static/main.yas --jobs 4
+cargo run -- run examples/modules/static/main.yas --gc-stress
+cargo run -- run examples/modules/static/main.yas --engine cranelift_speed --gc-stress
 ```
 
 Output: `42:retained`.

@@ -1,0 +1,13 @@
+// cargo run -- run examples/postfix-dereference.yas --gc-stress
+// Expected: 21, 12, 7 (one value per line).
+let mut number = 6
+let view = &mut number
+view.* += 1
+std::io::print(view.* * 3)
+
+let pair = (gc Cell::new(10), rc 7)
+pair.0.*.* = 12
+std::io::print(pair.0.*.*)
+
+fn read(value: &rc i64) -> i64 { return value.*.* }
+std::io::print(read(&pair.1))

@@ -66,7 +66,7 @@ std::io::print(kept.load())
 #[test]
 fn the_locations_example_runs_under_gc_stress() {
     assert_eq!(
-        run(include_str!("../examples/locations.ya"), true),
+        run(include_str!("../examples/locations.yas"), true),
         ["snapshot: 2", "field: 5", "first: updated", "other: second"]
     );
 }

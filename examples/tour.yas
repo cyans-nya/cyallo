@@ -1,0 +1,26 @@
+// A short tour. Run: cargo run -- run examples/tour.yas
+const limit = 6
+let mut total = 0
+let names = ["  Ada  ", "Grace", "Linus"]
+
+fn square(n: i64) -> i64 {
+    return n * n
+}
+
+proc announce(message: &string) {
+    std::io::print(std::string::upper(std::string::trim(message.*)))
+}
+
+// `0..=limit` includes both bounds; `0..limit` would stop before `limit`.
+// Continue skips 2; break stops before adding 5.
+for i in 0..=limit {
+    if i == 2 { continue }
+    if i == 5 { break }
+    total += square(i)
+}
+
+announce(&names[0])
+std::io::print("squares: ", total)
+// `1..5` excludes 5, exactly as it would in a `for` loop.
+std::io::print("range sum: ", std::array::sum(std::collections::Vec::from(1..5)))
+std::io::print("names: ", std::array::len(names))

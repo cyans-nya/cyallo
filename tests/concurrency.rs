@@ -81,21 +81,21 @@ fn parity(source: &str, expected: &str) {
 #[test]
 fn buffered_channels_keep_typed_errors_and_unsent_values() {
     parity(
-        include_str!("../examples/concurrency/channels/buffered.ya"),
+        include_str!("../examples/concurrency/channels/buffered.yas"),
         "true\n42\ntrue\n99\n",
     );
 }
 #[test]
 fn rendezvous_and_task_join_park_on_one_processor() {
     parity(
-        include_str!("../examples/concurrency/channels/rendezvous.ya"),
+        include_str!("../examples/concurrency/channels/rendezvous.yas"),
         "42\n7\n",
     );
 }
 #[test]
 fn clock_waits_resume_through_every_engine() {
     parity(
-        include_str!("../examples/concurrency/scheduling/clock.ya"),
+        include_str!("../examples/concurrency/scheduling/clock.yas"),
         "before\nafter\n",
     );
 }
@@ -198,7 +198,7 @@ fn declaration_aliases_and_user_spellings_keep_their_identity() {
 #[test]
 fn enum_payloads_cross_sessions_without_heap_cell_indices() {
     parity(
-        include_str!("../examples/concurrency/enums.ya"),
+        include_str!("../examples/concurrency/enums.yas"),
         "42:worker\nfinished\n",
     );
     for source in [
@@ -240,7 +240,7 @@ std::io::print(match result { ReceiveError::Closed => "closed", ReceiveError::Em
 #[test]
 fn standard_status_enum_example_executes() {
     parity(
-        include_str!("../examples/concurrency/status-enums.ya"),
+        include_str!("../examples/concurrency/status-enums.yas"),
         "7\ncomplete: finished\nrecovered: second\nempty\nclosed\n",
     );
 }

@@ -1,0 +1,581 @@
+//! HIR, MIR and AIR for the first executable slice of modern routine lowering.
+mod air;
+mod hir;
+mod mir;
+
+use super::{Result, Signature, collect, ir, key, routine_function};
+use cyallo_ast::{
+    Expr, ExprKind, Function, Literal, ParameterArity, ParameterPassing, RoutineKind, Span, Stmt,
+    StmtKind, Type,
+};
+use cyallo_parser::BodyHandle;
+use ir::{Op, Reg, Slot};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
+
+/// A parameter or local slot: parameters first, then locals in declaration order.
+#[derive(Clone, Copy, Debug, Hash)]
+struct Variable(usize);
+
+/// The scalar types a local may be annotated with in the migrated subset.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum ScalarType {
+    Integer,
+    Boolean,
+}
+
+impl ScalarType {
+    fn ty(self) -> Type {
+        match self {
+            Self::Integer => Type::Integer,
+            Self::Boolean => Type::Boolean,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash)]
+enum Scalar {
+    Integer(i64),
+    Boolean(bool),
+}
+
+/// File-relative control flow retained by the module graph in place of an
+/// owned AST body. Archive placement is applied when producing diagnostics or IR.
+#[derive(Clone, Debug)]
+pub struct IndexedRoutineBody {
+    mir: Arc<mir::Body>,
+    file_span: Span,
+    archived_span: Span,
+    offset: u32,
+    digest: crate::sdk::Digest,
+    /// Linked callee symbol for each reference site, in site order. Present once
+    /// the owned body has been dropped in favor of this overlay.
+    overlay: Option<Arc<[Box<str>]>>,
+    /// The body's syntax, kept so the linker can materialize it as a fallback.
+    handle: BodyHandle,
+}
+
+impl IndexedRoutineBody {
+    pub fn prepare(handle: &BodyHandle, offset: u32) -> Result<Option<Self>> {
+        let function = handle.function();
+        let Some(hir) = hir::from_indexed(handle.unit().syntax(), function) else {
+            return Ok(None);
+        };
+        let mir = mir::lower(&hir, function.span);
+        Ok(Some(Self {
+            digest: crate::module_cache::fingerprint(&mir),
+            mir: Arc::new(mir),
+            file_span: function.span,
+            archived_span: shift(function.span, offset)?,
+            offset,
+            overlay: None,
+            handle: handle.clone(),
+        }))
+    }
+
+    /// Reference sites in source order as `(path, argument count, archived span)`.
+    pub(crate) fn reference_sites(&self) -> impl Iterator<Item = (&str, usize, Span)> {
+        self.mir.sites.iter().map(|site| {
+            let span = shift(site.span, self.offset).unwrap_or(site.span);
+            (&*site.path, site.arguments, span)
+        })
+    }
+
+    /// Attach the linker's resolved callee symbol for each site, in site order.
+    /// The overlay is part of the digest, so a retargeted call changes cache keys.
+    pub(crate) fn with_targets(mut self, targets: Vec<Box<str>>) -> Self {
+        debug_assert_eq!(targets.len(), self.mir.sites.len());
+        self.digest = crate::module_cache::fingerprint(&(self.digest, &targets));
+        self.overlay = Some(targets.into());
+        self
+    }
+
+    /// The owned statements with archive-placed spans, for a routine the indexed
+    /// pipeline cannot take and the linker must resolve as a tree.
+    pub(crate) fn materialize_owned(&self) -> Result<Vec<Stmt>> {
+        let mut tree = cyallo_ast::Ast {
+            body: self.handle.materialize_body(),
+            ..Default::default()
+        };
+        if self.offset != 0 {
+            cyallo_ast::spans::shift_ast(&mut tree, self.offset)?;
+        }
+        Ok(tree.body)
+    }
+
+    pub fn archived_span(&self) -> Span {
+        self.archived_span
+    }
+
+    pub(crate) fn digest(&self) -> crate::sdk::Digest {
+        self.digest
+    }
+
+    pub(super) fn estimate(&self) -> crate::admission::Estimate {
+        crate::admission::Estimate {
+            nodes: self
+                .mir
+                .blocks
+                .iter()
+                .map(|block| block.operations.len())
+                .sum(),
+            // Direct-call edges come from the overlay, as they do from an owned body.
+            calls: self
+                .overlay
+                .iter()
+                .flat_map(|o| o.iter().cloned())
+                .collect(),
+            shape: ir::RoutineShape {
+                calls: !self.mir.sites.is_empty(),
+                loops: self.mir.blocks.iter().enumerate().any(|(index, block)| {
+                    matches!(block.exit.kind, mir::Exit::Jump(target) if target.0 <= index)
+                }),
+            },
+        }
+    }
+
+    /// `Ok(None)` leaves the routine to the existing route: a reference site
+    /// that does not bind to a plain `i64` function contract is unsupported.
+    pub(super) fn emit(
+        &self,
+        function: &Function,
+        source_names: &BTreeMap<Box<str>, Box<str>>,
+        signatures: &HashMap<String, Signature>,
+    ) -> Result<Option<ir::Function>> {
+        let Some(callees) = self.bind_callees(function, signatures)? else {
+            return Ok(None);
+        };
+        lower_mir(
+            &self.mir,
+            self.file_span,
+            self.offset,
+            function,
+            source_names,
+            &callees,
+        )
+        .map(Some)
+    }
+
+    /// Bind each reference site to a callee contract. The overlay is read from
+    /// the linker's resolved call targets, keyed by archive-placed site span.
+    /// The MIR itself stays independent of every imported declaration.
+    fn bind_callees(
+        &self,
+        function: &Function,
+        signatures: &HashMap<String, Signature>,
+    ) -> Result<Option<Vec<air::Callee>>> {
+        if self.mir.sites.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let mut targets = HashMap::new();
+        if self.overlay.is_none() {
+            call_targets(&function.body, &mut targets);
+        }
+        let mut callees = Vec::with_capacity(self.mir.sites.len());
+        for (index, site) in self.mir.sites.iter().enumerate() {
+            let target = match &self.overlay {
+                Some(overlay) => overlay.get(index).map(|target| &**target),
+                None => targets.get(&shift(site.span, self.offset)?).copied(),
+            };
+            let Some(signature) = target.and_then(|target| signatures.get(&key(target))) else {
+                return Ok(None);
+            };
+            if !plain_contract(
+                signature.kind,
+                &signature.params,
+                &signature.result,
+                site.arguments,
+            ) {
+                return Ok(None);
+            }
+            callees.push(air::Callee {
+                id: signature.id,
+                parameters: signature.params.iter().map(|p| p.ty.clone()).collect(),
+                result: signature.result.clone(),
+            });
+        }
+        Ok(Some(callees))
+    }
+}
+
+/// A callee the first slice can call: a function over by-value `i64` parameters
+/// returning `i64`, called with exactly its parameter count.
+pub(crate) fn plain_contract(
+    kind: RoutineKind,
+    parameters: &[cyallo_ast::Param],
+    result: &Type,
+    arguments: usize,
+) -> bool {
+    kind == RoutineKind::Function
+        && *result == Type::Integer
+        && parameters.len() == arguments
+        && parameters.iter().all(|parameter| {
+            parameter.ty == Type::Integer
+                && parameter.arity == ParameterArity::One
+                && parameter.passing == ParameterPassing::Value
+                && !parameter.by_ref
+                && !parameter.receiver
+        })
+}
+
+fn call_targets<'a>(statements: &'a [Stmt], targets: &mut HashMap<Span, &'a str>) {
+    for statement in statements {
+        match &statement.kind {
+            StmtKind::If(condition, yes, no) => {
+                call_expression_targets(condition, targets);
+                call_targets(yes, targets);
+                call_targets(no, targets);
+            }
+            StmtKind::Return(value) => call_expression_targets(value, targets),
+            _ => {}
+        }
+    }
+}
+
+fn call_expression_targets<'a>(expression: &'a Expr, targets: &mut HashMap<Span, &'a str>) {
+    match &expression.kind {
+        ExprKind::Call(target, arguments) => {
+            targets.insert(expression.span, target);
+            for argument in arguments {
+                call_expression_targets(argument, targets);
+            }
+        }
+        ExprKind::Parenthesized(inner) => call_expression_targets(inner, targets),
+        ExprKind::Binary(_, left, right) => {
+            call_expression_targets(left, targets);
+            call_expression_targets(right, targets);
+        }
+        _ => {}
+    }
+}
+
+fn shift(span: Span, offset: u32) -> Result<Span> {
+    cyallo_ast::spans::shift_span_checked(span, offset)
+        .map_err(cyallo_ast::spans::invalid_span_shift)
+}
+
+fn lower_mir(
+    mir: &mir::Body,
+    file_span: Span,
+    offset: u32,
+    function: &Function,
+    source_names: &BTreeMap<Box<str>, Box<str>>,
+    callees: &[air::Callee],
+) -> Result<ir::Function> {
+    let mut locals = collect(&[], &function.params)?;
+    for local in &mut locals {
+        if let Some(name) = source_names.get(&local.name) {
+            local.display_name = Some(name.clone());
+        }
+    }
+    let air = match air::analyze(mir, &function.params, &function.result, callees, file_span) {
+        Ok(body) => body,
+        Err(mut error) => {
+            cyallo_ast::spans::shift_diagnostic(&mut error, offset)?;
+            return Err(error);
+        }
+    };
+    for (info, ty) in mir.locals.iter().zip(&air.locals) {
+        locals.push(ir::Local {
+            display_name: Some(info.name.clone()),
+            name: info.name.clone(),
+            ty: ty.clone(),
+            constant: info.constant,
+            span: shift(info.span, offset)?,
+        });
+    }
+    let output = routine_function(function, locals, true);
+    let mut emitted = emit(air, output);
+    if offset != 0 {
+        for instruction in &mut emitted.code {
+            instruction.span = shift(instruction.span, offset)?;
+        }
+    }
+    cyallo_startup_profile::count(cyallo_startup_profile::Counter::BodiesEmittedFromAir, 1);
+    Ok(emitted)
+}
+
+fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
+    // The adapter expands a parameter read into Address and Load. Explicit
+    // fallthrough blocks consume no logical instruction.
+    let mut starts = Vec::with_capacity(checked.blocks.len());
+    let mut pc = 0;
+    for block in &checked.blocks {
+        starts.push(pc);
+        pc += block
+            .operations
+            .iter()
+            .map(|operation| match operation.kind {
+                air::Operation::ReadVariable(..) | air::Operation::Store(..) => 2,
+                _ => 1,
+            })
+            .sum::<usize>();
+        if !matches!(block.exit.kind, mir::Exit::Next(_)) {
+            pc += 1;
+        }
+    }
+    function.code.reserve(pc);
+    let mut registers = Vec::with_capacity(checked.types.len());
+    for block in checked.blocks {
+        for mir::Located { kind, span } in block.operations {
+            let operation = match kind {
+                air::Operation::Statement => Op::Statement,
+                air::Operation::Constant(value, scalar) => {
+                    let literal = match scalar {
+                        Scalar::Integer(value) => Literal::Integer(value),
+                        Scalar::Boolean(value) => Literal::Boolean(value),
+                    };
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers.push(dst);
+                    Op::Literal(dst, literal)
+                }
+                air::Operation::Store(variable, value) => {
+                    let ty = &checked.types[value.0];
+                    let address = register(&mut function, ty);
+                    push(
+                        &mut function,
+                        Op::Address(
+                            address,
+                            Slot {
+                                global: false,
+                                index: variable.0,
+                            },
+                        ),
+                        span,
+                    );
+                    Op::Store(address, registers[value.0])
+                }
+                air::Operation::ReadVariable(value, parameter) => {
+                    let ty = &checked.types[value.0];
+                    let address = register(&mut function, ty);
+                    push(
+                        &mut function,
+                        Op::Address(
+                            address,
+                            Slot {
+                                global: false,
+                                index: parameter.0,
+                            },
+                        ),
+                        span,
+                    );
+                    let dst = register(&mut function, ty);
+                    registers.push(dst);
+                    Op::Load(dst, address)
+                }
+                air::Operation::Call(value, target, range) => {
+                    let arguments = checked.operands[range.start..range.start + range.len]
+                        .iter()
+                        .map(|argument| registers[argument.0])
+                        .collect();
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers.push(dst);
+                    Op::Call(Some(dst), target, arguments)
+                }
+                air::Operation::Binary(value, operator, left, right) => {
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers.push(dst);
+                    Op::Binary(dst, operator, registers[left.0], registers[right.0])
+                }
+            };
+            push(&mut function, operation, span);
+        }
+        let operation = match block.exit.kind {
+            mir::Exit::Branch {
+                condition, yes, no, ..
+            } => Op::Branch(registers[condition.0], starts[yes.0], starts[no.0]),
+            mir::Exit::Jump(target) => Op::Jump(starts[target.0]),
+            mir::Exit::Next(_) => continue,
+            mir::Exit::Return { value, .. } => Op::Return(Some(registers[value.0])),
+            mir::Exit::End => Op::Return(None),
+        };
+        push(&mut function, operation, block.exit.span);
+    }
+    debug_assert_eq!(function.code.len(), pc);
+    function
+}
+
+fn register(function: &mut ir::Function, ty: &Type) -> Reg {
+    let index = function.registers.len();
+    function.registers.push(ty.clone());
+    index
+}
+
+fn push(function: &mut ir::Function, op: Op, span: Span) {
+    function.code.push(ir::Instruction { op, span });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prepare(source: &str) -> (Function, IndexedRoutineBody) {
+        let file =
+            cyallo_parser::parse_modern_snapshot(source.into(), false, crate::Jobs(1)).unwrap();
+        let handle = file
+            .units()
+            .iter()
+            .flat_map(|unit| unit.bodies())
+            .next()
+            .unwrap();
+        let body = IndexedRoutineBody::prepare(&handle, 0)
+            .unwrap()
+            .expect("scalar routine is selected");
+        let header = file
+            .to_source_tree_with_bodies(&|_| false)
+            .functions
+            .remove(0);
+        (header, body)
+    }
+
+    #[test]
+    fn indexed_routine_produces_explicit_blocks_and_checked_values() {
+        let source = include_str!("../../../../examples/routine-ir.yas");
+        let (function, prepared) = prepare(source);
+        let mir = &prepared.mir;
+        let mir::Exit::Branch { yes, no, .. } = mir.blocks[0].exit.kind else {
+            panic!("the condition terminates the entry block");
+        };
+        assert!(matches!(
+            mir.blocks[yes.0].exit.kind,
+            mir::Exit::Return { .. }
+        ));
+        assert!(matches!(
+            mir.blocks[no.0].exit.kind,
+            mir::Exit::Return { .. }
+        ));
+        let locals = collect(&[], &function.params).unwrap();
+        let body =
+            air::analyze(mir, &function.params, &function.result, &[], function.span).unwrap();
+        assert!(matches!(
+            body.types.as_slice(),
+            [Type::Integer, Type::Integer, Type::Boolean, ..]
+        ));
+        let emitted = emit(body, routine_function(&function, locals, true));
+        for instruction in &emitted.code {
+            if let Op::Branch(_, yes, no) = instruction.op {
+                assert!(matches!(emitted.code[yes].op, Op::Statement));
+                assert!(matches!(emitted.code[no].op, Op::Statement));
+            }
+        }
+    }
+
+    #[test]
+    fn selected_routine_reports_type_errors_at_source_expressions() {
+        for (source, diagnostic_span) in [
+            (
+                "fn wrong(n: i64) -> i64 { if n { return 1 }\nreturn 0 }",
+                "n",
+            ),
+            ("fn wrong(n: i64) -> i64 { return (n > 0) }", "(n > 0)"),
+            ("fn wrong(n: i64) -> i64 { return n + true }", "n + true"),
+        ] {
+            let (function, body) = prepare(source);
+            let diagnostic = body
+                .emit(&function, &BTreeMap::new(), &HashMap::new())
+                .unwrap_err();
+            assert_eq!(diagnostic.span.source_text(source), diagnostic_span);
+            assert!(matches!(diagnostic.code, "E109" | "E105"));
+        }
+    }
+
+    /// Parse `source`, prepare MIR for body `index`, and materialize every body
+    /// so call targets are visible to the overlay.
+    fn prepare_nth(source: &str, index: usize) -> (Vec<Function>, IndexedRoutineBody) {
+        let file =
+            cyallo_parser::parse_modern_snapshot(source.into(), false, crate::Jobs(1)).unwrap();
+        let handle = file
+            .units()
+            .iter()
+            .flat_map(|unit| unit.bodies())
+            .nth(index)
+            .unwrap();
+        let body = IndexedRoutineBody::prepare(&handle, 0).unwrap().unwrap();
+        (file.to_source_tree_with_bodies(&|_| true).functions, body)
+    }
+
+    fn signature(function: &Function, id: usize) -> Signature {
+        Signature {
+            kind: function.kind,
+            params: function.params.clone(),
+            result: function.result.clone(),
+            id,
+        }
+    }
+
+    #[test]
+    fn direct_calls_keep_sites_in_mir_and_bind_through_the_overlay() {
+        let source = "fn bump(n: i64) -> i64 { return n + 1 }\nfn twice(n: i64) -> i64 { return bump(bump(n)) }";
+        let (functions, body) = prepare_nth(source, 1);
+        // Two sites in source order; MIR holds no resolved target.
+        assert_eq!(body.mir.sites.len(), 2);
+        assert!(body.mir.sites.iter().all(|site| &*site.path == "bump"));
+        let signatures = HashMap::from([("bump".to_owned(), signature(&functions[0], 7))]);
+        let emitted = body
+            .emit(&functions[1], &BTreeMap::new(), &signatures)
+            .unwrap()
+            .expect("a plain i64 callee is bound");
+        let calls: Vec<_> = emitted
+            .code
+            .iter()
+            .filter_map(|instruction| match &instruction.op {
+                Op::Call(Some(_), target, arguments) => Some((*target, arguments.len())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, [(7, 1), (7, 1)]);
+        // The inner call's result feeds the outer call's only argument.
+        let results: Vec<_> = emitted
+            .code
+            .iter()
+            .filter_map(|instruction| match &instruction.op {
+                Op::Call(Some(result), _, arguments) => Some((*result, arguments[0])),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results[0].0, results[1].1);
+    }
+
+    #[test]
+    fn unbound_or_mismatched_callees_leave_the_routine_to_the_existing_route() {
+        let source = "fn bump(n: i64) -> i64 { return n + 1 }\nfn twice(n: i64) -> i64 { return bump(n, n) }";
+        let (functions, body) = prepare_nth(source, 1);
+        let signatures = HashMap::from([("bump".to_owned(), signature(&functions[0], 0))]);
+        let emitted = body.emit(&functions[1], &BTreeMap::new(), &signatures);
+        assert!(emitted.unwrap().is_none(), "arity mismatch is unsupported");
+        let emitted = body.emit(&functions[1], &BTreeMap::new(), &HashMap::new());
+        assert!(emitted.unwrap().is_none(), "unbound site is unsupported");
+    }
+
+    #[test]
+    fn mir_is_independent_of_the_callee_declaration() {
+        let call = "fn twice(n: i64) -> i64 { return bump(n) }";
+        let (_, first) = prepare_nth(
+            &format!("fn bump(n: i64) -> i64 {{ return n + 1 }}\n{call}"),
+            1,
+        );
+        let (_, second) = prepare_nth(
+            &format!("fn bump(n: u64) -> u64 {{ return n * 9 }}\n{call}"),
+            1,
+        );
+        assert_eq!(first.digest(), second.digest());
+    }
+
+    #[test]
+    fn reachable_fallthrough_requires_a_return() {
+        let (complete, body) =
+            prepare("fn choose(n: i64) -> i64 { if n > 1 { return n }\nreturn 1 }");
+        assert!(
+            body.emit(&complete, &BTreeMap::new(), &HashMap::new())
+                .is_ok()
+        );
+        let (incomplete, body) = prepare("fn choose(n: i64) -> i64 { if n > 1 { return n } }");
+        let diagnostic = body
+            .emit(&incomplete, &BTreeMap::new(), &HashMap::new())
+            .unwrap_err();
+        assert_eq!(diagnostic.code, "E103");
+        assert_eq!(diagnostic.span, incomplete.span);
+    }
+}

@@ -54,13 +54,19 @@ pub(crate) fn specialize_calls(
             continue;
         }
         let core = plan.core.view();
-        let mut linked = crate::namespace::link_with_core(
-            plan.trees.materialize(plan.entry).map_err(E::CallCheck)?,
+        let (trees, indexed_bodies) = plan
+            .trees
+            .materialize_with_indexed(plan.entry, plan.options.dialect == crate::Dialect::Modern)
+            .map_err(E::CallCheck)?;
+        let mut linked = crate::namespace::link_program(
+            trees,
             &plan.paths,
             plan.entry,
             &plan.policy,
             &core,
             plan.core_base,
+            crate::EntryMode::Script,
+            indexed_bodies,
         )
         .map_err(E::CallCheck)?;
         linked.source_files = plan.source_files.clone();

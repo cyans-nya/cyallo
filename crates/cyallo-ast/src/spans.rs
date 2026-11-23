@@ -48,7 +48,7 @@ pub fn invalid_span_shift(error: SpanShiftError) -> Diagnostic {
     Diagnostic::new("E175", error.to_string(), span)
 }
 
-fn shifted(span: Span, offset: u32) -> Result<Span, SpanShiftError> {
+pub fn shift_span_checked(span: Span, offset: u32) -> Result<Span, SpanShiftError> {
     if span.start > span.end {
         return Err(SpanShiftError::InvalidRange { span });
     }
@@ -74,9 +74,11 @@ fn shifted(span: Span, offset: u32) -> Result<Span, SpanShiftError> {
 /// Relocates the AST transactionally. Validation visits every coordinate before
 /// any is changed, so overflow leaves the caller's AST unchanged.
 pub fn shift_ast_checked(ast: &mut Ast, offset: u32) -> Result<(), SpanShiftError> {
-    walk_ast(ast, &mut |span| shifted(*span, offset).map(|_| ()))?;
     walk_ast(ast, &mut |span| {
-        *span = shifted(*span, offset)?;
+        shift_span_checked(*span, offset).map(|_| ())
+    })?;
+    walk_ast(ast, &mut |span| {
+        *span = shift_span_checked(*span, offset)?;
         Ok(())
     })
 }
@@ -99,10 +101,12 @@ pub fn visit_spans(ast: &mut Ast, mut visit: impl FnMut(&mut Span)) {
 
 /// Relocates primary and related diagnostic spans; leaves all unchanged on error.
 pub fn shift_diagnostic(diagnostic: &mut Diagnostic, offset: u32) -> Result<(), Diagnostic> {
-    walk_diagnostic(diagnostic, &mut |span| shifted(*span, offset).map(|_| ()))
-        .map_err(invalid_span_shift)?;
     walk_diagnostic(diagnostic, &mut |span| {
-        *span = shifted(*span, offset)?;
+        shift_span_checked(*span, offset).map(|_| ())
+    })
+    .map_err(invalid_span_shift)?;
+    walk_diagnostic(diagnostic, &mut |span| {
+        *span = shift_span_checked(*span, offset)?;
         Ok(())
     })
     .map_err(invalid_span_shift)

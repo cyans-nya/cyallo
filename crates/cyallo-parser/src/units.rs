@@ -208,9 +208,17 @@ impl ParsedFile {
 
     /// Materialize the ordered, file-relative tree at the legacy resolver boundary.
     pub fn to_source_tree(&self) -> Ast {
+        self.to_source_tree_with_bodies(&|_| true)
+    }
+
+    /// Apply a file-relative body selection to every root parse unit.
+    pub fn to_source_tree_with_bodies(&self, include_body: &impl Fn(Span) -> bool) -> Ast {
         let mut tree = Ast::default();
         for unit in &self.units {
-            append_unit(&mut tree, unit.syntax.to_source_tree());
+            append_unit(
+                &mut tree,
+                unit.syntax.to_source_tree_with_bodies(include_body),
+            );
         }
         tree
     }
@@ -276,6 +284,11 @@ impl BodyHandle {
             .syntax
             .get(self.id)
             .expect("function belongs to this unit")
+    }
+
+    /// The owned statements of this body, with file-relative spans.
+    pub fn materialize_body(&self) -> Vec<cyallo_ast::Stmt> {
+        self.unit.syntax.thaw_body(self.id)
     }
 }
 
@@ -413,10 +426,10 @@ mod tests {
     #[test]
     fn indexed_snapshots_round_trip_declarations_and_executable_syntax() {
         for source in [
-            include_str!("../../../examples/sdk/worlds.ya"),
-            include_str!("../../../examples/composites.ya"),
-            include_str!("../../../examples/enums/patterns.ya"),
-            include_str!("../../../examples/concurrency/generators/delegation.ya"),
+            include_str!("../../../examples/sdk/worlds.yas"),
+            include_str!("../../../examples/composites.yas"),
+            include_str!("../../../examples/enums/patterns.yas"),
+            include_str!("../../../examples/concurrency/generators/delegation.yas"),
             "mod external;\nmod empty {}\npub world W { import empty {}; import external; }\n",
         ] {
             let index = index_modern(source).unwrap();

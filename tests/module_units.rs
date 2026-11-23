@@ -325,7 +325,7 @@ fn checked_module_example_runs_in_all_engines_with_budget_handoffs() {
         ),
         module(
             "main.ya",
-            include_str!("../examples/modules/static/main.ya"),
+            include_str!("../examples/modules/static/main.yas"),
         ),
     ];
     for deferred in [false, true] {

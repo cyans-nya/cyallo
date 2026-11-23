@@ -148,13 +148,16 @@ fn compile_modern_snapshot(
     let core_archive = core
         .append_to(&mut archive)
         .map_err(cyallo_ir::core_package::invalid_core_source)?;
-    let mut ast = crate::namespace::link_with_core(
-        trees.materialize(0)?,
+    let (linker_trees, indexed_bodies) = trees.materialize_with_indexed(0, true)?;
+    let mut ast = crate::namespace::link_program(
+        linker_trees,
         &["main.ya".into()],
         0,
         policy,
         core,
         core_archive.base,
+        options.entry,
+        indexed_bodies,
     )?;
     ast.source_files = std::iter::once(cyallo_ir::module_graph::SourceFile {
         id: cyallo_ir::module_graph::SourceFileId {

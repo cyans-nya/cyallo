@@ -1,0 +1,10 @@
+fn choose(value: i64) -> i64 {
+    if value > 10 {
+        return value * 2
+    } else {
+        return value + 3
+    }
+}
+
+std::io::print(choose(12))
+std::io::print(choose(10))

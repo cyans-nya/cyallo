@@ -15,14 +15,14 @@ language-level generators. Task, channel, and managed transport integration is
 still in progress.
 
 ```sh
-cargo run -- run examples/tour.ya
-cargo run -- run examples/osr-loop.ya --jit-trace=summary
+cargo run -- run examples/tour.yas
+cargo run -- run examples/osr-loop.yas --jit-trace=summary
 cargo run -- repl
-cargo run -- pretty examples/modern.ya --color always
-cargo run -- debug examples/modern.ya
+cargo run -- pretty examples/modern.yas --color always
+cargo run -- debug examples/modern.yas
 cargo run -- check examples/loops.psc
-cargo run -- bytecode examples/modern.ya
-cargo run -- bytecode examples/modern.ya --wasm 1
+cargo run -- bytecode examples/modern.yas
+cargo run -- bytecode examples/modern.yas --wasm 1
 ```
 
 Start with the [example guide](examples/README.md) for a reading order, run commands,
@@ -173,7 +173,7 @@ Scalar/control instructions are 16-byte words with explicit register IDs, branch
 
 **Current engines (2026-11-20).** The **next-generation verified pipeline** lowers typed IR to verified register bytecode (`src/bytecode/verified`). `run`, `repl` and `debug` default to its resumable interpreter (`--engine ng` for `run` and `repl`). Both `ng` and `ng_jit` report a diagnostic for programs they cannot lower, including programs that use characters, 32-bit numbers, or the simplified dialect's sparse arrays. See [overhaul stages](docs/overhaul-stages.md), [native tiers: next steps](docs/native-tiers-next-steps.md) and the [legacy removal plan](docs/legacy-removal-plan.md).
 
-`cyallo run examples/hot-loop.ya --engine ng_jit` compiles eligible verified routines before execution. It tries Winch first and low-latency Cranelift when Winch cannot emit a routine. Shared-runtime native code can hand off work to the verified interpreter. If the entry point cannot be published, the whole invocation runs on the verified interpreter. Reports and inspection using `--jit-*` require a legacy engine.
+`cyallo run examples/hot-loop.yas --engine ng_jit` compiles eligible verified routines before execution. It tries Winch first and low-latency Cranelift when Winch cannot emit a routine. Shared-runtime native code can hand off work to the verified interpreter. If the entry point cannot be published, the whole invocation runs on the verified interpreter. Reports and inspection using `--jit-*` require a legacy engine.
 
 The rest of this section describes the **legacy engines** (`--engine legacy_jit|legacy_interpreter|legacy_cranelift|legacy_cranelift_speed`, `--jit-*` reports and `cyallo trace`). A dedicated **`cyallo-codegen-N` worker pool** performs native compilation. The default worker count is `min(3, logical CPUs - 1)`, with one worker on single-core/unknown hosts. A Kanal-backed priority scheduler coalesces requests and retains the highest desired tier even while another job is queued or running. Hot upgrades take priority; aging gives older requests a turn. Code is installed on the execution thread at safepoints.
 
@@ -232,15 +232,15 @@ JIT reports are selected with `--jit-trace`:
 
 ```sh
 cargo build --release
-./target/release/cyallo run examples/osr-loop.ya --engine legacy_jit --jit-trace=summary
-./target/release/cyallo run examples/hot-loop.ya --engine legacy_cranelift_speed --jit-trace=summary
-./target/release/cyallo run examples/osr-loop.ya --engine legacy_jit --jit-trace
+./target/release/cyallo run examples/osr-loop.yas --engine legacy_jit --jit-trace=summary
+./target/release/cyallo run examples/hot-loop.yas --engine legacy_cranelift_speed --jit-trace=summary
+./target/release/cyallo run examples/osr-loop.yas --engine legacy_jit --jit-trace
 ```
 
 Trace files drive an interactive timeline viewer:
 
 ```sh
-./target/release/cyallo run examples/mergesort.ya --engine legacy_jit --jit-trace --jit-trace-format=json --jit-trace-out trace.json
+./target/release/cyallo run examples/mergesort.yas --engine legacy_jit --jit-trace --jit-trace-format=json --jit-trace-out trace.json
 ./target/release/cyallo trace trace.json
 ```
 
@@ -304,7 +304,7 @@ current limits count cells rather than all bytes. See [GC progress](docs/gc-plan
 and [measurements](docs/gc-benchmarks.md).
 
 ```sh
-cyallo run examples/gc-cells.ya --gc --jit-trace=summary
+cyallo run examples/gc-cells.yas --gc --jit-trace=summary
 cyallo repl --gc-stress
 cargo bench --bench gc
 ```

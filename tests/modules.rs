@@ -21,7 +21,7 @@ fn filesystem_dialects_stay_separate() {
     let directory =
         Sources(std::env::temp_dir().join(format!("caie-dialects-{}-{nonce}", std::process::id())));
     std::fs::create_dir_all(directory.0.join("lib")).unwrap();
-    let entry = directory.0.join("main.ya");
+    let entry = directory.0.join("main.yas");
     std::fs::write(
         &entry,
         "mod math;\nuse crate::math::ANSWER\nstd::io::print(ANSWER)\n",
@@ -82,7 +82,7 @@ fn filesystem_dialects_stay_separate() {
 #[test]
 fn reachable_modules_constants_and_import_aliases() {
     let sources = [
-        module("unused.ya", "std::io::print(\"must not run\")\n"),
+        module("unused.ya", "pub const UNUSED = 1\n"),
         module("b.ya", "pub const BASE = 4\n"),
         module("a.ya", "use crate::b::BASE\npub const ANSWER = BASE + 3\n"),
         module(
@@ -95,6 +95,17 @@ fn reachable_modules_constants_and_import_aliases() {
     s.run(1000);
     assert_eq!(s.status(), &Status::Finished);
     assert_eq!(s.context.output, "7\n");
+}
+#[test]
+fn every_file_is_a_module_so_an_unreferenced_file_is_still_checked() {
+    // Files are modules: no `mod` line is needed, so a file with a top-level
+    // statement is rejected even when nothing imports it.
+    let sources = [
+        module("unused.ya", "std::io::print(\"must not run\")\n"),
+        module("main.ya", "std::io::print(1)\n"),
+    ];
+    let error = compile_modules(1, &sources, Default::default(), false).unwrap_err();
+    assert_eq!(error.code, "E140");
 }
 #[test]
 fn imported_constants_evaluate_pure_routines() {
@@ -220,7 +231,7 @@ fn service_modules_run_from_cli() {
         let result = std::process::Command::new(env!("CARGO_BIN_EXE_cyallo"))
             .args([
                 "run",
-                "examples/services/main.ya",
+                "examples/services/main.yas",
                 "--engine",
                 engine,
                 "--gc-stress",

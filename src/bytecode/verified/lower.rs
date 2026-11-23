@@ -25,6 +25,7 @@ use cyallo_ir::{
     lookup::{Operation, ResumeInput},
     services::Metadata,
 };
+use cyallo_startup_profile::{Counter, Stage, count, stage};
 use std::{collections::HashMap, fmt, sync::Arc};
 
 #[derive(Debug)]
@@ -208,6 +209,7 @@ impl VerifiedModule {
         extra_roots: &[usize],
         every_main_variable: bool,
     ) -> Result<Self, LowerError> {
+        let _module_lower = stage(Stage::VerifiedModuleLower);
         let entry = FunctionId(0);
         let mut pending_roots = extra_roots.iter().copied();
         let mut ids = HashMap::from([(routine, entry)]);
@@ -269,6 +271,7 @@ impl VerifiedModule {
                         Ok(CallTarget::Direct(next))
                     },
                 )?);
+                count(Counter::VerifiedBodiesLowered, 1);
             }
             // The extra roots come after everything the entry reaches.
             let Some(root) = pending_roots.next() else {
@@ -1016,6 +1019,7 @@ fn lower_function(
     param_access: &dyn Fn(usize, usize) -> Option<LoanAccess>,
     mut call_target: impl FnMut(usize) -> Result<CallTarget, LowerError>,
 ) -> Result<FunctionImage, LowerError> {
+    let _body_lower = stage(Stage::VerifiedBodyLower);
     let signature_error = || LowerError::UnsupportedSignature { routine };
     if function.params.iter().any(|&by_ref| by_ref) {
         return Err(signature_error());

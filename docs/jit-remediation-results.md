@@ -165,9 +165,9 @@ cargo bench --bench engines -- modern --matched
 cargo bench --bench engines -- hot-loop --matched
 cargo bench --bench engines -- codegen-size --matched
 hyperfine --warmup 5 --runs 40 \
-  './target/release/cyallo run examples/modern.ya --engine jit' \
-  './target/release/cyallo run examples/modern.ya --engine cranelift' \
-  './target/release/cyallo run examples/modern.ya --engine cranelift_speed'
+  './target/release/cyallo run examples/modern.yas --engine jit' \
+  './target/release/cyallo run examples/modern.yas --engine cranelift' \
+  './target/release/cyallo run examples/modern.yas --engine cranelift_speed'
 ```
 
 Raw traces and benchmark outputs remain in `/tmp/caie-remediation-*` on this

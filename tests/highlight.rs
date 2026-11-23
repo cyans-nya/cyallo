@@ -180,9 +180,9 @@ fn modern_coloring_is_lossless_for_real_sources_and_partial_input() {
         "\tuse std::io;\r\nlet mut n = 123u16 // 水\r\n",
         "fn unfinished<T>(value: &'a mut T) ->",
         "let text = \"\\\" // use mut\"; let ch = '\\n'",
-        include_str!("../examples/tour.ya"),
-        include_str!("../examples/modern.ya"),
-        include_str!("../examples/concurrency/generators/delegation.ya"),
+        include_str!("../examples/tour.yas"),
+        include_str!("../examples/modern.yas"),
+        include_str!("../examples/concurrency/generators/delegation.yas"),
         include_str!("../std.ya"),
     ] {
         let colored = cyallo::highlight::highlight(source, true).unwrap();
@@ -223,7 +223,7 @@ fn modern_contextual_keywords_do_not_leak_into_compatibility() {
 
 #[test]
 fn pretty_cli_colors_modern_keywords_and_preserves_source_in_every_mode() {
-    let file = "examples/concurrency/generators/delegation.ya";
+    let file = "examples/concurrency/generators/delegation.yas";
     let source = std::fs::read_to_string(file).unwrap();
     for mode in ["always", "auto", "never"] {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_cyallo"))

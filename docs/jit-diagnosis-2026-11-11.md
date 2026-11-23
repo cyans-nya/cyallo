@@ -35,11 +35,11 @@ Reproduction:
 
 ```sh
 hyperfine --warmup 5 --runs 40 \
-  './target/release/cyallo run examples/modern.ya --engine interpreter' \
-  './target/release/cyallo run examples/modern.ya --engine jit' \
-  './target/release/cyallo run examples/modern.ya --engine cranelift' \
-  './target/release/cyallo run examples/modern.ya --engine cranelift_speed' \
-  './target/release/cyallo run examples/modern.ya --engine jit --jit-trace=summary'
+  './target/release/cyallo run examples/modern.yas --engine interpreter' \
+  './target/release/cyallo run examples/modern.yas --engine jit' \
+  './target/release/cyallo run examples/modern.yas --engine cranelift' \
+  './target/release/cyallo run examples/modern.yas --engine cranelift_speed' \
+  './target/release/cyallo run examples/modern.yas --engine jit --jit-trace=summary'
 ```
 
 **Confirmed bug: native execution can miss the fast-tier threshold.**

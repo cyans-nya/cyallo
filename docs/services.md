@@ -4,8 +4,8 @@ The language supports Rust-style module paths and imports, extension properties,
 traits with erased dispatch, and typed service contexts. Run the complete example:
 
 ```sh
-cargo run -- run examples/services/main.ya --gc-stress --jit-trace=summary
-cargo run -- check examples/services/main.ya
+cargo run -- run examples/services/main.yas --gc-stress --jit-trace=summary
+cargo run -- check examples/services/main.yas
 ```
 
 It prints `first: ready`, `first: cleanup`, `second: ready`, then `false`.
