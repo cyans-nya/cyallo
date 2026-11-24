@@ -90,6 +90,10 @@ struct Resolver {
     bound_traits: HashMap<Box<str>, crate::generics::Bound>,
     /// The traits the program declares (without type parameters), by linked name.
     user_traits: std::collections::HashSet<Box<str>>,
+    /// The native members each type declares, by the type's linked name.
+    member_names: HashMap<String, std::collections::HashSet<Box<str>>>,
+    /// The names of every method any declared trait has.
+    trait_method_names: std::collections::HashSet<Box<str>>,
     /// Enums with type parameters, by linked name: the parameters and the variants'
     /// payload types, which mention them.
     generic_enums: HashMap<Box<str>, (Vec<Box<str>>, Vec<Option<Type>>)>,
@@ -110,6 +114,9 @@ struct Resolver {
     associated_functions: Vec<(usize, NativeFunctionDeclaration)>,
     permissions: Option<crate::import_policy::ResolvedPolicy>,
     requesting_modules: std::collections::BTreeMap<u32, DeclarationId>,
+    /// Calls bound over indexed syntax never pass through `expr`, so the module of each
+    /// native member call is recorded as it is bound.
+    bound_requesters: std::sync::Mutex<Vec<(u32, DeclarationId)>>,
     opaque: std::collections::HashSet<DeclarationId>,
     /// Declared type-parameter count of each provider-bound opaque host type.
     opaque_arity: HashMap<DeclarationId, usize>,
@@ -324,6 +331,51 @@ impl Resolver {
         table
     }
 
+    /// The native members each type declares through an inherent `impl`, by the type's
+    /// linked name, and the method names of every trait: a call to a trait's method on a
+    /// type is not a native member call.
+    fn member_table(
+        &self,
+    ) -> (
+        HashMap<String, std::collections::HashSet<Box<str>>>,
+        std::collections::HashSet<Box<str>>,
+    ) {
+        let mut members: HashMap<String, std::collections::HashSet<Box<str>>> = HashMap::new();
+        let mut traits = std::collections::HashSet::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            for declaration in &node.ast.traits {
+                for method in &declaration.methods {
+                    traits.insert(method.name.clone());
+                }
+            }
+            for implementation in &node.ast.inherent_implementations {
+                let owner = match &implementation.receiver {
+                    Type::Named(name) | Type::Applied(name, _) => self
+                        .path(index, name, Some(Kind::Type))
+                        .map(|symbol| symbol.target.to_string()),
+                    _ => None,
+                };
+                let Some(owner) = owner else {
+                    continue;
+                };
+                for method in &implementation.methods {
+                    if method
+                        .function
+                        .params
+                        .first()
+                        .is_some_and(|parameter| parameter.receiver)
+                    {
+                        members
+                            .entry(owner.clone())
+                            .or_default()
+                            .insert(method.function.name.clone());
+                    }
+                }
+            }
+        }
+        (members, traits)
+    }
+
     /// The traits declared in source, which a generic routine may use as a bound.
     fn user_trait_table(&self) -> std::collections::HashSet<Box<str>> {
         let mut table = std::collections::HashSet::new();
@@ -517,6 +569,27 @@ impl Resolver {
     /// Whether a routine's parameters and result are all types the pipeline lowers, with
     /// every parameter passed by value and no reference as a result.
     fn pipeline_signature(&self, module: usize, f: &Function) -> bool {
+        self.signature_with(module, f, false)
+    }
+
+    /// Whether the routine's parameters are the standard `Option` or `Result` (in the storage
+    /// form the linker resolves them to), which the routine may hold and call members of,
+    /// but not match, build or pass on to a callee.
+    fn storage_parameters(&self, module: usize, f: &Function) -> bool {
+        f.params.iter().any(|parameter| {
+            self.resolved_with(module, &parameter.ty, parameter.span, &f.type_params)
+                .is_some_and(|ty| {
+                    matches!(
+                        ty.pointee_or_self(),
+                        Type::Storage(StorageKind::Option | StorageKind::Result, _)
+                    )
+                })
+        })
+    }
+
+    /// As `pipeline_signature`; with `storage`, a parameter may be a standard `Option` or
+    /// `Result` of types the pipeline lowers.
+    fn signature_with(&self, module: usize, f: &Function, storage: bool) -> bool {
         // A type parameter stands for a scalar here: each instance is checked when made.
         let probe: Vec<Type> = f.type_params.iter().map(|_| Type::Integer).collect();
         let resolved = |ty: &Type, span: Span| {
@@ -524,13 +597,27 @@ impl Resolver {
             substitute_named(&mut ty, &f.type_params, &probe);
             Some(ty)
         };
+        for parameter in &f.params {
+        }
         let parameters = f.params.iter().all(|parameter| {
             parameter.arity == ParameterArity::One
                 && parameter.passing == ParameterPassing::Value
                 && !parameter.by_ref
                 && !parameter.receiver
-                && resolved(&parameter.ty, parameter.span)
-                    .is_some_and(|ty| self.pipeline_type(&ty, 0))
+                && resolved(&parameter.ty, parameter.span).is_some_and(|ty| {
+                    self.pipeline_type(&ty, 0)
+                        || (storage
+                            && match ty.pointee_or_self() {
+                                Type::Storage(StorageKind::Option, inner) => {
+                                    self.pipeline_type(inner, 1)
+                                }
+                                Type::Storage(StorageKind::Result, inner) => {
+                                    matches!(&**inner, Type::Tuple(items) if items.len() == 2)
+                                        && self.pipeline_type(inner, 1)
+                                }
+                                _ => false,
+                            })
+                })
         });
         let result = match f.kind {
             RoutineKind::Procedure if f.result == Type::Void => true,
@@ -561,6 +648,47 @@ impl Resolver {
         plain
     }
 
+    /// Whether `name` is a native member of the type a parameter is declared with, and the
+    /// type is one whose receiver the pipeline lowers: a declared enum, which no field of
+    /// function type or trait method of the same name can stand for.
+    fn native_member(
+        &self,
+        module: usize,
+        function: &Function,
+        declared: &Type,
+        span: Span,
+        name: &str,
+    ) -> bool {
+        if self.trait_method_names.contains(name) {
+            return false;
+        }
+        let Some(resolved) = self.resolved_with(module, declared, span, &function.type_params)
+        else {
+            return false;
+        };
+        let declared = |owner: &str| {
+            self.member_names
+                .get(owner)
+                .is_some_and(|names| names.contains(name))
+        };
+        // The standard `Option` and `Result`: the members of the declaration the library
+        // gives them, whatever module it is in.
+        let library = |suffix: &str| {
+            self.member_names
+                .iter()
+                .any(|(owner, names)| owner.ends_with(suffix) && names.contains(name))
+        };
+        match resolved.pointee_or_self() {
+            Type::Named(target) if self.enums.contains_key(target) => declared(target),
+            Type::Applied(target, _) if self.generic_enums.contains_key(target) => {
+                declared(target)
+            }
+            Type::Storage(StorageKind::Option, _) => library("$Type$Option"),
+            Type::Storage(StorageKind::Result, _) => library("$Type$Result"),
+            _ => false,
+        }
+    }
+
     /// The mutable variables of a script's top level whose scalar type is plain from the
     /// source: an annotation, or an unannotated literal. A routine of the same file reads
     /// and writes them through their global slot.
@@ -586,7 +714,12 @@ impl Resolver {
         >,
     > {
         // The routine's own signature must be one the pipeline lowers.
-        if !self.pipeline_signature(module, function) {
+        if !self.signature_with(module, function, true) {
+            return Ok(Err(body));
+        }
+        // With a standard `Option` or `Result` parameter the body may only call its members.
+        let storage = self.storage_parameters(module, function);
+        if storage && body.has_match() {
             return Ok(Err(body));
         }
         if !function.constraints.is_empty() && self.declared_bounds(module, function).is_none() {
@@ -602,12 +735,28 @@ impl Resolver {
                     site.record,
                     site.name_use,
                     site.contextual,
+                    site.receiver,
                     site.span,
                 )
             })
             .collect();
         let mut targets = Vec::with_capacity(sites.len());
-        for (path, arguments, discard, record, name_use, contextual, span) in sites {
+        for (path, arguments, discard, record, name_use, contextual, receiver, span) in sites {
+            if let Some(slot) = receiver {
+                // A method called on a parameter: a native member of the parameter's type,
+                // which no trait of the program names too.
+                if function.params.get(slot).is_none_or(|parameter| {
+                    !self.native_member(module, function, &parameter.ty, parameter.span, &path)
+                }) {
+                    return Ok(Err(body));
+                }
+                self.bound_requesters
+                    .lock()
+                    .expect("requesters")
+                    .push((span.start, self.nodes[module].id));
+                targets.push("$member".into());
+                continue;
+            }
             if record {
                 // A record literal names a record type whose fields the pipeline lowers.
                 let Some(symbol) = self.path(module, &path, Some(Kind::Type)) else {
@@ -636,6 +785,9 @@ impl Resolver {
                 let Some(symbol) = self.path(module, &path, Some(Kind::Value)) else {
                     return Ok(Err(body));
                 };
+                if storage && self.variants.contains_key(&symbol.id) {
+                    return Ok(Err(body));
+                }
                 self.check_import(module, &symbol, span)?;
                 let supported = self
                     .variants
@@ -659,6 +811,9 @@ impl Resolver {
             let Some(symbol) = self.path(module, &path, Some(Kind::Value)) else {
                 return Ok(Err(body));
             };
+            if storage && self.variants.contains_key(&symbol.id) {
+                return Ok(Err(body));
+            }
             self.check_import(module, &symbol, span)?;
             // A constructor of a supported enum's variant with a payload is a plain callee.
             let constructor = self
@@ -3190,6 +3345,7 @@ impl Resolver {
         self.generic_enums = self.generic_enum_table();
         self.bound_traits = self.bound_trait_table();
         self.user_traits = self.user_trait_table();
+        (self.member_names, self.trait_method_names) = self.member_table();
         self.plain = self.plain_functions();
         for index in 0..self.nodes.len() {
             self.next_binding = 0;
@@ -3618,7 +3774,11 @@ impl Resolver {
                             .collect(),
                     })
                     .collect(),
-                requesters: self.requesting_modules,
+                requesters: {
+                    let mut requesters = self.requesting_modules;
+                    requesters.extend(self.bound_requesters.into_inner().unwrap_or_default());
+                    requesters
+                },
             });
         }
         // Every indexed body was left out of the owned tree, so each must be bound
@@ -3774,6 +3934,8 @@ pub fn link_program(
         generic_enums: HashMap::new(),
         bound_traits: HashMap::new(),
         user_traits: Default::default(),
+        member_names: Default::default(),
+        trait_method_names: Default::default(),
         variants: HashMap::new(),
         aliases: HashMap::new(),
         source_names: Default::default(),
@@ -3788,6 +3950,7 @@ pub fn link_program(
         associated_functions: vec![],
         permissions: None,
         requesting_modules: Default::default(),
+        bound_requesters: Default::default(),
         opaque: Default::default(),
         opaque_arity: HashMap::new(),
         bound_opaque: HashMap::new(),

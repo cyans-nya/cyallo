@@ -47,6 +47,8 @@ pub(crate) struct SiteFacts<'a> {
     pub(crate) name_use: bool,
     /// The value's type is fixed by where it stands: a returned value or a call argument.
     pub(crate) contextual: bool,
+    /// A method called on a parameter: the parameter's index.
+    pub(crate) receiver: Option<usize>,
     pub(crate) span: Span,
 }
 
@@ -66,6 +68,8 @@ struct ReferenceSite {
     name_use: bool,
     /// The value's type is fixed by where it stands: a returned value or a call argument.
     contextual: bool,
+    /// A method called on a parameter: the parameter's index. The path is the method name.
+    receiver: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Hash)]
@@ -82,6 +86,8 @@ pub struct IndexedRoutineBody {
     /// Admission facts, computed from the syntax so they do not force the graph.
     size: usize,
     loops: bool,
+    /// The body matches on a value or tests one with `if let`.
+    matched: bool,
     file_span: Span,
     archived_span: Span,
     offset: u32,
@@ -170,6 +176,7 @@ impl IndexedRoutineBody {
             sites: Arc::from(hir.sites.clone()),
             size: hir.size(),
             loops: hir.has_loops(),
+            matched: hir.matched,
             lowering: Arc::new(Lowering {
                 hir: Mutex::new(Some(hir)),
                 mir: OnceLock::new(),
@@ -183,6 +190,11 @@ impl IndexedRoutineBody {
             handle: handle.clone(),
             generic: None,
         }))
+    }
+
+    /// Whether the body matches on a value, or tests one with `if let`.
+    pub(crate) fn has_match(&self) -> bool {
+        self.matched
     }
 
     /// Reference sites in source order as `(path, argument count, is a statement, archived span)`.
@@ -199,6 +211,7 @@ impl IndexedRoutineBody {
             record: site.record,
             name_use: site.name_use,
             contextual: site.contextual,
+            receiver: site.receiver,
             span: shift(site.span, self.offset).unwrap_or(site.span),
         })
     }
@@ -283,6 +296,8 @@ impl IndexedRoutineBody {
                     &header.bounds,
                     Some(header),
                     Some(services),
+                    None,
+                    self.offset,
                 )
                 .map(|_| ())
                 .map_err(|mut error| {
@@ -349,6 +364,7 @@ impl IndexedRoutineBody {
             definitions,
             &crate::services::Metadata::default(),
             &[],
+            None,
         )
     }
 
@@ -362,6 +378,7 @@ impl IndexedRoutineBody {
         definitions: &HashMap<String, Type>,
         services: &crate::services::Metadata,
         globals: &[ir::Local],
+        env: Option<&crate::declarations::TypeEnvironment>,
     ) -> Result<Option<ir::Function>> {
         let Some(callees) =
             self.bind_callees(Some(function), signatures, source_names, globals)?
@@ -379,6 +396,7 @@ impl IndexedRoutineBody {
             self.handle.unit().syntax(),
             self.generic.as_deref(),
             services,
+            env,
         )
     }
 
@@ -416,6 +434,10 @@ impl IndexedRoutineBody {
                 Some(overlay) => overlay.get(index).map(|target| &**target),
                 None => targets.get(&shift(site.span, self.offset)?).copied(),
             };
+            if target == Some("$member") {
+                callees.push(air::Site::Member);
+                continue;
+            }
             if target == Some("$print") {
                 if !site.discard {
                     return Ok(None);
@@ -583,6 +605,7 @@ fn lower_mir(
     syntax: &IndexedAst,
     generic: Option<&GenericHeader>,
     services: &crate::services::Metadata,
+    env: Option<&crate::declarations::TypeEnvironment>,
 ) -> Result<Option<ir::Function>> {
     let mut locals = collect(&[], &function.params)?;
     for local in &mut locals {
@@ -601,6 +624,8 @@ fn lower_mir(
         &[],
         generic,
         Some(services),
+        env,
+        offset,
     ) {
         Ok(body) => body,
         Err(mut error) => {
@@ -838,6 +863,24 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                         span,
                     );
                     Op::Store(address, registers[value.0])
+                }
+                air::Operation::Lookup(value, operation, range) => {
+                    let arguments = checked.operands[range.start..range.start + range.len]
+                        .iter()
+                        .map(|argument| registers[argument.0])
+                        .collect();
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::Lookup(dst, operation, arguments)
+                }
+                air::Operation::Service(value, operation, range) => {
+                    let arguments = checked.operands[range.start..range.start + range.len]
+                        .iter()
+                        .map(|argument| registers[argument.0])
+                        .collect();
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::Service(dst, operation, arguments)
                 }
                 air::Operation::FunctionValue(value, id) => {
                     let dst = register(&mut function, &checked.types[value.0]);
@@ -1106,6 +1149,8 @@ mod tests {
             &[],
             None,
             None,
+            None,
+            0,
         )
         .unwrap();
         assert!(matches!(
