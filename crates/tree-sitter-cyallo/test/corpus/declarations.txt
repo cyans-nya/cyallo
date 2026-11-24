@@ -1,0 +1,48 @@
+==================
+Contextual declaration names and a generic function
+==================
+record Item { value: i64 }
+fn use<T>(mut: T) -> T { return mut }
+
+---
+
+(source_file
+  (record_declaration
+    (type_identifier (identifier))
+    (field_declaration (identifier) (type_identifier (identifier))))
+  (function_declaration
+    (identifier)
+    (generic_parameters (type_parameter (type_identifier (identifier))))
+    (parameters (parameter (identifier) (type_identifier (identifier))))
+    (type_identifier (identifier))
+    (block (return_statement (identifier)))))
+
+==================
+An unfinished literal leaves the next line intact
+==================
+let text = "unfinished
+let next = 3
+
+---
+
+(source_file
+  (variable_declaration (identifier) (string))
+  (variable_declaration (identifier) (number)))
+
+==================
+Variadic read parameter in a standard declaration
+==================
+pub proc print<...T: Printable>(...read values: T);
+
+---
+
+(source_file
+  (function_declaration
+    (visibility)
+    (identifier)
+    (generic_parameters
+      (type_parameter
+        (type_identifier (identifier))
+        (type_identifier (identifier))))
+    (parameters
+      (parameter (identifier) (type_identifier (identifier))))))

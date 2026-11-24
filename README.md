@@ -278,6 +278,9 @@ Supported CAIE core: primitive types, literal constants, arrays with explicit si
 
 ## REPL, colors, and debugger
 
+[Editor setup for Zed and Neovim](docs/language-server.md) covers Tree-sitter
+highlighting and the `cya-ls` language server for Cyallo and CAIE pseudocode.
+
 The persistent line-oriented REPL accepts statements, bare expressions, and multiline blocks/routines. `:vars` inspects globals, `:reset` clears the session, `:cancel` discards an incomplete entry, `:quit` exits, and `:help` lists commands. Previous statements are not replayed. Static errors leave prior state unchanged; runtime errors preserve writes already performed. INPUT consumes a separate line. The per-entry instruction limit defaults to one million (`--max-instructions`). Definitions/types stay fixed; routine redefinition is not supported. Native caches are scoped to a validated program, rather than shared across REPL submissions.
 
 `pretty <file>` uses the same lexer and preserves the original source. `--color auto|always|never` controls syntax colors and Oxc diagnostics. Auto detects stdout for pretty/prompts and stderr for diagnostics. `NO_COLOR` and `TERM=dumb` disable auto color; `always` overrides them.

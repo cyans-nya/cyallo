@@ -1,0 +1,11 @@
+name = "CAIE Pseudocode"
+grammar = "caie"
+path_suffixes = ["psc", "pss"]
+line_comments = ["// "]
+tab_size = 4
+brackets = [
+    { start = "[", end = "]", close = true, newline = false, not_in = ["string", "comment"] },
+    { start = "(", end = ")", close = true, newline = false, not_in = ["string", "comment"] },
+    { start = "\"", end = "\"", close = true, newline = false, not_in = ["string", "comment"] },
+    { start = "'", end = "'", close = true, newline = false, not_in = ["string", "comment"] },
+]

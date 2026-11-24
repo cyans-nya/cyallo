@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/cyallo-shapes", "crates/cyallo-startup-profile", "crates/cyallo-modules", "crates/cyallo-compile-jobs", "crates/cyallo-ast", "crates/cyallo-parser", "crates/caie-int-parser", "crates/cyallo-ir", "crates/cyallo-values", "crates/cyallo-concurrent-values", "crates/cyallo-scheduler", "crates/cyallo-channel", "crates/cyallo-io", "crates/cyallo-clock", "crates/cyallo-host", "xtask"]
+members = ["crates/cyallo-shapes", "crates/cyallo-startup-profile", "crates/cyallo-modules", "crates/cyallo-compile-jobs", "crates/cyallo-ast", "crates/cyallo-parser", "crates/caie-int-parser", "crates/cyallo-ir", "crates/cyallo-values", "crates/cyallo-concurrent-values", "crates/cyallo-scheduler", "crates/cyallo-channel", "crates/cyallo-io", "crates/cyallo-clock", "crates/cyallo-host", "crates/cya-ls", "crates/tree-sitter-cyallo", "crates/tree-sitter-caie", "xtask"]
 exclude = ["vendor/winch-codegen"]
 resolver = "3"
 

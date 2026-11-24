@@ -1,0 +1,18 @@
+id = "cyallo"
+name = "Cyallo and CAIE"
+description = "Cyallo and supported CAIE pseudocode highlighting with cya-ls."
+version = "0.1.0"
+schema_version = 1
+authors = ["Cyallo contributors"]
+repository = "https://github.com/cyans-nya/cyallo"
+
+[language_servers.cya-ls]
+name = "cya-ls"
+languages = ["Cyallo", "CAIE Pseudocode"]
+
+[language_servers.cya-ls.language_ids]
+"Cyallo" = "cyallo"
+"CAIE Pseudocode" = "caie"
+
+# The development packaging task inserts grammar repositories/revisions from
+# local snapshots and copies the canonical queries into each language folder.

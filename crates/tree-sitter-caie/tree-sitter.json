@@ -1,0 +1,11 @@
+{
+  "grammars": [{
+    "name": "caie",
+    "camelcase": "Caie",
+    "scope": "source.caie",
+    "path": ".",
+    "file-types": ["psc", "pss"],
+    "highlights": "queries/highlights.scm"
+  }],
+  "metadata": {"version": "0.1.0", "description": "Supported CAIE pseudocode highlighting"}
+}

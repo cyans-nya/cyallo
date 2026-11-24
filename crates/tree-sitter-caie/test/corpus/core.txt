@@ -1,0 +1,25 @@
+==================
+Mixed case keywords and Unicode assignment
+==================
+dEcLaRe Count : INTEGER
+Count ← 1
+OUTPUT Count
+
+---
+
+(source_file
+  (declaration (declare_keyword) (identifier) (primitive_type))
+  (assignment_statement (identifier) (assignment_operator) (number))
+  (output_statement (output_keyword) (identifier)))
+
+==================
+Unfinished literal recovery and literal backslash character
+==================
+OUTPUT "unfinished
+OUTPUT '\'
+
+---
+
+(source_file
+  (output_statement (output_keyword) (string))
+  (output_statement (output_keyword) (character)))

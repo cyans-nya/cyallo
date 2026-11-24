@@ -1,0 +1,11 @@
+{
+  "grammars": [{
+    "name": "cyallo",
+    "camelcase": "Cyallo",
+    "scope": "source.cyallo",
+    "path": ".",
+    "file-types": ["ya"],
+    "highlights": "queries/highlights.scm"
+  }],
+  "metadata": {"version": "0.1.0", "description": "Cyallo highlighting grammar"}
+}

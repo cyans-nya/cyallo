@@ -1,4 +1,6 @@
 //! Reconstruct the fork from an immutable crates.io archive and exact patches.
+mod editors;
+
 use clap::{Parser, Subcommand};
 use sha2::{Digest, Sha256};
 use std::{
@@ -16,6 +18,11 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Task {
+    /// Generate editor parsers or package the development extension.
+    Editors {
+        #[command(subcommand)]
+        command: editors::Task,
+    },
     VendorWinch {
         #[command(subcommand)]
         command: Vendor,
@@ -249,10 +256,11 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 fn main() -> Result<()> {
-    let Cli {
-        command: Task::VendorWinch { command },
-    } = Cli::parse();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let command = match Cli::parse().command {
+        Task::Editors { command } => return Ok(editors::run(root, command)?),
+        Task::VendorWinch { command } => command,
+    };
     let m = manifest(root)?;
     let scratch = Scratch::new()?;
     match command {
