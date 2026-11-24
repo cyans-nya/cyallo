@@ -63,6 +63,9 @@ pub(super) enum Site {
     },
 }
 
+/// A record's fields in declaration order, with their types.
+type RecordFields = Vec<(Box<str>, Type)>;
+
 /// A native member resolved against the types of its receiver and arguments.
 struct MemberPlan {
     resolved: crate::member::Resolved,
@@ -478,6 +481,7 @@ fn contextualize_number<'e>(
 
 /// Check the routine's statements in source order, then decide from reachability
 /// whether control can fall off the end of a routine that returns a value.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn analyze(
     body: &mir::Body,
     parameters: &[Param],
@@ -697,7 +701,7 @@ fn extra_blocks(block: &mir::Block) -> usize {
             | Statement::CompoundGlobal { value, .. } => count(value),
             Statement::AssignIndex { index, value, .. }
             | Statement::CompoundIndex { index, value, .. } => count(index) + count(value),
-            Statement::CallStatement(call) => count(call),
+            Statement::Call(call) => count(call),
             Statement::RangeStart { start, finish, .. } => count(start) + count(finish),
             Statement::Marker
             | Statement::RangeBound { .. }
@@ -882,7 +886,7 @@ impl Analysis<'_> {
         &self,
         site: SiteId,
         span: Span,
-    ) -> Result<(Type, Vec<(Box<str>, Type)>), Diagnostic> {
+    ) -> Result<(Type, RecordFields), Diagnostic> {
         let Some(Site::Record(target)) = self.callees.get(site.0) else {
             return Err(invalid(span));
         };
@@ -2478,14 +2482,14 @@ impl Analysis<'_> {
             values.push(value);
             types.push(ty);
         }
-        if let Some(_) = types.iter().find(|ty| {
+        if types.iter().find(|ty| {
             ty.number_kind().is_none()
                 && !matches!(ty, Type::String | Type::Char | Type::Boolean)
                 && !self
                     .bounds_of(ty)
                     .iter()
                     .any(|bound| bound.grants(crate::generics::Bound::Format))
-        }) {
+        }).is_some() {
             let found = types
                 .iter()
                 .map(ToString::to_string)
@@ -2949,7 +2953,7 @@ impl Analysis<'_> {
                     | Statement::CompoundProject { value, .. }
                     | Statement::AssignGlobal { value, .. }
                     | Statement::CompoundGlobal { value, .. }
-                    | Statement::CallStatement(value) => gather_matches(value, &mut matches),
+                    | Statement::Call(value) => gather_matches(value, &mut matches),
                     Statement::AssignIndex { index, value, .. }
                     | Statement::CompoundIndex { index, value, .. } => {
                         gather_matches(index, &mut matches);
@@ -3375,7 +3379,7 @@ impl Analysis<'_> {
                 self.emit(Operation::Binary(combined, operator, old, operand), span);
                 self.emit(Operation::StoreIndirect(pointer, combined), span);
             }
-            Statement::CallStatement(call) => {
+            Statement::Call(call) => {
                 if let ExpressionKind::MethodCall(method) = &call.kind {
                     self.method_call(method, call.span, true)?;
                     return Ok(());

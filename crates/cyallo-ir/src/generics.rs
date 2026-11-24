@@ -899,7 +899,7 @@ pub fn specialize_modules_with_bodies(
             asts[owner].records.push(r);
         }
         let mut types = crate::declarations::TypeEnvironment::new(
-            crate::composites::resolve_modules(asts, &native)?,
+            crate::composites::resolve_modules(asts, native)?,
             native.clone(),
         );
         for ast in asts.iter() {

@@ -522,7 +522,7 @@ mod tests {
     fn scanners_agree_on_all_lengths_positions_and_bytes() {
         let probes = [b'\n', b' ', b'\t', b'\r', b'a', b'/', 0x80, 0xff, 0, b'"'];
         for len in 0..=3 * LANES + 1 {
-            for fill in [b' ', b'x', b'\n', b'\r', b'\t'] {
+            for fill in *b" x\n\r\t" {
                 let base = vec![fill; len];
                 assert_eq!(line_comment_len_scalar(&base), line_comment_len_simd(&base));
                 assert_eq!(blank_run_len_scalar(&base), blank_run_len_simd(&base));

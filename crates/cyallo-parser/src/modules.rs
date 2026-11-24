@@ -399,7 +399,9 @@ impl Parser<'_, '_> {
                 if function.body_kind != FunctionBodyKind::Declaration {
                     return Err(self.error("a world export declares a signature only"));
                 }
-                items.push(WorldItem::Export { function });
+                items.push(WorldItem::Export {
+                    function: Box::new(function),
+                });
             } else {
                 return Err(self.error("expected include, import or export"));
             }

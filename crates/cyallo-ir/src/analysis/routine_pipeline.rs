@@ -272,8 +272,7 @@ impl IndexedRoutineBody {
             .generic_check
             .get_or_init(|| {
                 let Some(callees) = self
-                    .bind_callees(None, signatures, source_names, &[])
-                    .map_err(|error| error)?
+                    .bind_callees(None, signatures, source_names, &[])?
                 else {
                     return Ok(());
                 };
@@ -362,6 +361,7 @@ impl IndexedRoutineBody {
 
     /// As `emit`, with the program's traits and implementations, which a method call on a
     /// generic routine's parameter is resolved against.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn emit_with(
         &self,
         function: &Function,
@@ -586,6 +586,7 @@ fn shift(span: Span, offset: u32) -> Result<Span> {
         .map_err(cyallo_ast::spans::invalid_span_shift)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_mir(
     mir: &mir::Body,
     file_span: Span,

@@ -211,9 +211,7 @@ pub fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
     crate::with_stack(|| {
         match &e.kind {
             ExprKind::EnumConstruct(_, _, payload) => {
-                if let Some(payload) = payload {
-                    walk_expr(payload, f);
-                }
+                payload.iter().for_each(|payload| walk_expr(payload, f));
             }
             ExprKind::Match(value, arms) => {
                 walk_expr(value, f);

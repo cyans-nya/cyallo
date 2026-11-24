@@ -674,7 +674,7 @@ impl Context<'_> {
         &mut self,
         binding: NameId,
         span: Span,
-        mut shared: Option<&mut Vec<(NameId, Variable)>>,
+        shared: Option<&mut Vec<(NameId, Variable)>>,
     ) -> Option<Variable> {
         if self.pattern_names.contains(&binding) {
             return decline(|| "name bound twice in a pattern".into());
@@ -696,7 +696,7 @@ impl Context<'_> {
                     mutable: false,
                     reference: self.pattern_reference,
                 });
-                if let Some(shared) = shared.as_deref_mut() {
+                if let Some(shared) = shared {
                     shared.push((binding, slot));
                 }
                 slot
@@ -1511,9 +1511,7 @@ impl Context<'_> {
                     ExpressionKind::Unary(operator, Box::new(self.value(operand, split)?))
                 }
                 ExprSyntax::Field(..) | ExprSyntax::TupleField(..) => {
-                    let Some((root, path)) = self.projected(id) else {
-                        return None;
-                    };
+                    let (root, path) = self.projected(id)?;
                     ExpressionKind::Project { root, path }
                 }
                 ExprSyntax::Index(..) => {

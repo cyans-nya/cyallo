@@ -237,6 +237,7 @@ impl VerifiedModule {
     }
 
     /// `Ok(None)`: lowering reached a routine outside `scope`.
+    #[allow(clippy::too_many_arguments)]
     fn lower_scoped(
         checked: &[Routine],
         routine: usize,

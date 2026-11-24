@@ -54,6 +54,16 @@ struct Placement {
     boundary: ModuleBoundary,
     source: ModuleSource,
 }
+/// The variants of each enum without type parameters, by linked name.
+type EnumTable = HashMap<Box<str>, Vec<(Box<str>, Option<Type>)>>;
+/// The type parameters and variant payloads of each generic enum, by linked name.
+type GenericEnumTable = HashMap<Box<str>, (Vec<Box<str>>, Vec<Option<Type>>)>;
+/// The native members each type declares, and the method names of every trait.
+type MemberTable = (
+    HashMap<String, std::collections::HashSet<Box<str>>>,
+    std::collections::HashSet<Box<str>>,
+);
+
 struct Node {
     interface: bool,
     parent: Option<usize>,
@@ -85,7 +95,7 @@ struct Resolver {
     records: HashMap<Box<str>, Vec<(Box<str>, Type)>>,
     /// The variants of each enum without type parameters, by the enum's linked name, with
     /// their resolved payload types.
-    enums: HashMap<Box<str>, Vec<(Box<str>, Option<Type>)>>,
+    enums: EnumTable,
     /// The standard traits a generic routine may be bounded by, by linked name.
     bound_traits: HashMap<Box<str>, crate::generics::Bound>,
     /// The traits the program declares (without type parameters), by linked name.
@@ -96,7 +106,7 @@ struct Resolver {
     trait_method_names: std::collections::HashSet<Box<str>>,
     /// Enums with type parameters, by linked name: the parameters and the variants'
     /// payload types, which mention them.
-    generic_enums: HashMap<Box<str>, (Vec<Box<str>>, Vec<Option<Type>>)>,
+    generic_enums: GenericEnumTable,
     /// The enum each variant belongs to, and whether it carries a payload.
     variants: HashMap<DeclarationId, (Box<str>, bool)>,
     /// Source-file mode: the entry runs `proc main()` and no top level may hold statements.
@@ -273,7 +283,7 @@ impl Resolver {
     }
 
     /// The variants of every enum without type parameters, resolved in its own module.
-    fn enum_table(&self) -> HashMap<Box<str>, Vec<(Box<str>, Option<Type>)>> {
+    fn enum_table(&self) -> EnumTable {
         let mut table = HashMap::new();
         for (index, node) in self.nodes.iter().enumerate() {
             for declaration in &node.ast.enums {
@@ -334,12 +344,7 @@ impl Resolver {
     /// The native members each type declares through an inherent `impl`, by the type's
     /// linked name, and the method names of every trait: a call to a trait's method on a
     /// type is not a native member call.
-    fn member_table(
-        &self,
-    ) -> (
-        HashMap<String, std::collections::HashSet<Box<str>>>,
-        std::collections::HashSet<Box<str>>,
-    ) {
+    fn member_table(&self) -> MemberTable {
         let mut members: HashMap<String, std::collections::HashSet<Box<str>>> = HashMap::new();
         let mut traits = std::collections::HashSet::new();
         for (index, node) in self.nodes.iter().enumerate() {
@@ -432,7 +437,7 @@ impl Resolver {
 
     /// The payload types of every enum with type parameters, resolved in its own module with
     /// the parameters left as names.
-    fn generic_enum_table(&self) -> HashMap<Box<str>, (Vec<Box<str>>, Vec<Option<Type>>)> {
+    fn generic_enum_table(&self) -> GenericEnumTable {
         let mut table = HashMap::new();
         for (index, node) in self.nodes.iter().enumerate() {
             for declaration in &node.ast.enums {
@@ -1853,7 +1858,7 @@ impl Resolver {
                         )?;
                     }
                     WorldItem::Export { function } => {
-                        let mut signature = function.clone();
+                        let mut signature = Function::clone(function);
                         for parameter in &mut signature.params {
                             this.ty(
                                 module,
@@ -3868,6 +3873,7 @@ pub fn link_with_core(
     )
 }
 /// Link with an explicit entry mode. `EntryMode::Main` is for source files.
+#[allow(clippy::too_many_arguments)]
 pub fn link_program(
     asts: Vec<Ast>,
     paths: &[String],

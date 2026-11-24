@@ -103,7 +103,7 @@ pub(super) enum Statement {
         value: Expression,
     },
     /// A call to a procedure for its effects.
-    CallStatement(Expression),
+    Call(Expression),
     /// Evaluate both bounds of a range loop into the counter and `end`.
     RangeStart {
         variable: Variable,
@@ -392,7 +392,7 @@ impl Builder {
                         span,
                     ),
                     hir::StatementKind::CallStatement(call) => {
-                        self.emit(Statement::CallStatement(call), span)
+                        self.emit(Statement::Call(call), span)
                     }
                     hir::StatementKind::Return(expression) => {
                         self.take_block()

@@ -545,7 +545,7 @@ pub enum WorldItem {
         span: Span,
     },
     /// A routine the instantiated component must provide.
-    Export { function: Function },
+    Export { function: Box<Function> },
 }
 /// `impl interface P for M { type T = U; }`: M implements interface module P and
 /// binds P's opaque types.

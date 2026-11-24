@@ -3,7 +3,7 @@ fn link(source: &str) -> Result<cyallo_ir::module_graph::ResolvedProgram, cyallo
     namespace::single(cyallo_parser::parse(source).unwrap())
 }
 fn message(source: &str) -> String {
-    link(source).err().expect("source must be rejected").message
+    link(source).expect_err("source must be rejected").message
 }
 const SDK: &str = "
 pub interface mod api {

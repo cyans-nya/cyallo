@@ -105,34 +105,6 @@ fn starts(code: &[CheckedInstruction], routine: usize) -> Result<Vec<usize>, Low
         .collect())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reachability_prunes_dead_blocks_but_rejects_reachable_fallthrough() {
-        let instruction = |op| CheckedInstruction {
-            op,
-            span: Span::default(),
-        };
-        let valid = [
-            instruction(Op::Jump(2)),
-            instruction(Op::Nop),
-            instruction(Op::Return(None)),
-        ];
-        let blocks = reachable(&valid, 0, false).unwrap();
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[1].start, 2);
-        assert!(matches!(blocks[0].exit.value, Exit::Jump(BlockId(1))));
-
-        let invalid = [instruction(Op::Jump(1)), instruction(Op::Nop)];
-        assert!(matches!(
-            reachable(&invalid, 0, false),
-            Err(LowerError::InvalidFallthrough { routine: 0 })
-        ));
-    }
-}
-
 fn source_exit(
     op: &Op,
     target: impl Fn(usize) -> BlockId,
@@ -230,4 +202,32 @@ pub(super) fn reachable(
             })
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reachability_prunes_dead_blocks_but_rejects_reachable_fallthrough() {
+        let instruction = |op| CheckedInstruction {
+            op,
+            span: Span::default(),
+        };
+        let valid = [
+            instruction(Op::Jump(2)),
+            instruction(Op::Nop),
+            instruction(Op::Return(None)),
+        ];
+        let blocks = reachable(&valid, 0, false).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1].start, 2);
+        assert!(matches!(blocks[0].exit.value, Exit::Jump(BlockId(1))));
+
+        let invalid = [instruction(Op::Jump(1)), instruction(Op::Nop)];
+        assert!(matches!(
+            reachable(&invalid, 0, false),
+            Err(LowerError::InvalidFallthrough { routine: 0 })
+        ));
+    }
 }

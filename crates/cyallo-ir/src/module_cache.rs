@@ -317,7 +317,7 @@ pub(crate) fn keys(
                 .filter_map(|name| {
                     signatures
                         .get(name)
-                        .map(|s| (name.clone(), s.clone().into()))
+                        .map(|s| (name.clone(), (*s)))
                         .or_else(|| {
                             globals
                                 .iter()

@@ -160,63 +160,6 @@ impl SourceTrees {
     }
 }
 
-#[cfg(test)]
-mod indexed_body_tests {
-    use super::*;
-
-    #[test]
-    fn every_prepared_body_leaves_the_owned_tree_until_the_linker_binds_it() {
-        let source = "fn indexed(n: i64) -> i64 { return n + 1 }\n\
-                      fn caller(n: i64) -> i64 { return indexed(n) }\n";
-        let file =
-            cyallo_parser::parse_modern_snapshot(source.into(), false, crate::Jobs(1)).unwrap();
-        let trees = SourceTrees::new(vec![ArchivedSyntax {
-            file: Arc::new(file),
-            offset: 17,
-        }]);
-        let (files, bodies) = trees.materialize_with_indexed(0, true).unwrap();
-        assert_eq!(bodies.len(), 2);
-        assert_eq!(bodies[0].archived_span(), files[0].functions[0].span);
-        assert!(files[0].functions.iter().all(|f| f.body.is_empty()));
-    }
-
-    #[test]
-    fn the_linker_binds_call_sites_over_indexed_syntax_and_falls_back_to_a_tree() {
-        let source = "fn indexed(n: i64) -> i64 { return n + 1 }\n\
-                      fn caller(n: i64) -> i64 { return indexed(n) }\n\
-                      fn arity(n: i64) -> i64 { return caller(n, n) }\n\
-                      fn missing(n: i64) -> i64 { return nowhere(n) }\n\
-                      fn local(indexed: i64) -> i64 { return indexed(1) }\n";
-        let file =
-            cyallo_parser::parse_modern_snapshot(source.into(), false, crate::Jobs(1)).unwrap();
-        let trees = SourceTrees::new(vec![ArchivedSyntax {
-            file: Arc::new(file),
-            offset: 0,
-        }]);
-        let (files, bodies) = trees.materialize_with_indexed(0, true).unwrap();
-        let program =
-            cyallo_ir::namespace::link_with_indexed_bodies(files, &["main.ya".into()], 0, bodies)
-                .unwrap();
-        let by_name = |suffix: &str| {
-            program
-                .functions()
-                .find(|function| function.name.ends_with(suffix))
-                .unwrap()
-        };
-        // Plain calls keep only MIR and the resolved overlay: no owned tree.
-        for name in ["indexed", "caller", "local"] {
-            assert!(by_name(name).body.is_empty(), "{name}");
-            assert!(program.has_indexed_body(&by_name(name).name), "{name}");
-        }
-        // Anything else is materialized and linked as a tree, so the existing
-        // resolver resolves or reports it.
-        for name in ["arity", "missing"] {
-            assert!(!by_name(name).body.is_empty(), "{name}");
-            assert!(!program.has_indexed_body(&by_name(name).name), "{name}");
-        }
-    }
-}
-
 impl CompilePlan {
     pub(crate) fn call_requests(&self) -> Vec<CallRequest> {
         self.calls
@@ -720,4 +663,61 @@ fn localize(plan: &CompilePlan, mut error: LoadError) -> LoadError {
         *diagnostic = local;
     }
     error
+}
+
+#[cfg(test)]
+mod indexed_body_tests {
+    use super::*;
+
+    #[test]
+    fn every_prepared_body_leaves_the_owned_tree_until_the_linker_binds_it() {
+        let source = "fn indexed(n: i64) -> i64 { return n + 1 }\n\
+                      fn caller(n: i64) -> i64 { return indexed(n) }\n";
+        let file =
+            cyallo_parser::parse_modern_snapshot(source.into(), false, crate::Jobs(1)).unwrap();
+        let trees = SourceTrees::new(vec![ArchivedSyntax {
+            file: Arc::new(file),
+            offset: 17,
+        }]);
+        let (files, bodies) = trees.materialize_with_indexed(0, true).unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0].archived_span(), files[0].functions[0].span);
+        assert!(files[0].functions.iter().all(|f| f.body.is_empty()));
+    }
+
+    #[test]
+    fn the_linker_binds_call_sites_over_indexed_syntax_and_falls_back_to_a_tree() {
+        let source = "fn indexed(n: i64) -> i64 { return n + 1 }\n\
+                      fn caller(n: i64) -> i64 { return indexed(n) }\n\
+                      fn arity(n: i64) -> i64 { return caller(n, n) }\n\
+                      fn missing(n: i64) -> i64 { return nowhere(n) }\n\
+                      fn local(indexed: i64) -> i64 { return indexed(1) }\n";
+        let file =
+            cyallo_parser::parse_modern_snapshot(source.into(), false, crate::Jobs(1)).unwrap();
+        let trees = SourceTrees::new(vec![ArchivedSyntax {
+            file: Arc::new(file),
+            offset: 0,
+        }]);
+        let (files, bodies) = trees.materialize_with_indexed(0, true).unwrap();
+        let program =
+            cyallo_ir::namespace::link_with_indexed_bodies(files, &["main.ya".into()], 0, bodies)
+                .unwrap();
+        let by_name = |suffix: &str| {
+            program
+                .functions()
+                .find(|function| function.name.ends_with(suffix))
+                .unwrap()
+        };
+        // Plain calls keep only MIR and the resolved overlay: no owned tree.
+        for name in ["indexed", "caller", "local"] {
+            assert!(by_name(name).body.is_empty(), "{name}");
+            assert!(program.has_indexed_body(&by_name(name).name), "{name}");
+        }
+        // Anything else is materialized and linked as a tree, so the existing
+        // resolver resolves or reports it.
+        for name in ["arity", "missing"] {
+            assert!(!by_name(name).body.is_empty(), "{name}");
+            assert!(!program.has_indexed_body(&by_name(name).name), "{name}");
+        }
+    }
 }

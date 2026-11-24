@@ -186,6 +186,8 @@ fn analyze_modules_with(
                     .collect();
             }
             let services = std::sync::Arc::new(metadata);
+            // Ends the stage timer when the profile feature is on.
+            #[allow(clippy::drop_non_drop)]
             drop(declarations);
             let initializers: Vec<_> = asts
                 .iter()
@@ -382,6 +384,7 @@ fn analyze_modules_with(
                     Ok((module, id, routine))
                 },
             );
+            #[allow(clippy::drop_non_drop)]
             drop(wave);
             let _link = stage(Stage::ModuleLink);
             let mut owned: Vec<Vec<_>> = cached
