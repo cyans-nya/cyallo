@@ -148,6 +148,10 @@ HIR accepts a non-empty array literal and `a[i]` on a local array, as a value, a
 
 A named plain function is a value (`let held = negate`, `apply(double, 5)`), and a local or parameter holding one is called (`f(n)`, as an expression or a statement). Parameters and results may have function types whose own parameters and result the pipeline lowers; a by-reference function parameter, a closure expression and a call of a call result (`choose(true)(4)`) stay on the old route. The linker binds a name that is not a local to `$function:<target>` when the target is a plain function, and the binder turns it into `Site::Function` with the callee's contract and kind. AIR types it as `Type::Function(kind, parameters, result)`, emits `FunctionValue`, and `invoke` checks the argument count (E110) and each argument against the function type (E109); a local that is not a function type is E110. Tests: `tests/function_values.rs`; example: `examples/functions/values.yas`. The two tests that expected a call of a local to fall back now expect it to migrate.
 
+### Script variables
+
+A routine of a script file may read and write the script's own `let mut` variables when their type is plain from the source: a scalar annotation, or an unannotated integer, real or boolean literal. HIR gives a name that is not a local a reference site (`name_use`), and `name = v` / `name op= v` become `AssignGlobal` / `CompoundGlobal`. The linker reads the variables from the script's statements before the tree is taken for linking (`script_variables_of`, cached per module) and binds the site to `$global:<module>:<name>`; generic routines and immutable script values stay on the old route (the latter are constants it substitutes). The binder finds the slot in the program's globals, where the module declares the variable as `$module<N>$Value$<name>`, and AIR types reads and writes from that local. Emission is `Address` of the global slot followed by `Load` or `Store`, so the effect analysis sees the same operations as the old route: a `fn` that touches a mutable script variable is still rejected. Tests: `tests/script_variables.rs`; example: `examples/script_variables.yas`. `hot-loop.yas` and `osr-loop.yas` now lower entirely on the pipeline. Open: strings and aggregates as script variables, and script variables read from other modules.
+
 ## Removal roadmap: what the old route still does alone
 
 Measured by `tests/pipeline_coverage.rs` over `examples/` and `std/` (55 of 97 routines accepted, 2026-11-24). The old route (linked AST → `lower_routine`) can be deleted only when every row below is covered by the pipeline, in this order of payoff per effort:
@@ -159,7 +163,6 @@ Measured by `tests/pipeline_coverage.rs` over `examples/` and `std/` (55 of 97 r
 | Closures (capturing function values) | 4 | Capture lowering and closure conversion; named function values are done |
 | Collections: arrays, `Vec`, indexing, typed collections | 5 | Array literals, indexing and element assignment, native collection methods through `Site::Builtin` |
 | Method calls on non-names and chained receivers | 5 | Hoist the receiver into a temporary; native and trait methods beyond generic bounds |
-| Module globals: `let mut` in the entry script read and assigned from routines | 2 | A `Site::Global` that binds a module slot |
 | Nested and tuple patterns, record payload patterns | 1+ | In progress in a separate session |
 | Generic records and generic callees | 2 | `Applied` record construction; inference of a callee's `T` in AIR |
 

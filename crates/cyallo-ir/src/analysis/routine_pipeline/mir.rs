@@ -67,6 +67,17 @@ pub(super) enum Statement {
         operator: cyallo_ast::Operator,
         value: Expression,
     },
+    /// `name = value` on a script variable.
+    AssignGlobal {
+        site: super::SiteId,
+        value: Expression,
+    },
+    /// `name op= value` on a script variable.
+    CompoundGlobal {
+        site: super::SiteId,
+        operator: cyallo_ast::Operator,
+        value: Expression,
+    },
     /// `a[i] = value`.
     AssignIndex {
         root: Variable,
@@ -318,6 +329,21 @@ impl Builder {
                         Statement::CompoundProject {
                             root,
                             path,
+                            operator,
+                            value,
+                        },
+                        span,
+                    ),
+                    hir::StatementKind::AssignGlobal { site, value } => {
+                        self.emit(Statement::AssignGlobal { site, value }, span)
+                    }
+                    hir::StatementKind::CompoundGlobal {
+                        site,
+                        operator,
+                        value,
+                    } => self.emit(
+                        Statement::CompoundGlobal {
+                            site,
                             operator,
                             value,
                         },

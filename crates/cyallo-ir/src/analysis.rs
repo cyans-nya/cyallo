@@ -473,6 +473,7 @@ impl DeferredBody {
                         &c.signatures,
                         &c.routine_types,
                         &c.services,
+                        &c.globals,
                     )?,
                     None => None,
                 };

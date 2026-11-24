@@ -38,6 +38,8 @@ pub(super) enum Site {
     Record(Box<str>),
     /// The built-in `print`, which writes its arguments to the output.
     Print,
+    /// A mutable script variable, at its slot in the program's globals.
+    Global { index: usize, ty: Type },
     /// A named function used as a value, or called through a local that holds it.
     Function {
         callee: Callee,
@@ -103,6 +105,9 @@ pub(super) enum Operation {
     ArrayLiteral(Value, Operands),
     /// A named function as a value.
     FunctionValue(Value, usize),
+    /// A script variable read, and written.
+    ReadGlobal(Value, usize),
+    WriteGlobal(usize, Value),
     /// A call through a function value held in a local.
     Invoke(Option<Value>, Value, Operands),
     /// A reference to an array, viewed as a reference to a slice of its elements.
@@ -628,7 +633,9 @@ fn extra_blocks(block: &mir::Block) -> usize {
             | Statement::AssignDeref { value, .. }
             | Statement::CompoundDeref { value, .. }
             | Statement::AssignProject { value, .. }
-            | Statement::CompoundProject { value, .. } => count(value),
+            | Statement::CompoundProject { value, .. }
+            | Statement::AssignGlobal { value, .. }
+            | Statement::CompoundGlobal { value, .. } => count(value),
             Statement::AssignIndex { index, value, .. }
             | Statement::CompoundIndex { index, value, .. } => count(index) + count(value),
             Statement::CallStatement(call) => count(call),
@@ -1122,6 +1129,7 @@ impl Analysis<'_> {
                 }
                 Some(Site::Variant { result, .. }) => Ok(self.view(result)),
                 Some(Site::Function { callee, kind }) => Ok(function_type(*kind, callee)),
+                Some(Site::Global { ty, .. }) => Ok(ty.clone()),
                 Some(Site::GenericVariant { .. }) => Err(Diagnostic::new(
                     "E114",
                     "the enum instance of this variant is not known here; annotate the type",
@@ -1174,6 +1182,14 @@ impl Analysis<'_> {
         };
         self.operands.extend(values);
         Ok((range, result))
+    }
+
+    /// The slot and type of the script variable a site names.
+    fn global(&self, site: SiteId, span: Span) -> Result<(usize, Type), Diagnostic> {
+        match self.callees.get(site.0) {
+            Some(Site::Global { index, ty }) => Ok((*index, ty.clone())),
+            _ => Err(invalid(span)),
+        }
     }
 
     fn callee(&self, site: SiteId, span: Span) -> Result<&Callee, Diagnostic> {
@@ -1442,6 +1458,17 @@ impl Analysis<'_> {
                     if matches!(self.callees.get(site.0), Some(Site::Variant { .. })) =>
                 {
                     self.construct(*site, arguments, span)
+                }
+                ExpressionKind::Call(site, _)
+                    if matches!(self.callees.get(site.0), Some(Site::Global { .. })) =>
+                {
+                    let Some(Site::Global { index, ty }) = self.callees.get(site.0) else {
+                        return Err(invalid(span));
+                    };
+                    let (index, ty) = (*index, ty.clone());
+                    let value = self.value(ty.clone());
+                    self.emit(Operation::ReadGlobal(value, index), span);
+                    Ok((value, ty))
                 }
                 ExpressionKind::Call(site, _)
                     if matches!(self.callees.get(site.0), Some(Site::Function { .. })) =>
@@ -2290,6 +2317,8 @@ impl Analysis<'_> {
                     | Statement::CompoundDeref { value, .. }
                     | Statement::AssignProject { value, .. }
                     | Statement::CompoundProject { value, .. }
+                    | Statement::AssignGlobal { value, .. }
+                    | Statement::CompoundGlobal { value, .. }
                     | Statement::CallStatement(value) => gather_matches(value, &mut matches),
                     Statement::AssignIndex { index, value, .. }
                     | Statement::CompoundIndex { index, value, .. } => {
@@ -2537,6 +2566,29 @@ impl Analysis<'_> {
                 let operator = super::super::specialized_operator(*operator, &result);
                 self.emit(Operation::Binary(combined, operator, old, operand), span);
                 self.store(*slot, combined, span);
+            }
+            Statement::AssignGlobal { site, value } => {
+                let (index, ty) = self.global(*site, span)?;
+                let (stored, actual) = self.expected_as(value, &ty, Use::Move)?;
+                require(&ty, &actual, value.span)?;
+                self.emit(Operation::WriteGlobal(index, stored), span);
+            }
+            Statement::CompoundGlobal {
+                site,
+                operator,
+                value,
+            } => {
+                let (index, ty) = self.global(*site, span)?;
+                let old = self.value(ty.clone());
+                self.emit(Operation::ReadGlobal(old, index), span);
+                let contextual = contextualize(value, &ty)?;
+                let (operand, operand_type) = self.expression(&contextual)?;
+                let result = super::super::binary_type(*operator, &ty, &operand_type, span)?;
+                require(&ty, &result, span)?;
+                let combined = self.value(result.clone());
+                let operator = super::super::specialized_operator(*operator, &result);
+                self.emit(Operation::Binary(combined, operator, old, operand), span);
+                self.emit(Operation::WriteGlobal(index, combined), span);
             }
             Statement::AssignIndex { root, index, value } => {
                 let (_, element) = self.element_of(*root, true, span)?;

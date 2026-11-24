@@ -267,7 +267,7 @@ impl IndexedRoutineBody {
             .generic_check
             .get_or_init(|| {
                 let Some(callees) = self
-                    .bind_callees(None, signatures, source_names)
+                    .bind_callees(None, signatures, source_names, &[])
                     .map_err(|error| error)?
                 else {
                     return Ok(());
@@ -348,6 +348,7 @@ impl IndexedRoutineBody {
             signatures,
             definitions,
             &crate::services::Metadata::default(),
+            &[],
         )
     }
 
@@ -360,8 +361,11 @@ impl IndexedRoutineBody {
         signatures: &HashMap<String, Signature>,
         definitions: &HashMap<String, Type>,
         services: &crate::services::Metadata,
+        globals: &[ir::Local],
     ) -> Result<Option<ir::Function>> {
-        let Some(callees) = self.bind_callees(Some(function), signatures, source_names)? else {
+        let Some(callees) =
+            self.bind_callees(Some(function), signatures, source_names, globals)?
+        else {
             return Ok(None);
         };
         lower_mir(
@@ -386,6 +390,7 @@ impl IndexedRoutineBody {
         function: Option<&Function>,
         signatures: &HashMap<String, Signature>,
         source_names: &BTreeMap<Box<str>, Box<str>>,
+        globals: &[ir::Local],
     ) -> Result<Option<Vec<air::Site>>> {
         if self.sites.is_empty() {
             return Ok(Some(Vec::new()));
@@ -426,6 +431,30 @@ impl IndexedRoutineBody {
                 })
             {
                 callees.push(air::Site::Builtin(id));
+                continue;
+            }
+            if let Some(named) = target.and_then(|target| target.strip_prefix("$global:")) {
+                // A script variable the linker checked: its slot and type come from the
+                // program's globals, where the entry script declares it.
+                // The target names the module and the variable; the program's globals carry
+                // the module in the name they are declared under.
+                let (module, plain) = named.split_once(':').unwrap_or(("", named));
+                let declared = format!("$module{module}$Value${plain}");
+                let Some((index, local)) = globals
+                    .iter()
+                    .enumerate()
+                    .find(|(_, local)| *local.name == *declared || *local.name == *plain)
+                else {
+                    return Err(Diagnostic::new(
+                        "E114",
+                        "a script variable is not declared where the module graph found it",
+                        site.span,
+                    ));
+                };
+                callees.push(air::Site::Global {
+                    index,
+                    ty: local.ty.clone(),
+                });
                 continue;
             }
             if let Some(named) = target.and_then(|target| target.strip_prefix("$function:")) {
@@ -622,6 +651,7 @@ fn instruction_count(operation: &air::Operation) -> usize {
             1 + usize::from(place.via_reference) + place.steps.len() + 1
         }
         // The array's address, the element's address, and the load or store.
+        air::Operation::ReadGlobal(..) | air::Operation::WriteGlobal(..) => 2,
         air::Operation::IndexRead(_, _, _, through)
         | air::Operation::IndexWrite(_, _, _, through) => 3 + usize::from(*through),
         _ => 1,
@@ -776,6 +806,38 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                         crate::lookup::Operation::Slice(mutable),
                         vec![registers[array.0]],
                     )
+                }
+                air::Operation::ReadGlobal(value, index) => {
+                    let address = register(&mut function, &checked.types[value.0]);
+                    push(
+                        &mut function,
+                        Op::Address(
+                            address,
+                            Slot {
+                                global: true,
+                                index,
+                            },
+                        ),
+                        span,
+                    );
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::Load(dst, address)
+                }
+                air::Operation::WriteGlobal(index, value) => {
+                    let address = register(&mut function, &checked.types[value.0]);
+                    push(
+                        &mut function,
+                        Op::Address(
+                            address,
+                            Slot {
+                                global: true,
+                                index,
+                            },
+                        ),
+                        span,
+                    );
+                    Op::Store(address, registers[value.0])
                 }
                 air::Operation::FunctionValue(value, id) => {
                     let dst = register(&mut function, &checked.types[value.0]);

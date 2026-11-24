@@ -213,6 +213,17 @@ pub(super) enum StatementKind {
         operator: Operator,
         value: Expression,
     },
+    /// `name = value` where `name` is a mutable script variable, bound by the module graph.
+    AssignGlobal {
+        site: SiteId,
+        value: Expression,
+    },
+    /// `name op= value` on a script variable.
+    CompoundGlobal {
+        site: SiteId,
+        operator: Operator,
+        value: Expression,
+    },
     /// `a[i] = value`.
     AssignIndex {
         root: Variable,
@@ -306,7 +317,9 @@ impl Routine {
                         | StatementKind::AssignDeref { value, .. }
                         | StatementKind::CompoundDeref { value, .. }
                         | StatementKind::AssignProject { value, .. }
-                        | StatementKind::CompoundProject { value, .. } => value.size(),
+                        | StatementKind::CompoundProject { value, .. }
+                        | StatementKind::AssignGlobal { value, .. }
+                        | StatementKind::CompoundGlobal { value, .. } => value.size(),
                         StatementKind::AssignIndex { index, value, .. }
                         | StatementKind::CompoundIndex { index, value, .. } => {
                             index.size() + value.size()
@@ -783,6 +796,11 @@ impl Context<'_> {
                                     path,
                                     value: self.expression(value)?,
                                 }
+                            } else if let Some(site) = self.global_target(target) {
+                                StatementKind::AssignGlobal {
+                                    site,
+                                    value: self.value(value, false)?,
+                                }
                             } else if let Some(variable) = self.dereferenced(target) {
                                 StatementKind::AssignDeref {
                                     variable,
@@ -811,6 +829,12 @@ impl Context<'_> {
                                 StatementKind::CompoundProject {
                                     root,
                                     path,
+                                    operator,
+                                    value: self.value(value, false)?,
+                                }
+                            } else if let Some(site) = self.global_target(target) {
+                                StatementKind::CompoundGlobal {
+                                    site,
                                     operator,
                                     value: self.value(value, false)?,
                                 }
@@ -1063,6 +1087,19 @@ impl Context<'_> {
             return decline(|| "index of a parameter".into());
         }
         Some((visible.slot, self.value(*index, false)?))
+    }
+
+    /// A reference site when `target` names something that is not a local: the module graph
+    /// accepts it only if it is a mutable script variable with a scalar type.
+    fn global_target(&mut self, target: Id<ExprNode>) -> Option<SiteId> {
+        let node = self.ast.get(target)?;
+        let ExprSyntax::Name(name) = node.kind else {
+            return None;
+        };
+        if self.every_name.contains(&name) {
+            return None;
+        }
+        Some(self.site(name, node.span, 0, false, false, true))
     }
 
     /// The reference parameter `p` when `target` is `p.*`.

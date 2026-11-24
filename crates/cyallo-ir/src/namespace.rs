@@ -64,6 +64,8 @@ struct Node {
     ast: Ast,
     names: HashMap<String, Vec<Symbol>>,
     bindings: HashMap<u32, Box<str>>,
+    /// The mutable script variables with a scalar type a routine may use, found once.
+    script_variables: std::sync::OnceLock<HashMap<Box<str>, Type>>,
 }
 #[derive(Clone)]
 struct Local {
@@ -556,6 +558,15 @@ impl Resolver {
         plain
     }
 
+    /// The mutable variables of a script's top level whose scalar type is plain from the
+    /// source: an annotation, or an unannotated literal. A routine of the same file reads
+    /// and writes them through their global slot.
+    fn script_variables(&self, module: usize) -> &HashMap<Box<str>, Type> {
+        self.nodes[module]
+            .script_variables
+            .get_or_init(|| script_variables_of(&self.nodes[module].ast.body))
+    }
+
     /// Resolve an indexed body's call sites against the module namespace, with no
     /// owned tree. `Err(body)` gives the body back when a site is not a plain call
     /// (a local, an intrinsic, a unit variant, an unresolved name or another
@@ -608,6 +619,14 @@ impl Resolver {
             }
             if function.params.iter().any(|param| param.name == path) {
                 return Ok(Err(body));
+            }
+            if name_use
+                && function.type_params.is_empty()
+                && self.script_variables(module).contains_key(&*path)
+            {
+                // A mutable script variable: its slot is found when the body is emitted.
+                targets.push(format!("$global:{module}:{path}").into());
+                continue;
             }
             if name_use {
                 // A name that is not a local: acceptable only as a unit variant.
@@ -734,6 +753,7 @@ impl Resolver {
             ast,
             names: HashMap::new(),
             bindings: HashMap::new(),
+            script_variables: std::sync::OnceLock::new(),
         });
         for declaration in declarations {
             let child_path = format!("{path}::{}", declaration.name);
@@ -3170,6 +3190,11 @@ impl Resolver {
         self.plain = self.plain_functions();
         for index in 0..self.nodes.len() {
             self.next_binding = 0;
+            // The script's variables are read from its statements before the tree is taken
+            // for linking, which is when its routines are bound.
+            let _ = self.nodes[index]
+                .script_variables
+                .set(script_variables_of(&self.nodes[index].ast.body));
             let mut ast = std::mem::take(&mut self.nodes[index].ast);
             for declaration in &mut ast.enums {
                 declaration.name =
@@ -3630,6 +3655,32 @@ fn first_by_name<'a, T>(
     }
     first
 }
+/// The mutable variables of a script's top level whose scalar type is plain from the source:
+/// an annotation, or an unannotated literal.
+fn script_variables_of(body: &[Stmt]) -> HashMap<Box<str>, Type> {
+    let mut variables = HashMap::new();
+    for statement in body {
+        let StmtKind::Binding(name, annotation, false, true, initializer) = &statement.kind else {
+            continue;
+        };
+        let ty = match (annotation, &initializer.kind) {
+            (Some(ty @ (Type::Integer | Type::Boolean | Type::Real | Type::Numeric(_))), _) => {
+                ty.clone()
+            }
+            (None, ExprKind::Literal(Literal::Integer(_))) => Type::Integer,
+            (None, ExprKind::Literal(Literal::Real(_))) => Type::Real,
+            (None, ExprKind::Literal(Literal::Boolean(_))) => Type::Boolean,
+            _ => continue,
+        };
+        // A name declared twice is the old route's error.
+        if variables.insert(name.clone(), ty).is_some() {
+            variables.insert(name.clone(), Type::Void);
+        }
+    }
+    variables.retain(|_, ty| *ty != Type::Void);
+    variables
+}
+
 pub fn link(asts: Vec<Ast>, paths: &[String], entry: usize) -> Result<ResolvedProgram> {
     link_with_policy(
         asts,
