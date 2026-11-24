@@ -1,16 +1,24 @@
 use cyallo::vm::{Session, Status};
 use cyallo::{CompileOptions, Dialect, compile, compile_with_options, ir::RoutineKind};
 use std::sync::Arc;
+/// A routine by name: the standard library adds routines ahead of the program's own.
+fn routine<'a>(program: &'a cyallo::ir::Program, name: &str) -> &'a cyallo::ir::Routine {
+    program
+        .functions()
+        .iter()
+        .find(|routine| &*routine.name == name)
+        .unwrap_or_else(|| panic!("no routine {name}"))
+}
 #[test]
 fn returning_procedures_and_private_mutation() {
     let source = "let mut counter = 0\nproc advance(n: &mut i64) -> i64 { n.* += 1; return n.* }\nfn work(n: i64) -> i64 { let mut copy = [n,2]; copy[0] += 3; let mut x = 0; for i in 1..=3 { x += i }; return copy[0] + x }\nstd::io::print(advance(&mut counter), work(1), counter)\nadvance(&mut counter)\nadvance(&mut counter)\nstd::io::print(counter)\n";
     let program = Arc::new(compile(source).unwrap());
-    assert_eq!(program.functions()[1].kind, RoutineKind::Procedure);
-    assert!(program.functions()[1].effects.writes_references);
-    assert!(program.functions()[2].pure);
-    assert!(program.functions()[2].effects.is_observably_pure());
-    assert!(program.functions()[2].effects.may_allocate);
-    assert!(program.functions()[2].effects.may_diverge);
+    assert_eq!(routine(&program, "advance").kind, RoutineKind::Procedure);
+    assert!(routine(&program, "advance").effects.writes_references);
+    assert!(routine(&program, "work").pure);
+    assert!(routine(&program, "work").effects.is_observably_pure());
+    assert!(routine(&program, "work").effects.may_allocate);
+    assert!(routine(&program, "work").effects.may_diverge);
     let mut session = Session::new(program).unwrap();
     session.run(10000);
     assert_eq!(session.status(), &Status::Finished);
@@ -36,14 +44,14 @@ fn rejects_effects_including_transitive_calls() {
 fn recursion_and_checked_failures_remain_observable() {
     let program =
         Arc::new(compile("fn forever(n: i64) -> i64 { return forever(n) }\nforever(0)\n").unwrap());
-    assert!(program.functions()[1].effects.may_diverge);
+    assert!(routine(&program, "forever").effects.may_diverge);
     let mut session = Session::new(program).unwrap();
     session.run(100);
     assert_eq!(session.status(), &Status::Paused);
     let program = Arc::new(compile("const n = 5\nfn f() -> i64 { return n / 0 }\nf()\n").unwrap());
     // Const uses have already become immediate values.
-    assert!(!program.functions()[1].effects.reads_immutable);
-    assert!(program.functions()[1].effects.may_fail);
+    assert!(!routine(&program, "f").effects.reads_immutable);
+    assert!(routine(&program, "f").effects.may_fail);
     let mut session = Session::new(program).unwrap();
     session.run(100);
     assert!(matches!(session.status(), Status::Failed(_)));

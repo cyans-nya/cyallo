@@ -2270,12 +2270,13 @@ mod tests {
             .unwrap();
         assert_eq!(resumed.callable.kind, RoutineKind::Function);
         assert!(resumed.callable.params.is_empty());
-        assert_eq!(
-            resumed.callable.result,
-            storage(
-                StorageKind::GeneratorStep,
-                Type::Tuple(vec![Type::Integer, Type::Integer])
-            )
+        // `Step` is a standard enum now, applied to the yielded and returned types.
+        assert!(
+            matches!(&resumed.callable.result, Type::Enum(step)
+                if step.name.ends_with("Step")
+                    && step.identity.arguments == [Type::Integer, Type::Integer]),
+            "{:?}",
+            resumed.callable.result
         );
     }
 
@@ -2310,7 +2311,13 @@ mod tests {
             &[reference(weak.clone())],
         )
         .unwrap();
-        assert_eq!(upgraded.result, storage(StorageKind::Option, owner.clone()));
+        // `Option` is a standard enum now, applied to the owner type.
+        assert!(
+            matches!(&upgraded.result, Type::Enum(option)
+                if option.name.ends_with("Option") && option.identity.arguments == [owner.clone()]),
+            "{:?}",
+            upgraded.result
+        );
         let method = member(&env, &owner, "clone", &[], &[], SPAN)
             .unwrap()
             .unwrap();
@@ -2318,7 +2325,12 @@ mod tests {
         let method = member(&env, &weak, "upgrade", &[], &[], SPAN)
             .unwrap()
             .unwrap();
-        assert_eq!(method.callable.result, storage(StorageKind::Option, owner));
+        assert!(
+            matches!(&method.callable.result, Type::Enum(option)
+                if option.name.ends_with("Option") && option.identity.arguments == [owner.clone()]),
+            "{:?}",
+            method.callable.result
+        );
     }
 
     #[test]
@@ -2343,12 +2355,11 @@ mod tests {
             TraitObligationKind::Allocator
         );
         assert_eq!(allocated.obligations[0].ty, allocator);
-        let Type::Storage(StorageKind::Result, result) = allocated.result else {
+        // `Result` is a standard enum now, applied to the owner and the error types.
+        let Type::Enum(result) = allocated.result else {
             panic!("declared Result")
         };
-        let Type::Tuple(result) = *result else {
-            panic!("Result type arguments")
-        };
+        let result = result.identity.arguments.clone();
         assert!(
             matches!(&result[0],Type::Managed {kind:MemoryKind::Rc,lifetime:Some(_),pointee,..} if **pointee==Type::Integer)
         );
@@ -2438,7 +2449,7 @@ mod tests {
             Err(NativeContractError::InvalidHeader)
         ));
         assert!(matches!(
-            call(&env, "option_none", &[], &[], &[]),
+            call(&env, "array_empty", &[], &[], &[]),
             Err(NativeContractError::UninferredParameter(_))
         ));
         assert!(matches!(
@@ -2653,13 +2664,16 @@ mod tests {
     #[test]
     fn native_callable_infers_return_only_generics_and_type_families() {
         let env = environment();
-        let parsed = storage(
-            StorageKind::Result,
-            Type::Tuple(vec![
-                Type::numeric(NumberKind::U8),
-                storage(StorageKind::ParseError, Type::Void),
-            ]),
-        );
+        // `Result` is a standard enum now: take the instance the declaration itself produces.
+        let parsed = call(
+            &env,
+            "numeric_parse",
+            &[Type::numeric(NumberKind::U8)],
+            &[text("1")],
+            &[Type::String],
+        )
+        .unwrap()
+        .result;
         let converted = as_callable(
             &env,
             header(&env, "numeric_parse").id,
