@@ -396,3 +396,18 @@ fn an_or_pattern_may_be_guarded_when_it_binds_nothing() {
     assert_eq!(run(&source), "1\n2\n2\n");
     assert_lowered_by_the_pipeline(&source);
 }
+
+#[test]
+fn a_variant_pattern_may_be_written_with_the_enum_name() {
+    let source = "enum Wrapped {\n    Item: i64,\n    Nothing,\n}\n\
+        fn total(w: Wrapped) -> i64 {\n    return match w {\n        Wrapped::Item(n) => n,\n        Wrapped::Nothing => 0,\n    }\n}\n\
+        std::io::print(total(Wrapped::Item(7)))\nstd::io::print(total(Wrapped::Nothing))\n";
+    assert_eq!(run(source), "7\n0\n");
+    assert_lowered_by_the_pipeline(source);
+    // Another enum's name is still wrong.
+    let error = failure(
+        "enum A {\n    X,\n}\nenum B {\n    X,\n}\n\
+         fn f(a: A) -> i64 {\n    return match a {\n        B::X => 1,\n    }\n}\nstd::io::print(f(A::X))\n",
+    );
+    assert_eq!(error.code, "E185", "{}", error.message);
+}

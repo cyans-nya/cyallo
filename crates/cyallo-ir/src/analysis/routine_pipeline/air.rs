@@ -1297,7 +1297,7 @@ impl Analysis<'_> {
                 },
                 span,
             )),
-            Some(_) if qualifier.is_some_and(|owner| owner != last(&contract.name)) => {
+            Some(_) if qualifier.is_some_and(|owner| owner != last(cyallo_ast::source_name(&contract.name))) => {
                 Err(patterns::invalid_pattern(
                     patterns::PatternError::WrongVariant {
                         enumeration: contract.name.clone(),
