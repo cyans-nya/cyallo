@@ -244,7 +244,7 @@ pub fn highlight_with_dialect(
                 source.to_owned()
             })
         }
-        Dialect::Compatibility | Dialect::Simplified | Dialect::Strict => {
+        Dialect::Caie27 | Dialect::CaieSimplified => {
             let tokens = caie_int_parser::lex(source)?;
             Ok(if color {
                 render(

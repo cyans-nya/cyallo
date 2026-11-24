@@ -34,7 +34,7 @@ fn caie(source: &str) -> Result<Vec<String>, RunError> {
         &compile_with_options(
             source,
             CompileOptions {
-                dialect: Dialect::Compatibility,
+                dialect: Dialect::Caie27,
                 convenience_builtins: true,
                 ..Default::default()
             },

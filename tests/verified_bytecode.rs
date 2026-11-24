@@ -658,7 +658,7 @@ fn factorial_excludes_nops_and_keeps_statement_boundaries_after_relocation() {
     let checked = cyallo::compile_with_options(
         source,
         cyallo::CompileOptions {
-            dialect: cyallo::Dialect::Compatibility,
+            dialect: cyallo::Dialect::Caie27,
             ..Default::default()
         },
     )

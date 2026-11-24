@@ -140,7 +140,7 @@ pub fn analyze(
     );
     let source_names = ast.source_names.clone();
     let mut globals = collect(&ast.body, &[])?;
-    if matches!(options.dialect, Dialect::Modern | Dialect::Simplified) {
+    if matches!(options.dialect, Dialect::Modern | Dialect::CaieSimplified) {
         crate::inference::infer(&ast.body, &mut globals, &[], &routine_types, options)?;
     }
     crate::native_thunk::rewrite(&mut ast, &routine_types, options)?;
@@ -164,7 +164,7 @@ pub fn analyze(
             .map(|f| (key(&f.name), crate::composites::function_type(f))),
     );
     globals = collect(&ast.body, &[])?;
-    if matches!(options.dialect, Dialect::Modern | Dialect::Simplified) {
+    if matches!(options.dialect, Dialect::Modern | Dialect::CaieSimplified) {
         crate::inference::infer(&ast.body, &mut globals, &[], &routine_types, options)?;
     }
     for local in &mut globals {
@@ -339,7 +339,7 @@ fn lower_routine(
     }
     let mut locals = collect(&f.body, &f.params)?;
     crate::generator::input_local(f, &mut locals);
-    if matches!(options.dialect, Dialect::Modern | Dialect::Simplified) {
+    if matches!(options.dialect, Dialect::Modern | Dialect::CaieSimplified) {
         crate::inference::infer(&f.body, &mut locals, globals, routine_types, options)?;
     }
     for local in &mut locals {
@@ -1254,11 +1254,7 @@ impl Lower<'_> {
                 Ok((r, call.result))
             }
             Lowering::Utility(id) => {
-                if matches!(
-                    self.options.dialect,
-                    Dialect::Compatibility | Dialect::Strict
-                ) && !self.options.convenience_builtins
-                {
+                if self.options.dialect == Dialect::Caie27 && !self.options.convenience_builtins {
                     if !crate::builtins::standard_id(id) {
                         return Err(Diagnostic::new(
                             "E112",

@@ -8,7 +8,7 @@ fn debugger(source: &str) -> Debugger {
     let program = compile_with_options(
         source,
         CompileOptions {
-            dialect: Dialect::Compatibility,
+            dialect: Dialect::Caie27,
             ..Default::default()
         },
     )

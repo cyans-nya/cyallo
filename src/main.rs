@@ -32,7 +32,7 @@ use std::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "Typed language, CAIE compatibility, bytecode and background tiered JIT"
+    about = "Typed language, CAIE pseudocode, bytecode and background tiered JIT"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -50,7 +50,7 @@ struct Cli {
         long,
         global = true,
         value_enum,
-        help = "Override source dialect (.ya: modern, .psc: CAIE pseudo code, .pss: simplified CAIE pseudo code; otherwise modern)"
+        help = "Override the source dialect (.psc defaults to caie, all other inputs to modern)"
     )]
     dialect: Option<Dialect>,
     #[arg(long, global = true, value_enum, default_value = "auto")]
@@ -154,10 +154,12 @@ enum ReportStyle {
 #[derive(Clone, Copy, ValueEnum)]
 enum Dialect {
     Modern,
-    Compatibility,
-    #[value(alias = "caie")]
-    Strict,
-    Simplified,
+    /// Latest supported CAIE edition (currently caie27).
+    Caie,
+    /// Cambridge 9618 pseudocode for the syllabus starting in 2027.
+    Caie27,
+    /// CAIE pseudocode with inferred variable types.
+    CaieSimplified,
 }
 #[derive(Subcommand)]
 enum Command {
@@ -378,7 +380,7 @@ fn main() -> color_eyre::Result<()> {
     let dialect =
         cli.dialect
             .unwrap_or_else(|| match cli.command.file().and_then(Path::extension) {
-                Some(extension) if extension == "psc" => Dialect::Compatibility,
+                Some(extension) if extension == "psc" => Dialect::Caie,
                 _ => Dialect::Modern,
             });
     let options = cyallo::CompileOptions {
@@ -387,9 +389,9 @@ fn main() -> color_eyre::Result<()> {
         jobs: cli.jobs,
         dialect: match dialect {
             Dialect::Modern => cyallo::Dialect::Modern,
-            Dialect::Compatibility => cyallo::Dialect::Compatibility,
-            Dialect::Strict => cyallo::Dialect::Strict,
-            Dialect::Simplified => cyallo::Dialect::Simplified,
+            Dialect::Caie => cyallo::Dialect::Caie,
+            Dialect::Caie27 => cyallo::Dialect::Caie27,
+            Dialect::CaieSimplified => cyallo::Dialect::CaieSimplified,
         },
     };
     match &cli.command {
@@ -529,11 +531,10 @@ fn main() -> color_eyre::Result<()> {
             lower_analyzed_or_exit(&program, &source_name, diagnostic_color, options.dialect);
             println!(
                 "OK: {}",
-                match dialect {
-                    Dialect::Modern => "modern",
-                    Dialect::Compatibility => "CAIE 9618 compatibility (2027–2029)",
-                    Dialect::Strict => "CAIE compatibility (strict alias)",
-                    Dialect::Simplified => "simplified (fixed inferred types)",
+                match options.dialect {
+                    cyallo::Dialect::Modern => "modern",
+                    cyallo::Dialect::Caie27 => "CAIE 9618 (2027–2029)",
+                    cyallo::Dialect::CaieSimplified => "CAIE simplified (fixed inferred types)",
                 }
             )
         }

@@ -125,7 +125,7 @@ fn caie_real_division_and_its_zero_divisor() {
         compile_with_options(
             source,
             CompileOptions {
-                dialect: Dialect::Compatibility,
+                dialect: Dialect::Caie27,
                 ..Default::default()
             },
         )

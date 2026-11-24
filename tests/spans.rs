@@ -117,7 +117,7 @@ fn duplicate_declaration_labels_both_locations() {
     let d = cyallo::compile_with_options(
         source,
         cyallo::CompileOptions {
-            dialect: cyallo::Dialect::Compatibility,
+            dialect: cyallo::Dialect::Caie27,
             ..Default::default()
         },
     )

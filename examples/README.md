@@ -1,6 +1,6 @@
 # Examples
 
-Run commands from the repository root. Modern examples use `.ya`; CAIE compatibility examples use `.psc`. The extension selects the dialect:
+Run commands from the repository root. Modern examples use `.ya` and CAIE examples use `.psc`. The extension selects the dialect:
 
 ```sh
 cargo run -- run examples/tour.yas
@@ -263,23 +263,22 @@ Correct!
 
 ## CAIE syntax and migration
 
-These `.psc` files use CAIE syntax, which modern mode rejects. Compatibility
-mode is selected automatically. The declaration-free variant still requires
-`--dialect simplified`.
+These `.psc` files select `caie` automatically, which currently resolves to
+`caie27`. The declaration-free variant requires `--dialect caie-simplified`.
 
 | Example | Dialect | Input / output |
 | --- | --- | --- |
-| [loops.psc](loops.psc) | Compatibility (automatic) | Prints `5050` |
-| [functions.psc](functions.psc) | Compatibility (automatic) | Prints `3628800` |
-| [arrays.psc](arrays.psc) | Compatibility (automatic) | Prints `4,4` |
-| [strings.psc](strings.psc) | Compatibility (automatic) | Prints `Cambridge9`; positions are one-based |
-| [input.psc](input.psc) | Compatibility (automatic) | Prompts `Number?`; entering `42` prints `42` |
-| [simplified.psc](simplified.psc) | `--dialect simplified` | Prints `3:11:3:123` |
+| [loops.psc](loops.psc) | `caie` (automatic) | Prints `5050` |
+| [functions.psc](functions.psc) | `caie` (automatic) | Prints `3628800` |
+| [arrays.psc](arrays.psc) | `caie` (automatic) | Prints `4,4` |
+| [strings.psc](strings.psc) | `caie` (automatic) | Prints `Cambridge9`; positions are one-based |
+| [input.psc](input.psc) | `caie` (automatic) | Prompts `Number?`; entering `42` prints `42` |
+| [simplified.psc](simplified.psc) | `--dialect caie-simplified` | Prints `3:11:3:123` |
 
 ```sh
 cargo run -- run examples/arrays.psc
 printf '42\n' | cargo run -- run examples/input.psc
-cargo run -- run examples/simplified.psc --dialect simplified
+cargo run -- run examples/simplified.psc --dialect caie-simplified
 ```
 
 ## Runtime source loading

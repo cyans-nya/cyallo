@@ -53,7 +53,7 @@ fn snapshot_keeps_the_same_diagnostic_span_as_source_compilation() {
 fn compatibility_compilation_preserves_case_folded_names() {
     let source = "DECLARE Count : INTEGER\ncount <- 41\nOUTPUT Count + 1\n";
     let options = CompileOptions {
-        dialect: cyallo::Dialect::Compatibility,
+        dialect: cyallo::Dialect::Caie27,
         ..Default::default()
     };
     for program in [

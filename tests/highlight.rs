@@ -1,5 +1,5 @@
 fn highlight(source: &str, color: bool) -> Result<String, cyallo::Diagnostic> {
-    cyallo::highlight::highlight_with_dialect(source, color, cyallo::Dialect::Compatibility)
+    cyallo::highlight::highlight_with_dialect(source, color, cyallo::Dialect::Caie27)
 }
 fn plain(ansi: &str) -> String {
     let mut out = String::new();
@@ -57,15 +57,14 @@ fn compatibility_keeps_literal_backslashes() {
         cyallo::compile_with_options(
             source,
             cyallo::CompileOptions {
-                dialect: cyallo::Dialect::Compatibility,
+                dialect: cyallo::Dialect::Caie27,
                 ..Default::default()
             }
         )
         .is_ok()
     );
     assert!(
-        cyallo::highlight::highlight_with_dialect(source, true, cyallo::Dialect::Compatibility)
-            .is_ok()
+        cyallo::highlight::highlight_with_dialect(source, true, cyallo::Dialect::Caie27).is_ok()
     );
 }
 
@@ -195,11 +194,7 @@ fn modern_coloring_is_lossless_for_real_sources_and_partial_input() {
 fn compatibility_types_literals_and_operators_use_the_new_palette() {
     let source =
         "DECLARE n : INTEGER\nCONSTANT limit = 3\nIF TRUE AND FALSE THEN\nOUTPUT n DIV 2\nENDIF\n";
-    for dialect in [
-        cyallo::Dialect::Compatibility,
-        cyallo::Dialect::Strict,
-        cyallo::Dialect::Simplified,
-    ] {
+    for dialect in [cyallo::Dialect::Caie27, cyallo::Dialect::CaieSimplified] {
         let colored = cyallo::highlight::highlight_with_dialect(source, true, dialect).unwrap();
         assert_eq!(plain(&colored), source);
         assert_style(&colored, "DECLARE", "1;35");

@@ -63,7 +63,7 @@ fn compatibility_functions_keep_effects() {
     let program = compile_with_options(
         source,
         CompileOptions {
-            dialect: Dialect::Compatibility,
+            dialect: Dialect::Caie27,
             ..Default::default()
         },
     )

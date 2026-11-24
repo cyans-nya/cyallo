@@ -21,9 +21,9 @@ checked routines and initialization through executable linking; see
 instances, and effects have ordered coordination barriers. See
 [parallel compilation](parallel-compilation.md) and [general lookup plans](lookups.md).
 
-Modern mode is the default. Compatibility preserves CAIE syntax and imperative
-functions. `NativeBackend`/`Executable` provide the extension point for a future
-LLVM backend.
+Modern mode is the default. The `caie` dialect selects the latest supported
+CAIE edition, currently `caie27`, with CAIE syntax and imperative functions.
+`NativeBackend`/`Executable` provide the extension point for a future LLVM backend.
 
 The [concurrency runtime](concurrency.md) separates C/T/P scheduling, channels,
 single-commit operations, clocks, and blocking host work into independent crates.

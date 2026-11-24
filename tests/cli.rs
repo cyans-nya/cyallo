@@ -63,7 +63,7 @@ fn moving_gc_cli_and_repl_reset_report_collections() {
             "run",
             "examples/simplified.psc",
             "--dialect",
-            "simplified",
+            "caie-simplified",
             "--engine",
             engine,
             "--gc-stress",
@@ -93,13 +93,19 @@ fn moving_gc_cli_and_repl_reset_report_collections() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("collections"));
 }
 #[test]
-fn extensions_select_dialects_and_simplified_is_explicit() {
-    let strict = cli(&["check", "examples/loops.psc"]).output().unwrap();
-    assert!(strict.status.success());
-    assert_eq!(
-        strict.stdout,
-        "OK: CAIE 9618 compatibility (2027–2029)\n".as_bytes()
-    );
+fn extensions_select_caie27_or_modern_and_caie_simplified_is_explicit() {
+    for flags in [&[][..], &["--dialect", "caie"], &["--dialect", "caie27"]] {
+        let caie = cli(&["check", "examples/loops.psc"])
+            .args(flags)
+            .output()
+            .unwrap();
+        assert!(
+            caie.status.success(),
+            "{flags:?}: {}",
+            String::from_utf8_lossy(&caie.stderr)
+        );
+        assert_eq!(caie.stdout, "OK: CAIE 9618 (2027–2029)\n".as_bytes());
+    }
     let modern = cli(&["check", "examples/tour.yas"]).output().unwrap();
     assert!(modern.status.success());
     assert_eq!(modern.stdout, b"OK: modern\n");
@@ -117,20 +123,15 @@ fn extensions_select_dialects_and_simplified_is_explicit() {
         "check",
         "examples/simplified.psc",
         "--dialect",
-        "simplified",
+        "caie-simplified",
     ])
     .output()
     .unwrap();
     assert!(!simplified.status.success());
     assert!(String::from_utf8_lossy(&simplified.stderr).contains("unsupported"));
-    let invalid = cli(&[
-        "check",
-        "examples/simplified.psc",
-        "--dialect",
-        "compatibility",
-    ])
-    .output()
-    .unwrap();
+    let invalid = cli(&["check", "examples/simplified.psc", "--dialect", "caie27"])
+        .output()
+        .unwrap();
     assert!(!invalid.status.success());
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("E114"));
 }
@@ -145,7 +146,7 @@ fn engines_run_simplified_source() {
             "run",
             "examples/simplified.psc",
             "--dialect",
-            "simplified",
+            "caie-simplified",
             "--engine",
             engine,
         ])
@@ -313,7 +314,7 @@ fn pretty_color_modes_preserve_plain_source() {
             "pretty",
             "examples/simplified.psc",
             "--dialect",
-            "compatibility",
+            "caie",
             "--color",
             mode,
         ])
@@ -335,7 +336,7 @@ fn diagnostic_color_modes_work_when_redirected() {
             "check",
             "examples/simplified.psc",
             "--dialect",
-            "compatibility",
+            "caie27",
             "--color",
             mode,
         ])
@@ -344,15 +345,10 @@ fn diagnostic_color_modes_work_when_redirected() {
         assert!(!result.status.success());
         assert_eq!(result.stderr.contains(&0x1b), mode == "always");
     }
-    let result = cli(&[
-        "check",
-        "examples/simplified.psc",
-        "--dialect",
-        "compatibility",
-    ])
-    .env("NO_COLOR", "1")
-    .output()
-    .unwrap();
+    let result = cli(&["check", "examples/simplified.psc", "--dialect", "caie27"])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
     assert!(!result.stderr.contains(&0x1b));
 }
 #[test]
@@ -364,10 +360,10 @@ fn modern_syntax_and_bytecode_are_inspectable() {
         String::from_utf8_lossy(&modern.stderr)
     );
     assert_eq!(modern.stdout, b"ADA\n288212784234102776:10:3\n");
-    let compat = cli(&["check", "examples/modern.yas", "--dialect", "compatibility"])
+    let caie = cli(&["check", "examples/modern.yas", "--dialect", "caie"])
         .output()
         .unwrap();
-    assert!(!compat.status.success());
+    assert!(!caie.status.success());
     let bytecode = cli(&["emit", "bytecode", "examples/modern.yas"])
         .output()
         .unwrap();

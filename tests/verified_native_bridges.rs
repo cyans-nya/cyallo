@@ -87,7 +87,7 @@ fn lower_entry(program: &Program) -> VerifiedModule {
 
 fn caie_module(source: &str) -> VerifiedModule {
     let options = CompileOptions {
-        dialect: Dialect::Compatibility,
+        dialect: Dialect::Caie27,
         convenience_builtins: true,
         ..Default::default()
     };

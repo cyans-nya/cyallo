@@ -195,7 +195,7 @@ fn main() {
         (
             "loops",
             include_str!("../examples/loops.psc"),
-            Dialect::Compatibility,
+            Dialect::Caie27,
         ),
         (
             "hot-loop",
@@ -205,17 +205,17 @@ fn main() {
         (
             "calls",
             include_str!("../examples/functions.psc"),
-            Dialect::Compatibility,
+            Dialect::Caie27,
         ),
         (
             "arrays",
             include_str!("../examples/arrays.psc"),
-            Dialect::Compatibility,
+            Dialect::Caie27,
         ),
         (
             "strings",
             include_str!("../examples/strings.psc"),
-            Dialect::Compatibility,
+            Dialect::Caie27,
         ),
     ]
     .into_iter()

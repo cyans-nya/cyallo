@@ -40,7 +40,7 @@ impl Repl {
     }
     pub fn simplified() -> Result<Self, Diagnostic> {
         Self::new(CompileOptions {
-            dialect: Dialect::Simplified,
+            dialect: Dialect::CaieSimplified,
             ..Default::default()
         })
     }

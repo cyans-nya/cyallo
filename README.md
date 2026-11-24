@@ -1,6 +1,6 @@
 # Cyallo interpreter and tiered compiler
 
-A typed language with a compact register-bytecode interpreter, background JIT compilation, a persistent REPL, Oxc diagnostics, syntax colors, and a Ratatui debugger. **Modern source uses `.ya`; CAIE compatibility source uses `.psc`.** File commands select the dialect from the extension. The REPL and files with other extensions default to modern syntax; `--dialect` overrides the selection.
+A typed language with a compact register-bytecode interpreter, background JIT compilation, a persistent REPL, Oxc diagnostics, syntax colors, and a Ratatui debugger. **Modern source uses `.ya` and CAIE pseudocode uses `.psc`.** File commands select the dialect from the extension. The REPL and files with other extensions default to modern syntax. Use `--dialect` to override the selection.
 
 The workspace uses `cyallo` for the runtime and CLI, `cyallo-parser` for modern syntax,
 `cyallo-ast` for the shared source model, `cyallo-ir` for resolution, type analysis and
@@ -171,7 +171,7 @@ Source → AST → declarations → per-body checking/inference → typed contro
 
 Scalar/control instructions are 16-byte words with explicit register IDs, branch PCs, and type tags. Source spans and variable-sized operations live separately. `emit bytecode <file>` disassembles the verified (ng) bytecode of every analyzed routine; `emit ir <file>` prints the checked typed IR that both lowerings consume. The native baseline consumes bytecode directly. The adapter requires matching runtime metadata and imports; it is not a standalone WASI application or a stable persisted package format.
 
-**Current engines (2026-11-20).** The **next-generation verified pipeline** lowers typed IR to verified register bytecode (`src/bytecode/verified`). `run`, `repl` and `debug` default to its resumable interpreter (`--engine ng` for `run` and `repl`). Both `ng` and `ng_jit` report a diagnostic for programs they cannot lower, including programs that use characters, 32-bit numbers, or the simplified dialect's sparse arrays. See [overhaul stages](docs/overhaul-stages.md), [native tiers: next steps](docs/native-tiers-next-steps.md) and the [legacy removal plan](docs/legacy-removal-plan.md).
+**Current engines (2026-11-20).** The **next-generation verified pipeline** lowers typed IR to verified register bytecode (`src/bytecode/verified`). `run`, `repl` and `debug` default to its resumable interpreter (`--engine ng` for `run` and `repl`). Both `ng` and `ng_jit` report a diagnostic for programs they cannot lower, including programs that use characters, 32-bit numbers, or sparse arrays in `caie-simplified`. See [overhaul stages](docs/overhaul-stages.md), [native tiers: next steps](docs/native-tiers-next-steps.md) and the [legacy removal plan](docs/legacy-removal-plan.md).
 
 `cyallo run examples/hot-loop.yas --engine ng_jit` compiles eligible verified routines before execution. It tries Winch first and low-latency Cranelift when Winch cannot emit a routine. Shared-runtime native code can hand off work to the verified interpreter. If the entry point cannot be published, the whole invocation runs on the verified interpreter. Reports and inspection using `--jit-*` require a legacy engine.
 
@@ -263,16 +263,17 @@ cyallo run program.ya --engine legacy_cranelift_speed
 
 Native Winch and Cranelift read and write scalar registers and cells directly through a `repr(C)` VM view. Checked arithmetic, initialization checks, comparisons, and branches are native; PC and counters are batched at safepoints. Available native callees use stable entry slots across tiers. Scalar state is materialized before runtime calls, budget exits, and engine handoffs, preserving BYREF aliases and VM-frame OSR. Allocation, call setup/return, complex values, and I/O retain helpers; Winch uses native branch edges and a small write-through scalar register cache, with no Wasm/Wasmtime transitions in scalar loops. The old runtime adapter is available only with `--features wasm-adapter` for comparison. The CLI and benchmarks use [mimalloc](https://github.com/purpleprotocol/mimalloc_rust); library embedders choose their own allocator. See [architecture](docs/architecture.md) and [measurements](docs/benchmarks.md).
 
-## CAIE compatibility and migration
+## CAIE dialects
 
-Use `.psc` for the core [Cambridge 9618, 2027–2029 guide](https://www.cambridgeinternational.org/Images/721401-2027-2029-pseudocode-guide.pdf). Use `--dialect compatibility` to override another extension or select compatibility syntax in the REPL:
+`.psc` files use `caie`, which selects the latest supported CAIE edition. The current edition is `caie27`, based on the Cambridge 9618 syllabus starting in 2027. Use `--dialect caie` to select the latest edition explicitly or `--dialect caie27` to pin the edition. [Cambridge 9618 pseudocode guide for 2027–2029](https://www.cambridgeinternational.org/Images/721401-2027-2029-pseudocode-guide.pdf)
 
 ```sh
 cyallo run exam.psc
-cyallo repl --dialect compatibility
+cyallo repl --dialect caie
+cyallo run exam.psc --dialect caie27
 ```
 
-Compatibility mode requires DECLARE, preserves CAIE control structures and built-ins, and rejects modern syntax/utilities. `--convenience-builtins` explicitly enables utility functions there. `--dialect strict` remains an alias for the prior strict behavior; `--dialect simplified` preserves the prior declaration-free CAIE syntax. Library `compile()` now defaults to `Dialect::Modern`; use `compile_with_options` and `Dialect::Compatibility` for standard source.
+`caie27` requires `DECLARE` and supports CAIE control structures and built-ins. `--convenience-builtins` enables extra utility functions. Use `--dialect caie-simplified` for CAIE syntax with inferred variable types. Library `compile()` defaults to `Dialect::Modern`. With `compile_with_options`, use `Dialect::Caie` for the latest CAIE edition, `Dialect::Caie27` to pin it, or `Dialect::CaieSimplified` for inferred variable types.
 
 Supported CAIE core: primitive types, literal constants, arrays with explicit signed bounds, assignment, console I/O, IF, CASE/ranges, WHILE, REPEAT, FOR/STEP, procedures/functions, recursion, BYVAL and BYREF, and the standard string/numeric built-ins. Files, DATE, records, enums, pointers, sets, and classes remain unsupported. LLVM and standalone native executables are deferred.
 

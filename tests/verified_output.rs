@@ -29,7 +29,7 @@ fn caie(source: &str) -> cyallo::ir::Program {
     compile_with_options(
         source,
         CompileOptions {
-            dialect: Dialect::Compatibility,
+            dialect: Dialect::Caie27,
             ..Default::default()
         },
     )

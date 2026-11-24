@@ -5,7 +5,7 @@
 //! use cyallo::{compile_with_options, CompileOptions, Dialect, Session, Status};
 //! let program = Arc::new(compile_with_options(
 //!     "Count <- 0\nArr[10] <- 123\nOUTPUT LENGTH(Arr)\n",
-//!     CompileOptions { dialect: Dialect::Simplified, ..Default::default() },
+//!     CompileOptions { dialect: Dialect::CaieSimplified, ..Default::default() },
 //! )?);
 //! let mut session = Session::new(program)?;
 //! session.run(1_000);

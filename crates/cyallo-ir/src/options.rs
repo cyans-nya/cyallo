@@ -2,10 +2,17 @@
 pub enum Dialect {
     #[default]
     Modern,
-    Compatibility,
-    Strict,
-    Simplified,
+    /// Cambridge 9618 pseudocode for the syllabus starting in 2027.
+    Caie27,
+    /// CAIE pseudocode with inferred variable types.
+    CaieSimplified,
 }
+impl Dialect {
+    /// Selects the latest supported CAIE edition.
+    #[allow(non_upper_case_globals)]
+    pub const Caie: Self = Self::Caie27;
+}
+
 /// How the entry source is run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EntryMode {
