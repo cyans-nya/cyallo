@@ -78,7 +78,6 @@ pub(super) enum ExpressionKind {
     /// the module graph found among the receiver type's native members.
     Member {
         receiver: Variable,
-        site: SiteId,
         name: NameId,
         arguments: Vec<Expression>,
     },
@@ -389,8 +388,6 @@ pub(super) struct Routine {
     pub(super) statements: Vec<Statement>,
     /// Declared and hidden locals, after the parameters, in slot order.
     pub(super) locals: Vec<Local>,
-    /// Whether the body matches on a value, or tests one with `if let`.
-    pub(super) matched: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -413,8 +410,6 @@ struct Context<'a> {
     scopes: Vec<Vec<Visible>>,
     /// Loops enclosing the statement being lowered.
     loops: usize,
-    /// Whether any `match` or `if let` was lowered.
-    matched: bool,
     /// The routine returns no value.
     procedure: bool,
     /// For each parameter: whether its type is a type parameter, or a reference to one,
@@ -490,7 +485,6 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
         locals: Vec::new(),
         sites: Vec::new(),
         loops: 0,
-        matched: false,
         procedure,
         pending: Vec::new(),
         generic_receiver: {
@@ -532,7 +526,6 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
         sites: context.sites,
         statements,
         locals: context.locals,
-        matched: context.matched,
     })
 }
 
@@ -964,7 +957,6 @@ impl Context<'_> {
             self.scopes.pop();
             lowered.push(arm?);
         }
-        self.matched = true;
         Some(StatementKind::Match(Box::new(MatchStatement {
             scrutinee,
             held,
@@ -1385,7 +1377,6 @@ impl Context<'_> {
                             span: arm.span,
                         });
                     }
-                    self.matched = true;
                     ExpressionKind::Match(Box::new(Match {
                         scrutinee,
                         held,
@@ -1443,7 +1434,6 @@ impl Context<'_> {
                             expression.span,
                             ExpressionKind::Member {
                                 receiver: visible.slot,
-                                site,
                                 name: method,
                                 arguments,
                             },

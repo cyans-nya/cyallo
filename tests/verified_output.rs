@@ -4,7 +4,7 @@
 use cyallo::{
     CompileOptions, Dialect,
     bytecode::verified::{
-        CallTarget, ExecutionLimits, ExecutionStatus, LowerError, OutputSink, RunError,
+        CallTarget, ExecutionLimits, ExecutionStatus, OutputSink, RunError,
         VerifiedModule,
     },
     compile, compile_with_options,

@@ -1,7 +1,6 @@
-use cyallo::{CompileOptions, Dialect, compile, compile_with_options, vm::{Context, Session, Status}};
+use cyallo::{compile, vm::{Context, Session, Status}};
 use std::sync::Arc;
 
-use cyallo::runtime::{GeneratorError, RuntimeError};
 #[test]
 fn pure_factory_and_owned_delegation_forward_input_and_return() {
     output(
