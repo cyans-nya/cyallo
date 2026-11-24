@@ -1167,9 +1167,27 @@ impl Analysis<'_> {
         span: Span,
     ) -> Result<(Vec<(Type, bool)>, Type), Diagnostic> {
         let ty = self.typed(callee, span)?;
-        match self.view(&ty) {
+        // A function value behind a reference parameter is called through it.
+        let ty = match self.view(&ty) {
+            Type::Reference { pointee, .. } => self.view(&pointee),
+            other => other,
+        };
+        match ty {
             Type::Function(_, parameters, result) => Ok((parameters, self.view(&result))),
             _ => Err(Diagnostic::new("E110", "value is not callable", span)),
+        }
+    }
+
+    /// The function value a local holds, loaded through the reference when it is one.
+    fn function_value(&mut self, callee: Variable, span: Span) -> Result<Value, Diagnostic> {
+        let (value, ty) = self.read(callee, span)?;
+        match self.view(&ty) {
+            Type::Reference { pointee, .. } => {
+                let loaded = self.value(self.view(&pointee));
+                self.emit(Operation::Load(loaded, value), span);
+                Ok(loaded)
+            }
+            _ => Ok(value),
         }
     }
 
@@ -1543,7 +1561,7 @@ impl Analysis<'_> {
                             span,
                         ));
                     }
-                    let (function, _) = self.read(*callee, span)?;
+                    let function = self.function_value(*callee, span)?;
                     let value = self.value(result.clone());
                     self.emit(Operation::Invoke(Some(value), function, operands), span);
                     Ok((value, result))
@@ -2753,7 +2771,7 @@ impl Analysis<'_> {
                 }
                 if let ExpressionKind::Invoke { callee, arguments } = &call.kind {
                     let (operands, result) = self.invoke(*callee, arguments, call.span)?;
-                    let (function, _) = self.read(*callee, call.span)?;
+                    let function = self.function_value(*callee, call.span)?;
                     let value = (result != Type::Void).then(|| self.value(result));
                     self.emit(Operation::Invoke(value, function, operands), call.span);
                     return Ok(());

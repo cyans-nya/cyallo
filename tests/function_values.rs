@@ -73,3 +73,11 @@ fn a_procedure_value_is_called_as_a_statement() {
     let source = "proc hello(n: i64) { std::io::print(n) }\nproc run(f: proc(i64), n: i64) { f(n)\n f(n + 1) }\nrun(hello, 4)";
     assert_eq!(run(source), "4\n5\n");
 }
+
+#[test]
+fn a_function_value_behind_a_reference_is_called_through_it() {
+    let source = include_str!("../examples/functions/references.yas");
+    assert_eq!(run(source), "hello\nhello\n0\n1\n2\n");
+    // twice, repeat, hello, count and demo.
+    assert_eq!(lowered(source), 5);
+}

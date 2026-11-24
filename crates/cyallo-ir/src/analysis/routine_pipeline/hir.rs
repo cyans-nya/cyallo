@@ -1422,9 +1422,7 @@ impl Context<'_> {
                     // A local of the same name shadows the declaration: a call of it is a
                     // call of the function value it holds.
                     if self.every_name.contains(&name) {
-                        let visible = self.lookup(name);
-                        let Some(visible) = visible.filter(|visible| visible.reference.is_none())
-                        else {
+                        let Some(visible) = self.lookup(name) else {
                             return decline(|| "call of a local name".into());
                         };
                         let arguments: Vec<Expression> = ast

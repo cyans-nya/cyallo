@@ -1,0 +1,26 @@
+// A function value behind a reference parameter is called through it.
+// Run: cargo run -- run examples/functions/references.yas
+proc twice(action: &mut proc()) {
+    action()
+    action()
+}
+
+proc repeat(action: &proc(i64), n: i64) {
+    let mut i = 0
+    while i < n {
+        action(i)
+        i += 1
+    }
+}
+
+proc hello() { std::io::print("hello") }
+proc count(n: i64) { std::io::print(n) }
+
+proc demo() {
+    let mut greet = hello
+    twice(&mut greet)
+    let show = count
+    repeat(&show, 3)
+}
+
+demo()
