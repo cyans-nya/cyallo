@@ -57,13 +57,13 @@ pub(super) enum Statement {
     /// `p.a.b = value`.
     AssignProject {
         root: Variable,
-        path: Vec<cyallo_ast::indexed::NameId>,
+        path: Vec<super::hir::Step>,
         value: Expression,
     },
     /// `p.a.b op= value`.
     CompoundProject {
         root: Variable,
-        path: Vec<cyallo_ast::indexed::NameId>,
+        path: Vec<super::hir::Step>,
         operator: cyallo_ast::Operator,
         value: Expression,
     },

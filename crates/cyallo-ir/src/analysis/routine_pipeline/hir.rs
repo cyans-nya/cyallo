@@ -9,6 +9,13 @@ use cyallo_ast::{
     FunctionBodyKind, Literal, Operator, ParameterArity, ParameterPassing, RoutineKind, Span, Type,
 };
 
+/// One step of a place: a record field by name, or a tuple element by position.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Step {
+    Field(NameId),
+    Index(usize),
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Expression {
     pub(super) span: Span,
@@ -48,8 +55,10 @@ pub(super) enum ExpressionKind {
     /// `p.a.b`: a field of a local or of a reference parameter, found by name.
     Project {
         root: Variable,
-        path: Vec<NameId>,
+        path: Vec<Step>,
     },
+    /// `(a, b, ...)`: the elements in order.
+    Tuple(Vec<Expression>),
     /// A string literal: its text is interned in the body's unit.
     Text(NameId),
     /// `value as number`: a numeric conversion.
@@ -151,6 +160,7 @@ impl Expression {
                 fields.iter().map(|(_, value)| value.size()).sum()
             }
             ExpressionKind::Project { path, .. } => path.len(),
+            ExpressionKind::Tuple(elements) => elements.iter().map(Expression::size).sum(),
             ExpressionKind::Text(_) => 0,
             ExpressionKind::ArrayLiteral(values) => values.iter().map(Expression::size).sum(),
             ExpressionKind::Index { index, .. } => index.size(),
@@ -207,13 +217,13 @@ pub(super) enum StatementKind {
     /// `p.a.b = value`.
     AssignProject {
         root: Variable,
-        path: Vec<NameId>,
+        path: Vec<Step>,
         value: Expression,
     },
     /// `p.a.b op= value`.
     CompoundProject {
         root: Variable,
-        path: Vec<NameId>,
+        path: Vec<Step>,
         operator: Operator,
         value: Expression,
     },
@@ -1050,19 +1060,26 @@ impl Context<'_> {
     /// The slot of a mutable local named by `target`. Parameters, immutable names,
     /// loop counters and anything else stay with the existing route, which owns
     /// those diagnostics.
-    /// The root variable and field names of a place such as `p.a.b`.
-    fn projected(&self, target: Id<ExprNode>) -> Option<(Variable, Vec<NameId>)> {
-        let ExprSyntax::Field(base, name) = self.ast.get(target)?.kind else {
-            return None;
-        };
-        let mut path = vec![name];
-        let mut current = base;
+    /// The base and step of one field or tuple-element access.
+    fn step_of(&self, target: Id<ExprNode>) -> Option<(Id<ExprNode>, Step)> {
+        match self.ast.get(target)?.kind {
+            ExprSyntax::Field(base, name) => Some((base, Step::Field(name))),
+            ExprSyntax::TupleField(base, index) => Some((base, Step::Index(index))),
+            _ => None,
+        }
+    }
+
+    /// The root variable and steps of a place such as `p.a.0.b`.
+    fn projected(&self, target: Id<ExprNode>) -> Option<(Variable, Vec<Step>)> {
+        let (mut current, first) = self.step_of(target)?;
+        let mut path = vec![first];
         loop {
+            if let Some((inner, step)) = self.step_of(current) {
+                path.push(step);
+                current = inner;
+                continue;
+            }
             match self.ast.get(current)?.kind {
-                ExprSyntax::Field(inner, name) => {
-                    path.push(name);
-                    current = inner;
-                }
                 ExprSyntax::Name(root) => {
                     let visible = self.lookup(root)?;
                     path.reverse();
@@ -1259,7 +1276,7 @@ impl Context<'_> {
                 ExprSyntax::Unary(operator @ (Operator::Not | Operator::Subtract), operand) => {
                     ExpressionKind::Unary(operator, Box::new(self.value(operand, split)?))
                 }
-                ExprSyntax::Field(..) => {
+                ExprSyntax::Field(..) | ExprSyntax::TupleField(..) => {
                     let Some((root, path)) = self.projected(id) else {
                         return None;
                     };
@@ -1282,6 +1299,13 @@ impl Context<'_> {
                         return decline(|| "empty array literal".into());
                     }
                     ExpressionKind::ArrayLiteral(values)
+                }
+                ExprSyntax::Tuple(elements) => {
+                    let mut written = Vec::new();
+                    for &element in ast.get_list(elements)? {
+                        written.push(self.value(element, false)?);
+                    }
+                    ExpressionKind::Tuple(written)
                 }
                 ExprSyntax::Record(name, fields) => {
                     let mut written = Vec::new();
@@ -1517,6 +1541,13 @@ fn signature_type(ast: &IndexedAst, node: &TypeNode) -> Option<Type> {
         }
         // Only the fact that it is acceptable is used; the type itself is resolved later.
         TypeNode::Named(_) | TypeNode::Applied(..) => Some(Type::Void),
+        TypeNode::Tuple(elements) => {
+            let all = ast.get_list(*elements)?.iter().all(|&element| {
+                ast.get(element)
+                    .is_some_and(|node| signature_type(ast, node).is_some())
+            });
+            all.then_some(Type::Void)
+        }
         other => scalar_type(other),
     }
 }

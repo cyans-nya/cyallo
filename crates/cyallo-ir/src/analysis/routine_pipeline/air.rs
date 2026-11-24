@@ -9,7 +9,7 @@ use super::{LocalName, SiteId, Variable, hir, mir};
 use crate::patterns;
 use cyallo_ast::indexed::{IndexedAst, NameId};
 use cyallo_ast::{Diagnostic, Literal, Number, NumberKind, Operator, Param, Span, Type};
-use hir::{Expression, ExpressionKind};
+use hir::{Expression, ExpressionKind, Step};
 use mir::{Located, Statement};
 use std::{borrow::Cow, collections::HashMap, fmt, sync::Arc};
 
@@ -327,6 +327,22 @@ fn contextualize<'e>(
     expression: &'e Expression,
     wanted: &Type,
 ) -> Result<Cow<'e, Expression>, Diagnostic> {
+    if let (Type::Tuple(items), ExpressionKind::Tuple(elements)) = (wanted, &expression.kind)
+        && items.len() == elements.len()
+    {
+        let fitted = elements
+            .iter()
+            .zip(items)
+            .map(|(element, item)| contextualize(element, item))
+            .collect::<Result<Vec<_>, _>>()?;
+        if fitted.iter().all(|element| matches!(element, Cow::Borrowed(_))) {
+            return Ok(Cow::Borrowed(expression));
+        }
+        return Ok(Cow::Owned(Expression::new(
+            expression.span,
+            ExpressionKind::Tuple(fitted.into_iter().map(Cow::into_owned).collect()),
+        )));
+    }
     let Some(kind) = wanted.number_kind() else {
         return Ok(Cow::Borrowed(expression));
     };
@@ -599,6 +615,7 @@ fn extra_blocks(block: &mir::Block) -> usize {
             ExpressionKind::ArrayLiteral(values) => values.iter().map(count).sum(),
             ExpressionKind::Index { index, .. } => count(index),
             ExpressionKind::Cast(inner, _) => count(inner),
+            ExpressionKind::Tuple(elements) => elements.iter().map(count).sum(),
             ExpressionKind::Record { fields, .. } => {
                 fields.iter().map(|(_, value)| count(value)).sum()
             }
@@ -827,7 +844,7 @@ impl Analysis<'_> {
     fn place(
         &self,
         root: Variable,
-        path: &[NameId],
+        path: &[Step],
         write: bool,
         span: Span,
     ) -> Result<Place, Diagnostic> {
@@ -853,27 +870,23 @@ impl Analysis<'_> {
             }
         };
         let mut steps = Vec::with_capacity(path.len());
-        for name in path {
-            let name = self.text(*name);
-            let Type::Record(_, fields) = &current else {
-                return Err(Diagnostic::new(
-                    "E116",
-                    "unknown field or tuple index",
-                    span,
-                ));
-            };
-            let Some((index, (_, field))) = fields
-                .iter()
-                .enumerate()
-                .find(|(_, (field, _))| &**field == name)
-            else {
-                return Err(Diagnostic::new(
-                    "E116",
-                    "unknown field or tuple index",
-                    span,
-                ));
-            };
-            let field = self.view(field);
+        for step in path {
+            let (index, field) = match (&current, step) {
+                (Type::Record(_, fields), Step::Field(name)) => {
+                    let name = self.text(*name);
+                    fields
+                        .iter()
+                        .enumerate()
+                        .find(|(_, (field, _))| &**field == name)
+                        .map(|(index, (_, field))| (index, field.clone()))
+                }
+                (Type::Tuple(items), Step::Index(index)) => {
+                    items.get(*index).map(|item| (*index, item.clone()))
+                }
+                _ => None,
+            }
+            .ok_or_else(|| Diagnostic::new("E116", "unknown field or tuple index", span))?;
+            let field = self.view(&field);
             steps.push((index, field.clone()));
             current = field;
         }
@@ -1063,6 +1076,11 @@ impl Analysis<'_> {
                     .last()
                     .map_or(place.root_type, |(_, ty)| ty.clone()))
             }
+            ExpressionKind::Tuple(elements) => elements
+                .iter()
+                .map(|element| self.infer(element))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Type::Tuple),
             ExpressionKind::Record { site, .. } => {
                 self.record_type(*site, expression.span).map(|(ty, _)| ty)
             }
@@ -1308,6 +1326,19 @@ impl Analysis<'_> {
                     }
                     let value = self.value(ty.clone());
                     self.emit(Operation::FieldRead(value, *root, Box::new(place)), span);
+                    Ok((value, ty))
+                }
+                ExpressionKind::Tuple(elements) => {
+                    let mut values = Vec::with_capacity(elements.len());
+                    let mut types = Vec::with_capacity(elements.len());
+                    for element in elements {
+                        let (value, ty) = self.expression_as(element, Use::Move)?;
+                        values.push(value);
+                        types.push(ty);
+                    }
+                    let ty = Type::Tuple(types);
+                    let value = self.value(ty.clone());
+                    self.emit(Operation::Aggregate(value, values), span);
                     Ok((value, ty))
                 }
                 ExpressionKind::Record { site, fields } => self.record(*site, fields, span),
@@ -2955,6 +2986,9 @@ fn mentions(expression: &Expression, variables: &[Variable]) -> bool {
         | ExpressionKind::Borrow { variable, .. } => {
             variables.iter().any(|other| other.0 == variable.0)
         }
+        ExpressionKind::Tuple(elements) => {
+            elements.iter().any(|element| mentions(element, variables))
+        }
         ExpressionKind::Record { fields, .. } => {
             fields.iter().any(|(_, value)| mentions(value, variables))
         }
@@ -3032,6 +3066,11 @@ fn gather_in<'e>(expression: &'e Expression, out: &mut Vec<(&'e hir::Match, Span
         ExpressionKind::Call(_, arguments) | ExpressionKind::Invoke { arguments, .. } => {
             for argument in arguments {
                 gather_matches(argument, out);
+            }
+        }
+        ExpressionKind::Tuple(elements) => {
+            for element in elements {
+                gather_matches(element, out);
             }
         }
         ExpressionKind::Record { fields, .. } => {

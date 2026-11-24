@@ -156,6 +156,10 @@ A routine of a script file may read and write the script's own `let mut` variabl
 
 `char` is accepted as a parameter, result and local type and as a literal; comparisons use the existing operator typing. The verified engine has no character lowering, so `char` programs are compiled and checked but not run (`tests/scalars.rs`). `value as number` lowers to the cast intrinsic, typed from the target (`i64`, `f64` and the sized numbers); a value that is not a number is E109 as on the old route, and a cast to anything else stays on it. The parity harness used a `char` local as its out-of-subset marker; it now uses a closure local, the next construct the pipeline does not lower. Tests: `tests/scalars.rs`; example: `examples/scalars/casts.yas`.
 
+### Tuples
+
+Tuple expressions, tuple types in signatures and locals, and element places (`t.0`, `t.1 += 1`, `a.b.0`) lower through the pipeline. A place path is a list of steps, a record field by name or a tuple element by position (`hir::Step`), so records and tuples nest freely. A tuple literal is typed from its elements, and an expected tuple type contextualizes each element, so `return (3, 4)` fits `(u8, i64)`. Moving an owned element out of a tuple is E118, as for records. The earlier parked work (`wip/tuples`) is merged here; patterns that destructure a tuple (`let (a, b) = ...`, `(x, y) =>`) stay on the old route. Tests: `tests/tuples.rs`; example: `examples/tuples/basic.yas`.
+
 ## Removal roadmap: what the old route still does alone
 
 Measured by `tests/pipeline_coverage.rs` over `examples/` and `std/` (55 of 97 routines accepted, 2026-11-24). The old route (linked AST → `lower_routine`) can be deleted only when every row below is covered by the pipeline, in this order of payoff per effort:
