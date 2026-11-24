@@ -465,6 +465,28 @@ impl Builder {
                                 previous.push(at);
                             }
                         }
+                        Part::Literal { held, value } => {
+                            let test = self.take_block();
+                            let yes = self.next_block();
+                            let at = fails.len();
+                            let condition = Expression::new(
+                                value.span,
+                                hir::ExpressionKind::Binary(
+                                    cyallo_ast::Operator::Equal,
+                                    Box::new(Expression::new(
+                                        value.span,
+                                        hir::ExpressionKind::Read(held),
+                                    )),
+                                    Box::new(value),
+                                ),
+                            );
+                            fails.push((test, Exit::Branch { condition, yes, no: yes }, arm.span));
+                            if last {
+                                pending_no.push(at);
+                            } else {
+                                previous.push(at);
+                            }
+                        }
                         Part::Bind {
                             held,
                             name,
@@ -523,7 +545,9 @@ impl Builder {
                         to_shared.push((open, arm.span));
                         let next = self.next_block();
                         for at in previous.drain(..) {
-                            if let Exit::MatchTest { no, .. } = &mut fails[at].1 {
+                            if let Exit::MatchTest { no, .. } | Exit::Branch { no, .. } =
+                                &mut fails[at].1
+                            {
                                 *no = next;
                             }
                         }
@@ -573,7 +597,9 @@ impl Builder {
             let next = self.next_block();
             for index in pending_no.drain(..) {
                 match &mut fails[index].1 {
-                    Exit::MatchTest { no, .. } | Exit::Guard { no, .. } => *no = next,
+                    Exit::MatchTest { no, .. } | Exit::Guard { no, .. } | Exit::Branch { no, .. } => {
+                        *no = next
+                    }
                     _ => unreachable!("only tests and guards are pending"),
                 }
             }
@@ -685,6 +711,11 @@ enum Part {
         slot: Variable,
         leaf: bool,
     },
+    /// Whether `held` equals a literal.
+    Literal {
+        held: Variable,
+        value: Expression,
+    },
     /// Read a tuple element or record field of `root` into `slot`, likewise.
     Project {
         root: Variable,
@@ -699,6 +730,10 @@ fn flatten(pattern: &hir::Pattern) -> Vec<Part> {
     fn walk(pattern: &hir::Pattern, out: &mut Vec<Part>) {
         match pattern {
             hir::Pattern::Wildcard | hir::Pattern::Binding(_) => {}
+            hir::Pattern::Literal { value, at } => out.push(Part::Literal {
+                held: *at,
+                value: value.clone(),
+            }),
             hir::Pattern::Variant { name, payload, at } => {
                 out.push(Part::Test {
                     held: *at,

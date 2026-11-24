@@ -71,6 +71,10 @@ enum Shape {
     Variant(usize, Option<Box<Shape>>),
     /// A tuple or a record: one shape per element or per field in declaration order.
     Product(Vec<Shape>),
+    /// `true` or `false`.
+    Bool(bool),
+    /// Any other literal: it matches some values of its type and never all of them.
+    Literal,
 }
 
 /// How many cases the coverage check explores before it gives up.
@@ -1296,6 +1300,34 @@ impl Analysis<'_> {
         let ty = self.peeled(ty).0;
         match pattern {
             hir::Pattern::Wildcard | hir::Pattern::Binding(_) => Ok(Shape::Any),
+            hir::Pattern::Literal { value, .. } => {
+                let fits = match (&value.kind, &ty) {
+                    (ExpressionKind::Literal(Literal::Boolean(b)), Type::Boolean) => {
+                        return Ok(Shape::Bool(*b));
+                    }
+                    (ExpressionKind::Literal(Literal::Integer(_)), ty)
+                    | (ExpressionKind::Literal(Literal::Number(_)), ty) => {
+                        ty.number_kind().is_some()
+                    }
+                    (ExpressionKind::Literal(Literal::Real(_)), ty) => {
+                        ty.number_kind().is_some_and(NumberKind::float)
+                    }
+                    (ExpressionKind::Text(_), Type::String) => true,
+                    _ => false,
+                };
+                if fits {
+                    Ok(Shape::Literal)
+                } else {
+                    let actual = self.infer(value).unwrap_or(Type::Void);
+                    Err(patterns::invalid_pattern(
+                        patterns::PatternError::LiteralType {
+                            expected: ty.clone(),
+                            actual,
+                        },
+                        span,
+                    ))
+                }
+            }
             hir::Pattern::Variant { name, payload, .. } => {
                 let (contract, index) = self.variant_of(&ty, *name, span)?;
                 let declared = contract.variants[index].payload.as_ref();
@@ -1419,6 +1451,9 @@ impl Analysis<'_> {
                             inner.iter().map(|inner| (**inner).clone()).collect()
                         }
                         (Shape::Product(parts), None) => parts.clone(),
+                        (Shape::Bool(value), Some(wanted)) if usize::from(*value) == wanted => {
+                            Vec::new()
+                        }
                         _ => return None,
                     };
                     parts.extend(tail.iter().cloned());
@@ -1444,6 +1479,20 @@ impl Analysis<'_> {
                         Some(part) if part != "_" => format!("{name}({part})"),
                         _ => name.clone(),
                     }));
+                }
+                Ok(missing)
+            }
+            Type::Boolean => {
+                let mut missing = Vec::new();
+                for (index, name) in ["false", "true"].into_iter().enumerate() {
+                    let mut next: Vec<Type> = rest.to_vec();
+                    let found = self.uncovered(
+                        &specialize(Some(index), 0),
+                        &std::mem::take(&mut next),
+                        budget,
+                        span,
+                    )?;
+                    missing.extend(wrap(found, 0, &|_| name.to_owned()));
                 }
                 Ok(missing)
             }

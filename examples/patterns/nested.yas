@@ -1,0 +1,70 @@
+// Nested patterns: a variant inside a variant, tuples and records taken apart, literals,
+// guards over nested names, and alternatives that bind the same name.
+// Run: cargo run -- run examples/patterns/nested.yas
+// Output: "5", "-1", "8", "34", "9", "100", "7" (one line each).
+enum Inner {
+    A: i64,
+    B,
+}
+enum Outer {
+    Wrap: Inner,
+    Plain: i64,
+}
+enum Wrapped {
+    Item: (i64, i64),
+    Nothing,
+}
+record Entry {
+    key: i64
+    value: i64
+}
+enum Item {
+    Pair: Entry,
+    Empty,
+}
+
+fn nested(o: Outer) -> i64 {
+    return match o {
+        Outer::Wrap(Inner::A(n)) => n,
+        Outer::Wrap(Inner::B) => -1,
+        Outer::Plain(n) => n * 2,
+    }
+}
+
+fn tuple_payload(w: Wrapped) -> i64 {
+    return match w {
+        Wrapped::Item((a, b)) => a * 10 + b,
+        Wrapped::Nothing => 0,
+    }
+}
+
+fn record_payload(i: Item) -> i64 {
+    return match i {
+        Item::Pair { key, value } => key + value,
+        Item::Empty => 0,
+    }
+}
+
+fn guarded(o: Outer) -> i64 {
+    return match o {
+        Outer::Wrap(Inner::A(n)) if n > 10 => 100,
+        Outer::Wrap(Inner::A(n)) => n,
+        Outer::Wrap(Inner::B) => -1,
+        Outer::Plain(_) => 0,
+    }
+}
+
+fn either(o: Outer) -> i64 {
+    return match o {
+        Outer::Wrap(Inner::A(n)) | Outer::Plain(n) => n,
+        Outer::Wrap(Inner::B) => -1,
+    }
+}
+
+std::io::print(nested(Outer::Wrap(Inner::A(5))))
+std::io::print(nested(Outer::Wrap(Inner::B)))
+std::io::print(nested(Outer::Plain(4)))
+std::io::print(tuple_payload(Wrapped::Item((3, 4))))
+std::io::print(record_payload(Item::Pair(Entry { key: 4, value: 5 })))
+std::io::print(guarded(Outer::Wrap(Inner::A(50))))
+std::io::print(either(Outer::Plain(7)))

@@ -128,6 +128,11 @@ pub(super) enum Pattern {
         rest: bool,
         at: Variable,
     },
+    /// A value written out, compared with the value `at` holds.
+    Literal {
+        value: Expression,
+        at: Variable,
+    },
 }
 
 impl Pattern {
@@ -148,16 +153,17 @@ impl Pattern {
     pub(super) fn at(&self) -> Option<Variable> {
         match self {
             Pattern::Wildcard | Pattern::Binding(_) => None,
-            Pattern::Variant { at, .. } | Pattern::Tuple { at, .. } | Pattern::Record { at, .. } => {
-                Some(*at)
-            }
+            Pattern::Variant { at, .. }
+            | Pattern::Tuple { at, .. }
+            | Pattern::Record { at, .. }
+            | Pattern::Literal { at, .. } => Some(*at),
         }
     }
 
     /// The names the pattern binds, in the order written.
     pub(super) fn bindings(&self, out: &mut Vec<Variable>) {
         match self {
-            Pattern::Wildcard => {}
+            Pattern::Wildcard | Pattern::Literal { .. } => {}
             Pattern::Binding(slot) => out.push(*slot),
             Pattern::Variant { payload, .. } => {
                 if let Some(payload) = payload {
@@ -725,6 +731,22 @@ impl Context<'_> {
                     at,
                 })
             }
+            PatternSyntax::Literal(value) => {
+                let kind = match ast.get(value)? {
+                    LiteralNode::String(text) => ExpressionKind::Text(*text),
+                    LiteralNode::Number(number) => ExpressionKind::Literal(Literal::Number(*number)),
+                    LiteralNode::Integer(value) => ExpressionKind::Literal(Literal::Integer(*value)),
+                    LiteralNode::Real(value) => ExpressionKind::Literal(Literal::Real(*value)),
+                    LiteralNode::Boolean(value) => {
+                        ExpressionKind::Literal(Literal::Boolean(*value))
+                    }
+                    _ => return decline(|| "literal pattern of this kind".into()),
+                };
+                Some(Pattern::Literal {
+                    value: Expression::new(node.span, kind),
+                    at,
+                })
+            }
             ref other => decline(|| format!("pattern {}", variant(other))),
         }
     }
@@ -972,6 +994,23 @@ impl Context<'_> {
         }
         let result = self.declare(LocalName::Hidden("$match"), span, false);
         let kind = self.match_statement(scrutinee, arms, span, Some(result))?;
+        // A value is read where every arm that finishes has assigned it. When none finishes
+        // the value has no type to give, and the existing route owns that case.
+        if let StatementKind::Match(matched) = &kind
+            && matched.arms.iter().all(|arm| {
+                matches!(
+                    arm.body.last().map(|last| &last.kind),
+                    Some(
+                        StatementKind::Return(_)
+                            | StatementKind::ReturnVoid
+                            | StatementKind::Break
+                            | StatementKind::Continue
+                    )
+                )
+            })
+        {
+            return decline(|| "match whose arms all leave the routine or the loop".into());
+        }
         self.pending.push(Statement { span, kind });
         Some(Some(Expression::new(span, ExpressionKind::Read(result))))
     }

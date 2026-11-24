@@ -231,3 +231,55 @@ fn coverage_and_shape_errors_apply_through_a_reference_too() {
     assert_eq!(error.code, "E185", "{}", error.message);
     assert!(error.message.contains("Wrap(B)"), "{}", error.message);
 }
+
+#[test]
+fn a_literal_is_compared_with_the_part_it_stands_for() {
+    let source = "enum Pair {\n    Both: (i64, bool),\n    Name: string,\n}\n\
+        fn f(p: Pair) -> i64 {\n    return match p {\n        Pair::Both((1, true)) => 10,\n        Pair::Both((_, false)) => 20,\n        Pair::Both((n, true)) => n,\n        Pair::Name(\"x\") => 30,\n        Pair::Name(_) => 40,\n    }\n}\n\
+        fn g(n: i64) -> i64 {\n    return match n {\n        0 => 100,\n        1 | 2 => 200,\n        _ => 300,\n    }\n}\n\
+        std::io::print(f(Pair::Both((1, true))))\nstd::io::print(f(Pair::Both((5, false))))\nstd::io::print(f(Pair::Both((7, true))))\n\
+        std::io::print(f(Pair::Name(\"x\")))\nstd::io::print(f(Pair::Name(\"y\")))\n\
+        std::io::print(g(0))\nstd::io::print(g(2))\nstd::io::print(g(9))\n";
+    assert_eq!(run(source), "10\n20\n7\n30\n40\n100\n200\n300\n");
+    assert_lowered_by_the_pipeline(source);
+}
+
+#[test]
+fn booleans_are_covered_as_two_values_and_other_literals_never_are() {
+    let ok = "fn f(a: bool, b: bool) -> i64 {\n    return match (a, b) {\n        (true, true) => 1,\n        (true, false) => 2,\n        (false, _) => 3,\n    }\n}\n\
+        std::io::print(f(true, false))\nstd::io::print(f(false, true))\n";
+    assert_eq!(run(ok), "2\n3\n");
+    assert_lowered_by_the_pipeline(ok);
+    let error = failure(
+        "fn f(a: bool, b: bool) -> i64 {\n    return match (a, b) {\n        (true, true) => 1,\n        (false, _) => 3,\n    }\n}\nstd::io::print(f(true, true))\n",
+    );
+    assert_eq!(error.code, "E185", "{}", error.message);
+    assert!(error.message.contains("(true, false)"), "{}", error.message);
+    let error = failure("fn g(n: i64) -> i64 {\n    return match n {\n        0 => 1,\n        1 => 2,\n    }\n}\nstd::io::print(g(0))\n");
+    assert_eq!(error.code, "E185", "{}", error.message);
+}
+
+#[test]
+fn a_literal_of_the_wrong_type_is_an_error() {
+    let error = failure("fn g(n: i64) -> i64 {\n    return match n {\n        true => 1,\n        _ => 0,\n    }\n}\nstd::io::print(g(0))\n");
+    assert_eq!(error.code, "E185", "{}", error.message);
+}
+
+#[test]
+fn the_examples_run_and_are_lowered_by_the_pipeline() {
+    let nested = include_str!("../examples/patterns/nested.yas");
+    assert_eq!(run(nested), "5\n-1\n8\n34\n9\n100\n7\n");
+    assert_lowered_by_the_pipeline(nested);
+    let references = include_str!("../examples/patterns/references.yas");
+    assert_eq!(run(references), "5\n5\n11\n8\n7\n");
+    assert_lowered_by_the_pipeline(references);
+}
+
+#[test]
+fn a_match_whose_arms_all_return_is_left_to_the_existing_route() {
+    // No arm finishes, so the match has no value to give; the routine still runs.
+    let source = "enum Choice {\n    A: bool,\n    B,\n}\n\
+        fn choose(value: Choice) -> i64 {\n    return match value {\n        Choice::A(true) => { return 1 },\n        Choice::A(false) | Choice::B => { return 2 },\n    }\n}\n\
+        std::io::print(choose(Choice::A(true)))\nstd::io::print(choose(Choice::B))\n";
+    assert_eq!(run(source), "1\n2\n");
+}

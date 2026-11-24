@@ -1,0 +1,47 @@
+// Matching through references: a borrow written in the `match`, or a reference parameter.
+// Every name a pattern binds is a reference to its part, so the value is not moved, and a
+// `&mut` reference lets an arm change it.
+// Run: cargo run -- run examples/patterns/references.yas
+// Output: "5", "5", "11", "8", "7" (one line each).
+enum Inner {
+    A: i64,
+    B,
+}
+enum Outer {
+    Wrap: Inner,
+    Plain: i64,
+}
+
+proc show(o: &Outer) -> i64 {
+    return match o {
+        Outer::Wrap(Inner::A(n)) => n.*,
+        Outer::Wrap(Inner::B) => 0,
+        Outer::Plain(n) => n.*,
+    }
+}
+
+proc bump(o: &mut Outer) {
+    match o {
+        Outer::Wrap(Inner::A(n)) => { n.* += 10 },
+        Outer::Wrap(Inner::B) => {},
+        Outer::Plain(n) => { n.* = n.* * 2 },
+    }
+}
+
+proc add(pair: &(i64, i64)) -> i64 {
+    return match pair {
+        (a, b) => a.* + b.*,
+    }
+}
+
+let v = Outer::Wrap(Inner::A(5))
+std::io::print(show(&v))
+std::io::print(show(&v))
+let mut a = Outer::Wrap(Inner::A(1))
+let mut b = Outer::Plain(4)
+bump(&mut a)
+bump(&mut b)
+std::io::print(show(&a))
+std::io::print(show(&b))
+let t = (3, 4)
+std::io::print(add(&t))
