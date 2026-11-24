@@ -467,6 +467,9 @@ impl Resolver {
                 pointee,
                 ..
             } => !matches!(**pointee, Type::Reference { .. }) && self.pipeline_type(pointee, depth),
+            Type::Tuple(items) if depth < 8 => items.iter().all(|item| {
+                !matches!(item, Type::Reference { .. }) && self.pipeline_type(item, depth + 1)
+            }),
             Type::Applied(target, arguments) if depth < 8 => self
                 .generic_enums
                 .get(target)
