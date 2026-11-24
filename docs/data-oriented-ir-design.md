@@ -136,6 +136,23 @@ Four waves. Each is parallel inside and deterministic between. The bounded jobs 
 
 Batching units are routine-sized for storage and publication, module-sized for overlays and component-sized for interfaces.
 
+## Removal roadmap: what the old route still does alone
+
+Measured by `tests/pipeline_coverage.rs` over `examples/` and `std/` (55 of 97 routines accepted, 2026-11-24). The old route (linked AST → `lower_routine`) can be deleted only when every row below is covered by the pipeline, in this order of payoff per effort:
+
+| Slice | Declines today (routines) | Needs |
+| --- | --- | --- |
+| Managed values: `gc`/`rc` parameters, results, `.*` through them | 14 | `ManagedNew`, managed address/load/store ops, tracing flag, `Cell` access, ownership of `rc` |
+| References as general values: `&T` / `&mut T` parameters used as values, `&rc T`, `&mut []T` | 7 + 2 | Reference locals and by-value reads, slices with bounds checks, reborrows |
+| Function values and closures | 5 | Function-typed parameters/results, capture lowering, calls of locals |
+| Collections: arrays, `Vec`, indexing, typed collections | 5 | Array literals, indexing and element assignment, native collection methods through `Site::Builtin` |
+| Method calls on non-names and chained receivers | 5 | Hoist the receiver into a temporary; native and trait methods beyond generic bounds |
+| Module globals: `let mut` in the entry script read and assigned from routines | 2 | A `Site::Global` that binds a module slot |
+| Nested and tuple patterns, record payload patterns | 1+ | In progress in a separate session |
+| Generic records and generic callees | 2 | `Applied` record construction; inference of a callee's `T` in AIR |
+
+Not in the corpus but still old-route only: generators, `dyn` trait objects and services, lookups and registrations, objects and native object ICs, `try`/errors beyond enums, strings beyond concatenation and print, `char`, 32-bit numbers, the compatibility and simplified dialects (which already have no verified lowering), and the unchanged declaration-level checks. Deleting the route also needs the namespace linker to stop producing the owned tree (`materialize`) and the 8 failing tests to be resolved.
+
 ## Data partitions and lifetimes
 
 | Partition | Owner | Contents and lifetime |
