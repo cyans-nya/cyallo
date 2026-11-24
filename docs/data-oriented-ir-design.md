@@ -136,6 +136,30 @@ Four waves. Each is parallel inside and deterministic between. The bounded jobs 
 
 Batching units are routine-sized for storage and publication, module-sized for overlays and component-sized for interfaces.
 
+### Local arrays
+
+HIR accepts a non-empty array literal and `a[i]` on a local array, as a value, an assignment target (`a[i] = v`) and a compound target (`a[i] += v`). Parameters, reference parameters and arrays from calls stay on the old route: only a local initialized from a literal has an array type here. AIR types the literal `[T; n]` from its first element and requires the others to agree (E109). `element_of` rejects a non-array root (E108) and a wrong number of subscripts; the index must be an integer (E109); writing a `let` array is E107; moving a non-Copy element out is E118. Emission is `Address` of the array, `Op::Index` for the element address (bounds-checked at run time, write flag set for stores), then `Load` or `Store`. Compound assignment reads the element, computes, and writes it back through a second `Index`. Tests: `tests/arrays.rs`; example: `examples/arrays/basic.yas`. Coverage floor 65 of 105 after slices. Open: array parameters and results, annotated and empty arrays, multi-dimensional and sparse arrays, `len`, element projections (`a[i].x`).
+
+### Slice parameters
+
+`&[]T` and `&mut []T` parameters (scalar elements) are accepted. Indexing a slice parameter loads the reference stored in the parameter and applies `Op::Index` to it, so `a[i]`, `a[i] = v` and `a[i] += v` work in place; writing through a shared slice is E107. A call argument that is a reference to a local array (`&mut values`) stands where a slice reference is wanted: `expected_as` emits `Operation::Slice`, which lowers to the existing `Lookup(Slice)` operation, and the mutability and element type must agree (E107/E109). A slice reference passes on unchanged (`quicksort(a, lo, i - 1)`). Index operations carry whether the root is a reference, so the instruction count stays exact. `swap`, `reverse`, `sum` and `quicksort` in `examples/arrays/slices.yas` all lower through the pipeline. Open: slices of records, strings or nested slices; collections (`Vec`) passed where a slice is wanted, which the old route coerces through the same lookup.
+
+### Function values
+
+A function value behind a reference parameter (`action: &mut proc()`) is loaded through the reference and called. A named plain function is a value (`let held = negate`, `apply(double, 5)`), and a local or parameter holding one is called (`f(n)`, as an expression or a statement). Parameters and results may have function types whose own parameters and result the pipeline lowers; a by-reference function parameter, a closure expression and a call of a call result (`choose(true)(4)`) stay on the old route. The linker binds a name that is not a local to `$function:<target>` when the target is a plain function, and the binder turns it into `Site::Function` with the callee's contract and kind. AIR types it as `Type::Function(kind, parameters, result)`, emits `FunctionValue`, and `invoke` checks the argument count (E110) and each argument against the function type (E109); a local that is not a function type is E110. Tests: `tests/function_values.rs`; example: `examples/functions/values.yas`. The two tests that expected a call of a local to fall back now expect it to migrate.
+
+### Script variables
+
+A routine of a script file may read and write the script's own `let mut` variables when their type is plain from the source: a scalar annotation, or an unannotated integer, real or boolean literal. HIR gives a name that is not a local a reference site (`name_use`), and `name = v` / `name op= v` become `AssignGlobal` / `CompoundGlobal`. The linker reads the variables from the script's statements before the tree is taken for linking (`script_variables_of`, cached per module) and binds the site to `$global:<module>:<name>`; generic routines and immutable script values stay on the old route (the latter are constants it substitutes). The binder finds the slot in the program's globals, where the module declares the variable as `$module<N>$Value$<name>`, and AIR types reads and writes from that local. Emission is `Address` of the global slot followed by `Load` or `Store`, so the effect analysis sees the same operations as the old route: a `fn` that touches a mutable script variable is still rejected. Tests: `tests/script_variables.rs`; example: `examples/script_variables.yas`. `hot-loop.yas` and `osr-loop.yas` now lower entirely on the pipeline. Open: strings and aggregates as script variables, and script variables read from other modules.
+
+### Characters and numeric casts
+
+`char` is accepted as a parameter, result and local type and as a literal; comparisons use the existing operator typing. The verified engine has no character lowering, so `char` programs are compiled and checked but not run (`tests/scalars.rs`). `value as number` lowers to the cast intrinsic, typed from the target (`i64`, `f64` and the sized numbers); a value that is not a number is E109 as on the old route, and a cast to anything else stays on it. The parity harness used a `char` local as its out-of-subset marker; it now uses a closure local, the next construct the pipeline does not lower. Tests: `tests/scalars.rs`; example: `examples/scalars/casts.yas`.
+
+### Tuples
+
+Tuple expressions, tuple types in signatures and locals, and element places (`t.0`, `t.1 += 1`, `a.b.0`) lower through the pipeline. A place path is a list of steps, a record field by name or a tuple element by position (`hir::Step`), so records and tuples nest freely. A tuple literal is typed from its elements, and an expected tuple type contextualizes each element, so `return (3, 4)` fits `(u8, i64)`. Moving an owned element out of a tuple is E118, as for records. The earlier parked work (`wip/tuples`) is merged here; patterns that destructure a tuple (`let (a, b) = ...`, `(x, y) =>`) stay on the old route. Tests: `tests/tuples.rs`; example: `examples/tuples/basic.yas`.
+
 ## Removal roadmap: what the old route still does alone
 
 Measured by `tests/pipeline_coverage.rs` over `examples/` and `std/` (55 of 97 routines accepted, 2026-11-24). The old route (linked AST → `lower_routine`) can be deleted only when every row below is covered by the pipeline, in this order of payoff per effort:
@@ -143,12 +167,13 @@ Measured by `tests/pipeline_coverage.rs` over `examples/` and `std/` (55 of 97 r
 | Slice | Declines today (routines) | Needs |
 | --- | --- | --- |
 | Managed values: `gc`/`rc` parameters, results, `.*` through them | 14 | `ManagedNew`, managed address/load/store ops, tracing flag, `Cell` access, ownership of `rc` |
-| References as general values: `&T` / `&mut T` parameters used as values, `&rc T`, `&mut []T` | 7 + 2 | Reference locals and by-value reads, slices with bounds checks, reborrows |
-| Function values and closures | 5 | Function-typed parameters/results, capture lowering, calls of locals |
+| References as general values: `&T` / `&mut T` parameters used as values, `&rc T` | 3 | Reference locals and by-value reads, reborrows (`&mut []T` slices are done) |
+| Closures (capturing function values) | 4 | Capture lowering and closure conversion; named function values are done |
 | Collections: arrays, `Vec`, indexing, typed collections | 5 | Array literals, indexing and element assignment, native collection methods through `Site::Builtin` |
 | Method calls on non-names and chained receivers | 5 | Hoist the receiver into a temporary; native and trait methods beyond generic bounds |
 | Module globals: `let mut` in the entry script read and assigned from routines | 2 | A `Site::Global` that binds a module slot |
 | Literal patterns for strings in `or` position, `or` patterns nested inside a payload | 1+ | An alternative inside a payload expands to top-level alternatives |
+| Nested and tuple patterns, record payload patterns | 1+ | In progress in a separate session |
 | Generic records and generic callees | 2 | `Applied` record construction; inference of a callee's `T` in AIR |
 
 Not in the corpus but still old-route only: generators, `dyn` trait objects and services, lookups and registrations, objects and native object ICs, `try`/errors beyond enums, strings beyond concatenation and print, `char`, 32-bit numbers, the compatibility and simplified dialects (which already have no verified lowering), and the unchanged declaration-level checks. Deleting the route also needs the namespace linker to stop producing the owned tree (`materialize`) and the 8 failing tests to be resolved.

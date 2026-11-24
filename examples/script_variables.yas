@@ -1,0 +1,28 @@
+// Mutable script variables read and written from routines.
+// Run: cargo run -- run examples/script_variables.yas
+let mut calls = 0
+let mut total = 0
+let mut scale = 1.5
+let mut verbose = false
+
+proc tally(n: i64) {
+    calls += 1
+    total = total + n
+    if n > 3 { verbose = true }
+}
+
+proc scaled() -> f64 {
+    scale *= 2.0
+    return scale
+}
+
+proc shadowed(calls: i64) -> i64 {
+    // The parameter hides the script variable of the same name.
+    return calls + 100
+}
+
+tally(2)
+tally(5)
+std::io::print(calls, ":", total, ":", verbose)
+std::io::print(scaled())
+std::io::print(shadowed(1), ":", calls)

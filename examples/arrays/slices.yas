@@ -1,0 +1,49 @@
+// Slice parameters: `&[]T` reads and `&mut []T` writes in place, and a local array
+// is passed where a slice is wanted.
+// Run: cargo run -- run examples/arrays/slices.yas
+proc swap(a: &mut []i64, i: i64, j: i64) {
+    let held = a[i]
+    a[i] = a[j]
+    a[j] = held
+}
+
+proc reverse(a: &mut []i64, n: i64) {
+    let mut lo = 0
+    let mut hi = n - 1
+    while lo < hi {
+        swap(a, lo, hi)
+        lo += 1
+        hi -= 1
+    }
+}
+
+proc sum(a: &[]i64, n: i64) -> i64 {
+    let mut total = 0
+    for i in 0..n { total += a[i] }
+    return total
+}
+
+proc quicksort(a: &mut []i64, lo: i64, hi: i64) {
+    if lo >= hi { return }
+    let pivot = a[hi]
+    let mut i = lo
+    for j in lo..=hi - 1 {
+        if a[j] < pivot {
+            swap(a, i, j)
+            i += 1
+        }
+    }
+    swap(a, i, hi)
+    quicksort(a, lo, i - 1)
+    quicksort(a, i + 1, hi)
+}
+
+proc demo() -> i64 {
+    let mut values = [5, 3, 9, 1, 7]
+    reverse(&mut values, 5)
+    let first = values[0]
+    quicksort(&mut values, 0, 4)
+    return first * 1000 + sum(&values, 5) * 10 + values[0]
+}
+
+std::io::print(demo())

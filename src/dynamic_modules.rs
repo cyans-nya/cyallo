@@ -204,13 +204,13 @@ mod indexed_body_tests {
                 .unwrap()
         };
         // Plain calls keep only MIR and the resolved overlay: no owned tree.
-        for name in ["indexed", "caller"] {
+        for name in ["indexed", "caller", "local"] {
             assert!(by_name(name).body.is_empty(), "{name}");
             assert!(program.has_indexed_body(&by_name(name).name), "{name}");
         }
         // Anything else is materialized and linked as a tree, so the existing
         // resolver resolves or reports it.
-        for name in ["arity", "missing", "local"] {
+        for name in ["arity", "missing"] {
             assert!(!by_name(name).body.is_empty(), "{name}");
             assert!(!program.has_indexed_body(&by_name(name).name), "{name}");
         }

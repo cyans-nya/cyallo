@@ -2,14 +2,14 @@
 //!
 //! Each program marks function bodies with `PAD`. The migrated variant removes it, so
 //! every routine is in the HIR/MIR/AIR subset. The fallback variant replaces it with a
-//! statement outside the subset (a char local), which keeps the old route and changes
+//! statement outside the subset (a closure local), which keeps the old route and changes
 //! nothing observable. Both must produce the same output or the same diagnostic.
 use cyallo::{Diagnostic, Session, Status, compile};
 use cyallo_ir::analysis::IndexedRoutineBody;
 use std::sync::Arc;
 
 const PAD: &str = "PAD";
-const FALLBACK: &str = "let unused_char = 'a'\n";
+const FALLBACK: &str = "let unused_closure = fn(n: i64) -> i64 { return n }\n";
 
 fn variants(source: &str) -> (String, String) {
     (source.replace(PAD, ""), source.replace(PAD, FALLBACK))
@@ -182,11 +182,15 @@ fn programs_outside_the_subset_keep_the_existing_route() {
         "fn f(n: i64) -> i64 { for i in 0..n { i = 1 }\n return n }",
         // A name used before or outside its scope, and a repeated name.
         "fn f(n: i64) -> i64 { let x = 1\n let x = 2\n return x }",
-        // A call to a local name, and `break`/`continue`.
-        "fn f(n: i64) -> i64 { let g = 1\n return g(n) }",
     ] {
         assert_fallback(source);
     }
+    // A call through a local is a call of the function value it holds; a local that
+    // holds something else is not callable, on either route.
+    same_diagnostic(
+        "fn f(n: i64) -> i64 {PAD\n    let g = 1\n    return g(n)\n}\n",
+        "E110",
+    );
     // A name that is not a local at the point of use is left to the module graph, which
     // accepts it only as a unit variant, so these reach the existing route at link time.
     for source in [

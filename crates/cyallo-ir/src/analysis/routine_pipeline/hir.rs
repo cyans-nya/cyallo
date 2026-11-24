@@ -61,10 +61,24 @@ pub(super) enum ExpressionKind {
     Tuple(Vec<Expression>),
     /// A string literal: its text is interned in the body's unit.
     Text(NameId),
+    /// `value as number`: a numeric conversion.
+    Cast(Box<Expression>, Type),
+    /// `[a, b, c]`: a fixed-size array with at least one element.
+    ArrayLiteral(Vec<Expression>),
+    /// `a[i]`: an element of a local array, by a single integer index.
+    Index {
+        root: Variable,
+        index: Box<Expression>,
+    },
     /// `match value { Variant(binding) => expression, ... }`.
     Match(Box<Match>),
     /// `receiver.method(arguments)` on a parameter whose type is a type parameter.
     MethodCall(Box<MethodCall>),
+    /// `f(arguments)` where `f` is a local or parameter holding a function value.
+    Invoke {
+        callee: Variable,
+        arguments: Vec<Expression>,
+    },
     /// `p.*`: the value a reference parameter refers to.
     Deref(Variable),
     /// `&x` or `&mut x`, as a call argument: a reference to a local or a by-value parameter.
@@ -195,13 +209,17 @@ impl Expression {
             | ExpressionKind::Deref(_)
             | ExpressionKind::Borrow { .. }
             | ExpressionKind::Reborrow(_) => 0,
-            ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => inner.size(),
+            ExpressionKind::Group(inner)
+            | ExpressionKind::Unary(_, inner)
+            | ExpressionKind::Cast(inner, _) => inner.size(),
             ExpressionKind::Record { fields, .. } => {
                 fields.iter().map(|(_, value)| value.size()).sum()
             }
             ExpressionKind::Project { path, .. } => path.len(),
             ExpressionKind::Tuple(elements) => elements.iter().map(Expression::size).sum(),
             ExpressionKind::Text(_) => 0,
+            ExpressionKind::ArrayLiteral(values) => values.iter().map(Expression::size).sum(),
+            ExpressionKind::Index { index, .. } => index.size(),
             ExpressionKind::MethodCall(call) => {
                 1 + call.arguments.iter().map(Expression::size).sum::<usize>()
             }
@@ -217,7 +235,9 @@ impl Expression {
             }
             ExpressionKind::Binary(_, left, right)
             | ExpressionKind::ShortCircuit { left, right, .. } => left.size() + right.size(),
-            ExpressionKind::Call(_, arguments) => arguments.iter().map(Expression::size).sum(),
+            ExpressionKind::Call(_, arguments) | ExpressionKind::Invoke { arguments, .. } => {
+                arguments.iter().map(Expression::size).sum()
+            }
         }
     }
 }
@@ -260,6 +280,30 @@ pub(super) enum StatementKind {
     CompoundProject {
         root: Variable,
         path: Vec<Step>,
+        operator: Operator,
+        value: Expression,
+    },
+    /// `name = value` where `name` is a mutable script variable, bound by the module graph.
+    AssignGlobal {
+        site: SiteId,
+        value: Expression,
+    },
+    /// `name op= value` on a script variable.
+    CompoundGlobal {
+        site: SiteId,
+        operator: Operator,
+        value: Expression,
+    },
+    /// `a[i] = value`.
+    AssignIndex {
+        root: Variable,
+        index: Expression,
+        value: Expression,
+    },
+    /// `a[i] op= value`.
+    CompoundIndex {
+        root: Variable,
+        index: Expression,
         operator: Operator,
         value: Expression,
     },
@@ -343,7 +387,13 @@ impl Routine {
                         | StatementKind::AssignDeref { value, .. }
                         | StatementKind::CompoundDeref { value, .. }
                         | StatementKind::AssignProject { value, .. }
-                        | StatementKind::CompoundProject { value, .. } => value.size(),
+                        | StatementKind::CompoundProject { value, .. }
+                        | StatementKind::AssignGlobal { value, .. }
+                        | StatementKind::CompoundGlobal { value, .. } => value.size(),
+                        StatementKind::AssignIndex { index, value, .. }
+                        | StatementKind::CompoundIndex { index, value, .. } => {
+                            index.size() + value.size()
+                        }
                         StatementKind::CallStatement(call) => call.size(),
                         StatementKind::Match(matched) => {
                             matched.scrutinee.size()
@@ -856,7 +906,7 @@ impl Context<'_> {
                                 ExpressionKind::Call(site, _) => {
                                     self.sites[site.0].discard = true;
                                 }
-                                ExpressionKind::MethodCall(_) => {}
+                                ExpressionKind::MethodCall(_) | ExpressionKind::Invoke { .. } => {}
                                 _ => {
                                     return decline(|| "statement that is not a call".into());
                                 }
@@ -903,11 +953,22 @@ impl Context<'_> {
                             }
                         }
                         StmtSyntax::Assign(target, value) => {
-                            if let Some((root, path)) = self.projected(target) {
+                            if let Some((root, index)) = self.indexed(target) {
+                                StatementKind::AssignIndex {
+                                    root,
+                                    index,
+                                    value: self.value(value, false)?,
+                                }
+                            } else if let Some((root, path)) = self.projected(target) {
                                 StatementKind::AssignProject {
                                     root,
                                     path,
                                     value: self.expression(value)?,
+                                }
+                            } else if let Some(site) = self.global_target(target) {
+                                StatementKind::AssignGlobal {
+                                    site,
+                                    value: self.value(value, false)?,
                                 }
                             } else if let Some(variable) = self.dereferenced(target) {
                                 StatementKind::AssignDeref {
@@ -926,10 +987,23 @@ impl Context<'_> {
                         StmtSyntax::Compound(target, operator, value)
                             if operator.is_arithmetic() && operator != Operator::RealDivide =>
                         {
-                            if let Some((root, path)) = self.projected(target) {
+                            if let Some((root, index)) = self.indexed(target) {
+                                StatementKind::CompoundIndex {
+                                    root,
+                                    index,
+                                    operator,
+                                    value: self.value(value, false)?,
+                                }
+                            } else if let Some((root, path)) = self.projected(target) {
                                 StatementKind::CompoundProject {
                                     root,
                                     path,
+                                    operator,
+                                    value: self.value(value, false)?,
+                                }
+                            } else if let Some(site) = self.global_target(target) {
+                                StatementKind::CompoundGlobal {
+                                    site,
                                     operator,
                                     value: self.value(value, false)?,
                                 }
@@ -1238,6 +1312,39 @@ impl Context<'_> {
         }
     }
 
+    /// The local array and the index expression of a place `a[i]`.
+    fn indexed(&mut self, target: Id<ExprNode>) -> Option<(Variable, Expression)> {
+        let ExprSyntax::Index(base, arguments) = self.ast.get(target)?.kind else {
+            return None;
+        };
+        let arguments = self.ast.get_list(arguments)?;
+        let [index] = arguments else {
+            return decline(|| "index with other than one subscript".into());
+        };
+        let ExprSyntax::Name(name) = self.ast.get(base)?.kind else {
+            return decline(|| "index of something other than a local array".into());
+        };
+        let visible = self.lookup(name)?;
+        // A by-value parameter cannot be an array here; a reference parameter may be a slice.
+        if visible.reference.is_none() && visible.slot.0 < self.parameters {
+            return decline(|| "index of a parameter".into());
+        }
+        Some((visible.slot, self.value(*index, false)?))
+    }
+
+    /// A reference site when `target` names something that is not a local: the module graph
+    /// accepts it only if it is a mutable script variable with a scalar type.
+    fn global_target(&mut self, target: Id<ExprNode>) -> Option<SiteId> {
+        let node = self.ast.get(target)?;
+        let ExprSyntax::Name(name) = node.kind else {
+            return None;
+        };
+        if self.every_name.contains(&name) {
+            return None;
+        }
+        Some(self.site(name, node.span, 0, false, false, true))
+    }
+
     /// The reference parameter `p` when `target` is `p.*`.
     fn dereferenced(&self, target: Id<ExprNode>) -> Option<Variable> {
         let ExprSyntax::Unary(Operator::Dereference, inner) = self.ast.get(target)?.kind else {
@@ -1342,6 +1449,7 @@ impl Context<'_> {
                     LiteralNode::Integer(value) => Literal::Integer(*value),
                     LiteralNode::Real(value) => Literal::Real(*value),
                     LiteralNode::Boolean(value) => Literal::Boolean(*value),
+                    LiteralNode::Char(value) => Literal::Char(*value),
                     other => return decline(|| format!("literal {}", variant(other))),
                 }),
                 ExprSyntax::Name(name) => match self.lookup(name) {
@@ -1380,6 +1488,13 @@ impl Context<'_> {
                         Box::new(self.value(right, false)?),
                     )
                 }
+                ExprSyntax::Cast(value, ty) => {
+                    let Some(wanted) = scalar_type(ast.get(ty)?).filter(|t| t.number_kind().is_some())
+                    else {
+                        return decline(|| "cast to something other than a number".into());
+                    };
+                    ExpressionKind::Cast(Box::new(self.value(value, false)?), wanted)
+                }
                 ExprSyntax::Unary(operator @ (Operator::Not | Operator::Subtract), operand) => {
                     ExpressionKind::Unary(operator, Box::new(self.value(operand, split)?))
                 }
@@ -1388,6 +1503,24 @@ impl Context<'_> {
                         return None;
                     };
                     ExpressionKind::Project { root, path }
+                }
+                ExprSyntax::Index(..) => {
+                    let (root, index) = self.indexed(id)?;
+                    ExpressionKind::Index {
+                        root,
+                        index: Box::new(index),
+                    }
+                }
+                ExprSyntax::ArrayLiteral(values) => {
+                    let values: Vec<Expression> = ast
+                        .get_list(values)?
+                        .iter()
+                        .map(|&value| self.value(value, false))
+                        .collect::<Option<_>>()?;
+                    if values.is_empty() {
+                        return decline(|| "empty array literal".into());
+                    }
+                    ExpressionKind::ArrayLiteral(values)
                 }
                 ExprSyntax::Tuple(elements) => {
                     let mut written = Vec::new();
@@ -1504,9 +1637,24 @@ impl Context<'_> {
                     }))
                 }
                 ExprSyntax::Call(name, arguments) => {
-                    // A local of the same name shadows the declaration.
+                    // A local of the same name shadows the declaration: a call of it is a
+                    // call of the function value it holds.
                     if self.every_name.contains(&name) {
-                        return decline(|| "call of a local name".into());
+                        let Some(visible) = self.lookup(name) else {
+                            return decline(|| "call of a local name".into());
+                        };
+                        let arguments: Vec<Expression> = ast
+                            .get_list(arguments)?
+                            .iter()
+                            .map(|&argument| self.argument(argument))
+                            .collect::<Option<_>>()?;
+                        return Some(Expression::new(
+                            expression.span,
+                            ExpressionKind::Invoke {
+                                callee: visible.slot,
+                                arguments,
+                            },
+                        ));
                     }
                     let arguments: Vec<Expression> = ast
                         .get_list(arguments)?
@@ -1571,7 +1719,13 @@ fn reference_type(ast: &IndexedAst, node: &TypeNode) -> Option<(bool, Type)> {
     else {
         return None;
     };
-    let pointee = signature_type(ast, ast.get(*pointee)?)?;
+    // `&[]T` and `&mut []T`: a slice of scalars, which indexing reads and writes in place.
+    let pointee = match ast.get(*pointee)? {
+        TypeNode::Slice(element) => {
+            Type::Slice(Box::new(scalar_type(ast.get(*element)?)?))
+        }
+        node => signature_type(ast, node)?,
+    };
     Some((
         *mutable,
         Type::Reference {
@@ -1586,6 +1740,21 @@ fn reference_type(ast: &IndexedAst, node: &TypeNode) -> Option<(bool, Type)> {
 /// checks is a record whose fields are all supported (HIR cannot resolve names).
 fn signature_type(ast: &IndexedAst, node: &TypeNode) -> Option<Type> {
     match node {
+        // A function type: its parameters and result are themselves signature types.
+        TypeNode::Function(_, parameters, result) => {
+            for &(parameter, by_ref) in ast.get_list(*parameters)? {
+                if by_ref || signature_type(ast, ast.get(parameter)?).is_none() {
+                    return None;
+                }
+            }
+            match ast.get(*result)? {
+                TypeNode::Void => {}
+                result => {
+                    signature_type(ast, result)?;
+                }
+            }
+            Some(Type::Void)
+        }
         // Only the fact that it is acceptable is used; the type itself is resolved later.
         TypeNode::Named(_) | TypeNode::Applied(..) => Some(Type::Void),
         TypeNode::Tuple(elements) => {
@@ -1604,6 +1773,7 @@ fn scalar_type(node: &TypeNode) -> Option<Type> {
     Some(match node {
         TypeNode::Integer => Type::Integer,
         TypeNode::Boolean => Type::Boolean,
+        TypeNode::Char => Type::Char,
         TypeNode::Real => Type::Real,
         TypeNode::String => Type::String,
         TypeNode::Numeric(kind) => Type::numeric(*kind),

@@ -1,0 +1,16 @@
+// Numeric casts between integers and reals.
+// Run: cargo run -- run examples/scalars/casts.yas
+fn average(total: i64, count: i64) -> f64 {
+    return (total as f64) / (count as f64)
+}
+
+fn truncate(x: f64) -> i64 {
+    return x as i64
+}
+
+proc demo() {
+    std::io::print(average(7, 2))
+    std::io::print(truncate(9.75))
+}
+
+demo()

@@ -38,6 +38,13 @@ pub(super) enum Site {
     Record(Box<str>),
     /// The built-in `print`, which writes its arguments to the output.
     Print,
+    /// A mutable script variable, at its slot in the program's globals.
+    Global { index: usize, ty: Type },
+    /// A named function used as a value, or called through a local that holds it.
+    Function {
+        callee: Callee,
+        kind: cyallo_ast::RoutineKind,
+    },
     /// A utility resolved from its operand types: string and numeric helpers.
     Builtin(crate::intrinsic::Intrinsic),
     /// A variant of a generic enum, whose instance is the type expected where it stands.
@@ -112,6 +119,21 @@ pub(super) enum Operation {
     Aggregate(Value, Vec<Value>),
     /// Read a field of a local or of the record a reference parameter refers to.
     FieldRead(Value, Variable, Box<Place>),
+    /// `[a, b, c]`: a fixed-size array of the operands.
+    ArrayLiteral(Value, Operands),
+    /// A named function as a value.
+    FunctionValue(Value, usize),
+    /// A script variable read, and written.
+    ReadGlobal(Value, usize),
+    WriteGlobal(usize, Value),
+    /// A call through a function value held in a local.
+    Invoke(Option<Value>, Value, Operands),
+    /// A reference to an array, viewed as a reference to a slice of its elements.
+    Slice(Value, Value, bool),
+    /// The element of a local array at an index value.
+    IndexRead(Value, Variable, Value, bool),
+    /// Store a value into the element of a local array at an index value.
+    IndexWrite(Variable, Value, Value, bool),
     /// Write a field.
     FieldWrite(Variable, Box<Place>, Value),
     /// Move a value out of a local, which is then empty until it is written again.
@@ -254,6 +276,19 @@ fn writable(ty: &Type, span: Span) -> Result<Type, Diagnostic> {
 
 /// An argument matches its parameter, and a mutable reference may be passed where a
 /// shared one of the same pointee is wanted.
+/// The type of a named function used as a value.
+fn function_type(kind: cyallo_ast::RoutineKind, callee: &Callee) -> Type {
+    Type::Function(
+        kind,
+        callee
+            .parameters
+            .iter()
+            .map(|parameter| (parameter.clone(), false))
+            .collect(),
+        Box::new(callee.result.clone()),
+    )
+}
+
 fn require_argument(parameter: &Type, actual: &Type, span: Span) -> Result<(), Diagnostic> {
     if let (
         Type::Reference {
@@ -524,6 +559,8 @@ fn check_moves(blocks: &[Block], variables: usize) -> Result<(), Diagnostic> {
                 Operation::ReadVariable(_, variable)
                 | Operation::Borrow(_, variable)
                 | Operation::FieldRead(_, variable, _)
+                | Operation::IndexRead(_, variable, _, _)
+                | Operation::IndexWrite(variable, _, _, _)
                 | Operation::EnumTest(_, variable, _)
                 | Operation::EnumPayload(_, variable, _, _)
                 | Operation::EnumTake(_, variable, _, _)
@@ -599,6 +636,9 @@ fn extra_blocks(block: &mir::Block) -> usize {
             | ExpressionKind::Borrow { .. }
             | ExpressionKind::Reborrow(_) => 0,
             ExpressionKind::Project { .. } => 0,
+            ExpressionKind::ArrayLiteral(values) => values.iter().map(count).sum(),
+            ExpressionKind::Index { index, .. } => count(index),
+            ExpressionKind::Cast(inner, _) => count(inner),
             ExpressionKind::Tuple(elements) => elements.iter().map(count).sum(),
             ExpressionKind::Record { fields, .. } => {
                 fields.iter().map(|(_, value)| count(value)).sum()
@@ -619,7 +659,9 @@ fn extra_blocks(block: &mir::Block) -> usize {
                         })
                         .sum::<usize>()
             }
-            ExpressionKind::Call(_, arguments) => arguments.iter().map(count).sum(),
+            ExpressionKind::Call(_, arguments) | ExpressionKind::Invoke { arguments, .. } => {
+                arguments.iter().map(count).sum()
+            }
             ExpressionKind::MethodCall(call) => call.arguments.iter().map(count).sum(),
         }
     }
@@ -633,7 +675,11 @@ fn extra_blocks(block: &mir::Block) -> usize {
             | Statement::AssignDeref { value, .. }
             | Statement::CompoundDeref { value, .. }
             | Statement::AssignProject { value, .. }
-            | Statement::CompoundProject { value, .. } => count(value),
+            | Statement::CompoundProject { value, .. }
+            | Statement::AssignGlobal { value, .. }
+            | Statement::CompoundGlobal { value, .. } => count(value),
+            Statement::AssignIndex { index, value, .. }
+            | Statement::CompoundIndex { index, value, .. } => count(index) + count(value),
             Statement::CallStatement(call) => count(call),
             Statement::RangeStart { start, finish, .. } => count(start) + count(finish),
             Statement::Marker
@@ -921,6 +967,56 @@ impl Analysis<'_> {
     }
 
     /// Whether a local was declared without `mut` (parameters were not).
+    /// The element type of a local array, with the number of its dimensions checked.
+    fn element_of(
+        &self,
+        root: Variable,
+        write: bool,
+        span: Span,
+    ) -> Result<(Type, Type), Diagnostic> {
+        let array = self.typed(root, span)?;
+        match &array {
+            // A slice parameter: writing needs `&mut`.
+            Type::Reference {
+                mutable, pointee, ..
+            } if matches!(**pointee, Type::Slice(_)) => {
+                if write && !*mutable {
+                    return Err(Diagnostic::new(
+                        "E107",
+                        "cannot write through a read-only reference",
+                        span,
+                    ));
+                }
+                let Type::Slice(element) = &**pointee else {
+                    unreachable!()
+                };
+                Ok((array.clone(), self.view(element)))
+            }
+            Type::Array(bounds, element) if bounds.len() == 1 => {
+                Ok((array.clone(), self.view(element)))
+            }
+            Type::Array(..) => Err(Diagnostic::new(
+                "E108",
+                "incorrect number of array indices",
+                span,
+            )),
+            _ => Err(Diagnostic::new("E108", "indexing requires an array", span)),
+        }
+    }
+
+    /// An index operand: an integer value.
+    fn index_value(&mut self, index: &Expression) -> Result<Value, Diagnostic> {
+        let (value, ty) = self.expression(index)?;
+        if ty.number_kind().is_none_or(|kind| kind.float()) {
+            return Err(Diagnostic::new(
+                "E109",
+                "index requires an integer",
+                index.span,
+            ));
+        }
+        Ok(value)
+    }
+
     fn constant(&self, variable: Variable) -> bool {
         variable
             .0
@@ -992,6 +1088,7 @@ impl Analysis<'_> {
                 .variable_type(*variable)
                 .ok_or_else(|| Diagnostic::new("E114", "type is not known yet", expression.span)),
             ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => self.infer(inner),
+            ExpressionKind::Cast(_, wanted) => Ok(wanted.clone()),
             ExpressionKind::Deref(variable) => {
                 let ty = self.variable_type(*variable).ok_or_else(|| {
                     Diagnostic::new("E114", "type is not known yet", expression.span)
@@ -1012,6 +1109,16 @@ impl Analysis<'_> {
                 .map(Type::Tuple),
             ExpressionKind::Record { site, .. } => {
                 self.record_type(*site, expression.span).map(|(ty, _)| ty)
+            }
+            ExpressionKind::ArrayLiteral(values) => {
+                let element = self.infer(&values[0])?;
+                Ok(Type::Array(
+                    vec![(0, values.len() as i64 - 1)],
+                    Box::new(element),
+                ))
+            }
+            ExpressionKind::Index { root, .. } => {
+                self.element_of(*root, false, expression.span).map(|(_, element)| element)
             }
             ExpressionKind::Reborrow(variable) => self
                 .variable_type(*variable)
@@ -1058,12 +1165,17 @@ impl Analysis<'_> {
             ExpressionKind::MethodCall(call) => {
                 Ok(self.resolve_method(call, expression.span)?.result)
             }
+            ExpressionKind::Invoke { callee, .. } => {
+                Ok(self.function_signature(*callee, expression.span)?.1)
+            }
             ExpressionKind::Call(site, arguments) => match self.callees.get(site.0) {
                 Some(Site::Builtin(id)) => {
                     let (_, types) = self.builtin_arguments(*id, arguments)?;
                     self.builtin_result(*id, &types, expression.span)
                 }
                 Some(Site::Variant { result, .. }) => Ok(self.view(result)),
+                Some(Site::Function { callee, kind }) => Ok(function_type(*kind, callee)),
+                Some(Site::Global { ty, .. }) => Ok(ty.clone()),
                 Some(Site::GenericVariant { .. }) => Err(Diagnostic::new(
                     "E114",
                     "the enum instance of this variant is not known here; annotate the type",
@@ -1072,6 +1184,76 @@ impl Analysis<'_> {
                 _ => Ok(self.callee(*site, expression.span)?.result.clone()),
             },
         })
+    }
+
+    /// The parameter and result types of the function value a local holds.
+    fn function_signature(
+        &self,
+        callee: Variable,
+        span: Span,
+    ) -> Result<(Vec<(Type, bool)>, Type), Diagnostic> {
+        let ty = self.typed(callee, span)?;
+        // A function value behind a reference parameter is called through it.
+        let ty = match self.view(&ty) {
+            Type::Reference { pointee, .. } => self.view(&pointee),
+            other => other,
+        };
+        match ty {
+            Type::Function(_, parameters, result) => Ok((parameters, self.view(&result))),
+            _ => Err(Diagnostic::new("E110", "value is not callable", span)),
+        }
+    }
+
+    /// The function value a local holds, loaded through the reference when it is one.
+    fn function_value(&mut self, callee: Variable, span: Span) -> Result<Value, Diagnostic> {
+        let (value, ty) = self.read(callee, span)?;
+        match self.view(&ty) {
+            Type::Reference { pointee, .. } => {
+                let loaded = self.value(self.view(&pointee));
+                self.emit(Operation::Load(loaded, value), span);
+                Ok(loaded)
+            }
+            _ => Ok(value),
+        }
+    }
+
+    /// The arguments of a call through a function value, against its parameter types.
+    fn invoke(
+        &mut self,
+        callee: Variable,
+        arguments: &[Expression],
+        span: Span,
+    ) -> Result<(Operands, Type), Diagnostic> {
+        let (parameters, result) = self.function_signature(callee, span)?;
+        if arguments.len() != parameters.len() {
+            return Err(Diagnostic::new("E110", "incorrect argument count", span));
+        }
+        let mut values = Vec::with_capacity(arguments.len());
+        for (argument, (parameter, _)) in arguments.iter().zip(&parameters) {
+            let parameter = self.view(parameter);
+            let usage = if matches!(parameter, Type::Reference { .. }) {
+                Use::Read
+            } else {
+                Use::Move
+            };
+            let (value, actual) = self.expected_as(argument, &parameter, usage)?;
+            require_argument(&parameter, &actual, argument.span)?;
+            values.push(value);
+        }
+        let range = Operands {
+            start: self.operands.len(),
+            len: values.len(),
+        };
+        self.operands.extend(values);
+        Ok((range, result))
+    }
+
+    /// The slot and type of the script variable a site names.
+    fn global(&self, site: SiteId, span: Span) -> Result<(usize, Type), Diagnostic> {
+        match self.callees.get(site.0) {
+            Some(Site::Global { index, ty }) => Ok((*index, ty.clone())),
+            _ => Err(invalid(span)),
+        }
     }
 
     fn callee(&self, site: SiteId, span: Span) -> Result<&Callee, Diagnostic> {
@@ -1102,7 +1284,31 @@ impl Analysis<'_> {
             return self.construct_generic(*site, arguments, wanted, expression.span);
         }
         let expression = contextualize(expression, wanted)?;
-        self.expression_as(&expression, usage)
+        let (value, actual) = self.expression_as(&expression, usage)?;
+        // A reference to an array stands where a reference to a slice of its elements is wanted.
+        if let Type::Reference {
+            mutable: wanted_mutable,
+            pointee: wanted_pointee,
+            ..
+        } = wanted
+            && let Type::Slice(element) = &**wanted_pointee
+            && let Type::Reference {
+                mutable: given_mutable,
+                pointee: given_pointee,
+                ..
+            } = &actual
+            && (!*wanted_mutable || *given_mutable)
+            && matches!(&**given_pointee, Type::Array(_, held) if **held == **element)
+        {
+            let value_type = wanted.clone();
+            let slice = self.value(value_type.clone());
+            self.emit(
+                Operation::Slice(slice, value, *wanted_mutable),
+                expression.span,
+            );
+            return Ok((slice, value_type));
+        }
+        Ok((value, actual))
     }
 
     fn expression(&mut self, expression: &Expression) -> Result<(Value, Type), Diagnostic> {
@@ -1180,6 +1386,72 @@ impl Analysis<'_> {
                     Ok((value, ty))
                 }
                 ExpressionKind::Record { site, fields } => self.record(*site, fields, span),
+                ExpressionKind::Cast(inner, wanted) => {
+                    let (value, got) = self.expression(inner)?;
+                    if got.number_kind().is_none() {
+                        return Err(cyallo_ast::diagnostic::numeric_cast_requires_number(
+                            got, span,
+                        ));
+                    }
+                    let kind = wanted.number_kind().expect("a numeric cast target");
+                    let operands = Operands {
+                        start: self.operands.len(),
+                        len: 1,
+                    };
+                    self.operands.push(value);
+                    let result = self.value(wanted.clone());
+                    self.emit(
+                        Operation::Builtin(result, crate::intrinsic::Intrinsic::cast(kind), operands),
+                        span,
+                    );
+                    Ok((result, wanted.clone()))
+                }
+                ExpressionKind::ArrayLiteral(values) => {
+                    let mut element: Option<Type> = None;
+                    let mut operands = Vec::with_capacity(values.len());
+                    for value in values {
+                        let (operand, ty) = self.expression_as(value, Use::Move)?;
+                        match &element {
+                            Some(first) if !crate::memory::same_regions(first, &ty) => {
+                                return Err(Diagnostic::new(
+                                    "E109",
+                                    "array literal elements must have the same type",
+                                    value.span,
+                                ));
+                            }
+                            Some(_) => {}
+                            None => element = Some(ty),
+                        }
+                        operands.push(operand);
+                    }
+                    let ty = Type::Array(
+                        vec![(0, values.len() as i64 - 1)],
+                        Box::new(element.expect("an array literal has an element")),
+                    );
+                    let range = Operands {
+                        start: self.operands.len(),
+                        len: operands.len(),
+                    };
+                    self.operands.extend(operands);
+                    let value = self.value(ty.clone());
+                    self.emit(Operation::ArrayLiteral(value, range), span);
+                    Ok((value, ty))
+                }
+                ExpressionKind::Index { root, index } => {
+                    let (_, element) = self.element_of(*root, false, span)?;
+                    if usage == Use::Move && !self.is_copy(&element) {
+                        return Err(Diagnostic::new(
+                            "E118",
+                            "cannot move an element out of an array; read it in place or clone it",
+                            span,
+                        ));
+                    }
+                    let index = self.index_value(index)?;
+                    let value = self.value(element.clone());
+                    let through = matches!(self.typed(*root, span)?, Type::Reference { .. });
+                    self.emit(Operation::IndexRead(value, *root, index, through), span);
+                    Ok((value, element))
+                }
                 ExpressionKind::Deref(variable) => {
                     let (reference, ty) = self.read(*variable, span)?;
                     let target = pointee(&ty, span)?;
@@ -1283,6 +1555,42 @@ impl Analysis<'_> {
                     if matches!(self.callees.get(site.0), Some(Site::Variant { .. })) =>
                 {
                     self.construct(*site, arguments, span)
+                }
+                ExpressionKind::Call(site, _)
+                    if matches!(self.callees.get(site.0), Some(Site::Global { .. })) =>
+                {
+                    let Some(Site::Global { index, ty }) = self.callees.get(site.0) else {
+                        return Err(invalid(span));
+                    };
+                    let (index, ty) = (*index, ty.clone());
+                    let value = self.value(ty.clone());
+                    self.emit(Operation::ReadGlobal(value, index), span);
+                    Ok((value, ty))
+                }
+                ExpressionKind::Call(site, _)
+                    if matches!(self.callees.get(site.0), Some(Site::Function { .. })) =>
+                {
+                    let Some(Site::Function { callee, kind }) = self.callees.get(site.0) else {
+                        return Err(invalid(span));
+                    };
+                    let (id, ty) = (callee.id, function_type(*kind, callee));
+                    let value = self.value(ty.clone());
+                    self.emit(Operation::FunctionValue(value, id), span);
+                    Ok((value, ty))
+                }
+                ExpressionKind::Invoke { callee, arguments } => {
+                    let (operands, result) = self.invoke(*callee, arguments, span)?;
+                    if result == Type::Void {
+                        return Err(Diagnostic::new(
+                            "E110",
+                            "procedure cannot be used as an expression",
+                            span,
+                        ));
+                    }
+                    let function = self.function_value(*callee, span)?;
+                    let value = self.value(result.clone());
+                    self.emit(Operation::Invoke(Some(value), function, operands), span);
+                    Ok((value, result))
                 }
                 ExpressionKind::Call(site, arguments) => {
                     let (target, result, operands) = self.arguments(*site, arguments, span)?;
@@ -2379,7 +2687,14 @@ impl Analysis<'_> {
                     | Statement::CompoundDeref { value, .. }
                     | Statement::AssignProject { value, .. }
                     | Statement::CompoundProject { value, .. }
+                    | Statement::AssignGlobal { value, .. }
+                    | Statement::CompoundGlobal { value, .. }
                     | Statement::CallStatement(value) => gather_matches(value, &mut matches),
+                    Statement::AssignIndex { index, value, .. }
+                    | Statement::CompoundIndex { index, value, .. } => {
+                        gather_matches(index, &mut matches);
+                        gather_matches(value, &mut matches);
+                    }
                     Statement::RangeStart { start, finish, .. } => {
                         gather_matches(start, &mut matches);
                         gather_matches(finish, &mut matches);
@@ -2674,6 +2989,63 @@ impl Analysis<'_> {
                 self.emit(Operation::Binary(combined, operator, old, operand), span);
                 self.store(*slot, combined, span);
             }
+            Statement::AssignGlobal { site, value } => {
+                let (index, ty) = self.global(*site, span)?;
+                let (stored, actual) = self.expected_as(value, &ty, Use::Move)?;
+                require(&ty, &actual, value.span)?;
+                self.emit(Operation::WriteGlobal(index, stored), span);
+            }
+            Statement::CompoundGlobal {
+                site,
+                operator,
+                value,
+            } => {
+                let (index, ty) = self.global(*site, span)?;
+                let old = self.value(ty.clone());
+                self.emit(Operation::ReadGlobal(old, index), span);
+                let contextual = contextualize(value, &ty)?;
+                let (operand, operand_type) = self.expression(&contextual)?;
+                let result = super::super::binary_type(*operator, &ty, &operand_type, span)?;
+                require(&ty, &result, span)?;
+                let combined = self.value(result.clone());
+                let operator = super::super::specialized_operator(*operator, &result);
+                self.emit(Operation::Binary(combined, operator, old, operand), span);
+                self.emit(Operation::WriteGlobal(index, combined), span);
+            }
+            Statement::AssignIndex { root, index, value } => {
+                let (_, element) = self.element_of(*root, true, span)?;
+                if self.constant(*root) {
+                    return Err(Diagnostic::new("E107", "cannot modify a constant", span));
+                }
+                let index = self.index_value(index)?;
+                let (stored, actual) = self.expected_as(value, &element, Use::Move)?;
+                require(&element, &actual, value.span)?;
+                let through = matches!(self.typed(*root, span)?, Type::Reference { .. });
+                self.emit(Operation::IndexWrite(*root, index, stored, through), span);
+            }
+            Statement::CompoundIndex {
+                root,
+                index,
+                operator,
+                value,
+            } => {
+                let (_, element) = self.element_of(*root, true, span)?;
+                if self.constant(*root) {
+                    return Err(Diagnostic::new("E107", "cannot modify a constant", span));
+                }
+                let index = self.index_value(index)?;
+                let old = self.value(element.clone());
+                let through = matches!(self.typed(*root, span)?, Type::Reference { .. });
+                self.emit(Operation::IndexRead(old, *root, index, through), span);
+                let contextual = contextualize(value, &element)?;
+                let (operand, operand_type) = self.expression(&contextual)?;
+                let result = super::super::binary_type(*operator, &element, &operand_type, span)?;
+                require(&element, &result, span)?;
+                let combined = self.value(result.clone());
+                let operator = super::super::specialized_operator(*operator, &result);
+                self.emit(Operation::Binary(combined, operator, old, operand), span);
+                self.emit(Operation::IndexWrite(*root, index, combined, through), span);
+            }
             Statement::AssignProject { root, path, value } => {
                 let place = self.place(*root, path, true, span)?;
                 let target = place
@@ -2746,6 +3118,13 @@ impl Analysis<'_> {
             Statement::CallStatement(call) => {
                 if let ExpressionKind::MethodCall(method) = &call.kind {
                     self.method_call(method, call.span, true)?;
+                    return Ok(());
+                }
+                if let ExpressionKind::Invoke { callee, arguments } = &call.kind {
+                    let (operands, result) = self.invoke(*callee, arguments, call.span)?;
+                    let function = self.function_value(*callee, call.span)?;
+                    let value = (result != Type::Void).then(|| self.value(result));
+                    self.emit(Operation::Invoke(value, function, operands), call.span);
                     return Ok(());
                 }
                 let ExpressionKind::Call(site, arguments) = &call.kind else {
@@ -2990,6 +3369,13 @@ fn mentions(expression: &Expression, variables: &[Variable]) -> bool {
         ExpressionKind::Record { fields, .. } => {
             fields.iter().any(|(_, value)| mentions(value, variables))
         }
+        ExpressionKind::ArrayLiteral(values) => {
+            values.iter().any(|value| mentions(value, variables))
+        }
+        ExpressionKind::Cast(inner, _) => mentions(inner, variables),
+        ExpressionKind::Index { root, index } => {
+            variables.iter().any(|other| other.0 == root.0) || mentions(index, variables)
+        }
         ExpressionKind::Match(matched) => {
             mentions(&matched.scrutinee, variables)
                 || matched.arms.iter().any(|arm| {
@@ -3006,6 +3392,10 @@ fn mentions(expression: &Expression, variables: &[Variable]) -> bool {
         ExpressionKind::Binary(_, left, right)
         | ExpressionKind::ShortCircuit { left, right, .. } => {
             mentions(left, variables) || mentions(right, variables)
+        }
+        ExpressionKind::Invoke { callee, arguments } => {
+            variables.iter().any(|other| other.0 == callee.0)
+                || arguments.iter().any(|argument| mentions(argument, variables))
         }
         ExpressionKind::MethodCall(call) => {
             variables.iter().any(|other| other.0 == call.receiver.0)
@@ -3037,9 +3427,9 @@ fn gather_in<'e>(expression: &'e Expression, out: &mut Vec<(&'e hir::Match, Span
                 gather_matches(&arm.body, out);
             }
         }
-        ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => {
-            gather_matches(inner, out)
-        }
+        ExpressionKind::Group(inner)
+        | ExpressionKind::Unary(_, inner)
+        | ExpressionKind::Cast(inner, _) => gather_matches(inner, out),
         ExpressionKind::Binary(_, left, right)
         | ExpressionKind::ShortCircuit { left, right, .. } => {
             gather_matches(left, out);
@@ -3050,7 +3440,7 @@ fn gather_in<'e>(expression: &'e Expression, out: &mut Vec<(&'e hir::Match, Span
                 gather_matches(argument, out);
             }
         }
-        ExpressionKind::Call(_, arguments) => {
+        ExpressionKind::Call(_, arguments) | ExpressionKind::Invoke { arguments, .. } => {
             for argument in arguments {
                 gather_matches(argument, out);
             }

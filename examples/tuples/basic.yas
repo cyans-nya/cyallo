@@ -1,0 +1,25 @@
+// Tuples: construction, element reads and writes, and tuples as parameters and results.
+// Run: cargo run -- run examples/tuples/basic.yas
+fn swapped(a: i64, b: i64) -> (i64, i64) {
+    return (b, a)
+}
+
+fn total(pair: (i64, i64)) -> i64 {
+    return pair.0 + pair.1
+}
+
+fn mixed(n: i64) -> (i64, bool, f64) {
+    return (n * 2, n > 3, 1.5)
+}
+
+proc demo() -> i64 {
+    let mut t = swapped(3, 4)
+    t.0 += 10
+    t.1 = t.1 * 2
+    let m = mixed(5)
+    let flag = m.1
+    if flag { t.0 += 1 }
+    return total(t) * 100 + m.0
+}
+
+std::io::print(demo())

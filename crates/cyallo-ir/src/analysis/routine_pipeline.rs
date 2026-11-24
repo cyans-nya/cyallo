@@ -267,7 +267,7 @@ impl IndexedRoutineBody {
             .generic_check
             .get_or_init(|| {
                 let Some(callees) = self
-                    .bind_callees(None, signatures, source_names)
+                    .bind_callees(None, signatures, source_names, &[])
                     .map_err(|error| error)?
                 else {
                     return Ok(());
@@ -348,6 +348,7 @@ impl IndexedRoutineBody {
             signatures,
             definitions,
             &crate::services::Metadata::default(),
+            &[],
         )
     }
 
@@ -360,8 +361,11 @@ impl IndexedRoutineBody {
         signatures: &HashMap<String, Signature>,
         definitions: &HashMap<String, Type>,
         services: &crate::services::Metadata,
+        globals: &[ir::Local],
     ) -> Result<Option<ir::Function>> {
-        let Some(callees) = self.bind_callees(Some(function), signatures, source_names)? else {
+        let Some(callees) =
+            self.bind_callees(Some(function), signatures, source_names, globals)?
+        else {
             return Ok(None);
         };
         lower_mir(
@@ -386,6 +390,7 @@ impl IndexedRoutineBody {
         function: Option<&Function>,
         signatures: &HashMap<String, Signature>,
         source_names: &BTreeMap<Box<str>, Box<str>>,
+        globals: &[ir::Local],
     ) -> Result<Option<Vec<air::Site>>> {
         if self.sites.is_empty() {
             return Ok(Some(Vec::new()));
@@ -426,6 +431,45 @@ impl IndexedRoutineBody {
                 })
             {
                 callees.push(air::Site::Builtin(id));
+                continue;
+            }
+            if let Some(named) = target.and_then(|target| target.strip_prefix("$global:")) {
+                // A script variable the linker checked: its slot and type come from the
+                // program's globals, where the entry script declares it.
+                // The target names the module and the variable; the program's globals carry
+                // the module in the name they are declared under.
+                let (module, plain) = named.split_once(':').unwrap_or(("", named));
+                let declared = format!("$module{module}$Value${plain}");
+                let Some((index, local)) = globals
+                    .iter()
+                    .enumerate()
+                    .find(|(_, local)| *local.name == *declared || *local.name == *plain)
+                else {
+                    return Err(Diagnostic::new(
+                        "E114",
+                        "a script variable is not declared where the module graph found it",
+                        site.span,
+                    ));
+                };
+                callees.push(air::Site::Global {
+                    index,
+                    ty: local.ty.clone(),
+                });
+                continue;
+            }
+            if let Some(named) = target.and_then(|target| target.strip_prefix("$function:")) {
+                // A named function used as a value: its contract, with no call.
+                let Some(signature) = signatures.get(&key(named)) else {
+                    return Ok(None);
+                };
+                callees.push(air::Site::Function {
+                    callee: air::Callee {
+                        id: signature.id,
+                        parameters: signature.params.iter().map(|p| p.ty.clone()).collect(),
+                        result: signature.result.clone(),
+                    },
+                    kind: signature.kind,
+                });
                 continue;
             }
             let signature = target.and_then(|target| signatures.get(&key(target)));
@@ -609,6 +653,10 @@ fn instruction_count(operation: &air::Operation) -> usize {
         air::Operation::FieldRead(_, _, place) | air::Operation::FieldWrite(_, place, _) => {
             1 + usize::from(place.via_reference) + place.steps.len() + 1
         }
+        // The array's address, the element's address, and the load or store.
+        air::Operation::ReadGlobal(..) | air::Operation::WriteGlobal(..) => 2,
+        air::Operation::IndexRead(_, _, _, through)
+        | air::Operation::IndexWrite(_, _, _, through) => 3 + usize::from(*through),
         _ => 1,
     }
 }
@@ -752,6 +800,95 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                     let dst = register(&mut function, &checked.types[value.0]);
                     registers[value.0] = dst;
                     Op::Load(dst, address)
+                }
+                air::Operation::Slice(value, array, mutable) => {
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::Lookup(
+                        dst,
+                        crate::lookup::Operation::Slice(mutable),
+                        vec![registers[array.0]],
+                    )
+                }
+                air::Operation::ReadGlobal(value, index) => {
+                    let address = register(&mut function, &checked.types[value.0]);
+                    push(
+                        &mut function,
+                        Op::Address(
+                            address,
+                            Slot {
+                                global: true,
+                                index,
+                            },
+                        ),
+                        span,
+                    );
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::Load(dst, address)
+                }
+                air::Operation::WriteGlobal(index, value) => {
+                    let address = register(&mut function, &checked.types[value.0]);
+                    push(
+                        &mut function,
+                        Op::Address(
+                            address,
+                            Slot {
+                                global: true,
+                                index,
+                            },
+                        ),
+                        span,
+                    );
+                    Op::Store(address, registers[value.0])
+                }
+                air::Operation::FunctionValue(value, id) => {
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::FunctionValue(dst, id, Vec::new())
+                }
+                air::Operation::Invoke(value, callee, range) => {
+                    let arguments = checked.operands[range.start..range.start + range.len]
+                        .iter()
+                        .map(|argument| registers[argument.0])
+                        .collect();
+                    let dst = value.map(|value| {
+                        let dst = register(&mut function, &checked.types[value.0]);
+                        registers[value.0] = dst;
+                        dst
+                    });
+                    Op::Invoke(dst, registers[callee.0], arguments)
+                }
+                air::Operation::ArrayLiteral(value, range) => {
+                    let elements = checked.operands[range.start..range.start + range.len]
+                        .iter()
+                        .map(|element| registers[element.0])
+                        .collect();
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::ArrayLiteral(dst, elements)
+                }
+                air::Operation::IndexRead(value, root, index, _) => {
+                    let array = index_base(&mut function, root, span);
+                    let element = register(&mut function, &checked.types[value.0]);
+                    push(
+                        &mut function,
+                        Op::Index(element, array, vec![registers[index.0]], false),
+                        span,
+                    );
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::Load(dst, element)
+                }
+                air::Operation::IndexWrite(root, index, value, _) => {
+                    let array = index_base(&mut function, root, span);
+                    let element = register(&mut function, &checked.types[value.0]);
+                    push(
+                        &mut function,
+                        Op::Index(element, array, vec![registers[index.0]], true),
+                        span,
+                    );
+                    Op::Store(element, registers[value.0])
                 }
                 air::Operation::FieldWrite(root, place, value) => {
                     let address = field_address(&mut function, root, &place, span);
@@ -914,6 +1051,19 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
 }
 
 /// The address of the local that holds an enum.
+/// What `Op::Index` takes: the local array's address, or, for a slice parameter, the
+/// reference stored in it.
+fn index_base(function: &mut ir::Function, root: Variable, span: Span) -> Reg {
+    let address = enum_address(function, root, span);
+    if matches!(function.locals[root.0].ty, Type::Reference { .. }) {
+        let reference = register(function, &function.locals[root.0].ty.clone());
+        push(function, Op::Load(reference, address), span);
+        reference
+    } else {
+        address
+    }
+}
+
 fn enum_address(function: &mut ir::Function, variable: Variable, span: Span) -> Reg {
     let ty = function.locals[variable.0].ty.clone();
     let address = register(function, &ty);
