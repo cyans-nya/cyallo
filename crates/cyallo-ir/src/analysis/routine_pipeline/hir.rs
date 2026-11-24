@@ -52,6 +52,13 @@ pub(super) enum ExpressionKind {
     },
     /// A string literal: its text is interned in the body's unit.
     Text(NameId),
+    /// `[a, b, c]`: a fixed-size array with at least one element.
+    ArrayLiteral(Vec<Expression>),
+    /// `a[i]`: an element of a local array, by a single integer index.
+    Index {
+        root: Variable,
+        index: Box<Expression>,
+    },
     /// `match value { Variant(binding) => expression, ... }`.
     Match(Box<Match>),
     /// `receiver.method(arguments)` on a parameter whose type is a type parameter.
@@ -136,6 +143,8 @@ impl Expression {
             }
             ExpressionKind::Project { path, .. } => path.len(),
             ExpressionKind::Text(_) => 0,
+            ExpressionKind::ArrayLiteral(values) => values.iter().map(Expression::size).sum(),
+            ExpressionKind::Index { index, .. } => index.size(),
             ExpressionKind::MethodCall(call) => {
                 1 + call.arguments.iter().map(Expression::size).sum::<usize>()
             }
@@ -194,6 +203,19 @@ pub(super) enum StatementKind {
     CompoundProject {
         root: Variable,
         path: Vec<NameId>,
+        operator: Operator,
+        value: Expression,
+    },
+    /// `a[i] = value`.
+    AssignIndex {
+        root: Variable,
+        index: Expression,
+        value: Expression,
+    },
+    /// `a[i] op= value`.
+    CompoundIndex {
+        root: Variable,
+        index: Expression,
         operator: Operator,
         value: Expression,
     },
@@ -278,6 +300,10 @@ impl Routine {
                         | StatementKind::CompoundDeref { value, .. }
                         | StatementKind::AssignProject { value, .. }
                         | StatementKind::CompoundProject { value, .. } => value.size(),
+                        StatementKind::AssignIndex { index, value, .. }
+                        | StatementKind::CompoundIndex { index, value, .. } => {
+                            index.size() + value.size()
+                        }
                         StatementKind::CallStatement(call) => call.size(),
                         StatementKind::Match(matched) => {
                             matched.scrutinee.size()
@@ -738,7 +764,13 @@ impl Context<'_> {
                             }
                         }
                         StmtSyntax::Assign(target, value) => {
-                            if let Some((root, path)) = self.projected(target) {
+                            if let Some((root, index)) = self.indexed(target) {
+                                StatementKind::AssignIndex {
+                                    root,
+                                    index,
+                                    value: self.value(value, false)?,
+                                }
+                            } else if let Some((root, path)) = self.projected(target) {
                                 StatementKind::AssignProject {
                                     root,
                                     path,
@@ -761,7 +793,14 @@ impl Context<'_> {
                         StmtSyntax::Compound(target, operator, value)
                             if operator.is_arithmetic() && operator != Operator::RealDivide =>
                         {
-                            if let Some((root, path)) = self.projected(target) {
+                            if let Some((root, index)) = self.indexed(target) {
+                                StatementKind::CompoundIndex {
+                                    root,
+                                    index,
+                                    operator,
+                                    value: self.value(value, false)?,
+                                }
+                            } else if let Some((root, path)) = self.projected(target) {
                                 StatementKind::CompoundProject {
                                     root,
                                     path,
@@ -999,6 +1038,25 @@ impl Context<'_> {
         }
     }
 
+    /// The local array and the index expression of a place `a[i]`.
+    fn indexed(&mut self, target: Id<ExprNode>) -> Option<(Variable, Expression)> {
+        let ExprSyntax::Index(base, arguments) = self.ast.get(target)?.kind else {
+            return None;
+        };
+        let arguments = self.ast.get_list(arguments)?;
+        let [index] = arguments else {
+            return decline(|| "index with other than one subscript".into());
+        };
+        let ExprSyntax::Name(name) = self.ast.get(base)?.kind else {
+            return decline(|| "index of something other than a local array".into());
+        };
+        let visible = self.lookup(name)?;
+        if visible.reference.is_some() || visible.slot.0 < self.parameters {
+            return decline(|| "index of a parameter".into());
+        }
+        Some((visible.slot, self.value(*index, false)?))
+    }
+
     /// The reference parameter `p` when `target` is `p.*`.
     fn dereferenced(&self, target: Id<ExprNode>) -> Option<Variable> {
         let ExprSyntax::Unary(Operator::Dereference, inner) = self.ast.get(target)?.kind else {
@@ -1149,6 +1207,24 @@ impl Context<'_> {
                         return None;
                     };
                     ExpressionKind::Project { root, path }
+                }
+                ExprSyntax::Index(..) => {
+                    let (root, index) = self.indexed(id)?;
+                    ExpressionKind::Index {
+                        root,
+                        index: Box::new(index),
+                    }
+                }
+                ExprSyntax::ArrayLiteral(values) => {
+                    let values: Vec<Expression> = ast
+                        .get_list(values)?
+                        .iter()
+                        .map(|&value| self.value(value, false))
+                        .collect::<Option<_>>()?;
+                    if values.is_empty() {
+                        return decline(|| "empty array literal".into());
+                    }
+                    ExpressionKind::ArrayLiteral(values)
                 }
                 ExprSyntax::Record(name, fields) => {
                     let mut written = Vec::new();

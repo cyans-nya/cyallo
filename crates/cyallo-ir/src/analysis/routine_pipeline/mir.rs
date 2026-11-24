@@ -67,6 +67,19 @@ pub(super) enum Statement {
         operator: cyallo_ast::Operator,
         value: Expression,
     },
+    /// `a[i] = value`.
+    AssignIndex {
+        root: Variable,
+        index: Expression,
+        value: Expression,
+    },
+    /// `a[i] op= value`.
+    CompoundIndex {
+        root: Variable,
+        index: Expression,
+        operator: cyallo_ast::Operator,
+        value: Expression,
+    },
     /// `p.* = value`, through a reference parameter.
     AssignDeref {
         variable: Variable,
@@ -305,6 +318,23 @@ impl Builder {
                         Statement::CompoundProject {
                             root,
                             path,
+                            operator,
+                            value,
+                        },
+                        span,
+                    ),
+                    hir::StatementKind::AssignIndex { root, index, value } => {
+                        self.emit(Statement::AssignIndex { root, index, value }, span)
+                    }
+                    hir::StatementKind::CompoundIndex {
+                        root,
+                        index,
+                        operator,
+                        value,
+                    } => self.emit(
+                        Statement::CompoundIndex {
+                            root,
+                            index,
                             operator,
                             value,
                         },

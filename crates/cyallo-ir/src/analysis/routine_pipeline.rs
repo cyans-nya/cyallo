@@ -606,6 +606,8 @@ fn instruction_count(operation: &air::Operation) -> usize {
         air::Operation::FieldRead(_, _, place) | air::Operation::FieldWrite(_, place, _) => {
             1 + usize::from(place.via_reference) + place.steps.len() + 1
         }
+        // The array's address, the element's address, and the load or store.
+        air::Operation::IndexRead(..) | air::Operation::IndexWrite(..) => 3,
         _ => 1,
     }
 }
@@ -749,6 +751,37 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                     let dst = register(&mut function, &checked.types[value.0]);
                     registers[value.0] = dst;
                     Op::Load(dst, address)
+                }
+                air::Operation::ArrayLiteral(value, range) => {
+                    let elements = checked.operands[range.start..range.start + range.len]
+                        .iter()
+                        .map(|element| registers[element.0])
+                        .collect();
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::ArrayLiteral(dst, elements)
+                }
+                air::Operation::IndexRead(value, root, index) => {
+                    let array = enum_address(&mut function, root, span);
+                    let element = register(&mut function, &checked.types[value.0]);
+                    push(
+                        &mut function,
+                        Op::Index(element, array, vec![registers[index.0]], false),
+                        span,
+                    );
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::Load(dst, element)
+                }
+                air::Operation::IndexWrite(root, index, value) => {
+                    let array = enum_address(&mut function, root, span);
+                    let element = register(&mut function, &checked.types[value.0]);
+                    push(
+                        &mut function,
+                        Op::Index(element, array, vec![registers[index.0]], true),
+                        span,
+                    );
+                    Op::Store(element, registers[value.0])
                 }
                 air::Operation::FieldWrite(root, place, value) => {
                     let address = field_address(&mut function, root, &place, span);

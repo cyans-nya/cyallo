@@ -94,6 +94,12 @@ pub(super) enum Operation {
     Aggregate(Value, Vec<Value>),
     /// Read a field of a local or of the record a reference parameter refers to.
     FieldRead(Value, Variable, Box<Place>),
+    /// `[a, b, c]`: a fixed-size array of the operands.
+    ArrayLiteral(Value, Operands),
+    /// The element of a local array at an index value.
+    IndexRead(Value, Variable, Value),
+    /// Store a value into the element of a local array at an index value.
+    IndexWrite(Variable, Value, Value),
     /// Write a field.
     FieldWrite(Variable, Box<Place>, Value),
     /// Move a value out of a local, which is then empty until it is written again.
@@ -484,6 +490,8 @@ fn check_moves(blocks: &[Block], variables: usize) -> Result<(), Diagnostic> {
                 Operation::ReadVariable(_, variable)
                 | Operation::Borrow(_, variable)
                 | Operation::FieldRead(_, variable, _)
+                | Operation::IndexRead(_, variable, _)
+                | Operation::IndexWrite(variable, _, _)
                 | Operation::EnumTest(_, variable, _)
                 | Operation::EnumPayload(_, variable, _, _)
                 | Operation::EnumTake(_, variable, _, _)
@@ -559,6 +567,8 @@ fn extra_blocks(block: &mir::Block) -> usize {
             | ExpressionKind::Borrow { .. }
             | ExpressionKind::Reborrow(_) => 0,
             ExpressionKind::Project { .. } => 0,
+            ExpressionKind::ArrayLiteral(values) => values.iter().map(count).sum(),
+            ExpressionKind::Index { index, .. } => count(index),
             ExpressionKind::Record { fields, .. } => {
                 fields.iter().map(|(_, value)| count(value)).sum()
             }
@@ -593,6 +603,8 @@ fn extra_blocks(block: &mir::Block) -> usize {
             | Statement::CompoundDeref { value, .. }
             | Statement::AssignProject { value, .. }
             | Statement::CompoundProject { value, .. } => count(value),
+            Statement::AssignIndex { index, value, .. }
+            | Statement::CompoundIndex { index, value, .. } => count(index) + count(value),
             Statement::CallStatement(call) => count(call),
             Statement::RangeStart { start, finish, .. } => count(start) + count(finish),
             Statement::Marker
@@ -882,6 +894,35 @@ impl Analysis<'_> {
     }
 
     /// Whether a local was declared without `mut` (parameters were not).
+    /// The element type of a local array, with the number of its dimensions checked.
+    fn element_of(&self, root: Variable, span: Span) -> Result<(Type, Type), Diagnostic> {
+        let array = self.typed(root, span)?;
+        match &array {
+            Type::Array(bounds, element) if bounds.len() == 1 => {
+                Ok((array.clone(), self.view(element)))
+            }
+            Type::Array(..) => Err(Diagnostic::new(
+                "E108",
+                "incorrect number of array indices",
+                span,
+            )),
+            _ => Err(Diagnostic::new("E108", "indexing requires an array", span)),
+        }
+    }
+
+    /// An index operand: an integer value.
+    fn index_value(&mut self, index: &Expression) -> Result<Value, Diagnostic> {
+        let (value, ty) = self.expression(index)?;
+        if ty.number_kind().is_none_or(|kind| kind.float()) {
+            return Err(Diagnostic::new(
+                "E109",
+                "index requires an integer",
+                index.span,
+            ));
+        }
+        Ok(value)
+    }
+
     fn constant(&self, variable: Variable) -> bool {
         variable
             .0
@@ -968,6 +1009,16 @@ impl Analysis<'_> {
             }
             ExpressionKind::Record { site, .. } => {
                 self.record_type(*site, expression.span).map(|(ty, _)| ty)
+            }
+            ExpressionKind::ArrayLiteral(values) => {
+                let element = self.infer(&values[0])?;
+                Ok(Type::Array(
+                    vec![(0, values.len() as i64 - 1)],
+                    Box::new(element),
+                ))
+            }
+            ExpressionKind::Index { root, .. } => {
+                self.element_of(*root, expression.span).map(|(_, element)| element)
             }
             ExpressionKind::Reborrow(variable) => self
                 .variable_type(*variable)
@@ -1123,6 +1174,51 @@ impl Analysis<'_> {
                     Ok((value, ty))
                 }
                 ExpressionKind::Record { site, fields } => self.record(*site, fields, span),
+                ExpressionKind::ArrayLiteral(values) => {
+                    let mut element: Option<Type> = None;
+                    let mut operands = Vec::with_capacity(values.len());
+                    for value in values {
+                        let (operand, ty) = self.expression_as(value, Use::Move)?;
+                        match &element {
+                            Some(first) if !crate::memory::same_regions(first, &ty) => {
+                                return Err(Diagnostic::new(
+                                    "E109",
+                                    "array literal elements must have the same type",
+                                    value.span,
+                                ));
+                            }
+                            Some(_) => {}
+                            None => element = Some(ty),
+                        }
+                        operands.push(operand);
+                    }
+                    let ty = Type::Array(
+                        vec![(0, values.len() as i64 - 1)],
+                        Box::new(element.expect("an array literal has an element")),
+                    );
+                    let range = Operands {
+                        start: self.operands.len(),
+                        len: operands.len(),
+                    };
+                    self.operands.extend(operands);
+                    let value = self.value(ty.clone());
+                    self.emit(Operation::ArrayLiteral(value, range), span);
+                    Ok((value, ty))
+                }
+                ExpressionKind::Index { root, index } => {
+                    let (_, element) = self.element_of(*root, span)?;
+                    if usage == Use::Move && !self.is_copy(&element) {
+                        return Err(Diagnostic::new(
+                            "E118",
+                            "cannot move an element out of an array; read it in place or clone it",
+                            span,
+                        ));
+                    }
+                    let index = self.index_value(index)?;
+                    let value = self.value(element.clone());
+                    self.emit(Operation::IndexRead(value, *root, index), span);
+                    Ok((value, element))
+                }
                 ExpressionKind::Deref(variable) => {
                     let (reference, ty) = self.read(*variable, span)?;
                     let target = pointee(&ty, span)?;
@@ -2050,6 +2146,11 @@ impl Analysis<'_> {
                     | Statement::AssignProject { value, .. }
                     | Statement::CompoundProject { value, .. }
                     | Statement::CallStatement(value) => gather_matches(value, &mut matches),
+                    Statement::AssignIndex { index, value, .. }
+                    | Statement::CompoundIndex { index, value, .. } => {
+                        gather_matches(index, &mut matches);
+                        gather_matches(value, &mut matches);
+                    }
                     Statement::RangeStart { start, finish, .. } => {
                         gather_matches(start, &mut matches);
                         gather_matches(finish, &mut matches);
@@ -2291,6 +2392,38 @@ impl Analysis<'_> {
                 let operator = super::super::specialized_operator(*operator, &result);
                 self.emit(Operation::Binary(combined, operator, old, operand), span);
                 self.store(*slot, combined, span);
+            }
+            Statement::AssignIndex { root, index, value } => {
+                let (_, element) = self.element_of(*root, span)?;
+                if self.constant(*root) {
+                    return Err(Diagnostic::new("E107", "cannot modify a constant", span));
+                }
+                let index = self.index_value(index)?;
+                let (stored, actual) = self.expected_as(value, &element, Use::Move)?;
+                require(&element, &actual, value.span)?;
+                self.emit(Operation::IndexWrite(*root, index, stored), span);
+            }
+            Statement::CompoundIndex {
+                root,
+                index,
+                operator,
+                value,
+            } => {
+                let (_, element) = self.element_of(*root, span)?;
+                if self.constant(*root) {
+                    return Err(Diagnostic::new("E107", "cannot modify a constant", span));
+                }
+                let index = self.index_value(index)?;
+                let old = self.value(element.clone());
+                self.emit(Operation::IndexRead(old, *root, index), span);
+                let contextual = contextualize(value, &element)?;
+                let (operand, operand_type) = self.expression(&contextual)?;
+                let result = super::super::binary_type(*operator, &element, &operand_type, span)?;
+                require(&element, &result, span)?;
+                let combined = self.value(result.clone());
+                let operator = super::super::specialized_operator(*operator, &result);
+                self.emit(Operation::Binary(combined, operator, old, operand), span);
+                self.emit(Operation::IndexWrite(*root, index, combined), span);
             }
             Statement::AssignProject { root, path, value } => {
                 let place = self.place(*root, path, true, span)?;
@@ -2596,6 +2729,12 @@ fn mentions(expression: &Expression, variables: &[Variable]) -> bool {
         }
         ExpressionKind::Record { fields, .. } => {
             fields.iter().any(|(_, value)| mentions(value, variables))
+        }
+        ExpressionKind::ArrayLiteral(values) => {
+            values.iter().any(|value| mentions(value, variables))
+        }
+        ExpressionKind::Index { root, index } => {
+            variables.iter().any(|other| other.0 == root.0) || mentions(index, variables)
         }
         ExpressionKind::Match(matched) => {
             mentions(&matched.scrutinee, variables)

@@ -136,6 +136,10 @@ Four waves. Each is parallel inside and deterministic between. The bounded jobs 
 
 Batching units are routine-sized for storage and publication, module-sized for overlays and component-sized for interfaces.
 
+### Local arrays
+
+HIR accepts a non-empty array literal and `a[i]` on a local array, as a value, an assignment target (`a[i] = v`) and a compound target (`a[i] += v`). Parameters, reference parameters and arrays from calls stay on the old route: only a local initialized from a literal has an array type here. AIR types the literal `[T; n]` from its first element and requires the others to agree (E109). `element_of` rejects a non-array root (E108) and a wrong number of subscripts; the index must be an integer (E109); writing a `let` array is E107; moving a non-Copy element out is E118. Emission is `Address` of the array, `Op::Index` for the element address (bounds-checked at run time, write flag set for stores), then `Load` or `Store`. Compound assignment reads the element, computes, and writes it back through a second `Index`. Tests: `tests/arrays.rs`; example: `examples/arrays/basic.yas`. Coverage floor 58 of 100. Open: array parameters and results, slices and `&mut []T`, annotated and empty arrays, multi-dimensional and sparse arrays, `len`, element projections (`a[i].x`).
+
 ## Removal roadmap: what the old route still does alone
 
 Measured by `tests/pipeline_coverage.rs` over `examples/` and `std/` (55 of 97 routines accepted, 2026-11-24). The old route (linked AST → `lower_routine`) can be deleted only when every row below is covered by the pipeline, in this order of payoff per effort:
