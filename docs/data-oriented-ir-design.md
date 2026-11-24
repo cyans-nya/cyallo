@@ -144,6 +144,10 @@ HIR accepts a non-empty array literal and `a[i]` on a local array, as a value, a
 
 `&[]T` and `&mut []T` parameters (scalar elements) are accepted. Indexing a slice parameter loads the reference stored in the parameter and applies `Op::Index` to it, so `a[i]`, `a[i] = v` and `a[i] += v` work in place; writing through a shared slice is E107. A call argument that is a reference to a local array (`&mut values`) stands where a slice reference is wanted: `expected_as` emits `Operation::Slice`, which lowers to the existing `Lookup(Slice)` operation, and the mutability and element type must agree (E107/E109). A slice reference passes on unchanged (`quicksort(a, lo, i - 1)`). Index operations carry whether the root is a reference, so the instruction count stays exact. `swap`, `reverse`, `sum` and `quicksort` in `examples/arrays/slices.yas` all lower through the pipeline. Open: slices of records, strings or nested slices; collections (`Vec`) passed where a slice is wanted, which the old route coerces through the same lookup.
 
+### Function values
+
+A named plain function is a value (`let held = negate`, `apply(double, 5)`), and a local or parameter holding one is called (`f(n)`, as an expression or a statement). Parameters and results may have function types whose own parameters and result the pipeline lowers; a by-reference function parameter, a closure expression and a call of a call result (`choose(true)(4)`) stay on the old route. The linker binds a name that is not a local to `$function:<target>` when the target is a plain function, and the binder turns it into `Site::Function` with the callee's contract and kind. AIR types it as `Type::Function(kind, parameters, result)`, emits `FunctionValue`, and `invoke` checks the argument count (E110) and each argument against the function type (E109); a local that is not a function type is E110. Tests: `tests/function_values.rs`; example: `examples/functions/values.yas`. The two tests that expected a call of a local to fall back now expect it to migrate.
+
 ## Removal roadmap: what the old route still does alone
 
 Measured by `tests/pipeline_coverage.rs` over `examples/` and `std/` (55 of 97 routines accepted, 2026-11-24). The old route (linked AST → `lower_routine`) can be deleted only when every row below is covered by the pipeline, in this order of payoff per effort:
@@ -152,7 +156,7 @@ Measured by `tests/pipeline_coverage.rs` over `examples/` and `std/` (55 of 97 r
 | --- | --- | --- |
 | Managed values: `gc`/`rc` parameters, results, `.*` through them | 14 | `ManagedNew`, managed address/load/store ops, tracing flag, `Cell` access, ownership of `rc` |
 | References as general values: `&T` / `&mut T` parameters used as values, `&rc T` | 3 | Reference locals and by-value reads, reborrows (`&mut []T` slices are done) |
-| Function values and closures | 5 | Function-typed parameters/results, capture lowering, calls of locals |
+| Closures (capturing function values) | 4 | Capture lowering and closure conversion; named function values are done |
 | Collections: arrays, `Vec`, indexing, typed collections | 5 | Array literals, indexing and element assignment, native collection methods through `Site::Builtin` |
 | Method calls on non-names and chained receivers | 5 | Hoist the receiver into a temporary; native and trait methods beyond generic bounds |
 | Module globals: `let mut` in the entry script read and assigned from routines | 2 | A `Site::Global` that binds a module slot |

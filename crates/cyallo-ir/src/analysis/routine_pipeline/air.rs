@@ -38,6 +38,11 @@ pub(super) enum Site {
     Record(Box<str>),
     /// The built-in `print`, which writes its arguments to the output.
     Print,
+    /// A named function used as a value, or called through a local that holds it.
+    Function {
+        callee: Callee,
+        kind: cyallo_ast::RoutineKind,
+    },
     /// A utility resolved from its operand types: string and numeric helpers.
     Builtin(crate::intrinsic::Intrinsic),
     /// A variant of a generic enum, whose instance is the type expected where it stands.
@@ -96,6 +101,10 @@ pub(super) enum Operation {
     FieldRead(Value, Variable, Box<Place>),
     /// `[a, b, c]`: a fixed-size array of the operands.
     ArrayLiteral(Value, Operands),
+    /// A named function as a value.
+    FunctionValue(Value, usize),
+    /// A call through a function value held in a local.
+    Invoke(Option<Value>, Value, Operands),
     /// A reference to an array, viewed as a reference to a slice of its elements.
     Slice(Value, Value, bool),
     /// The element of a local array at an index value.
@@ -238,6 +247,19 @@ fn writable(ty: &Type, span: Span) -> Result<Type, Diagnostic> {
 
 /// An argument matches its parameter, and a mutable reference may be passed where a
 /// shared one of the same pointee is wanted.
+/// The type of a named function used as a value.
+fn function_type(kind: cyallo_ast::RoutineKind, callee: &Callee) -> Type {
+    Type::Function(
+        kind,
+        callee
+            .parameters
+            .iter()
+            .map(|parameter| (parameter.clone(), false))
+            .collect(),
+        Box::new(callee.result.clone()),
+    )
+}
+
 fn require_argument(parameter: &Type, actual: &Type, span: Span) -> Result<(), Diagnostic> {
     if let (
         Type::Reference {
@@ -590,7 +612,9 @@ fn extra_blocks(block: &mir::Block) -> usize {
                         })
                         .sum::<usize>()
             }
-            ExpressionKind::Call(_, arguments) => arguments.iter().map(count).sum(),
+            ExpressionKind::Call(_, arguments) | ExpressionKind::Invoke { arguments, .. } => {
+                arguments.iter().map(count).sum()
+            }
             ExpressionKind::MethodCall(call) => call.arguments.iter().map(count).sum(),
         }
     }
@@ -1088,12 +1112,16 @@ impl Analysis<'_> {
             ExpressionKind::MethodCall(call) => {
                 Ok(self.resolve_method(call, expression.span)?.result)
             }
+            ExpressionKind::Invoke { callee, .. } => {
+                Ok(self.function_signature(*callee, expression.span)?.1)
+            }
             ExpressionKind::Call(site, arguments) => match self.callees.get(site.0) {
                 Some(Site::Builtin(id)) => {
                     let (_, types) = self.builtin_arguments(*id, arguments)?;
                     self.builtin_result(*id, &types, expression.span)
                 }
                 Some(Site::Variant { result, .. }) => Ok(self.view(result)),
+                Some(Site::Function { callee, kind }) => Ok(function_type(*kind, callee)),
                 Some(Site::GenericVariant { .. }) => Err(Diagnostic::new(
                     "E114",
                     "the enum instance of this variant is not known here; annotate the type",
@@ -1102,6 +1130,50 @@ impl Analysis<'_> {
                 _ => Ok(self.callee(*site, expression.span)?.result.clone()),
             },
         })
+    }
+
+    /// The parameter and result types of the function value a local holds.
+    fn function_signature(
+        &self,
+        callee: Variable,
+        span: Span,
+    ) -> Result<(Vec<(Type, bool)>, Type), Diagnostic> {
+        let ty = self.typed(callee, span)?;
+        match self.view(&ty) {
+            Type::Function(_, parameters, result) => Ok((parameters, self.view(&result))),
+            _ => Err(Diagnostic::new("E110", "value is not callable", span)),
+        }
+    }
+
+    /// The arguments of a call through a function value, against its parameter types.
+    fn invoke(
+        &mut self,
+        callee: Variable,
+        arguments: &[Expression],
+        span: Span,
+    ) -> Result<(Operands, Type), Diagnostic> {
+        let (parameters, result) = self.function_signature(callee, span)?;
+        if arguments.len() != parameters.len() {
+            return Err(Diagnostic::new("E110", "incorrect argument count", span));
+        }
+        let mut values = Vec::with_capacity(arguments.len());
+        for (argument, (parameter, _)) in arguments.iter().zip(&parameters) {
+            let parameter = self.view(parameter);
+            let usage = if matches!(parameter, Type::Reference { .. }) {
+                Use::Read
+            } else {
+                Use::Move
+            };
+            let (value, actual) = self.expected_as(argument, &parameter, usage)?;
+            require_argument(&parameter, &actual, argument.span)?;
+            values.push(value);
+        }
+        let range = Operands {
+            start: self.operands.len(),
+            len: values.len(),
+        };
+        self.operands.extend(values);
+        Ok((range, result))
     }
 
     fn callee(&self, site: SiteId, span: Span) -> Result<&Callee, Diagnostic> {
@@ -1370,6 +1442,31 @@ impl Analysis<'_> {
                     if matches!(self.callees.get(site.0), Some(Site::Variant { .. })) =>
                 {
                     self.construct(*site, arguments, span)
+                }
+                ExpressionKind::Call(site, _)
+                    if matches!(self.callees.get(site.0), Some(Site::Function { .. })) =>
+                {
+                    let Some(Site::Function { callee, kind }) = self.callees.get(site.0) else {
+                        return Err(invalid(span));
+                    };
+                    let (id, ty) = (callee.id, function_type(*kind, callee));
+                    let value = self.value(ty.clone());
+                    self.emit(Operation::FunctionValue(value, id), span);
+                    Ok((value, ty))
+                }
+                ExpressionKind::Invoke { callee, arguments } => {
+                    let (operands, result) = self.invoke(*callee, arguments, span)?;
+                    if result == Type::Void {
+                        return Err(Diagnostic::new(
+                            "E110",
+                            "procedure cannot be used as an expression",
+                            span,
+                        ));
+                    }
+                    let (function, _) = self.read(*callee, span)?;
+                    let value = self.value(result.clone());
+                    self.emit(Operation::Invoke(Some(value), function, operands), span);
+                    Ok((value, result))
                 }
                 ExpressionKind::Call(site, arguments) => {
                     let (target, result, operands) = self.arguments(*site, arguments, span)?;
@@ -2549,6 +2646,13 @@ impl Analysis<'_> {
                     self.method_call(method, call.span, true)?;
                     return Ok(());
                 }
+                if let ExpressionKind::Invoke { callee, arguments } = &call.kind {
+                    let (operands, result) = self.invoke(*callee, arguments, call.span)?;
+                    let (function, _) = self.read(*callee, call.span)?;
+                    let value = (result != Type::Void).then(|| self.value(result));
+                    self.emit(Operation::Invoke(value, function, operands), call.span);
+                    return Ok(());
+                }
                 let ExpressionKind::Call(site, arguments) = &call.kind else {
                     return Err(invalid(span));
                 };
@@ -2803,6 +2907,10 @@ fn mentions(expression: &Expression, variables: &[Variable]) -> bool {
         | ExpressionKind::ShortCircuit { left, right, .. } => {
             mentions(left, variables) || mentions(right, variables)
         }
+        ExpressionKind::Invoke { callee, arguments } => {
+            variables.iter().any(|other| other.0 == callee.0)
+                || arguments.iter().any(|argument| mentions(argument, variables))
+        }
         ExpressionKind::MethodCall(call) => {
             variables.iter().any(|other| other.0 == call.receiver.0)
                 || call
@@ -2846,7 +2954,7 @@ fn gather_in<'e>(expression: &'e Expression, out: &mut Vec<(&'e hir::Match, Span
                 gather_matches(argument, out);
             }
         }
-        ExpressionKind::Call(_, arguments) => {
+        ExpressionKind::Call(_, arguments) | ExpressionKind::Invoke { arguments, .. } => {
             for argument in arguments {
                 gather_matches(argument, out);
             }

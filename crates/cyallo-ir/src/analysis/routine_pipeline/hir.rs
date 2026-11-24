@@ -63,6 +63,11 @@ pub(super) enum ExpressionKind {
     Match(Box<Match>),
     /// `receiver.method(arguments)` on a parameter whose type is a type parameter.
     MethodCall(Box<MethodCall>),
+    /// `f(arguments)` where `f` is a local or parameter holding a function value.
+    Invoke {
+        callee: Variable,
+        arguments: Vec<Expression>,
+    },
     /// `p.*`: the value a reference parameter refers to.
     Deref(Variable),
     /// `&x` or `&mut x`, as a call argument: a reference to a local or a by-value parameter.
@@ -160,7 +165,9 @@ impl Expression {
             }
             ExpressionKind::Binary(_, left, right)
             | ExpressionKind::ShortCircuit { left, right, .. } => left.size() + right.size(),
-            ExpressionKind::Call(_, arguments) => arguments.iter().map(Expression::size).sum(),
+            ExpressionKind::Call(_, arguments) | ExpressionKind::Invoke { arguments, .. } => {
+                arguments.iter().map(Expression::size).sum()
+            }
         }
     }
 }
@@ -717,7 +724,7 @@ impl Context<'_> {
                                 ExpressionKind::Call(site, _) => {
                                     self.sites[site.0].discard = true;
                                 }
-                                ExpressionKind::MethodCall(_) => {}
+                                ExpressionKind::MethodCall(_) | ExpressionKind::Invoke { .. } => {}
                                 _ => {
                                     return decline(|| "statement that is not a call".into());
                                 }
@@ -1339,9 +1346,26 @@ impl Context<'_> {
                     }))
                 }
                 ExprSyntax::Call(name, arguments) => {
-                    // A local of the same name shadows the declaration.
+                    // A local of the same name shadows the declaration: a call of it is a
+                    // call of the function value it holds.
                     if self.every_name.contains(&name) {
-                        return decline(|| "call of a local name".into());
+                        let visible = self.lookup(name);
+                        let Some(visible) = visible.filter(|visible| visible.reference.is_none())
+                        else {
+                            return decline(|| "call of a local name".into());
+                        };
+                        let arguments: Vec<Expression> = ast
+                            .get_list(arguments)?
+                            .iter()
+                            .map(|&argument| self.argument(argument))
+                            .collect::<Option<_>>()?;
+                        return Some(Expression::new(
+                            expression.span,
+                            ExpressionKind::Invoke {
+                                callee: visible.slot,
+                                arguments,
+                            },
+                        ));
                     }
                     let arguments: Vec<Expression> = ast
                         .get_list(arguments)?
@@ -1425,8 +1449,23 @@ fn reference_type(ast: &IndexedAst, node: &TypeNode) -> Option<(bool, Type)> {
 
 /// A type a signature may use: a scalar, or a named type, which the module graph then
 /// checks is a record whose fields are all supported (HIR cannot resolve names).
-fn signature_type(_ast: &IndexedAst, node: &TypeNode) -> Option<Type> {
+fn signature_type(ast: &IndexedAst, node: &TypeNode) -> Option<Type> {
     match node {
+        // A function type: its parameters and result are themselves signature types.
+        TypeNode::Function(_, parameters, result) => {
+            for &(parameter, by_ref) in ast.get_list(*parameters)? {
+                if by_ref || signature_type(ast, ast.get(parameter)?).is_none() {
+                    return None;
+                }
+            }
+            match ast.get(*result)? {
+                TypeNode::Void => {}
+                result => {
+                    signature_type(ast, result)?;
+                }
+            }
+            Some(Type::Void)
+        }
         // Only the fact that it is acceptable is used; the type itself is resolved later.
         TypeNode::Named(_) | TypeNode::Applied(..) => Some(Type::Void),
         other => scalar_type(other),

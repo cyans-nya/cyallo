@@ -475,6 +475,15 @@ impl Resolver {
                 Type::Reference { .. } => false,
                 pointee => self.pipeline_type(pointee, depth),
             },
+            // A function value: by-value parameters and a result the pipeline lowers.
+            Type::Function(_, parameters, result) if depth < 8 => {
+                parameters
+                    .iter()
+                    .all(|(ty, by_ref)| !by_ref && self.pipeline_type(ty, depth + 1))
+                    && (**result == Type::Void
+                        || (!matches!(**result, Type::Reference { .. })
+                            && self.pipeline_type(result, depth + 1)))
+            }
             Type::Applied(target, arguments) if depth < 8 => self
                 .generic_enums
                 .get(target)
@@ -615,6 +624,11 @@ impl Resolver {
                                 || (contextual && self.generic_enum_supported(owner)))
                     });
                 if !supported {
+                    // A plain function named as a value.
+                    if symbol.intrinsic.is_none() && self.plain.contains_key(&symbol.target) {
+                        targets.push(format!("$function:{}", symbol.target).into());
+                        continue;
+                    }
                     return Ok(Err(body));
                 }
                 targets.push(symbol.target);

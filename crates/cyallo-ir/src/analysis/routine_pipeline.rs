@@ -428,6 +428,21 @@ impl IndexedRoutineBody {
                 callees.push(air::Site::Builtin(id));
                 continue;
             }
+            if let Some(named) = target.and_then(|target| target.strip_prefix("$function:")) {
+                // A named function used as a value: its contract, with no call.
+                let Some(signature) = signatures.get(&key(named)) else {
+                    return Ok(None);
+                };
+                callees.push(air::Site::Function {
+                    callee: air::Callee {
+                        id: signature.id,
+                        parameters: signature.params.iter().map(|p| p.ty.clone()).collect(),
+                        result: signature.result.clone(),
+                    },
+                    kind: signature.kind,
+                });
+                continue;
+            }
             let signature = target.and_then(|target| signatures.get(&key(target)));
             if let Some(target) = target
                 && target.starts_with("$variant")
@@ -761,6 +776,23 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                         crate::lookup::Operation::Slice(mutable),
                         vec![registers[array.0]],
                     )
+                }
+                air::Operation::FunctionValue(value, id) => {
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::FunctionValue(dst, id, Vec::new())
+                }
+                air::Operation::Invoke(value, callee, range) => {
+                    let arguments = checked.operands[range.start..range.start + range.len]
+                        .iter()
+                        .map(|argument| registers[argument.0])
+                        .collect();
+                    let dst = value.map(|value| {
+                        let dst = register(&mut function, &checked.types[value.0]);
+                        registers[value.0] = dst;
+                        dst
+                    });
+                    Op::Invoke(dst, registers[callee.0], arguments)
                 }
                 air::Operation::ArrayLiteral(value, range) => {
                     let elements = checked.operands[range.start..range.start + range.len]

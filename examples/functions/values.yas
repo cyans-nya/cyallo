@@ -1,0 +1,36 @@
+// Function values: a named function passed, held in a local and called through it,
+// and returned.
+// Run: cargo run -- run examples/functions/values.yas
+fn double(n: i64) -> i64 { return n * 2 }
+fn square(n: i64) -> i64 { return n * n }
+fn negate(n: i64) -> i64 { return -n }
+
+fn apply(f: fn(i64) -> i64, n: i64) -> i64 {
+    return f(n)
+}
+
+fn twice(f: fn(i64) -> i64, n: i64) -> i64 {
+    return f(f(n))
+}
+
+fn choose(big: bool) -> fn(i64) -> i64 {
+    if big { return square }
+    return double
+}
+
+proc show(f: fn(i64) -> i64, n: i64) {
+    std::io::print(f(n))
+}
+
+proc demo() -> i64 {
+    let held = negate
+    let a = apply(double, 5)
+    let b = twice(square, 3)
+    let c = held(7)
+    let pick = choose(true)
+    let d = pick(4)
+    show(held, 2)
+    return a + b + c + d
+}
+
+std::io::print(demo())
