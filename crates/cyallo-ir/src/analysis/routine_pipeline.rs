@@ -595,6 +595,9 @@ fn instruction_count(operation: &air::Operation) -> usize {
     match operation {
         air::Operation::Consume(..) => 0,
         air::Operation::EnumTake(..) => 3,
+        air::Operation::EnumTestThrough(..) => 1,
+        // The address of the part, then a reference value that holds it.
+        air::Operation::EnumRefThrough(..) | air::Operation::FieldRefThrough(..) => 2,
         air::Operation::ReadVariable(..)
         | air::Operation::EnumTest(..)
         | air::Operation::EnumPayload(..)
@@ -802,6 +805,39 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                     Op::EnumTest(dst, address, variant)
                 }
                 air::Operation::Consume(_) => continue,
+                air::Operation::EnumTestThrough(value, reference, variant) => {
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::EnumTest(dst, registers[reference.0], variant)
+                }
+                air::Operation::EnumRefThrough(value, reference, variant, ty) => {
+                    let address = register(&mut function, &ty);
+                    push(
+                        &mut function,
+                        Op::EnumPayload(
+                            address,
+                            registers[reference.0],
+                            variant,
+                            crate::enums::Projection::Address,
+                            Box::new(ty),
+                        ),
+                        span,
+                    );
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::Move(dst, address)
+                }
+                air::Operation::FieldRefThrough(value, reference, index, ty) => {
+                    let address = register(&mut function, &ty);
+                    push(
+                        &mut function,
+                        Op::Field(address, registers[reference.0], index),
+                        span,
+                    );
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::Move(dst, address)
+                }
                 air::Operation::Builtin(value, id, range) => {
                     let arguments = checked.operands[range.start..range.start + range.len]
                         .iter()

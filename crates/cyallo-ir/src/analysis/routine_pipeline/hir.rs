@@ -410,6 +410,9 @@ struct Context<'a> {
     pending: Vec<Statement>,
     /// The names bound so far by the pattern being lowered.
     pattern_names: Vec<NameId>,
+    /// Matching through a reference: every name the patterns bind is a reference to its
+    /// part, `&mut` when this is `Some(true)`.
+    pattern_reference: Option<bool>,
 }
 
 /// Lower eligible routine bodies directly from the file's indexed tables. `None`
@@ -481,6 +484,7 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
         procedure,
         pending: Vec::new(),
         pattern_names: Vec::new(),
+        pattern_reference: None,
         generic_receiver: {
             let type_params = ast.get_list(function.type_params)?;
             parameters
@@ -625,7 +629,7 @@ impl Context<'_> {
                     name: binding,
                     slot,
                     mutable: false,
-                    reference: None,
+                    reference: self.pattern_reference,
                 });
                 if let Some(shared) = shared.as_deref_mut() {
                     shared.push((binding, slot));
@@ -962,6 +966,7 @@ impl Context<'_> {
                 || matches!(ast.get(arm.pattern)?.kind, PatternSyntax::Or(_))
                 || !self.flat_syntax(arm.pattern)?;
         }
+        needs_statements |= self.reference_scrutinee(scrutinee).is_some();
         if !needs_statements {
             return Some(None);
         }
@@ -969,6 +974,43 @@ impl Context<'_> {
         let kind = self.match_statement(scrutinee, arms, span, Some(result))?;
         self.pending.push(Statement { span, kind });
         Some(Some(Expression::new(span, ExpressionKind::Read(result))))
+    }
+
+    /// A scrutinee that is a reference: `&x`, `&mut x`, or a reference parameter. Returns
+    /// whether it is `&mut`.
+    fn reference_scrutinee(&self, id: Id<ExprNode>) -> Option<bool> {
+        match self.ast.get(id)?.kind {
+            ExprSyntax::Unary(operator @ (Operator::Borrow | Operator::BorrowMut), inner) => {
+                let ExprSyntax::Name(name) = self.ast.get(inner)?.kind else {
+                    return None;
+                };
+                let visible = self.lookup(name)?;
+                visible
+                    .reference
+                    .is_none()
+                    .then_some(operator == Operator::BorrowMut)
+            }
+            ExprSyntax::Name(name) => self.lookup(name)?.reference,
+            _ => None,
+        }
+    }
+
+    /// The expression for a reference scrutinee, which the value lowering declines.
+    fn reference_value(&mut self, id: Id<ExprNode>, span: Span) -> Option<Expression> {
+        let kind = match self.ast.get(id)?.kind {
+            ExprSyntax::Unary(operator, inner) => {
+                let ExprSyntax::Name(name) = self.ast.get(inner)?.kind else {
+                    return None;
+                };
+                ExpressionKind::Borrow {
+                    variable: self.lookup(name)?.slot,
+                    mutable: operator == Operator::BorrowMut,
+                }
+            }
+            ExprSyntax::Name(name) => ExpressionKind::Reborrow(self.lookup(name)?.slot),
+            _ => return None,
+        };
+        Some(Expression::new(span, kind))
     }
 
     /// `match` as a statement, with `result` set when its value is wanted.
@@ -980,7 +1022,11 @@ impl Context<'_> {
         result: Option<Variable>,
     ) -> Option<StatementKind> {
         let ast = self.ast;
-        let scrutinee = self.value(scrutinee, false)?;
+        let reference = self.reference_scrutinee(scrutinee);
+        let scrutinee = match reference {
+            Some(_) => self.reference_value(scrutinee, span)?,
+            None => self.value(scrutinee, false)?,
+        };
         let (held, in_place) = match &scrutinee.kind {
             ExpressionKind::Read(variable) => (*variable, true),
             _ => (
@@ -993,13 +1039,21 @@ impl Context<'_> {
             return decline(|| "match without arms".into());
         }
         let mut lowered = Vec::new();
+        let outer = std::mem::replace(&mut self.pattern_reference, reference);
         for arm in nodes {
             // The arm's bindings are visible in its guard and body only.
             self.scopes.push(Vec::new());
             let arm = self.statement_arm(arm, held, result);
             self.scopes.pop();
-            lowered.push(arm?);
+            match arm {
+                Some(arm) => lowered.push(arm),
+                None => {
+                    self.pattern_reference = outer;
+                    return None;
+                }
+            }
         }
+        self.pattern_reference = outer;
         Some(StatementKind::Match(Box::new(MatchStatement {
             scrutinee,
             held,

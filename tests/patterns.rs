@@ -172,3 +172,62 @@ fn a_pattern_that_does_not_fit_its_value_is_an_error() {
     ));
     assert_eq!(error.code, "E185", "{}", error.message);
 }
+
+#[test]
+fn matching_through_a_shared_reference_binds_references_and_leaves_the_value() {
+    let source = program(
+        "proc f(o: &Outer) -> i64 {\n    return match o {\n        Outer::Wrap(Inner::A(n)) => n.*,\n        Outer::Wrap(Inner::B) => -1,\n        Outer::Plain(n) => n.* * 2,\n    }\n}\n\
+         let v = Outer::Wrap(Inner::A(5))\nstd::io::print(f(&v))\nstd::io::print(f(&v))\n\
+         let w = Outer::Plain(4)\nstd::io::print(f(&w))\n",
+    );
+    assert_eq!(run(&source), "5\n5\n8\n");
+    assert_lowered_by_the_pipeline(&source);
+}
+
+#[test]
+fn matching_a_borrow_written_in_the_match_does_not_move_the_value() {
+    let source = program(
+        "proc f(o: Outer) -> i64 {\n    let first = match &o {\n        Outer::Wrap(Inner::A(n)) => n.*,\n        Outer::Wrap(Inner::B) => 0,\n        Outer::Plain(n) => n.*,\n    }\n    let second = match o {\n        Outer::Wrap(Inner::A(n)) => n,\n        Outer::Wrap(Inner::B) => 0,\n        Outer::Plain(n) => n,\n    }\n    return first + second\n}\n\
+         std::io::print(f(Outer::Wrap(Inner::A(21))))\n",
+    );
+    assert_eq!(run(&source), "42\n");
+    assert_lowered_by_the_pipeline(&source);
+}
+
+#[test]
+fn a_mutable_reference_lets_the_arm_change_the_matched_value() {
+    let source = program(
+        "proc bump(o: &mut Outer) {\n    match o {\n        Outer::Wrap(Inner::A(n)) => { n.* += 10 },\n        Outer::Wrap(Inner::B) => {},\n        Outer::Plain(n) => { n.* = n.* * 2 },\n    }\n}\n\
+         proc show(o: &Outer) -> i64 {\n    return match o {\n        Outer::Wrap(Inner::A(n)) => n.*,\n        Outer::Wrap(Inner::B) => 0,\n        Outer::Plain(n) => n.*,\n    }\n}\n\
+         let mut a = Outer::Wrap(Inner::A(1))\nlet mut b = Outer::Plain(4)\nbump(&mut a)\nbump(&mut b)\n\
+         std::io::print(show(&a))\nstd::io::print(show(&b))\n",
+    );
+    assert_eq!(run(&source), "11\n8\n");
+    assert_lowered_by_the_pipeline(&source);
+}
+
+#[test]
+fn a_tuple_is_matched_through_a_reference() {
+    let source = "proc add(p: &(i64, i64)) -> i64 {\n    return match p {\n        (a, b) => a.* + b.*,\n    }\n}\n\
+        let t = (3, 4)\nstd::io::print(add(&t))\nstd::io::print(add(&t))\n";
+    assert_eq!(run(source), "7\n7\n");
+    assert_lowered_by_the_pipeline(source);
+}
+
+#[test]
+fn a_non_copy_part_is_read_in_place_through_a_reference() {
+    let source = "enum Boxed {\n    Text: (string, i64),\n    Empty,\n}\n\
+        proc show(b: &Boxed) {\n    match b {\n        Boxed::Text((s, n)) => {\n            std::io::print(s.*)\n            std::io::print(n.*)\n        },\n        Boxed::Empty => {},\n    }\n}\n\
+        let b = Boxed::Text((\"hi\", 3))\nshow(&b)\nshow(&b)\n";
+    assert_eq!(run(source), "hi\n3\nhi\n3\n");
+    assert_lowered_by_the_pipeline(source);
+}
+
+#[test]
+fn coverage_and_shape_errors_apply_through_a_reference_too() {
+    let error = failure(&program(
+        "proc f(o: &Outer) -> i64 {\n    return match o {\n        Outer::Wrap(Inner::A(n)) => n.*,\n        Outer::Plain(n) => n.*,\n    }\n}\nlet v = Outer::Plain(1)\nstd::io::print(f(&v))\n",
+    ));
+    assert_eq!(error.code, "E185", "{}", error.message);
+    assert!(error.message.contains("Wrap(B)"), "{}", error.message);
+}

@@ -126,6 +126,12 @@ pub(super) enum Operation {
     EnumPayload(Value, Variable, cyallo_ast::EnumVariant, Type),
     /// The payload of a non-`Copy` variant, moved out of the local that holds it.
     EnumTake(Value, Variable, cyallo_ast::EnumVariant, Type),
+    /// Whether the enum a reference value refers to is this variant.
+    EnumTestThrough(Value, Value, cyallo_ast::EnumVariant),
+    /// A reference to the payload of the variant a reference value refers to.
+    EnumRefThrough(Value, Value, cyallo_ast::EnumVariant, Type),
+    /// A reference to a field, by index, of the record a reference value refers to.
+    FieldRefThrough(Value, Value, usize, Type),
     /// The local's value has been (partly) moved out: it is empty on this path.
     Consume(Variable),
 }
@@ -1287,7 +1293,7 @@ impl Analysis<'_> {
     /// A pattern against the type of the value it matches: the shape the coverage check
     /// uses, or the error for a pattern that does not fit.
     fn shape(&self, pattern: &hir::Pattern, ty: &Type, span: Span) -> Result<Shape, Diagnostic> {
-        let ty = self.view(ty);
+        let ty = self.peeled(ty).0;
         match pattern {
             hir::Pattern::Wildcard | hir::Pattern::Binding(_) => Ok(Shape::Any),
             hir::Pattern::Variant { name, payload, .. } => {
@@ -1389,7 +1395,7 @@ impl Analysis<'_> {
         let Some((first, rest)) = types.split_first() else {
             return Ok(if rows.is_empty() { vec![vec![]] } else { vec![] });
         };
-        let first = self.view(first);
+        let first = self.peeled(first).0;
         let wrap = |witnesses: Vec<Vec<String>>, arity: usize, build: &dyn Fn(Vec<String>) -> String| {
             witnesses
                 .into_iter()
@@ -1485,6 +1491,30 @@ impl Analysis<'_> {
         }
     }
 
+    /// A type looked through one reference: the type a pattern matches, and whether the
+    /// value matched is a reference (`Some(true)` for `&mut`), which makes every name the
+    /// pattern binds a reference to its part.
+    fn peeled(&self, ty: &Type) -> (Type, Option<bool>) {
+        match self.view(ty) {
+            Type::Reference {
+                mutable, pointee, ..
+            } => (self.view(&pointee), Some(mutable)),
+            other => (other, None),
+        }
+    }
+
+    /// The type of a name a pattern binds to a part of type `part`.
+    fn bound_type(part: Type, through: Option<bool>) -> Type {
+        match through {
+            Some(mutable) => Type::Reference {
+                mutable,
+                lifetime: None,
+                pointee: Box::new(part),
+            },
+            None => part,
+        }
+    }
+
     /// The variant a pattern names in the enum being matched, and its index.
     fn variant_of(
         &self,
@@ -1492,7 +1522,7 @@ impl Analysis<'_> {
         name: NameId,
         span: Span,
     ) -> Result<(Arc<cyallo_ast::EnumType>, usize), Diagnostic> {
-        let Type::Enum(contract) = self.view(scrutinee) else {
+        let Type::Enum(contract) = self.peeled(scrutinee).0 else {
             return Err(patterns::invalid_pattern(
                 patterns::PatternError::ExpectedEnum {
                     actual: scrutinee.clone(),
@@ -2371,7 +2401,7 @@ impl Analysis<'_> {
                 if let Some(held) = self.variable_type(*held) {
                     let (contract, index) = self.variant_of(&held, *name, *span)?;
                     if let Some(payload) = &contract.variants[index].payload {
-                        let ty = self.view(payload);
+                        let ty = Self::bound_type(self.view(payload), self.peeled(&held).1);
                         match self.variable_type(*slot) {
                             None => {
                                 self.declare(*slot, ty, *span)?;
@@ -2395,7 +2425,8 @@ impl Analysis<'_> {
                     // A part the value does not have is reported where the pattern is checked.
                     && let Ok(place) = self.place(*root, &[*step], false, *span)
                 {
-                    self.declare(*slot, place.steps[0].1.clone(), *span)?;
+                    let through = self.variable_type(*root).and_then(|ty| self.peeled(&ty).1);
+                    self.declare(*slot, Self::bound_type(place.steps[0].1.clone(), through), *span)?;
                     changed = true;
                 }
             }
@@ -2479,18 +2510,32 @@ impl Analysis<'_> {
             }
             Statement::MatchProject { root, step, slot } => {
                 let place = self.place(*root, &[*step], false, span)?;
-                let ty = place.steps[0].1.clone();
+                let (index, part) = place.steps[0].clone();
+                let through = self.peeled(&self.typed(*root, span)?).1;
+                let ty = Self::bound_type(part.clone(), through);
                 if self.typed(*slot, span)? != ty {
                     return Err(patterns::invalid_pattern(
                         patterns::PatternError::AlternativeBindings,
                         span,
                     ));
                 }
-                let value = self.value(ty);
-                self.emit(Operation::FieldRead(value, *root, Box::new(place)), span);
-                self.store(*slot, value, span);
+                if through.is_some() {
+                    // The reference to the part, not a copy of it.
+                    let (reference, _) = self.read(*root, span)?;
+                    let value = self.value(ty.clone());
+                    self.emit(Operation::FieldRefThrough(value, reference, index, part), span);
+                    self.store(*slot, value, span);
+                } else {
+                    let value = self.value(ty);
+                    self.emit(Operation::FieldRead(value, *root, Box::new(place)), span);
+                    self.store(*slot, value, span);
+                }
             }
             Statement::MatchSpend { held, slots } => {
+                // Names bound through a reference leave the matched value where it is.
+                if self.peeled(&self.typed(*held, span)?).1.is_some() {
+                    return Ok(());
+                }
                 let mut spent = false;
                 for slot in slots {
                     spent |= !self.is_copy(&self.typed(*slot, span)?);
@@ -2509,6 +2554,25 @@ impl Analysis<'_> {
                 let (contract, index) = self.variant_of(&held_type, *name, span)?;
                 let operation = contract.variants[index].operation();
                 let ty = self.typed(*slot, span)?;
+                if self.peeled(&held_type).1.is_some() {
+                    // Through a reference the name refers to the payload in place, so there
+                    // is nothing to take once a guard has chosen the arm.
+                    if *stage == mir::Stage::Take {
+                        return Ok(());
+                    }
+                    let Type::Reference { pointee, .. } = &ty else {
+                        return Err(invalid(span));
+                    };
+                    let payload = (**pointee).clone();
+                    let (reference, _) = self.read(*held, span)?;
+                    let value = self.value(ty.clone());
+                    self.emit(
+                        Operation::EnumRefThrough(value, reference, operation, payload),
+                        span,
+                    );
+                    self.store(*slot, value, span);
+                    return Ok(());
+                }
                 let copy = self.is_copy(&ty);
                 if *stage == mir::Stage::Take && copy {
                     return Ok(());
@@ -2748,7 +2812,15 @@ impl Analysis<'_> {
                 let (contract, index) = self.variant_of(&held_type, *name, span)?;
                 let found = self.value(Type::Boolean);
                 let operation = contract.variants[index].operation();
-                self.emit(Operation::EnumTest(found, *held, operation), span);
+                if self.peeled(&held_type).1.is_some() {
+                    let (reference, _) = self.read(*held, span)?;
+                    self.emit(
+                        Operation::EnumTestThrough(found, reference, operation),
+                        span,
+                    );
+                } else {
+                    self.emit(Operation::EnumTest(found, *held, operation), span);
+                }
                 Exit::Branch {
                     condition: found,
                     yes: target(self, *yes)?,
