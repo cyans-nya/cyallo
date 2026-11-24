@@ -598,6 +598,7 @@ fn extra_blocks(block: &mir::Block) -> usize {
             ExpressionKind::Project { .. } => 0,
             ExpressionKind::ArrayLiteral(values) => values.iter().map(count).sum(),
             ExpressionKind::Index { index, .. } => count(index),
+            ExpressionKind::Cast(inner, _) => count(inner),
             ExpressionKind::Record { fields, .. } => {
                 fields.iter().map(|(_, value)| count(value)).sum()
             }
@@ -1048,6 +1049,7 @@ impl Analysis<'_> {
                 .variable_type(*variable)
                 .ok_or_else(|| Diagnostic::new("E114", "type is not known yet", expression.span)),
             ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => self.infer(inner),
+            ExpressionKind::Cast(_, wanted) => Ok(wanted.clone()),
             ExpressionKind::Deref(variable) => {
                 let ty = self.variable_type(*variable).ok_or_else(|| {
                     Diagnostic::new("E114", "type is not known yet", expression.span)
@@ -1309,6 +1311,26 @@ impl Analysis<'_> {
                     Ok((value, ty))
                 }
                 ExpressionKind::Record { site, fields } => self.record(*site, fields, span),
+                ExpressionKind::Cast(inner, wanted) => {
+                    let (value, got) = self.expression(inner)?;
+                    if got.number_kind().is_none() {
+                        return Err(cyallo_ast::diagnostic::numeric_cast_requires_number(
+                            got, span,
+                        ));
+                    }
+                    let kind = wanted.number_kind().expect("a numeric cast target");
+                    let operands = Operands {
+                        start: self.operands.len(),
+                        len: 1,
+                    };
+                    self.operands.push(value);
+                    let result = self.value(wanted.clone());
+                    self.emit(
+                        Operation::Builtin(result, crate::intrinsic::Intrinsic::cast(kind), operands),
+                        span,
+                    );
+                    Ok((result, wanted.clone()))
+                }
                 ExpressionKind::ArrayLiteral(values) => {
                     let mut element: Option<Type> = None;
                     let mut operands = Vec::with_capacity(values.len());
@@ -2939,6 +2961,7 @@ fn mentions(expression: &Expression, variables: &[Variable]) -> bool {
         ExpressionKind::ArrayLiteral(values) => {
             values.iter().any(|value| mentions(value, variables))
         }
+        ExpressionKind::Cast(inner, _) => mentions(inner, variables),
         ExpressionKind::Index { root, index } => {
             variables.iter().any(|other| other.0 == root.0) || mentions(index, variables)
         }
@@ -2993,9 +3016,9 @@ fn gather_in<'e>(expression: &'e Expression, out: &mut Vec<(&'e hir::Match, Span
                 gather_matches(&arm.body, out);
             }
         }
-        ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => {
-            gather_matches(inner, out)
-        }
+        ExpressionKind::Group(inner)
+        | ExpressionKind::Unary(_, inner)
+        | ExpressionKind::Cast(inner, _) => gather_matches(inner, out),
         ExpressionKind::Binary(_, left, right)
         | ExpressionKind::ShortCircuit { left, right, .. } => {
             gather_matches(left, out);

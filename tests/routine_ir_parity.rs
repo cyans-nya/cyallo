@@ -2,14 +2,14 @@
 //!
 //! Each program marks function bodies with `PAD`. The migrated variant removes it, so
 //! every routine is in the HIR/MIR/AIR subset. The fallback variant replaces it with a
-//! statement outside the subset (a char local), which keeps the old route and changes
+//! statement outside the subset (a closure local), which keeps the old route and changes
 //! nothing observable. Both must produce the same output or the same diagnostic.
 use cyallo::{Diagnostic, Session, Status, compile};
 use cyallo_ir::analysis::IndexedRoutineBody;
 use std::sync::Arc;
 
 const PAD: &str = "PAD";
-const FALLBACK: &str = "let unused_char = 'a'\n";
+const FALLBACK: &str = "let unused_closure = fn(n: i64) -> i64 { return n }\n";
 
 fn variants(source: &str) -> (String, String) {
     (source.replace(PAD, ""), source.replace(PAD, FALLBACK))

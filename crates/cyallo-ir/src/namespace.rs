@@ -463,7 +463,7 @@ impl Resolver {
     /// whose fields are all such types, and references to one of those.
     fn pipeline_type(&self, ty: &Type, depth: usize) -> bool {
         match ty {
-            Type::Integer | Type::Boolean | Type::Real | Type::Numeric(_) | Type::String => true,
+            Type::Integer | Type::Boolean | Type::Real | Type::Numeric(_) | Type::String | Type::Char => true,
             Type::Reference {
                 lifetime: None,
                 pointee,

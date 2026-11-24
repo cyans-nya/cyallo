@@ -52,6 +52,8 @@ pub(super) enum ExpressionKind {
     },
     /// A string literal: its text is interned in the body's unit.
     Text(NameId),
+    /// `value as number`: a numeric conversion.
+    Cast(Box<Expression>, Type),
     /// `[a, b, c]`: a fixed-size array with at least one element.
     ArrayLiteral(Vec<Expression>),
     /// `a[i]`: an element of a local array, by a single integer index.
@@ -142,7 +144,9 @@ impl Expression {
             | ExpressionKind::Deref(_)
             | ExpressionKind::Borrow { .. }
             | ExpressionKind::Reborrow(_) => 0,
-            ExpressionKind::Group(inner) | ExpressionKind::Unary(_, inner) => inner.size(),
+            ExpressionKind::Group(inner)
+            | ExpressionKind::Unary(_, inner)
+            | ExpressionKind::Cast(inner, _) => inner.size(),
             ExpressionKind::Record { fields, .. } => {
                 fields.iter().map(|(_, value)| value.size()).sum()
             }
@@ -1206,6 +1210,7 @@ impl Context<'_> {
                     LiteralNode::Integer(value) => Literal::Integer(*value),
                     LiteralNode::Real(value) => Literal::Real(*value),
                     LiteralNode::Boolean(value) => Literal::Boolean(*value),
+                    LiteralNode::Char(value) => Literal::Char(*value),
                     other => return decline(|| format!("literal {}", variant(other))),
                 }),
                 ExprSyntax::Name(name) => match self.lookup(name) {
@@ -1243,6 +1248,13 @@ impl Context<'_> {
                         Box::new(self.value(left, false)?),
                         Box::new(self.value(right, false)?),
                     )
+                }
+                ExprSyntax::Cast(value, ty) => {
+                    let Some(wanted) = scalar_type(ast.get(ty)?).filter(|t| t.number_kind().is_some())
+                    else {
+                        return decline(|| "cast to something other than a number".into());
+                    };
+                    ExpressionKind::Cast(Box::new(self.value(value, false)?), wanted)
                 }
                 ExprSyntax::Unary(operator @ (Operator::Not | Operator::Subtract), operand) => {
                     ExpressionKind::Unary(operator, Box::new(self.value(operand, split)?))
@@ -1514,6 +1526,7 @@ fn scalar_type(node: &TypeNode) -> Option<Type> {
     Some(match node {
         TypeNode::Integer => Type::Integer,
         TypeNode::Boolean => Type::Boolean,
+        TypeNode::Char => Type::Char,
         TypeNode::Real => Type::Real,
         TypeNode::String => Type::String,
         TypeNode::Numeric(kind) => Type::numeric(*kind),
