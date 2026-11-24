@@ -96,10 +96,12 @@ pub(super) enum Operation {
     FieldRead(Value, Variable, Box<Place>),
     /// `[a, b, c]`: a fixed-size array of the operands.
     ArrayLiteral(Value, Operands),
+    /// A reference to an array, viewed as a reference to a slice of its elements.
+    Slice(Value, Value, bool),
     /// The element of a local array at an index value.
-    IndexRead(Value, Variable, Value),
+    IndexRead(Value, Variable, Value, bool),
     /// Store a value into the element of a local array at an index value.
-    IndexWrite(Variable, Value, Value),
+    IndexWrite(Variable, Value, Value, bool),
     /// Write a field.
     FieldWrite(Variable, Box<Place>, Value),
     /// Move a value out of a local, which is then empty until it is written again.
@@ -490,8 +492,8 @@ fn check_moves(blocks: &[Block], variables: usize) -> Result<(), Diagnostic> {
                 Operation::ReadVariable(_, variable)
                 | Operation::Borrow(_, variable)
                 | Operation::FieldRead(_, variable, _)
-                | Operation::IndexRead(_, variable, _)
-                | Operation::IndexWrite(variable, _, _)
+                | Operation::IndexRead(_, variable, _, _)
+                | Operation::IndexWrite(variable, _, _, _)
                 | Operation::EnumTest(_, variable, _)
                 | Operation::EnumPayload(_, variable, _, _)
                 | Operation::EnumTake(_, variable, _, _)
@@ -895,9 +897,30 @@ impl Analysis<'_> {
 
     /// Whether a local was declared without `mut` (parameters were not).
     /// The element type of a local array, with the number of its dimensions checked.
-    fn element_of(&self, root: Variable, span: Span) -> Result<(Type, Type), Diagnostic> {
+    fn element_of(
+        &self,
+        root: Variable,
+        write: bool,
+        span: Span,
+    ) -> Result<(Type, Type), Diagnostic> {
         let array = self.typed(root, span)?;
         match &array {
+            // A slice parameter: writing needs `&mut`.
+            Type::Reference {
+                mutable, pointee, ..
+            } if matches!(**pointee, Type::Slice(_)) => {
+                if write && !*mutable {
+                    return Err(Diagnostic::new(
+                        "E107",
+                        "cannot write through a read-only reference",
+                        span,
+                    ));
+                }
+                let Type::Slice(element) = &**pointee else {
+                    unreachable!()
+                };
+                Ok((array.clone(), self.view(element)))
+            }
             Type::Array(bounds, element) if bounds.len() == 1 => {
                 Ok((array.clone(), self.view(element)))
             }
@@ -1018,7 +1041,7 @@ impl Analysis<'_> {
                 ))
             }
             ExpressionKind::Index { root, .. } => {
-                self.element_of(*root, expression.span).map(|(_, element)| element)
+                self.element_of(*root, false, expression.span).map(|(_, element)| element)
             }
             ExpressionKind::Reborrow(variable) => self
                 .variable_type(*variable)
@@ -1109,7 +1132,31 @@ impl Analysis<'_> {
             return self.construct_generic(*site, arguments, wanted, expression.span);
         }
         let expression = contextualize(expression, wanted)?;
-        self.expression_as(&expression, usage)
+        let (value, actual) = self.expression_as(&expression, usage)?;
+        // A reference to an array stands where a reference to a slice of its elements is wanted.
+        if let Type::Reference {
+            mutable: wanted_mutable,
+            pointee: wanted_pointee,
+            ..
+        } = wanted
+            && let Type::Slice(element) = &**wanted_pointee
+            && let Type::Reference {
+                mutable: given_mutable,
+                pointee: given_pointee,
+                ..
+            } = &actual
+            && (!*wanted_mutable || *given_mutable)
+            && matches!(&**given_pointee, Type::Array(_, held) if **held == **element)
+        {
+            let value_type = wanted.clone();
+            let slice = self.value(value_type.clone());
+            self.emit(
+                Operation::Slice(slice, value, *wanted_mutable),
+                expression.span,
+            );
+            return Ok((slice, value_type));
+        }
+        Ok((value, actual))
     }
 
     fn expression(&mut self, expression: &Expression) -> Result<(Value, Type), Diagnostic> {
@@ -1206,7 +1253,7 @@ impl Analysis<'_> {
                     Ok((value, ty))
                 }
                 ExpressionKind::Index { root, index } => {
-                    let (_, element) = self.element_of(*root, span)?;
+                    let (_, element) = self.element_of(*root, false, span)?;
                     if usage == Use::Move && !self.is_copy(&element) {
                         return Err(Diagnostic::new(
                             "E118",
@@ -1216,7 +1263,8 @@ impl Analysis<'_> {
                     }
                     let index = self.index_value(index)?;
                     let value = self.value(element.clone());
-                    self.emit(Operation::IndexRead(value, *root, index), span);
+                    let through = matches!(self.typed(*root, span)?, Type::Reference { .. });
+                    self.emit(Operation::IndexRead(value, *root, index, through), span);
                     Ok((value, element))
                 }
                 ExpressionKind::Deref(variable) => {
@@ -2394,14 +2442,15 @@ impl Analysis<'_> {
                 self.store(*slot, combined, span);
             }
             Statement::AssignIndex { root, index, value } => {
-                let (_, element) = self.element_of(*root, span)?;
+                let (_, element) = self.element_of(*root, true, span)?;
                 if self.constant(*root) {
                     return Err(Diagnostic::new("E107", "cannot modify a constant", span));
                 }
                 let index = self.index_value(index)?;
                 let (stored, actual) = self.expected_as(value, &element, Use::Move)?;
                 require(&element, &actual, value.span)?;
-                self.emit(Operation::IndexWrite(*root, index, stored), span);
+                let through = matches!(self.typed(*root, span)?, Type::Reference { .. });
+                self.emit(Operation::IndexWrite(*root, index, stored, through), span);
             }
             Statement::CompoundIndex {
                 root,
@@ -2409,13 +2458,14 @@ impl Analysis<'_> {
                 operator,
                 value,
             } => {
-                let (_, element) = self.element_of(*root, span)?;
+                let (_, element) = self.element_of(*root, true, span)?;
                 if self.constant(*root) {
                     return Err(Diagnostic::new("E107", "cannot modify a constant", span));
                 }
                 let index = self.index_value(index)?;
                 let old = self.value(element.clone());
-                self.emit(Operation::IndexRead(old, *root, index), span);
+                let through = matches!(self.typed(*root, span)?, Type::Reference { .. });
+                self.emit(Operation::IndexRead(old, *root, index, through), span);
                 let contextual = contextualize(value, &element)?;
                 let (operand, operand_type) = self.expression(&contextual)?;
                 let result = super::super::binary_type(*operator, &element, &operand_type, span)?;
@@ -2423,7 +2473,7 @@ impl Analysis<'_> {
                 let combined = self.value(result.clone());
                 let operator = super::super::specialized_operator(*operator, &result);
                 self.emit(Operation::Binary(combined, operator, old, operand), span);
-                self.emit(Operation::IndexWrite(*root, index, combined), span);
+                self.emit(Operation::IndexWrite(*root, index, combined, through), span);
             }
             Statement::AssignProject { root, path, value } => {
                 let place = self.place(*root, path, true, span)?;

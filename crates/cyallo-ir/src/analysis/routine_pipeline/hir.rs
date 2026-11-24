@@ -1051,7 +1051,8 @@ impl Context<'_> {
             return decline(|| "index of something other than a local array".into());
         };
         let visible = self.lookup(name)?;
-        if visible.reference.is_some() || visible.slot.0 < self.parameters {
+        // A by-value parameter cannot be an array here; a reference parameter may be a slice.
+        if visible.reference.is_none() && visible.slot.0 < self.parameters {
             return decline(|| "index of a parameter".into());
         }
         Some((visible.slot, self.value(*index, false)?))
@@ -1405,7 +1406,13 @@ fn reference_type(ast: &IndexedAst, node: &TypeNode) -> Option<(bool, Type)> {
     else {
         return None;
     };
-    let pointee = signature_type(ast, ast.get(*pointee)?)?;
+    // `&[]T` and `&mut []T`: a slice of scalars, which indexing reads and writes in place.
+    let pointee = match ast.get(*pointee)? {
+        TypeNode::Slice(element) => {
+            Type::Slice(Box::new(scalar_type(ast.get(*element)?)?))
+        }
+        node => signature_type(ast, node)?,
+    };
     Some((
         *mutable,
         Type::Reference {

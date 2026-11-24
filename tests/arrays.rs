@@ -106,3 +106,35 @@ fn an_owned_element_cannot_be_moved_out() {
     );
     assert_eq!(error.code, "E118", "{}", error.message);
 }
+
+#[test]
+fn slice_parameters_read_and_write_in_place() {
+    let source = include_str!("../examples/arrays/slices.yas");
+    assert_eq!(run(source), "7251\n");
+    // swap, reverse, sum, quicksort and demo; the entry script is not lowered here.
+    assert_eq!(lowered(source), 5);
+}
+
+#[test]
+fn a_shared_slice_cannot_be_written() {
+    let error = failure(
+        "proc f(a: &[]i64) {\n    a[0] = 1\n}\nproc g() {\n    let mut x = [1, 2]\n    f(&x)\n}\nstd::io::print(0)",
+    );
+    assert_eq!(error.code, "E107", "{}", error.message);
+}
+
+#[test]
+fn a_shared_array_reference_cannot_stand_for_a_mutable_slice() {
+    let error = failure(
+        "proc f(a: &mut []i64) {\n    a[0] = 1\n}\nproc g() {\n    let x = [1, 2]\n    f(&x)\n}\nstd::io::print(0)",
+    );
+    assert!(matches!(error.code, "E107" | "E109"), "{} {}", error.code, error.message);
+}
+
+#[test]
+fn a_slice_element_type_must_match() {
+    let error = failure(
+        "proc f(a: &[]i64) -> i64 {\n    return a[0]\n}\nproc g() -> i64 {\n    let x = [true, false]\n    return f(&x)\n}\nstd::io::print(0)",
+    );
+    assert_eq!(error.code, "E109", "{}", error.message);
+}

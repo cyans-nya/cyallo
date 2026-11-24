@@ -466,7 +466,15 @@ impl Resolver {
                 lifetime: None,
                 pointee,
                 ..
-            } => !matches!(**pointee, Type::Reference { .. }) && self.pipeline_type(pointee, depth),
+            } => match &**pointee {
+                // A slice of scalars, indexed in place.
+                Type::Slice(element) => matches!(
+                    **element,
+                    Type::Integer | Type::Boolean | Type::Real | Type::Numeric(_)
+                ),
+                Type::Reference { .. } => false,
+                pointee => self.pipeline_type(pointee, depth),
+            },
             Type::Applied(target, arguments) if depth < 8 => self
                 .generic_enums
                 .get(target)

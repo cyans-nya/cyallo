@@ -607,7 +607,8 @@ fn instruction_count(operation: &air::Operation) -> usize {
             1 + usize::from(place.via_reference) + place.steps.len() + 1
         }
         // The array's address, the element's address, and the load or store.
-        air::Operation::IndexRead(..) | air::Operation::IndexWrite(..) => 3,
+        air::Operation::IndexRead(_, _, _, through)
+        | air::Operation::IndexWrite(_, _, _, through) => 3 + usize::from(*through),
         _ => 1,
     }
 }
@@ -752,6 +753,15 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                     registers[value.0] = dst;
                     Op::Load(dst, address)
                 }
+                air::Operation::Slice(value, array, mutable) => {
+                    let dst = register(&mut function, &checked.types[value.0]);
+                    registers[value.0] = dst;
+                    Op::Lookup(
+                        dst,
+                        crate::lookup::Operation::Slice(mutable),
+                        vec![registers[array.0]],
+                    )
+                }
                 air::Operation::ArrayLiteral(value, range) => {
                     let elements = checked.operands[range.start..range.start + range.len]
                         .iter()
@@ -761,8 +771,8 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                     registers[value.0] = dst;
                     Op::ArrayLiteral(dst, elements)
                 }
-                air::Operation::IndexRead(value, root, index) => {
-                    let array = enum_address(&mut function, root, span);
+                air::Operation::IndexRead(value, root, index, _) => {
+                    let array = index_base(&mut function, root, span);
                     let element = register(&mut function, &checked.types[value.0]);
                     push(
                         &mut function,
@@ -773,8 +783,8 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
                     registers[value.0] = dst;
                     Op::Load(dst, element)
                 }
-                air::Operation::IndexWrite(root, index, value) => {
-                    let array = enum_address(&mut function, root, span);
+                air::Operation::IndexWrite(root, index, value, _) => {
+                    let array = index_base(&mut function, root, span);
                     let element = register(&mut function, &checked.types[value.0]);
                     push(
                         &mut function,
@@ -911,6 +921,19 @@ fn emit(checked: air::Body, mut function: ir::Function) -> ir::Function {
 }
 
 /// The address of the local that holds an enum.
+/// What `Op::Index` takes: the local array's address, or, for a slice parameter, the
+/// reference stored in it.
+fn index_base(function: &mut ir::Function, root: Variable, span: Span) -> Reg {
+    let address = enum_address(function, root, span);
+    if matches!(function.locals[root.0].ty, Type::Reference { .. }) {
+        let reference = register(function, &function.locals[root.0].ty.clone());
+        push(function, Op::Load(reference, address), span);
+        reference
+    } else {
+        address
+    }
+}
+
 fn enum_address(function: &mut ir::Function, variable: Variable, span: Span) -> Reg {
     let ty = function.locals[variable.0].ty.clone();
     let address = register(function, &ty);
