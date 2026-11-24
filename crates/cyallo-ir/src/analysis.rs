@@ -474,6 +474,7 @@ impl DeferredBody {
                         &c.routine_types,
                         &c.services,
                         &c.globals,
+                        Some(&c.routine_types),
                     )?,
                     None => None,
                 };

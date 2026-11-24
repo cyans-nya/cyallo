@@ -74,6 +74,14 @@ pub(super) enum ExpressionKind {
     Match(Box<Match>),
     /// `receiver.method(arguments)` on a parameter whose type is a type parameter.
     MethodCall(Box<MethodCall>),
+    /// `parameter.method(arguments)` on a parameter that is not a type parameter: a member
+    /// the module graph found among the receiver type's native members.
+    Member {
+        receiver: Variable,
+        site: SiteId,
+        name: NameId,
+        arguments: Vec<Expression>,
+    },
     /// `f(arguments)` where `f` is a local or parameter holding a function value.
     Invoke {
         callee: Variable,
@@ -235,8 +243,10 @@ impl Expression {
             }
             ExpressionKind::Binary(_, left, right)
             | ExpressionKind::ShortCircuit { left, right, .. } => left.size() + right.size(),
-            ExpressionKind::Call(_, arguments) | ExpressionKind::Invoke { arguments, .. } => {
-                arguments.iter().map(Expression::size).sum()
+            ExpressionKind::Call(_, arguments)
+            | ExpressionKind::Invoke { arguments, .. }
+            | ExpressionKind::Member { arguments, .. } => {
+                1 + arguments.iter().map(Expression::size).sum::<usize>()
             }
         }
     }
@@ -435,6 +445,8 @@ pub(super) struct Routine {
     pub(super) statements: Vec<Statement>,
     /// Declared and hidden locals, after the parameters, in slot order.
     pub(super) locals: Vec<Local>,
+    /// Whether the body matches on a value, or tests one with `if let`.
+    pub(super) matched: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -457,6 +469,8 @@ struct Context<'a> {
     scopes: Vec<Vec<Visible>>,
     /// Loops enclosing the statement being lowered.
     loops: usize,
+    /// Whether any `match` or `if let` was lowered.
+    matched: bool,
     /// The routine returns no value.
     procedure: bool,
     /// For each parameter: whether its type is a type parameter, or a reference to one,
@@ -537,6 +551,7 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
         locals: Vec::new(),
         sites: Vec::new(),
         loops: 0,
+        matched: false,
         procedure,
         pending: Vec::new(),
         pattern_names: Vec::new(),
@@ -580,6 +595,7 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
         sites: context.sites,
         statements,
         locals: context.locals,
+        matched: context.matched,
     })
 }
 
@@ -846,6 +862,7 @@ impl Context<'_> {
             record,
             name_use,
             contextual: false,
+            receiver: None,
         });
         SiteId(self.sites.len() - 1)
     }
@@ -906,7 +923,9 @@ impl Context<'_> {
                                 ExpressionKind::Call(site, _) => {
                                     self.sites[site.0].discard = true;
                                 }
-                                ExpressionKind::MethodCall(_) | ExpressionKind::Invoke { .. } => {}
+                                ExpressionKind::MethodCall(_)
+                                | ExpressionKind::Invoke { .. }
+                                | ExpressionKind::Member { .. } => {}
                                 _ => {
                                     return decline(|| "statement that is not a call".into());
                                 }
@@ -1167,6 +1186,7 @@ impl Context<'_> {
             }
         }
         self.pattern_reference = outer;
+        self.matched = true;
         Some(StatementKind::Match(Box::new(MatchStatement {
             scrutinee,
             held,
@@ -1583,6 +1603,7 @@ impl Context<'_> {
                             span: arm.span,
                         });
                     }
+                    self.matched = true;
                     ExpressionKind::Match(Box::new(Match {
                         scrutinee,
                         held,
@@ -1621,9 +1642,30 @@ impl Context<'_> {
                             .copied()
                             .unwrap_or(false)
                     {
-                        return decline(|| {
-                            "method call on something other than a generic parameter or a method result".into()
-                        });
+                        // A parameter of any other type: the module graph checks that the
+                        // method is a native member of the type.
+                        if visible.slot.0 >= self.parameters {
+                            return decline(|| {
+                                "method call on something other than a parameter or a method result"
+                                    .into()
+                            });
+                        }
+                        let arguments: Vec<Expression> = ast
+                            .get_list(arguments)?
+                            .iter()
+                            .map(|&argument| self.argument(argument))
+                            .collect::<Option<_>>()?;
+                        let site = self.site(method, expression.span, arguments.len(), false, false, false);
+                        self.sites[site.0].receiver = Some(visible.slot.0);
+                        return Some(Expression::new(
+                            expression.span,
+                            ExpressionKind::Member {
+                                receiver: visible.slot,
+                                site,
+                                name: method,
+                                arguments,
+                            },
+                        ));
                     }
                     let arguments: Vec<Expression> = ast
                         .get_list(arguments)?

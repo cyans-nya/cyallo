@@ -38,6 +38,8 @@ pub(super) enum Site {
     Record(Box<str>),
     /// The built-in `print`, which writes its arguments to the output.
     Print,
+    /// A native member of the receiver's type, resolved from the types when it is lowered.
+    Member,
     /// A mutable script variable, at its slot in the program's globals.
     Global { index: usize, ty: Type },
     /// A named function used as a value, or called through a local that holds it.
@@ -59,6 +61,13 @@ pub(super) enum Site {
         payload: Option<Type>,
         result: Type,
     },
+}
+
+/// A native member resolved against the types of its receiver and arguments.
+struct MemberPlan {
+    resolved: crate::member::Resolved,
+    arguments: Vec<Expression>,
+    receiver_type: Type,
 }
 
 /// A field place: the root local, whether it is a reference to the record, and the field
@@ -123,6 +132,10 @@ pub(super) enum Operation {
     ArrayLiteral(Value, Operands),
     /// A named function as a value.
     FunctionValue(Value, usize),
+    /// A storage or service operation a native member lowers to; the first operand is the
+    /// receiver.
+    Lookup(Value, crate::lookup::Operation, Operands),
+    Service(Value, crate::services::Operation, Operands),
     /// A script variable read, and written.
     ReadGlobal(Value, usize),
     WriteGlobal(usize, Value),
@@ -476,6 +489,8 @@ pub(super) fn analyze(
     bounds: &[(Box<str>, Vec<crate::generics::Bound>)],
     generic: Option<&super::GenericHeader>,
     services: Option<&crate::services::Metadata>,
+    env: Option<&crate::declarations::TypeEnvironment>,
+    offset: u32,
 ) -> Result<Body, Diagnostic> {
     // A short-circuit operator ends a block in the middle of an expression, so a
     // MIR block may become several. The count is syntactic, so targets are known
@@ -496,6 +511,8 @@ pub(super) fn analyze(
         bounds,
         generic,
         services,
+        env,
+        offset,
         start,
         types: Vec::new(),
         operands: Vec::new(),
@@ -659,9 +676,9 @@ fn extra_blocks(block: &mir::Block) -> usize {
                         })
                         .sum::<usize>()
             }
-            ExpressionKind::Call(_, arguments) | ExpressionKind::Invoke { arguments, .. } => {
-                arguments.iter().map(count).sum()
-            }
+            ExpressionKind::Call(_, arguments)
+            | ExpressionKind::Invoke { arguments, .. }
+            | ExpressionKind::Member { arguments, .. } => arguments.iter().map(count).sum(),
             ExpressionKind::MethodCall(call) => call.arguments.iter().map(count).sum(),
         }
     }
@@ -725,6 +742,10 @@ struct Analysis<'a> {
     generic: Option<&'a super::GenericHeader>,
     /// The program's traits and implementations, to find a method.
     services: Option<&'a crate::services::Metadata>,
+    /// Native declarations, to resolve a member of a library type.
+    env: Option<&'a crate::declarations::TypeEnvironment>,
+    /// The archive offset of this file's spans, which native declaration access is keyed by.
+    offset: u32,
     /// The first block built for each MIR block.
     start: Vec<usize>,
     types: Vec<Type>,
@@ -846,6 +867,12 @@ impl Analysis<'_> {
                 lifetime: lifetime.clone(),
                 pointee: Box::new(self.view(pointee)),
             },
+            // The standard `Option` and `Result` are the enums their declarations denote.
+            Type::Storage(cyallo_ast::StorageKind::Option | cyallo_ast::StorageKind::Result, _) => {
+                self.env
+                    .and_then(|env| crate::enums::contract(ty, &env.native))
+                    .map_or_else(|| ty.clone(), |contract| Type::Enum(Arc::new(contract)))
+            }
             other => other.clone(),
         }
     }
@@ -1168,6 +1195,15 @@ impl Analysis<'_> {
             ExpressionKind::Invoke { callee, .. } => {
                 Ok(self.function_signature(*callee, expression.span)?.1)
             }
+            ExpressionKind::Member {
+                receiver,
+                name,
+                arguments,
+                ..
+            } => Ok(self
+                .resolve_member(*receiver, *name, arguments, expression.span)?
+                .resolved
+                .result),
             ExpressionKind::Call(site, arguments) => match self.callees.get(site.0) {
                 Some(Site::Builtin(id)) => {
                     let (_, types) = self.builtin_arguments(*id, arguments)?;
@@ -1202,6 +1238,221 @@ impl Analysis<'_> {
             Type::Function(_, parameters, result) => Ok((parameters, self.view(&result))),
             _ => Err(Diagnostic::new("E110", "value is not callable", span)),
         }
+    }
+
+    /// Resolve a native member of the receiver's type from the types of the receiver and the
+    /// arguments, as the existing route does: each argument first takes the member's
+    /// parameter type.
+    fn resolve_member(
+        &self,
+        receiver: Variable,
+        name: NameId,
+        arguments: &[Expression],
+        span: Span,
+    ) -> Result<MemberPlan, Diagnostic> {
+        let Some(env) = self.env else {
+            return Err(Diagnostic::new("E106", "unresolved method", span));
+        };
+        let receiver_type = self.typed(receiver, span)?;
+        let text = self.text(name);
+        // Native access is checked against the span's place in the program's archive.
+        let placed = cyallo_ast::spans::shift_span_checked(span, self.offset).unwrap_or(span);
+        let parameters =
+            crate::native_contract::parameter_types(env, &receiver_type, text, placed);
+        let mut fitted = Vec::with_capacity(arguments.len());
+        let mut types = Vec::with_capacity(arguments.len());
+        let mut stand_ins = Vec::with_capacity(arguments.len());
+        for (index, argument) in arguments.iter().enumerate() {
+            let argument = match parameters.as_ref().and_then(|types| types.get(index)) {
+                Some(wanted) => contextualize(argument, wanted)?.into_owned(),
+                None => argument.clone(),
+            };
+            types.push(self.infer(&argument)?);
+            // The declaration lookup reads a literal string argument; every other argument
+            // is known by its type.
+            let kind = match &argument.kind {
+                ExpressionKind::Text(text) => cyallo_ast::ExprKind::Literal(Literal::String(
+                    self.text(*text).into(),
+                )),
+                _ => cyallo_ast::ExprKind::Name(format!("$argument{index}").into()),
+            };
+            stand_ins.push(cyallo_ast::Expr {
+                kind,
+                span: argument.span,
+            });
+            fitted.push(argument);
+        }
+        // A diagnostic from the resolver carries a placed span; the caller places it again.
+        let unplaced = |mut error: Diagnostic| {
+            error.span = span;
+            error
+        };
+        let resolved =
+            crate::member::resolve(env, &receiver_type, text, &stand_ins, &types, placed)
+                .map_err(unplaced)?
+                .ok_or_else(|| Diagnostic::new("E116", "unknown field or tuple index", span))?;
+        Ok(MemberPlan {
+            resolved,
+            arguments: fitted,
+            receiver_type,
+        })
+    }
+
+    /// `receiver.member(arguments)` on a parameter: the receiver is passed as the member's
+    /// mode says, the arguments are evaluated in order, and the member's operation is one
+    /// instruction.
+    fn member_call(
+        &mut self,
+        receiver: Variable,
+        name: NameId,
+        arguments: &[Expression],
+        span: Span,
+        statement: bool,
+    ) -> Result<(Value, Type), Diagnostic> {
+        use crate::lookup::ReceiverMode;
+        let plan = self.resolve_member(receiver, name, arguments, span)?;
+        let MemberPlan {
+            resolved,
+            arguments,
+            receiver_type,
+        } = plan;
+        self.member_obligations(&resolved.obligations, span)?;
+        if resolved.result == Type::Void && !statement {
+            return Err(Diagnostic::new(
+                "E110",
+                "procedure cannot be used as an expression",
+                span,
+            ));
+        }
+        let read = Expression::new(span, ExpressionKind::Read(receiver));
+        let first = match resolved.receiver {
+            ReceiverMode::Owner | ReceiverMode::Move => self.expression_as(&read, Use::Move)?.0,
+            ReceiverMode::Value => {
+                let (value, ty) = self.read(receiver, span)?;
+                match self.view(&ty) {
+                    Type::Reference { pointee, .. } | Type::Managed { pointee, .. } => {
+                        let loaded = self.value(self.view(&pointee));
+                        self.emit(Operation::Load(loaded, value), span);
+                        loaded
+                    }
+                    _ => value,
+                }
+            }
+            mode => {
+                let mutable = mode == ReceiverMode::Mutable;
+                match &receiver_type {
+                    // A reference parameter already is the address of the receiver.
+                    Type::Reference {
+                        mutable: writable, ..
+                    } => {
+                        if mutable && !*writable {
+                            return Err(Diagnostic::new(
+                                "E107",
+                                "cannot modify through a shared reference",
+                                span,
+                            ));
+                        }
+                        self.read(receiver, span)?.0
+                    }
+                    ty => {
+                        let reference = Type::Reference {
+                            mutable,
+                            lifetime: None,
+                            pointee: Box::new(ty.clone()),
+                        };
+                        let value = self.value(reference);
+                        self.emit(Operation::Borrow(value, receiver), span);
+                        value
+                    }
+                }
+            }
+        };
+        let mut operands = vec![first];
+        for (argument, parameter) in arguments.iter().zip(&resolved.params) {
+            let wanted = self.view(&parameter.ty);
+            let usage = if matches!(wanted, Type::Reference { .. }) {
+                Use::Read
+            } else {
+                Use::Move
+            };
+            operands.push(self.expression_as(argument, usage)?.0);
+        }
+        if operands
+            .iter()
+            .any(|operand| crate::composites::borrowed(&self.types[operand.0]))
+        {
+            return Err(Diagnostic::new(
+                "E117",
+                "borrowed values cannot enter managed storage or lookup plans",
+                span,
+            ));
+        }
+        let range = Operands {
+            start: self.operands.len(),
+            len: operands.len(),
+        };
+        self.operands.extend(operands);
+        let result = self.view(&resolved.result);
+        let value = self.value(result.clone());
+        match resolved.body {
+            crate::member::Body::Storage(operation) => {
+                self.emit(Operation::Lookup(value, operation, range), span)
+            }
+            crate::member::Body::Service(operation) => {
+                self.emit(Operation::Service(value, operation, range), span)
+            }
+        }
+        Ok((value, result))
+    }
+
+    /// The evidence a native member asks of its type arguments: an allocator, or a trait the
+    /// program implements for the type.
+    fn member_obligations(
+        &self,
+        obligations: &[crate::native_contract::TraitObligation],
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        use crate::native_contract::TraitObligationKind;
+        let Some(services) = self.services else {
+            return if obligations.is_empty() {
+                Ok(())
+            } else {
+                Err(invalid(span))
+            };
+        };
+        for obligation in obligations {
+            let ty = obligation.ty.pointee_or_self();
+            let proven = match obligation.kind {
+                TraitObligationKind::Allocator => services.allocator(ty).is_some(),
+                TraitObligationKind::UserTrait => {
+                    let name = match &obligation.bound {
+                        Type::Named(name) | Type::Applied(name, _) | Type::TraitObject(name) => {
+                            Some(name.as_ref())
+                        }
+                        _ => None,
+                    };
+                    name.and_then(|name| services.trait_id(name)).is_some_and(|trait_id| {
+                        services.implementations.iter().any(|implementation| {
+                            implementation.trait_id == trait_id
+                                && crate::declarations::equivalent_types(
+                                    &implementation.receiver,
+                                    ty,
+                                )
+                        })
+                    })
+                }
+            };
+            if !proven {
+                return Err(crate::declarations::invalid_declaration(
+                    crate::declarations::DeclarationError::UnsatisfiedTrait {
+                        ty: obligation.ty.clone(),
+                        bound: obligation.bound.clone(),
+                    },
+                    span,
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The function value a local holds, loaded through the reference when it is one.
@@ -1578,6 +1829,12 @@ impl Analysis<'_> {
                     self.emit(Operation::FunctionValue(value, id), span);
                     Ok((value, ty))
                 }
+                ExpressionKind::Member {
+                    receiver,
+                    name,
+                    arguments,
+                    ..
+                } => self.member_call(*receiver, *name, arguments, span, false),
                 ExpressionKind::Invoke { callee, arguments } => {
                     let (operands, result) = self.invoke(*callee, arguments, span)?;
                     if result == Type::Void {
@@ -1888,7 +2145,10 @@ impl Analysis<'_> {
             ));
         };
         let written = self.text(name);
-        let last = |text: &str| text.rsplit("::").next().unwrap_or(text).to_owned();
+        // A standard enum's contract carries its linked name (`$module17$Type$Option`).
+        let last = |text: &str| {
+            text.rsplit(['$', ':']).next().unwrap_or(text).to_owned()
+        };
         let found = contract
             .variants
             .iter()
@@ -3120,6 +3380,16 @@ impl Analysis<'_> {
                     self.method_call(method, call.span, true)?;
                     return Ok(());
                 }
+                if let ExpressionKind::Member {
+                    receiver,
+                    name,
+                    arguments,
+                    ..
+                } = &call.kind
+                {
+                    self.member_call(*receiver, *name, arguments, call.span, true)?;
+                    return Ok(());
+                }
                 if let ExpressionKind::Invoke { callee, arguments } = &call.kind {
                     let (operands, result) = self.invoke(*callee, arguments, call.span)?;
                     let function = self.function_value(*callee, call.span)?;
@@ -3393,8 +3663,16 @@ fn mentions(expression: &Expression, variables: &[Variable]) -> bool {
         | ExpressionKind::ShortCircuit { left, right, .. } => {
             mentions(left, variables) || mentions(right, variables)
         }
-        ExpressionKind::Invoke { callee, arguments } => {
-            variables.iter().any(|other| other.0 == callee.0)
+        ExpressionKind::Invoke {
+            callee: receiver,
+            arguments,
+        }
+        | ExpressionKind::Member {
+            receiver,
+            arguments,
+            ..
+        } => {
+            variables.iter().any(|other| other.0 == receiver.0)
                 || arguments.iter().any(|argument| mentions(argument, variables))
         }
         ExpressionKind::MethodCall(call) => {
@@ -3440,7 +3718,9 @@ fn gather_in<'e>(expression: &'e Expression, out: &mut Vec<(&'e hir::Match, Span
                 gather_matches(argument, out);
             }
         }
-        ExpressionKind::Call(_, arguments) | ExpressionKind::Invoke { arguments, .. } => {
+        ExpressionKind::Call(_, arguments)
+        | ExpressionKind::Invoke { arguments, .. }
+        | ExpressionKind::Member { arguments, .. } => {
             for argument in arguments {
                 gather_matches(argument, out);
             }

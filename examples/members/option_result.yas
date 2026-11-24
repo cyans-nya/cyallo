@@ -1,0 +1,38 @@
+// Native members of Option and Result called on parameters.
+// Run: cargo run -- run examples/members/option_result.yas
+use std::option::Option::{Some, None}
+use std::result::Result::{Ok, Err}
+
+fn first_or(value: Option<i64>, fallback: i64) -> i64 {
+    if value.is_some() { return value.unwrap() }
+    return fallback
+}
+
+fn empty(value: &Option<i64>) -> bool {
+    return value.is_none()
+}
+
+fn required(value: Option<i64>) -> i64 {
+    return value.or_fail("a value is required")
+}
+
+fn succeeded(outcome: &Result<i64, string>) -> bool {
+    return outcome.is_ok()
+}
+
+fn failed(outcome: &Result<i64, string>) -> bool {
+    return outcome.is_err()
+}
+
+proc demo() {
+    let present: Option<i64> = Some(4)
+    let absent: Option<i64> = None
+    std::io::print(first_or(present, 0), ":", first_or(absent, 9))
+    let again: Option<i64> = Some(1)
+    std::io::print(empty(&again), ":", required(again))
+    let good: Result<i64, string> = Ok(1)
+    let bad: Result<i64, string> = Err("no")
+    std::io::print(succeeded(&good), ":", failed(&good), ":", succeeded(&bad), ":", failed(&bad))
+}
+
+demo()
