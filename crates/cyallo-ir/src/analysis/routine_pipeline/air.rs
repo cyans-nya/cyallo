@@ -841,6 +841,12 @@ impl Analysis<'_> {
                 lifetime: lifetime.clone(),
                 pointee: Box::new(self.view(pointee)),
             },
+            // The standard `Option` and `Result` are the enums their declarations denote.
+            Type::Storage(cyallo_ast::StorageKind::Option | cyallo_ast::StorageKind::Result, _) => {
+                self.env
+                    .and_then(|env| crate::enums::contract(ty, &env.native))
+                    .map_or_else(|| ty.clone(), |contract| Type::Enum(Arc::new(contract)))
+            }
             other => other.clone(),
         }
     }
@@ -1843,7 +1849,10 @@ impl Analysis<'_> {
             ));
         };
         let written = self.text(name);
-        let last = |text: &str| text.rsplit("::").next().unwrap_or(text).to_owned();
+        // A standard enum's contract carries its linked name (`$module17$Type$Option`).
+        let last = |text: &str| {
+            text.rsplit(['$', ':']).next().unwrap_or(text).to_owned()
+        };
         let found = contract
             .variants
             .iter()

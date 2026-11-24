@@ -1,0 +1,44 @@
+// The standard Option and Result built, matched, returned and passed between routines.
+// Run: cargo run -- run examples/members/option_flow.yas
+use std::option::Option::{Some, None}
+use std::result::Result::{Ok, Err}
+
+fn find(n: i64) -> Option<i64> {
+    if n > 0 { return Some(n * 2) }
+    return None
+}
+
+fn unwrap_or(value: Option<i64>, fallback: i64) -> i64 {
+    return match value {
+        Some(v) => v,
+        None => fallback,
+    }
+}
+
+fn divide(a: i64, b: i64) -> Result<i64, string> {
+    if b == 0 { return Err("divide by zero") }
+    return Ok(a / b)
+}
+
+fn describe(outcome: Result<i64, string>) -> string {
+    return match outcome {
+        Ok(v) => "ok",
+        Err(e) => e,
+    }
+}
+
+fn bump(value: Option<i64>) -> i64 {
+    if value.is_some() { return value.unwrap() + 1 }
+    return -1
+}
+
+fn chain(n: i64) -> i64 {
+    return bump(find(n)) + unwrap_or(find(n - 100), 0)
+}
+
+proc demo() {
+    std::io::print(chain(5), ":", chain(-3))
+    std::io::print(describe(divide(8, 2)), ":", describe(divide(1, 0)))
+}
+
+demo()

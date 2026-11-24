@@ -538,6 +538,15 @@ impl Resolver {
                         || (!matches!(**result, Type::Reference { .. })
                             && self.pipeline_type(result, depth + 1)))
             }
+            // The standard `Option` and `Result`, in the storage form the linker resolves them
+            // to: the pipeline views them as the enums their declarations denote.
+            Type::Storage(StorageKind::Option, inner) if depth < 8 => {
+                !matches!(**inner, Type::Reference { .. }) && self.pipeline_type(inner, depth + 1)
+            }
+            Type::Storage(StorageKind::Result, inner) if depth < 8 => {
+                matches!(&**inner, Type::Tuple(items) if items.len() == 2)
+                    && self.pipeline_type(inner, depth + 1)
+            }
             Type::Tuple(items) if depth < 8 => items.iter().all(|item| {
                 !matches!(item, Type::Reference { .. }) && self.pipeline_type(item, depth + 1)
             }),
@@ -569,27 +578,6 @@ impl Resolver {
     /// Whether a routine's parameters and result are all types the pipeline lowers, with
     /// every parameter passed by value and no reference as a result.
     fn pipeline_signature(&self, module: usize, f: &Function) -> bool {
-        self.signature_with(module, f, false)
-    }
-
-    /// Whether the routine's parameters are the standard `Option` or `Result` (in the storage
-    /// form the linker resolves them to), which the routine may hold and call members of,
-    /// but not match, build or pass on to a callee.
-    fn storage_parameters(&self, module: usize, f: &Function) -> bool {
-        f.params.iter().any(|parameter| {
-            self.resolved_with(module, &parameter.ty, parameter.span, &f.type_params)
-                .is_some_and(|ty| {
-                    matches!(
-                        ty.pointee_or_self(),
-                        Type::Storage(StorageKind::Option | StorageKind::Result, _)
-                    )
-                })
-        })
-    }
-
-    /// As `pipeline_signature`; with `storage`, a parameter may be a standard `Option` or
-    /// `Result` of types the pipeline lowers.
-    fn signature_with(&self, module: usize, f: &Function, storage: bool) -> bool {
         // A type parameter stands for a scalar here: each instance is checked when made.
         let probe: Vec<Type> = f.type_params.iter().map(|_| Type::Integer).collect();
         let resolved = |ty: &Type, span: Span| {
@@ -604,20 +592,8 @@ impl Resolver {
                 && parameter.passing == ParameterPassing::Value
                 && !parameter.by_ref
                 && !parameter.receiver
-                && resolved(&parameter.ty, parameter.span).is_some_and(|ty| {
-                    self.pipeline_type(&ty, 0)
-                        || (storage
-                            && match ty.pointee_or_self() {
-                                Type::Storage(StorageKind::Option, inner) => {
-                                    self.pipeline_type(inner, 1)
-                                }
-                                Type::Storage(StorageKind::Result, inner) => {
-                                    matches!(&**inner, Type::Tuple(items) if items.len() == 2)
-                                        && self.pipeline_type(inner, 1)
-                                }
-                                _ => false,
-                            })
-                })
+                && resolved(&parameter.ty, parameter.span)
+                    .is_some_and(|ty| self.pipeline_type(&ty, 0))
         });
         let result = match f.kind {
             RoutineKind::Procedure if f.result == Type::Void => true,
@@ -714,12 +690,7 @@ impl Resolver {
         >,
     > {
         // The routine's own signature must be one the pipeline lowers.
-        if !self.signature_with(module, function, true) {
-            return Ok(Err(body));
-        }
-        // With a standard `Option` or `Result` parameter the body may only call its members.
-        let storage = self.storage_parameters(module, function);
-        if storage && body.has_match() {
+        if !self.pipeline_signature(module, function) {
             return Ok(Err(body));
         }
         if !function.constraints.is_empty() && self.declared_bounds(module, function).is_none() {
@@ -785,9 +756,6 @@ impl Resolver {
                 let Some(symbol) = self.path(module, &path, Some(Kind::Value)) else {
                     return Ok(Err(body));
                 };
-                if storage && self.variants.contains_key(&symbol.id) {
-                    return Ok(Err(body));
-                }
                 self.check_import(module, &symbol, span)?;
                 let supported = self
                     .variants
@@ -811,9 +779,6 @@ impl Resolver {
             let Some(symbol) = self.path(module, &path, Some(Kind::Value)) else {
                 return Ok(Err(body));
             };
-            if storage && self.variants.contains_key(&symbol.id) {
-                return Ok(Err(body));
-            }
             self.check_import(module, &symbol, span)?;
             // A constructor of a supported enum's variant with a payload is a plain callee.
             let constructor = self

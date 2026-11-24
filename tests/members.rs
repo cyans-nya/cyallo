@@ -91,3 +91,35 @@ fn a_trait_method_of_the_same_name_keeps_the_existing_route() {
     // `check` stays on the existing route; `demo` holds an annotated local, which does too.
     assert_eq!(lowered(&source), 0);
 }
+
+#[test]
+fn option_and_result_are_built_matched_returned_and_passed_on_the_pipeline() {
+    let source = include_str!("../examples/members/option_flow.yas");
+    assert_eq!(run(source), "11:-1\nok:divide by zero\n");
+    // find, unwrap_or, divide, describe, bump, chain and demo.
+    assert_eq!(lowered(source), 7);
+}
+
+#[test]
+fn a_match_on_an_option_must_cover_both_variants() {
+    let error = failure(&format!(
+        "{PRELUDE}fn f(value: Option<i64>) -> i64 {{\n    return match value {{\n        Some(v) => v,\n    }}\n}}\nstd::io::print(0)"
+    ));
+    assert_eq!(error.code, "E185", "{}", error.message);
+}
+
+#[test]
+fn a_variant_payload_must_have_the_options_type() {
+    let error = failure(&format!(
+        "{PRELUDE}fn f() -> Option<i64> {{\n    return Some(true)\n}}\nstd::io::print(0)"
+    ));
+    assert_eq!(error.code, "E109", "{}", error.message);
+}
+
+#[test]
+fn a_variant_of_another_enum_is_not_an_option() {
+    let error = failure(&format!(
+        "{PRELUDE}fn f() -> Option<i64> {{\n    return Ok(1)\n}}\nstd::io::print(0)"
+    ));
+    assert_eq!(error.code, "E109", "{}", error.message);
+}
