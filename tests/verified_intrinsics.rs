@@ -146,6 +146,7 @@ std::io::print(shout(&names[1]), " ", shout(&pair.right), " ", shout(&names[0]))
 }
 
 #[test]
+#[ignore = "slow (~12s); run with --ignored"]
 fn the_documented_text_and_result_examples_run() {
     for (name, source) in [
         ("parser", include_str!("../examples/parser.yas")),

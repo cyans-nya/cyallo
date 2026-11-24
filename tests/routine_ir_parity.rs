@@ -505,6 +505,7 @@ fn outcome(source: &str) -> (String, String) {
 }
 
 #[test]
+#[ignore = "slow (~28s); run with --ignored"]
 fn generated_numeric_programs_agree_with_the_existing_route() {
     // `ROUTINE_FUZZ_CASES` and `ROUTINE_FUZZ_SEED` widen the search from the command line.
     let variable = |name: &str, default: u64| {

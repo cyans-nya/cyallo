@@ -1,3 +1,7 @@
 /target
 /target-*
+/.worktrees/
 /editors/zed/target/
+/editors/vscode/dist/
+/editors/vscode/node_modules/
+/nvim.log

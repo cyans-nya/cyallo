@@ -776,6 +776,7 @@ fn enum_examples_execute_through_the_cli() {
 }
 
 #[test]
+#[ignore = "slow (~50s); run with --ignored"]
 fn verified_engines_match_the_interpreter_on_supported_programs() {
     for example in [
         "examples/functions.psc",

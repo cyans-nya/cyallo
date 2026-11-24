@@ -315,9 +315,19 @@ cargo bench --bench gc
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-features
+cargo nextest run --workspace --all-features
+cargo test --workspace --all-features --doc
 cargo xtask vendor-winch check
 cargo bench --bench engines --features wasm-adapter
+```
+
+Nextest runs each test in its own process and reports per-test timings. The
+`cargo test --doc` step covers doctests. CI runs four slower regression tests
+in a dedicated step. To run those locally, use the same command.
+
+```sh
+cargo test --locked --all-features --test cli --test routine_ir_parity \
+  --test verified_intrinsics --test verified_native_composites -- --ignored
 ```
 
 Tests cover the verified pipeline (`tests/verified_*.rs`: every example runs identically, also under `--gc-stress`), native conformance on all three tiers with recovery at every instruction budget (`tests/verified_native*.rs`), the verified session and REPL (`tests/vm_*.rs`), CLI parity for every example, worker-thread compilation, aliases, syntax/mode isolation, utilities, terminal output, lexer allocations, and UTF-8 spans. Benchmarks separate prewarming from median execution time; compilation latency and warm runtime speed are different measurements.

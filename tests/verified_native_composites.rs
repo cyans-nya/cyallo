@@ -194,6 +194,7 @@ fn entry(n: i64) -> i64 {
 }
 
 #[test]
+#[ignore = "slow (~26s); run with --ignored"]
 fn an_enum_rebuilt_in_a_loop_reuses_its_frame_words() {
     let source = r#"
 enum Step { Stop, Go: i64 }
