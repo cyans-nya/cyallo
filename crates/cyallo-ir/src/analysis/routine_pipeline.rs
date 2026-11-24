@@ -86,8 +86,6 @@ pub struct IndexedRoutineBody {
     /// Admission facts, computed from the syntax so they do not force the graph.
     size: usize,
     loops: bool,
-    /// The body matches on a value or tests one with `if let`.
-    matched: bool,
     file_span: Span,
     archived_span: Span,
     offset: u32,
@@ -176,7 +174,6 @@ impl IndexedRoutineBody {
             sites: Arc::from(hir.sites.clone()),
             size: hir.size(),
             loops: hir.has_loops(),
-            matched: hir.matched,
             lowering: Arc::new(Lowering {
                 hir: Mutex::new(Some(hir)),
                 mir: OnceLock::new(),
@@ -190,11 +187,6 @@ impl IndexedRoutineBody {
             handle: handle.clone(),
             generic: None,
         }))
-    }
-
-    /// Whether the body matches on a value, or tests one with `if let`.
-    pub(crate) fn has_match(&self) -> bool {
-        self.matched
     }
 
     /// Reference sites in source order as `(path, argument count, is a statement, archived span)`.

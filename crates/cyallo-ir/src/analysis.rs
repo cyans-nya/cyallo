@@ -11,7 +11,7 @@ fn key(s: &str) -> String {
     s.to_owned()
 }
 #[derive(Debug, Clone)]
-struct Signature {
+pub(crate) struct Signature {
     kind: RoutineKind,
     params: Vec<Param>,
     result: Type,

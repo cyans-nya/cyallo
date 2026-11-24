@@ -585,8 +585,6 @@ impl Resolver {
             substitute_named(&mut ty, &f.type_params, &probe);
             Some(ty)
         };
-        for parameter in &f.params {
-        }
         let parameters = f.params.iter().all(|parameter| {
             parameter.arity == ParameterArity::One
                 && parameter.passing == ParameterPassing::Value

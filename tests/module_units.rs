@@ -2,7 +2,7 @@ use cyallo::{
     modules::{Compiler, SourceModule},
     vm::{Context, Session, Status},
 };
-use cyallo_ir::{analysis::ModuleBuild, module_graph::BindingKind};
+use cyallo_ir::module_graph::BindingKind;
 use std::sync::Arc;
 fn module(path: &str, source: &str) -> SourceModule {
     SourceModule::new(path, source)
