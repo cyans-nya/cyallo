@@ -104,22 +104,72 @@ pub(super) struct Arm {
     pub(super) span: Span,
 }
 
-/// What an arm matches: any value, or one variant, whose payload is ignored or bound.
+/// What an arm matches. A pattern that takes a value apart (a variant, a tuple, a record)
+/// names the local that holds the value it tests: the matched value for the arm's own
+/// pattern, a hidden local for each part that is itself taken apart.
 #[derive(Clone, Debug)]
 pub(super) enum Pattern {
     Wildcard,
+    /// A name bound to the part it stands for.
+    Binding(Variable),
     /// The variant's name as written, possibly qualified (`Shape::Circle`).
     Variant {
         name: NameId,
-        payload: Payload,
+        payload: Option<Box<Pattern>>,
+        at: Variable,
+    },
+    Tuple {
+        items: Vec<Pattern>,
+        at: Variable,
+    },
+    /// Fields by name, in the order written; `rest` is a trailing `..`.
+    Record {
+        fields: Vec<(NameId, Pattern)>,
+        rest: bool,
+        at: Variable,
     },
 }
 
-#[derive(Clone, Debug)]
-pub(super) enum Payload {
-    Absent,
-    Wildcard,
-    Binding(Variable),
+impl Pattern {
+    /// A wildcard, or a variant whose payload is absent, ignored or one binding: the shapes
+    /// a `match` in a value position tests without statements.
+    pub(super) fn is_flat(&self) -> bool {
+        match self {
+            Pattern::Wildcard => true,
+            Pattern::Variant { payload, .. } => matches!(
+                payload.as_deref(),
+                None | Some(Pattern::Wildcard | Pattern::Binding(_))
+            ),
+            _ => false,
+        }
+    }
+
+    /// The local that holds the value this pattern tests, when it takes the value apart.
+    pub(super) fn at(&self) -> Option<Variable> {
+        match self {
+            Pattern::Wildcard | Pattern::Binding(_) => None,
+            Pattern::Variant { at, .. } | Pattern::Tuple { at, .. } | Pattern::Record { at, .. } => {
+                Some(*at)
+            }
+        }
+    }
+
+    /// The names the pattern binds, in the order written.
+    pub(super) fn bindings(&self, out: &mut Vec<Variable>) {
+        match self {
+            Pattern::Wildcard => {}
+            Pattern::Binding(slot) => out.push(*slot),
+            Pattern::Variant { payload, .. } => {
+                if let Some(payload) = payload {
+                    payload.bindings(out);
+                }
+            }
+            Pattern::Tuple { items, .. } => items.iter().for_each(|item| item.bindings(out)),
+            Pattern::Record { fields, .. } => {
+                fields.iter().for_each(|(_, field)| field.bindings(out))
+            }
+        }
+    }
 }
 
 impl Expression {
@@ -358,6 +408,8 @@ struct Context<'a> {
     generic_receiver: Vec<bool>,
     /// Statements to run before the one being lowered (a `match` hoisted out of its value).
     pending: Vec<Statement>,
+    /// The names bound so far by the pattern being lowered.
+    pattern_names: Vec<NameId>,
 }
 
 /// Lower eligible routine bodies directly from the file's indexed tables. `None`
@@ -428,6 +480,7 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
         loops: 0,
         procedure,
         pending: Vec::new(),
+        pattern_names: Vec::new(),
         generic_receiver: {
             let type_params = ast.get_list(function.type_params)?;
             parameters
@@ -472,6 +525,10 @@ pub(super) fn from_indexed(ast: &IndexedAst, function: &FunctionNode) -> Option<
 
 /// Collect every name a statement list declares. Statements this subset does not
 /// lower end the walk, because the whole routine then stays on the existing route.
+fn capitalized(name: &str) -> bool {
+    name.rsplit("::").next().is_some_and(|last| last.starts_with(char::is_uppercase))
+}
+
 fn declared_names(
     ast: &IndexedAst,
     list: List<Id<StmtNode>>,
@@ -526,71 +583,143 @@ impl Context<'_> {
         slot
     }
 
-    /// A pattern: `_`, or a variant with its payload ignored or bound to a new local.
-    /// A bare capitalized name is a variant; a bare lowercase name would bind the whole
-    /// value, which is left to the existing route.
+    /// Whether a pattern is one `match` in a value position can test without statements.
+    fn flat_syntax(&self, id: Id<PatternNode>) -> Option<bool> {
+        let ast = self.ast;
+        Some(match ast.get(id)?.kind {
+            PatternSyntax::Wildcard => true,
+            PatternSyntax::Binding(name) => capitalized(ast.name(name)?),
+            PatternSyntax::Variant(_, None) => true,
+            PatternSyntax::Variant(_, Some(inner)) => match ast.get(inner)?.kind {
+                PatternSyntax::Wildcard => true,
+                PatternSyntax::Binding(name) => !capitalized(ast.name(name)?),
+                _ => false,
+            },
+            _ => false,
+        })
+    }
+
+    /// The local a name in a pattern binds. Alternatives of one pattern bind one local
+    /// between them; a name twice in one alternative is left to the existing route.
+    fn binding_slot(
+        &mut self,
+        binding: NameId,
+        span: Span,
+        mut shared: Option<&mut Vec<(NameId, Variable)>>,
+    ) -> Option<Variable> {
+        if self.pattern_names.contains(&binding) {
+            return decline(|| "name bound twice in a pattern".into());
+        }
+        self.pattern_names.push(binding);
+        let earlier = shared.as_deref().and_then(|shared| {
+            shared
+                .iter()
+                .find(|(name, _)| *name == binding)
+                .map(|(_, slot)| *slot)
+        });
+        Some(match earlier {
+            Some(slot) => slot,
+            None => {
+                let slot = self.declare(LocalName::Source(binding), span, true);
+                self.scopes.last_mut()?.push(Visible {
+                    name: binding,
+                    slot,
+                    mutable: false,
+                    reference: None,
+                });
+                if let Some(shared) = shared.as_deref_mut() {
+                    shared.push((binding, slot));
+                }
+                slot
+            }
+        })
+    }
+
+    /// A pattern for the whole matched value, held in `at`. A bare lowercase name would bind
+    /// the whole value, which is left to the existing route.
     fn pattern(
         &mut self,
         id: Id<PatternNode>,
+        at: Variable,
+        shared: Option<&mut Vec<(NameId, Variable)>>,
+    ) -> Option<Pattern> {
+        self.pattern_names.clear();
+        self.pattern_at(id, at, shared, true)
+    }
+
+    /// A part of a pattern: a name binds it, `_` ignores it, anything else takes it apart
+    /// in a hidden local that holds the part.
+    fn part(
+        &mut self,
+        id: Id<PatternNode>,
+        shared: Option<&mut Vec<(NameId, Variable)>>,
+    ) -> Option<Pattern> {
+        let ast = self.ast;
+        let node = ast.get(id)?;
+        match node.kind {
+            PatternSyntax::Wildcard => Some(Pattern::Wildcard),
+            PatternSyntax::Binding(name) if !capitalized(ast.name(name)?) => {
+                Some(Pattern::Binding(self.binding_slot(name, node.span, shared)?))
+            }
+            _ => {
+                let at = self.declare(LocalName::Hidden("$part"), node.span, false);
+                self.pattern_at(id, at, shared, false)
+            }
+        }
+    }
+
+    fn pattern_at(
+        &mut self,
+        id: Id<PatternNode>,
+        at: Variable,
         mut shared: Option<&mut Vec<(NameId, Variable)>>,
+        root: bool,
     ) -> Option<Pattern> {
         let ast = self.ast;
         let node = ast.get(id)?;
         match node.kind {
             PatternSyntax::Wildcard => Some(Pattern::Wildcard),
             PatternSyntax::Binding(name) => {
-                if ast
-                    .name(name)?
-                    .rsplit("::")
-                    .next()?
-                    .starts_with(char::is_uppercase)
-                {
+                if capitalized(ast.name(name)?) {
                     Some(Pattern::Variant {
                         name,
-                        payload: Payload::Absent,
+                        payload: None,
+                        at,
                     })
-                } else {
+                } else if root {
                     decline(|| "pattern that binds the whole value".into())
+                } else {
+                    Some(Pattern::Binding(self.binding_slot(
+                        name,
+                        node.span,
+                        shared.as_deref_mut(),
+                    )?))
                 }
             }
             PatternSyntax::Variant(name, payload) => {
                 let payload = match payload {
-                    None => Payload::Absent,
-                    Some(inner) => match ast.get(inner)?.kind {
-                        PatternSyntax::Wildcard => Payload::Wildcard,
-                        PatternSyntax::Binding(binding) => {
-                            // Alternatives of one pattern bind one local between them.
-                            let earlier = shared.as_deref().and_then(|shared| {
-                                shared
-                                    .iter()
-                                    .find(|(name, _)| *name == binding)
-                                    .map(|(_, slot)| *slot)
-                            });
-                            let slot = match earlier {
-                                Some(slot) => slot,
-                                None => {
-                                    let slot =
-                                        self.declare(LocalName::Source(binding), node.span, true);
-                                    self.scopes.last_mut()?.push(Visible {
-                                        name: binding,
-                                        slot,
-                                        mutable: false,
-                                        reference: None,
-                                    });
-                                    if let Some(shared) = shared.as_deref_mut() {
-                                        shared.push((binding, slot));
-                                    }
-                                    slot
-                                }
-                            };
-                            Payload::Binding(slot)
-                        }
-                        ref other => {
-                            return decline(|| format!("payload pattern {}", variant(other)));
-                        }
-                    },
+                    None => None,
+                    Some(inner) => Some(Box::new(self.part(inner, shared.as_deref_mut())?)),
                 };
-                Some(Pattern::Variant { name, payload })
+                Some(Pattern::Variant { name, payload, at })
+            }
+            PatternSyntax::Tuple(items) => {
+                let mut parts = Vec::new();
+                for &item in ast.get_list(items)? {
+                    parts.push(self.part(item, shared.as_deref_mut())?);
+                }
+                Some(Pattern::Tuple { items: parts, at })
+            }
+            PatternSyntax::Record(fields, rest) => {
+                let mut parts = Vec::new();
+                for &(field, item) in ast.get_list(fields)? {
+                    parts.push((field, self.part(item, shared.as_deref_mut())?));
+                }
+                Some(Pattern::Record {
+                    fields: parts,
+                    rest,
+                    at,
+                })
             }
             ref other => decline(|| format!("pattern {}", variant(other))),
         }
@@ -830,7 +959,8 @@ impl Context<'_> {
         let mut needs_statements = false;
         for arm in ast.get_list(arms)? {
             needs_statements |= matches!(arm.body, MatchBodyNode::Block(..))
-                || matches!(ast.get(arm.pattern)?.kind, PatternSyntax::Or(_));
+                || matches!(ast.get(arm.pattern)?.kind, PatternSyntax::Or(_))
+                || !self.flat_syntax(arm.pattern)?;
         }
         if !needs_statements {
             return Some(None);
@@ -853,11 +983,10 @@ impl Context<'_> {
         let scrutinee = self.value(scrutinee, false)?;
         let (held, in_place) = match &scrutinee.kind {
             ExpressionKind::Read(variable) => (*variable, true),
-            ExpressionKind::Call(..) => (
+            _ => (
                 self.declare(LocalName::Hidden("$scrutinee"), span, false),
                 false,
             ),
-            _ => return decline(|| "match on something other than a local or call".into()),
         };
         let nodes = ast.get_list(arms)?;
         if nodes.is_empty() {
@@ -867,7 +996,7 @@ impl Context<'_> {
         for arm in nodes {
             // The arm's bindings are visible in its guard and body only.
             self.scopes.push(Vec::new());
-            let arm = self.statement_arm(arm, result);
+            let arm = self.statement_arm(arm, held, result);
             self.scopes.pop();
             lowered.push(arm?);
         }
@@ -882,6 +1011,7 @@ impl Context<'_> {
     fn statement_arm(
         &mut self,
         arm: &MatchArmNode,
+        held: Variable,
         result: Option<Variable>,
     ) -> Option<StatementArm> {
         let ast = self.ast;
@@ -890,27 +1020,26 @@ impl Context<'_> {
                 let mut shared = Vec::new();
                 let mut patterns = Vec::new();
                 for &alternative in ast.get_list(alternatives)? {
-                    patterns.push(self.pattern(alternative, Some(&mut shared))?);
+                    patterns.push(self.pattern(alternative, held, Some(&mut shared))?);
                 }
                 // Every alternative must bind the same locals, and a guard could not be
                 // given the payload of whichever alternative matched.
-                let bound = |pattern: &Pattern| match pattern {
-                    Pattern::Variant {
-                        payload: Payload::Binding(slot),
-                        ..
-                    } => Some(slot.0),
-                    _ => None,
+                let bound = |pattern: &Pattern| {
+                    let mut slots = Vec::new();
+                    pattern.bindings(&mut slots);
+                    slots.sort_by_key(|slot| slot.0);
+                    slots
                 };
                 let first = bound(patterns.first()?);
                 if patterns.iter().any(|pattern| bound(pattern) != first) {
                     return decline(|| "or-pattern alternatives bind different names".into());
                 }
-                if first.is_some() && arm.guard.is_some() {
+                if !first.is_empty() && arm.guard.is_some() {
                     return decline(|| "guarded or-pattern with a binding".into());
                 }
                 patterns
             }
-            _ => vec![self.pattern(arm.pattern, None)?],
+            _ => vec![self.pattern(arm.pattern, held, None)?],
         };
         let guard = match arm.guard {
             Some(guard) => Some(self.value(guard, true)?),
@@ -1194,14 +1323,7 @@ impl Context<'_> {
                     // A local is tested in place; a call's result is first held in a local.
                     let held = match &scrutinee.kind {
                         ExpressionKind::Read(variable) => *variable,
-                        ExpressionKind::Call(..) => {
-                            self.declare(LocalName::Hidden("$scrutinee"), expression.span, false)
-                        }
-                        _ => {
-                            return decline(|| {
-                                "match on something other than a local or call".into()
-                            });
-                        }
+                        _ => self.declare(LocalName::Hidden("$scrutinee"), expression.span, false),
                     };
                     if ast.get_list(arms)?.is_empty() {
                         return decline(|| "match without arms".into());
@@ -1214,7 +1336,10 @@ impl Context<'_> {
                         };
                         // The arm's bindings are visible in its body only.
                         self.scopes.push(Vec::new());
-                        let pattern = self.pattern(arm.pattern, None);
+                        let pattern = self
+                            .pattern(arm.pattern, held, None)
+                            .filter(Pattern::is_flat)
+                            .or_else(|| decline(|| "nested pattern under an operator".into()));
                         let guard = match (pattern.as_ref(), arm.guard) {
                             (Some(_), Some(guard)) => Some(self.value(guard, true)),
                             _ => None,

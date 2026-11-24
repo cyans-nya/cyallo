@@ -111,14 +111,24 @@ pub(super) enum Statement {
         slot: Variable,
         stage: Stage,
     },
+    /// Read one tuple element or record field of `root` into `slot`.
+    MatchProject {
+        root: Variable,
+        step: hir::Step,
+        slot: Variable,
+    },
+    /// The arm has been chosen and its bindings made from parts of `held`: when one of
+    /// them is not `Copy` the matched value is spent.
+    MatchSpend {
+        held: Variable,
+        slots: Vec<Variable>,
+    },
 }
 
 /// One arm of a `match` statement, for the coverage check.
 #[derive(Debug)]
 pub(super) struct Cover {
-    /// The variant the arm tests, or `None` for a wildcard.
-    pub(super) name: Option<cyallo_ast::indexed::NameId>,
-    pub(super) payload: hir::Payload,
+    pub(super) pattern: hir::Pattern,
     pub(super) guarded: bool,
     pub(super) span: Span,
 }
@@ -164,7 +174,7 @@ pub(super) enum Exit {
     /// A guard: like a branch, but the alias binding of the arm is read, not moved.
     Guard {
         condition: Expression,
-        alias: Option<Variable>,
+        alias: Vec<Variable>,
         yes: BlockId,
         no: BlockId,
     },
@@ -396,13 +406,8 @@ impl Builder {
         let mut covers = Vec::new();
         for arm in &matched.arms {
             for pattern in &arm.patterns {
-                let (name, payload) = match pattern {
-                    hir::Pattern::Wildcard => (None, hir::Payload::Absent),
-                    hir::Pattern::Variant { name, payload } => (Some(*name), payload.clone()),
-                };
                 covers.push(Cover {
-                    name,
-                    payload,
+                    pattern: pattern.clone(),
                     guarded: arm.guard.is_some(),
                     span: arm.span,
                 });
@@ -426,52 +431,82 @@ impl Builder {
         for arm in matched.arms {
             let alternatives = arm.patterns.len();
             let mut to_shared: Vec<(OpenBlock, Span)> = Vec::new();
-            // The test of the previous alternative, which continues with the next one.
-            let mut previous: Option<usize> = None;
-            let mut binding = None;
+            // The tests of the previous alternative, which continue with the next one.
+            let mut previous: Vec<usize> = Vec::new();
+            // The bindings that take a payload, and every binding, of the last alternative.
+            let mut takes: Vec<(Variable, cyallo_ast::indexed::NameId, Variable)> = Vec::new();
+            let mut leaves: Vec<Variable> = Vec::new();
+            let mut nested = false;
             for (index, pattern) in arm.patterns.into_iter().enumerate() {
                 let last = index + 1 == alternatives;
-                let (name, payload) = match pattern {
-                    hir::Pattern::Variant { name, payload } => (Some(name), payload),
-                    hir::Pattern::Wildcard => (None, hir::Payload::Absent),
-                };
-                if let Some(name) = name {
-                    let test = self.take_block();
-                    let yes = self.next_block();
-                    let at = fails.len();
-                    fails.push((
-                        test,
-                        Exit::MatchTest {
-                            held,
-                            name,
-                            yes,
-                            no: yes,
-                        },
-                        arm.span,
-                    ));
-                    if last {
-                        pending_no.push(at);
-                    } else {
-                        previous = Some(at);
-                    }
-                }
-                binding = match (name, &payload) {
-                    (Some(name), hir::Payload::Binding(slot)) => Some((name, *slot)),
-                    _ => None,
-                };
-                if let Some((name, slot)) = binding {
-                    // With a guard the payload is read where it lies, and taken afterwards.
-                    let stage = if arm.guard.is_some() {
-                        Stage::Alias
-                    } else {
-                        Stage::Direct
-                    };
-                    self.emit(
-                        Statement::MatchBind {
+                let steps = flatten(&pattern);
+                takes.clear();
+                leaves.clear();
+                nested = false;
+                for step in steps {
+                    match step {
+                        Part::Test { held, name } => {
+                            let test = self.take_block();
+                            let yes = self.next_block();
+                            let at = fails.len();
+                            fails.push((
+                                test,
+                                Exit::MatchTest {
+                                    held,
+                                    name,
+                                    yes,
+                                    no: yes,
+                                },
+                                arm.span,
+                            ));
+                            if last {
+                                pending_no.push(at);
+                            } else {
+                                previous.push(at);
+                            }
+                        }
+                        Part::Bind {
                             held,
                             name,
                             slot,
-                            stage,
+                            leaf,
+                        } => {
+                            // With a guard a payload is read where it lies, and taken
+                            // afterwards; a part that is taken apart further is only read.
+                            let stage = if !leaf || arm.guard.is_some() {
+                                Stage::Alias
+                            } else {
+                                Stage::Direct
+                            };
+                            if leaf {
+                                takes.push((held, name, slot));
+                                leaves.push(slot);
+                            }
+                            nested |= held != matched.held || !leaf;
+                            self.emit(
+                                Statement::MatchBind {
+                                    held,
+                                    name,
+                                    slot,
+                                    stage,
+                                },
+                                arm.span,
+                            );
+                        }
+                        Part::Project { root, step, slot, leaf } => {
+                            if leaf {
+                                leaves.push(slot);
+                            }
+                            nested = true;
+                            self.emit(Statement::MatchProject { root, step, slot }, arm.span);
+                        }
+                    }
+                }
+                if nested && arm.guard.is_none() && !leaves.is_empty() {
+                    self.emit(
+                        Statement::MatchSpend {
+                            held,
+                            slots: leaves.clone(),
                         },
                         arm.span,
                     );
@@ -487,10 +522,10 @@ impl Builder {
                     } else {
                         to_shared.push((open, arm.span));
                         let next = self.next_block();
-                        if let Some(at) = previous.take()
-                            && let Exit::MatchTest { no, .. } = &mut fails[at].1
-                        {
-                            *no = next;
+                        for at in previous.drain(..) {
+                            if let Exit::MatchTest { no, .. } = &mut fails[at].1 {
+                                *no = next;
+                            }
                         }
                     }
                 }
@@ -504,19 +539,28 @@ impl Builder {
                     block,
                     Exit::Guard {
                         condition: guard,
-                        alias: binding.map(|(_, slot)| slot),
+                        alias: leaves.clone(),
                         yes,
                         no: yes,
                     },
                     guard_span,
                 ));
-                if let Some((name, slot)) = binding {
+                for &(source, name, slot) in &takes {
                     self.emit(
                         Statement::MatchBind {
-                            held,
+                            held: source,
                             name,
                             slot,
                             stage: Stage::Take,
+                        },
+                        arm.span,
+                    );
+                }
+                if nested && !leaves.is_empty() {
+                    self.emit(
+                        Statement::MatchSpend {
+                            held,
+                            slots: leaves.clone(),
                         },
                         arm.span,
                     );
@@ -624,4 +668,96 @@ impl Builder {
             open.finish(self, Exit::Jump(exit), span);
         }
     }
+}
+
+/// One step of matching a pattern, in the order it runs.
+enum Part {
+    /// Whether `held` is variant `name`.
+    Test {
+        held: Variable,
+        name: cyallo_ast::indexed::NameId,
+    },
+    /// Read the payload of variant `name` in `held` into `slot`: a name the pattern binds
+    /// (`leaf`), or a hidden local for a payload that is taken apart further.
+    Bind {
+        held: Variable,
+        name: cyallo_ast::indexed::NameId,
+        slot: Variable,
+        leaf: bool,
+    },
+    /// Read a tuple element or record field of `root` into `slot`, likewise.
+    Project {
+        root: Variable,
+        step: hir::Step,
+        slot: Variable,
+        leaf: bool,
+    },
+}
+
+/// A pattern as the tests and reads that match it, parts after the whole they belong to.
+fn flatten(pattern: &hir::Pattern) -> Vec<Part> {
+    fn walk(pattern: &hir::Pattern, out: &mut Vec<Part>) {
+        match pattern {
+            hir::Pattern::Wildcard | hir::Pattern::Binding(_) => {}
+            hir::Pattern::Variant { name, payload, at } => {
+                out.push(Part::Test {
+                    held: *at,
+                    name: *name,
+                });
+                match payload.as_deref() {
+                    None | Some(hir::Pattern::Wildcard) => {}
+                    Some(hir::Pattern::Binding(slot)) => out.push(Part::Bind {
+                        held: *at,
+                        name: *name,
+                        slot: *slot,
+                        leaf: true,
+                    }),
+                    Some(inner) => {
+                        let inner_at = inner.at().expect("a pattern taken apart names its local");
+                        out.push(Part::Bind {
+                            held: *at,
+                            name: *name,
+                            slot: inner_at,
+                            leaf: false,
+                        });
+                        walk(inner, out);
+                    }
+                }
+            }
+            hir::Pattern::Tuple { items, at } => {
+                for (index, item) in items.iter().enumerate() {
+                    part(*at, hir::Step::Index(index), item, out);
+                }
+            }
+            hir::Pattern::Record { fields, at, .. } => {
+                for (name, item) in fields {
+                    part(*at, hir::Step::Field(*name), item, out);
+                }
+            }
+        }
+    }
+    fn part(root: Variable, step: hir::Step, item: &hir::Pattern, out: &mut Vec<Part>) {
+        match item {
+            hir::Pattern::Wildcard => {}
+            hir::Pattern::Binding(slot) => out.push(Part::Project {
+                root,
+                step,
+                slot: *slot,
+                leaf: true,
+            }),
+            inner => {
+                let inner_at = inner.at().expect("a pattern taken apart names its local");
+                out.push(Part::Project {
+                    root,
+                    step,
+                    slot: inner_at,
+                    leaf: false,
+                });
+                walk(inner, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(pattern, &mut out);
+    out
 }

@@ -62,6 +62,20 @@ pub(super) struct Place {
     pub(super) steps: Vec<(usize, Type)>,
 }
 
+/// A pattern as the coverage check sees it, against the type of the value matched.
+#[derive(Clone)]
+enum Shape {
+    /// A name or `_`: any value.
+    Any,
+    /// A variant by index, with the shape of its payload.
+    Variant(usize, Option<Box<Shape>>),
+    /// A tuple or a record: one shape per element or per field in declaration order.
+    Product(Vec<Shape>),
+}
+
+/// How many cases the coverage check explores before it gives up.
+const COVERAGE_BUDGET: usize = 4096;
+
 /// A callee contract bound to one reference site: the target's routine
 /// identity and its signature. The callee's body is never consulted.
 pub(super) struct Callee {
@@ -616,7 +630,9 @@ fn extra_blocks(block: &mir::Block) -> usize {
             | Statement::RangeBound { .. }
             | Statement::RangeStep { .. }
             | Statement::MatchCover { .. }
-            | Statement::MatchBind { .. } => 0,
+            | Statement::MatchBind { .. }
+            | Statement::MatchProject { .. }
+            | Statement::MatchSpend { .. } => 0,
         })
         .sum();
     statements
@@ -1268,6 +1284,207 @@ impl Analysis<'_> {
         })
     }
 
+    /// A pattern against the type of the value it matches: the shape the coverage check
+    /// uses, or the error for a pattern that does not fit.
+    fn shape(&self, pattern: &hir::Pattern, ty: &Type, span: Span) -> Result<Shape, Diagnostic> {
+        let ty = self.view(ty);
+        match pattern {
+            hir::Pattern::Wildcard | hir::Pattern::Binding(_) => Ok(Shape::Any),
+            hir::Pattern::Variant { name, payload, .. } => {
+                let (contract, index) = self.variant_of(&ty, *name, span)?;
+                let declared = contract.variants[index].payload.as_ref();
+                let inner = match (declared, payload.as_deref()) {
+                    (None, None) => None,
+                    (Some(declared), Some(inner)) => {
+                        Some(Box::new(self.shape(inner, &self.view(declared), span)?))
+                    }
+                    _ => {
+                        return Err(patterns::invalid_pattern(
+                            patterns::PatternError::PayloadArity,
+                            span,
+                        ));
+                    }
+                };
+                Ok(Shape::Variant(index, inner))
+            }
+            hir::Pattern::Tuple { items, .. } => {
+                let Type::Tuple(types) = &ty else {
+                    return Err(patterns::invalid_pattern(
+                        patterns::PatternError::ExpectedTuple {
+                            actual: ty.clone(),
+                            fields: items.len(),
+                        },
+                        span,
+                    ));
+                };
+                if types.len() != items.len() {
+                    return Err(patterns::invalid_pattern(
+                        patterns::PatternError::ExpectedTuple {
+                            actual: ty.clone(),
+                            fields: items.len(),
+                        },
+                        span,
+                    ));
+                }
+                items
+                    .iter()
+                    .zip(types)
+                    .map(|(item, ty)| self.shape(item, ty, span))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Shape::Product)
+            }
+            hir::Pattern::Record { fields, rest, .. } => {
+                let Type::Record(_, declared) = &ty else {
+                    return Err(patterns::invalid_pattern(
+                        patterns::PatternError::ExpectedRecord { actual: ty.clone() },
+                        span,
+                    ));
+                };
+                let mut shapes: Vec<Option<Shape>> = vec![None; declared.len()];
+                for (name, item) in fields {
+                    let written = self.text(*name);
+                    let Some(index) = declared.iter().position(|(field, _)| &**field == written)
+                    else {
+                        return Err(patterns::invalid_pattern(
+                            patterns::PatternError::RecordFields,
+                            span,
+                        ));
+                    };
+                    if shapes[index].is_some() {
+                        return Err(patterns::invalid_pattern(
+                            patterns::PatternError::RecordFields,
+                            span,
+                        ));
+                    }
+                    shapes[index] = Some(self.shape(item, &declared[index].1, span)?);
+                }
+                if !*rest && shapes.iter().any(Option::is_none) {
+                    return Err(patterns::invalid_pattern(
+                        patterns::PatternError::RecordFields,
+                        span,
+                    ));
+                }
+                Ok(Shape::Product(
+                    shapes
+                        .into_iter()
+                        .map(|shape| shape.unwrap_or(Shape::Any))
+                        .collect(),
+                ))
+            }
+        }
+    }
+
+    /// The values no row matches, as one pattern text per column for each kind of value
+    /// missed (none when the rows cover every value). Every row has a pattern per column.
+    fn uncovered(
+        &self,
+        rows: &[Vec<Shape>],
+        types: &[Type],
+        budget: &mut usize,
+        span: Span,
+    ) -> Result<Vec<Vec<String>>, Diagnostic> {
+        *budget = budget.checked_sub(1).ok_or_else(|| {
+            patterns::invalid_pattern(patterns::PatternError::ComplexityLimit, span)
+        })?;
+        let Some((first, rest)) = types.split_first() else {
+            return Ok(if rows.is_empty() { vec![vec![]] } else { vec![] });
+        };
+        let first = self.view(first);
+        let wrap = |witnesses: Vec<Vec<String>>, arity: usize, build: &dyn Fn(Vec<String>) -> String| {
+            witnesses
+                .into_iter()
+                .map(|mut witness| {
+                    let tail = witness.split_off(arity);
+                    let mut out = vec![build(witness)];
+                    out.extend(tail);
+                    out
+                })
+                .collect::<Vec<_>>()
+        };
+        // The rows that apply when the first column is a value built by `constructor` of
+        // `arity` parts, with those parts in front of the other columns.
+        let specialize = |constructor: Option<usize>, arity: usize| -> Vec<Vec<Shape>> {
+            rows.iter()
+                .filter_map(|row| {
+                    let (head, tail) = row.split_first()?;
+                    let mut parts: Vec<Shape> = match (head, constructor) {
+                        (Shape::Any, _) => vec![Shape::Any; arity],
+                        (Shape::Variant(index, inner), Some(wanted)) if *index == wanted => {
+                            inner.iter().map(|inner| (**inner).clone()).collect()
+                        }
+                        (Shape::Product(parts), None) => parts.clone(),
+                        _ => return None,
+                    };
+                    parts.extend(tail.iter().cloned());
+                    Some(parts)
+                })
+                .collect()
+        };
+        match &first {
+            Type::Enum(contract) => {
+                if contract.variants.is_empty() {
+                    return Ok(vec![vec!["_".into()]]);
+                }
+                let mut missing = Vec::new();
+                for (index, variant) in contract.variants.iter().enumerate() {
+                    let payload = variant.payload.as_ref().map(|payload| self.view(payload));
+                    let arity = usize::from(payload.is_some());
+                    let mut next: Vec<Type> = payload.into_iter().collect();
+                    next.extend(rest.iter().cloned());
+                    let found =
+                        self.uncovered(&specialize(Some(index), arity), &next, budget, span)?;
+                    let name = variant.name.to_string();
+                    missing.extend(wrap(found, arity, &|parts| match parts.first() {
+                        Some(part) if part != "_" => format!("{name}({part})"),
+                        _ => name.clone(),
+                    }));
+                }
+                Ok(missing)
+            }
+            Type::Tuple(items) => {
+                let arity = items.len();
+                let mut next: Vec<Type> = items.iter().map(|item| self.view(item)).collect();
+                next.extend(rest.iter().cloned());
+                let found = self.uncovered(&specialize(None, arity), &next, budget, span)?;
+                Ok(wrap(found, arity, &|parts| format!("({})", parts.join(", "))))
+            }
+            Type::Record(name, fields) => {
+                let arity = fields.len();
+                let mut next: Vec<Type> =
+                    fields.iter().map(|(_, field)| self.view(field)).collect();
+                next.extend(rest.iter().cloned());
+                let found = self.uncovered(&specialize(None, arity), &next, budget, span)?;
+                let labels: Vec<String> = fields.iter().map(|(field, _)| field.to_string()).collect();
+                let name = name.to_string();
+                Ok(wrap(found, arity, &|parts| {
+                    let shown: Vec<String> = labels
+                        .iter()
+                        .zip(parts)
+                        .filter(|(_, part)| part != "_")
+                        .map(|(label, part)| format!("{label}: {part}"))
+                        .collect();
+                    format!("{} {{ {} }}", cyallo_ast::source_name(&name), if shown.is_empty() { "..".into() } else { shown.join(", ") })
+                }))
+            }
+            // Any other type is only matched by a name or `_`.
+            _ => {
+                let rows: Vec<Vec<Shape>> = rows
+                    .iter()
+                    .filter(|row| matches!(row.first(), Some(Shape::Any)))
+                    .map(|row| row[1..].to_vec())
+                    .collect();
+                let found = self.uncovered(&rows, rest, budget, span)?;
+                Ok(found
+                    .into_iter()
+                    .map(|mut witness| {
+                        witness.insert(0, "_".into());
+                        witness
+                    })
+                    .collect())
+            }
+        }
+    }
+
     /// The variant a pattern names in the enum being matched, and its index.
     fn variant_of(
         &self,
@@ -1323,19 +1540,20 @@ impl Analysis<'_> {
             return Ok(changed);
         };
         for arm in &matched.arms {
-            let hir::Pattern::Variant { name, payload } = &arm.pattern else {
+            let hir::Pattern::Variant { name, payload, .. } = &arm.pattern else {
                 continue;
             };
+            let payload = payload.as_deref();
             let (contract, index) = self.variant_of(&held, *name, arm.span)?;
             let declared = contract.variants[index].payload.as_ref();
             match (declared, payload) {
-                (Some(_), hir::Payload::Binding(slot)) if self.variable_type(*slot).is_none() => {
+                (Some(_), Some(hir::Pattern::Binding(slot))) if self.variable_type(*slot).is_none() => {
                     let ty = self.view(declared.expect("matched a payload"));
                     self.declare(*slot, ty, arm.span)?;
                     changed = true;
                 }
-                (Some(_), hir::Payload::Binding(_) | hir::Payload::Wildcard)
-                | (None, hir::Payload::Absent) => {}
+                (Some(_), Some(hir::Pattern::Binding(_) | hir::Pattern::Wildcard))
+                | (None, None) => {}
                 _ => {
                     return Err(patterns::invalid_pattern(
                         patterns::PatternError::PayloadArity,
@@ -1399,16 +1617,17 @@ impl Analysis<'_> {
                         arm.span,
                     )
                 }
+                // Only flat patterns reach a match in a value position.
+                _ => return Err(invalid(arm.span)),
             };
             let mut fails = Vec::new();
             if matches!(self.blocks[test_block].exit.kind, Exit::Branch { .. }) {
                 fails.push(test_block);
             }
             let binding = match &arm.pattern {
-                hir::Pattern::Variant {
-                    name,
-                    payload: hir::Payload::Binding(slot),
-                } => {
+                hir::Pattern::Variant { name, payload, .. }
+                    if let Some(hir::Pattern::Binding(slot)) = payload.as_deref() =>
+                {
                     let (contract, index) = self.variant_of(&held, *name, arm.span)?;
                     let operation = contract.variants[index].operation();
                     Some((*slot, self.typed(*slot, arm.span)?, operation))
@@ -2064,6 +2283,7 @@ impl Analysis<'_> {
         let mut bounds = Vec::new();
         let mut matches: Vec<(&hir::Match, Span)> = Vec::new();
         let mut binds: Vec<(Variable, NameId, Variable, Span)> = Vec::new();
+        let mut projects: Vec<(Variable, hir::Step, Variable, Span)> = Vec::new();
         for block in &body.blocks {
             match &block.exit.kind {
                 mir::Exit::Branch { condition, .. } => gather_matches(condition, &mut matches),
@@ -2103,6 +2323,9 @@ impl Analysis<'_> {
                     Statement::MatchBind {
                         held, name, slot, ..
                     } => binds.push((*held, *name, *slot, span)),
+                    Statement::MatchProject { root, step, slot } => {
+                        projects.push((*root, *step, *slot, span))
+                    }
                     Statement::RangeStart {
                         variable,
                         end,
@@ -2166,6 +2389,16 @@ impl Analysis<'_> {
                     }
                 }
             }
+            for (root, step, slot, span) in &projects {
+                if self.variable_type(*root).is_some()
+                    && self.variable_type(*slot).is_none()
+                    // A part the value does not have is reported where the pattern is checked.
+                    && let Ok(place) = self.place(*root, &[*step], false, *span)
+                {
+                    self.declare(*slot, place.steps[0].1.clone(), *span)?;
+                    changed = true;
+                }
+            }
             if !changed {
                 break;
             }
@@ -2223,42 +2456,47 @@ impl Analysis<'_> {
             Statement::Marker => self.emit(Operation::Statement, span),
             Statement::MatchCover { held, arms } => {
                 let held_type = self.typed(*held, span)?;
-                let (mut covered, mut total, mut wildcard) = (Vec::new(), 0, false);
+                let mut rows: Vec<Vec<Shape>> = Vec::new();
                 for arm in arms {
-                    let Some(name) = arm.name else {
-                        wildcard |= !arm.guarded;
-                        continue;
-                    };
-                    let (contract, index) = self.variant_of(&held_type, name, arm.span)?;
-                    total = contract.variants.len();
-                    let declared = contract.variants[index].payload.is_some();
-                    if declared != !matches!(arm.payload, hir::Payload::Absent) {
-                        return Err(patterns::invalid_pattern(
-                            patterns::PatternError::PayloadArity,
-                            arm.span,
-                        ));
-                    }
+                    let shape = self.shape(&arm.pattern, &held_type, arm.span)?;
                     if !arm.guarded {
-                        covered.push(index);
+                        rows.push(vec![shape]);
                     }
                 }
-                covered.sort_unstable();
-                covered.dedup();
-                if !wildcard && (covered.len() != total || total == 0) {
-                    let missing = match self.view(&held_type) {
-                        Type::Enum(contract) => contract
-                            .variants
-                            .iter()
-                            .enumerate()
-                            .filter(|(index, _)| !covered.contains(index))
-                            .map(|(_, variant)| variant.name.clone())
-                            .collect(),
-                        _ => Vec::new(),
-                    };
+                let mut budget = COVERAGE_BUDGET;
+                let missing = self.uncovered(&rows, &[held_type], &mut budget, span)?;
+                if !missing.is_empty() {
+                    let missing = missing
+                        .into_iter()
+                        .filter_map(|witness| witness.into_iter().next())
+                        .map(String::into_boxed_str)
+                        .collect();
                     return Err(patterns::invalid_pattern(
                         patterns::PatternError::NonExhaustive { missing },
                         span,
                     ));
+                }
+            }
+            Statement::MatchProject { root, step, slot } => {
+                let place = self.place(*root, &[*step], false, span)?;
+                let ty = place.steps[0].1.clone();
+                if self.typed(*slot, span)? != ty {
+                    return Err(patterns::invalid_pattern(
+                        patterns::PatternError::AlternativeBindings,
+                        span,
+                    ));
+                }
+                let value = self.value(ty);
+                self.emit(Operation::FieldRead(value, *root, Box::new(place)), span);
+                self.store(*slot, value, span);
+            }
+            Statement::MatchSpend { held, slots } => {
+                let mut spent = false;
+                for slot in slots {
+                    spent |= !self.is_copy(&self.typed(*slot, span)?);
+                }
+                if spent {
+                    self.emit(Operation::Consume(*held), span);
                 }
             }
             Statement::MatchBind {
@@ -2523,10 +2761,10 @@ impl Analysis<'_> {
                 yes,
                 no,
             } => {
-                if let Some(slot) = alias
-                    && !self.is_copy(&self.typed(*slot, span)?)
-                {
-                    self.guard_aliases.push(*slot);
+                for slot in alias {
+                    if !self.is_copy(&self.typed(*slot, span)?) {
+                        self.guard_aliases.push(*slot);
+                    }
                 }
                 let result = self.expected(condition, &Type::Boolean);
                 self.guard_aliases.clear();
