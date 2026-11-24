@@ -28,6 +28,27 @@ pub struct Method {
     pub result: Type,
     pub receiver: Receiver,
 }
+impl Method {
+    /// The method's signature as one implementer sees it: `Self` is the implementing type.
+    pub fn signature_for(&self, receiver: &Type) -> (Vec<(Type, bool)>, Type) {
+        let with = |ty: &Type| {
+            let mut ty = ty.clone();
+            cyallo_ast::visit::visit_type(&mut ty, &mut |ty| {
+                if *ty == Type::SelfType {
+                    *ty = receiver.clone();
+                }
+            });
+            ty
+        };
+        (
+            self.params
+                .iter()
+                .map(|(ty, by_ref)| (with(ty), *by_ref))
+                .collect(),
+            with(&self.result),
+        )
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Receiver {
     Value,
@@ -245,9 +266,11 @@ fn prepare_into(
                 .skip(1)
                 .map(|p| (p.ty.clone(), p.by_ref))
                 .collect();
+            // The trait names its implementer `Self`; the implementation names it.
+            let (declared_params, declared_result) = declared.signature_for(&implementation.receiver);
             if f.kind != declared.kind
-                || f.result != declared.result
-                || params != declared.params
+                || f.result != declared_result
+                || params != declared_params
                 || f.params
                     .first()
                     .is_none_or(|p| !p.receiver || receiver(&p.ty) != declared.receiver)

@@ -352,6 +352,10 @@ The [verified-interpreter baseline](startup-baseline.md#verified-interpreter-bas
 
 Cache-key work and the deferred-body clone remain measurable during the transition. Keep warm module reuse separate from fresh-process results. Key binding overlays by typed syntax IDs scoped to the owning unit and body. Use spans for source origins and diagnostics. Compare eager and deferred behavior on malformed syntax, unresolved references and constant callees throughout migration. [Module cache](../crates/cyallo-ir/src/module_cache.rs) · [Name resolution tests](../tests/resolution_bindings.rs) · [Constant dependency tests](../tests/module_units.rs)
 
+### `Self` in trait method signatures
+
+`Self` in a trait's method signature is the type that implements it, wherever it appears (`other: &Self`, `-> Self`), not only in the receiver. Service preparation compares an `impl` against the trait with `Self` replaced by the implementer (`Method::signature_for`), and concrete calls through the old route see the same substitution. In a generic template `Self` is the receiver's type parameter, so `a.bigger(b)` needs `b: &T` and the result of `a.grown(1)` is a `T` with the same bounds, and the template is checked once with `T` opaque (no fields, no other argument types). Instances substitute the concrete type and call the `impl` method. A method's receiver may be a parameter or a local initialized from a method call (`let b = a.grown(1)`); a chained receiver (`a.grown(1).size()`) and an annotation naming the type parameter (`let b: T = ...`) still use the old route. Traits with type parameters are still E173. Tests: `tests/generics_routines.rs` (`self_in_*`, `a_concrete_call_sees_self_*`).
+
 ## Candidate checked representation
 
 ### Identity and ownership

@@ -719,6 +719,12 @@ impl Context<'_> {
                             };
                             let slot =
                                 self.declare(LocalName::Source(name), statement.span, !mutable);
+                            // A method's result may be the receiver's own type (`Self`), and
+                            // then has the methods of the same bounds.
+                            if matches!(value.kind, ExpressionKind::MethodCall(_)) {
+                                self.generic_receiver.resize(slot.0 + 1, false);
+                                self.generic_receiver[slot.0] = true;
+                            }
                             self.scopes.last_mut()?.push(Visible {
                                 name,
                                 slot,
@@ -1234,15 +1240,14 @@ impl Context<'_> {
                         return decline(|| "method call on something other than a name".into());
                     };
                     let visible = self.lookup(receiver)?;
-                    if visible.slot.0 >= self.parameters
-                        || !self
+                    if !self
                             .generic_receiver
                             .get(visible.slot.0)
                             .copied()
                             .unwrap_or(false)
                     {
                         return decline(|| {
-                            "method call on something other than a generic parameter".into()
+                            "method call on something other than a generic parameter or a method result".into()
                         });
                     }
                     let arguments: Vec<Expression> = ast

@@ -1628,56 +1628,91 @@ impl Analysis<'_> {
             Type::Reference { pointee, .. } => (**pointee).clone(),
             other => other.clone(),
         };
-        // The parameter's declared type names the type parameter, and so its bounds.
-        let declared = header
-            .params
-            .get(call.receiver.0)
-            .map(|parameter| peel(&parameter.ty))
-            .ok_or_else(|| invalid(span))?;
-        let Type::Named(parameter) = &declared else {
-            return Err(unresolved(format!("unresolved method `{name}`")));
-        };
-        let mut found = None;
-        let bounds = header
-            .bounds
-            .iter()
-            .find(|(candidate, _)| **candidate == **parameter)
-            .map_or(&[][..], |(_, bounds)| &bounds[..]);
-        for bound in bounds {
-            let crate::generics::Bound::User(index) = bound else {
-                continue;
-            };
-            let Some(trait_name) = header.user_traits.get(*index as usize) else {
-                continue;
-            };
-            let Some(trait_id) = services.trait_id(trait_name) else {
-                continue;
-            };
-            use cyallo_ast::IdentifierEq as _;
-            if let Some(method) = services.traits[trait_id]
-                .methods
+        // What the receiver is: a type parameter while a template is checked, the concrete
+        // type in an instance (whatever the receiver is: a parameter, or a local holding a
+        // value of the parameter's type, such as the result of a method returning `Self`).
+        let receiver_type = self.typed(call.receiver, span)?;
+        let concrete = self.view(&peel(&receiver_type));
+        let bounds_of = |parameter: &str| {
+            header
+                .bounds
                 .iter()
-                .position(|method| method.name.eq_identifier(name))
-            {
-                if found.is_some() {
-                    return Err(unresolved(format!(
-                        "method `{name}` is in more than one bound of `{parameter}`"
-                    )));
+                .find(|(candidate, _)| **candidate == *parameter)
+                .map_or(&[][..], |(_, bounds)| &bounds[..])
+        };
+        let is_parameter = matches!(&concrete,
+            Type::Named(name) if header.bounds.iter().any(|(candidate, _)| **candidate == **name)
+                || header.params.iter().any(|p| matches!(&peel(&p.ty), Type::Named(n) if n == name)));
+        use cyallo_ast::IdentifierEq as _;
+        // The trait methods of a parameter's bounds named `name`.
+        let in_bounds = |parameter: &str| -> Result<Vec<(usize, usize)>, Diagnostic> {
+            let mut found = Vec::new();
+            for bound in bounds_of(parameter) {
+                let crate::generics::Bound::User(index) = bound else {
+                    continue;
+                };
+                let Some(trait_id) = header
+                    .user_traits
+                    .get(*index as usize)
+                    .and_then(|trait_name| services.trait_id(trait_name))
+                else {
+                    continue;
+                };
+                if let Some(method) = services.traits[trait_id]
+                    .methods
+                    .iter()
+                    .position(|method| method.name.eq_identifier(name))
+                    && !found.contains(&(trait_id, method))
+                {
+                    found.push((trait_id, method));
                 }
-                found = Some((trait_id, method));
             }
-        }
-        let Some((trait_id, method)) = found else {
+            Ok(found)
+        };
+        let template = is_parameter;
+        let found = if let Type::Named(parameter) = &concrete
+            && template
+        {
+            let found = in_bounds(parameter)?;
+            if found.len() > 1 {
+                return Err(unresolved(format!(
+                    "method `{name}` is in more than one bound of `{parameter}`"
+                )));
+            }
+            found
+        } else {
+            // An instance: the methods the bounds of every parameter allow, which the
+            // concrete type implements.
+            let mut found = Vec::new();
+            for (parameter, _) in &header.bounds {
+                for (trait_id, method) in in_bounds(parameter)? {
+                    let implemented = services.implementations.iter().any(|implementation| {
+                        implementation.trait_id == trait_id
+                            && self.view(&implementation.receiver) == concrete
+                    });
+                    if implemented && !found.contains(&(trait_id, method)) {
+                        found.push((trait_id, method));
+                    }
+                }
+            }
+            if found.len() > 1 {
+                return Err(unresolved(format!(
+                    "method `{name}` is in more than one bound of `{concrete}`"
+                )));
+            }
+            found
+        };
+        let Some(&(trait_id, method)) = found.first() else {
             return Err(unresolved(format!(
-                "`{parameter}` has no method `{}` in its bounds",
+                "`{}` has no method `{}` in its bounds",
+                concrete,
                 cyallo_ast::source_name(name)
             )));
         };
         let contract = &services.traits[trait_id].methods[method];
         // A template is checked against the trait; an instance calls the `impl`'s method.
-        let receiver_type = self.typed(call.receiver, span)?;
-        let concrete = self.view(&peel(&receiver_type));
-        let id = if concrete == declared {
+        let declared = concrete.clone();
+        let id = if template {
             usize::MAX
         } else {
             let implementation = services
@@ -1694,10 +1729,30 @@ impl Analysis<'_> {
                 })?;
             implementation.methods[method]
         };
+        // `Self` in the trait's signature is the receiver's type: the parameter itself in a
+        // template, the concrete type in an instance.
+        let mut params = contract.params.clone();
+        let mut result = contract.result.clone();
+        let stand_in = if id == usize::MAX {
+            declared.clone()
+        } else {
+            concrete.clone()
+        };
+        let replace = |ty: &mut Type| {
+            cyallo_ast::visit::visit_type(ty, &mut |ty| {
+                if *ty == Type::SelfType {
+                    *ty = stand_in.clone();
+                }
+            });
+        };
+        for (parameter, _) in &mut params {
+            replace(parameter);
+        }
+        replace(&mut result);
         Ok(MethodTarget {
             id,
-            params: contract.params.clone(),
-            result: contract.result.clone(),
+            params,
+            result,
             receiver: contract.receiver,
         })
     }

@@ -431,20 +431,20 @@ fn resolve_using(
             implementation.span,
         )?;
         for f in &mut implementation.methods {
-            for p in &mut f.params {
-                if p.receiver {
-                    fn self_type(ty: &mut Type, receiver: &Type) {
-                        match ty {
-                            Type::SelfType => *ty = receiver.clone(),
-                            Type::Reference { pointee, .. } | Type::Managed { pointee, .. } => {
-                                self_type(pointee, receiver)
-                            }
-                            _ => {}
-                        }
+            // `Self` is the implementing type wherever the signature writes it, not
+            // only in the receiver: `other: &Self` and `-> Self` too.
+            let receiver = &implementation.receiver;
+            let replace = |ty: &mut Type| {
+                cyallo_ast::visit::visit_type(ty, &mut |ty| {
+                    if *ty == Type::SelfType {
+                        *ty = receiver.clone();
                     }
-                    self_type(&mut p.ty, &implementation.receiver);
-                }
+                });
+            };
+            for p in &mut f.params {
+                replace(&mut p.ty);
             }
+            replace(&mut f.result);
             function(f, definitions)?;
         }
     }

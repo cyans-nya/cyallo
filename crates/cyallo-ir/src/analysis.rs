@@ -125,11 +125,9 @@ pub fn analyze(
     for imp in &services.implementations {
         for method in &services.traits[imp.trait_id].methods {
             let name = format!("$CONCRETE${:?}.{}", imp.receiver, key(&method.name));
-            let ty = Type::Function(
-                method.kind,
-                method.params.clone(),
-                Box::new(method.result.clone()),
-            );
+            // A concrete call sees the trait's `Self` as the implementing type.
+            let (params, result) = method.signature_for(&imp.receiver);
+            let ty = Type::Function(method.kind, params, Box::new(result));
             if routine_types.insert(name.clone(), ty).is_some() {
                 routine_types.insert(name, Type::Void);
             }
@@ -1587,10 +1585,13 @@ impl Lower<'_> {
                     .services
                     .concrete_method(receiver_ty.pointee_or_self(), name)
             {
-                let m = self.services.traits
+                let mut m = self.services.traits
                     [self.services.implementations[implementation].trait_id]
                     .methods[method]
                     .clone();
+                // The trait's `Self` is the type this call is made on.
+                (m.params, m.result) = m
+                    .signature_for(&self.services.implementations[implementation].receiver);
                 let id = self.services.implementations[implementation].methods[method];
                 if m.result == Type::Void && usage == CallUse::Value {
                     return Err(Diagnostic::new(

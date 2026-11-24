@@ -293,3 +293,72 @@ fn a_trait_bound_combines_with_the_operator_bounds() {
     );
     assert_eq!(run(&source), "13\n");
 }
+
+const COMPARE: &str = "record Circle {\n    r: i64\n}\nrecord Square {\n    side: i64\n}\n\
+trait Compare {\n    proc area(self: &Self) -> i64\n    proc bigger(self: &Self, other: &Self) -> bool\n    proc grown(self: &Self, by: i64) -> Self\n}\n\
+impl Compare for Circle {\n    proc area(self: &Self) -> i64 {\n        return self.r * self.r * 3\n    }\n\
+    proc bigger(self: &Self, other: &Self) -> bool {\n        return self.r > other.r\n    }\n\
+    proc grown(self: &Self, by: i64) -> Self {\n        return Circle { r: self.r + by }\n    }\n}\n\
+impl Compare for Square {\n    proc area(self: &Self) -> i64 {\n        return self.side * self.side\n    }\n\
+    proc bigger(self: &Self, other: &Self) -> bool {\n        return self.side > other.side\n    }\n\
+    proc grown(self: &Self, by: i64) -> Self {\n        return Square { side: self.side + by }\n    }\n}\n";
+
+fn compare(rest: &str) -> String {
+    format!("{COMPARE}{rest}")
+}
+
+#[test]
+fn self_in_a_parameter_is_the_receivers_own_type() {
+    let source = compare(
+        "proc larger<T: Compare>(a: &T, b: &T) -> bool {\n    return a.bigger(b)\n}\n\
+         let c1 = Circle { r: 2 }\nlet c2 = Circle { r: 3 }\nlet s1 = Square { side: 5 }\nlet s2 = Square { side: 1 }\n\
+         std::io::print(larger(&c1, &c2))\nstd::io::print(larger(&s1, &s2))",
+    );
+    assert_eq!(run(&source), "false\ntrue\n");
+    assert_eq!(lowered(&source), 2);
+}
+
+#[test]
+fn self_in_a_result_is_usable_by_the_same_bounds() {
+    // `grown` returns `Self`, which has the methods of `T`'s bounds.
+    let source = compare(
+        "proc regrown<T: Compare>(a: &T) -> i64 {\n    let b = a.grown(1)\n    return b.area()\n}\n\
+         let c = Circle { r: 1 }\nlet s = Square { side: 4 }\n\
+         std::io::print(regrown(&c))\nstd::io::print(regrown(&s))",
+    );
+    assert_eq!(run(&source), "12\n25\n");
+    assert_eq!(lowered(&source), 2);
+}
+
+#[test]
+fn self_stays_opaque_in_the_template() {
+    // `Self` is `T` here, not a record: no field, and no argument of another type.
+    let error = failure(&compare(
+        "proc peek<T: Compare>(a: &T) -> i64 {\n    let b = a.grown(1)\n    return b.r\n}\n\
+         let c = Circle { r: 1 }\nstd::io::print(peek(&c))",
+    ));
+    assert_eq!(error.code, "E116", "{}", error.message);
+    let error = failure(&compare(
+        "proc mix<T: Compare>(a: &T, n: &i64) -> bool {\n    return a.bigger(n)\n}\n\
+         let c = Circle { r: 1 }\nlet k = 5\nstd::io::print(mix(&c, &k))",
+    ));
+    assert_eq!(error.code, "E109", "{}", error.message);
+}
+
+#[test]
+fn a_concrete_call_sees_self_as_the_implementing_type() {
+    let source = compare(
+        "let a = Circle { r: 2 }\nlet b = Circle { r: 3 }\nstd::io::print(a.bigger(&b))\nstd::io::print(a.grown(5).area())",
+    );
+    assert_eq!(run(&source), "false\n147\n");
+}
+
+#[test]
+fn an_impl_must_name_the_implementer_where_the_trait_says_self() {
+    let error = failure(
+        "record A {\n    n: i64\n}\nrecord B {\n    n: i64\n}\n\
+         trait Same {\n    proc same(self: &Self, other: &Self) -> bool\n}\n\
+         impl Same for A {\n    proc same(self: &Self, other: &B) -> bool {\n        return true\n    }\n}\n",
+    );
+    assert_eq!(error.code, "E130", "{}", error.message);
+}

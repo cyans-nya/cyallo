@@ -96,7 +96,8 @@ fn analyze_modules_with(
             for imp in &metadata.implementations {
                 for m in &metadata.traits[imp.trait_id].methods {
                     let name = format!("$CONCRETE${:?}.{}", imp.receiver, m.name);
-                    let ty = Type::Function(m.kind, m.params.clone(), Box::new(m.result.clone()));
+                    let (params, result) = m.signature_for(&imp.receiver);
+                    let ty = Type::Function(m.kind, params, Box::new(result));
                     if types.insert(name.clone(), ty).is_some() {
                         types.insert(name, Type::Void);
                     }
